@@ -1,0 +1,100 @@
+{
+  "comment": "此配置文件专为【双流 TFT 模型】设计，实现了 1min 微观狙击与 5min 宏观定海神针的物理隔离。",
+  "comment_keys": "键名在所有部分(labels, loss_weights)中保持一致，并与H5数据集内部路径匹配。",
+  "parameters": {
+    "slow_channel": {
+      "window_duration_minutes": {
+        "regular": 30,
+        "pre_market": 5,
+        "after_hours": 5
+      },
+      "step_duration_minutes": {
+        "regular": 5,
+        "pre_market": 5,
+        "after_hours": 5
+      },
+      "label_horizon_k": 5
+    },
+    "labeling": {
+      "method": "multi_task",
+      "targets": [
+        "direction",
+        "volatility",
+        "event"
+      ],
+      "volatility_k": 10,
+      "event_k": 10,
+      "k_option": 10,
+      "resolutions": {
+        "5s": { "horizon": 60, "entry_threshold": 0.0005, "upper_threshold": 0.0005, "lower_threshold": -0.0005, "vol_multiplier": 2.0 },
+        "10s": { "horizon": 45, "entry_threshold": 0.0007, "upper_threshold": 0.0007, "lower_threshold": -0.0007, "vol_multiplier": 2.0 },
+        "15s": { "horizon": 30, "entry_threshold": 0.0008, "upper_threshold": 0.0008, "lower_threshold": -0.0008, "vol_multiplier": 2.0 },
+        "30s": { "horizon": 20, "entry_threshold": 0.001, "upper_threshold": 0.001, "lower_threshold": -0.001, "vol_multiplier": 2.0 },
+        "1min": { "horizon": 10, "entry_threshold": 0.0015, "upper_threshold": 0.0015, "lower_threshold": -0.0015, "vol_multiplier": 2.0 },
+        "5min": { "horizon": 3, "entry_threshold": 0.0025, "upper_threshold": 0.0025, "lower_threshold": -0.0025, "vol_multiplier": 2.0 }
+      }
+    },
+    "pre_post_dropout_rate": 0.1,
+    "expert_dropout_rate": 0.25,
+    "backbone_dropout_rate": 0.3,
+    "5s": { "sequence_length": 36, "hidden_dim": 32, "learning_rate": 0.001, "epochs": 20 },
+    "10s": { "sequence_length": 30, "hidden_dim": 48, "learning_rate": 0.0008, "epochs": 30 },
+    "15s": { "sequence_length": 30, "hidden_dim": 48, "learning_rate": 0.0007, "epochs": 35 },
+    "30s": { "sequence_length": 20, "hidden_dim": 48, "learning_rate": 0.0005, "epochs": 40 },
+    "1min": { "sequence_length": 30, "hidden_dim": 64, "learning_rate": 0.0005, "epochs": 50 },
+    "5min": { "sequence_length": 15, "hidden_dim": 80, "learning_rate": 0.0001, "epochs": 45 }
+  },
+  "labels": {
+    "direction": { "type": "classification", "output_dim": 3 },
+    "volatility": { "type": "regression" },
+    "event": { "type": "classification", "output_dim": 1 },
+    "return_fwd": { "type": "regression" }
+  },
+  "loss_weights": {
+    "direction": 4.0,
+    "return_fwd": 1.0,
+    "volatility": 0.1,
+    "event": 0.5
+  },
+  "resample_freq": {
+    "regular": {
+      "09:30-16:00": ["1min", "5min"]
+    }
+  },
+  "OHLV": ["open", "high", "low", "close", "volume"],
+  "features": [
+    {"name": "close_log_return", "type": "real", "calc": "custom", "resolution": "1min"},
+    {"name": "volume_log", "type": "real", "calc": "custom", "resolution": "1min"},
+    {"name": "volume_ratio", "type": "real", "calc": "volume_ratio", "resolution": "1min"},
+    {"name": "vwap_diff", "type": "real", "calc": "zscore", "alpha_sign": -1, "resolution": "1min"},
+    
+    {"name": "k", "type": "real", "calc": "StochasticOscillator(high, low, close, window=9, smooth_window=3).stoch()", "resolution": "5min"},
+    {"name": "cci", "type": "real", "calc": "CCIIndicator(high, low, close, window=20).cci()", "resolution": "5min"},
+    {"name": "price_slope_norm_by_atr", "type": "real", "calc": "atr_normalized", "use_for_anomaly": false, "resolution": "5min"},
+    {"name": "garman_klass_vol", "type": "real", "calc": "leading", "use_for_anomaly": false, "resolution": "5min"},
+    {"name": "adx_smooth_10", "type": "real", "calc": "adx_smooth_10", "resolution": "5min"},
+    {"name": "rsi", "type": "real", "calc": "RSIIndicator(close, window=14).rsi()", "use_for_anomaly": false, "alpha_sign": -1, "resolution": "5min"},
+    {"name": "price_dist_from_ma_atr", "type": "real", "calc": "atr_normalized", "use_for_anomaly": false, "alpha_sign": -1, "resolution": "5min"},
+    {"name": "poc_deviation", "type": "real", "calc": "leading", "use_for_anomaly": false, "alpha_sign": -1, "resolution": "5min"},
+    {"name": "bb_width", "type": "real", "calc": "BollingerBands(close, window=20, window_dev=2).bollinger_width()", "description": "Normalized Bollinger Band width", "resolution": "5min"},
+    {"name": "vix_level", "type": "real", "calc": "vix_gate", "resolution": "5min"},
+    {"name": "hour", "type": "categorical", "calc": "time.hour", "cardinality": 24, "resolution": "5min"},
+    {"name": "day_of_week", "type": "categorical", "calc": "time.day_of_week", "cardinality": 7, "resolution": "5min"},
+
+   
+    {"name": "options_vw_spread", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    {"name": "options_vw_imbalance", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    {"name": "options_vw_iv", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    {"name": "options_vw_gamma", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    {"name": "options_vw_vega", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    {"name": "options_pcr_volume", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    {"name": "options_iv_momentum", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    {"name": "options_iv_divergence", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    
+    {"name": "options_struc_atm_iv", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "5min"},
+    {"name": "options_flow_skew", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "5min"},
+    {"name": "options_struc_skew", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "5min"},
+    {"name": "options_struc_term", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "5min"},
+    {"name": "options_gamma_accel", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "5min"}
+  ]
+}

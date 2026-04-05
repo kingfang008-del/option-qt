@@ -1,0 +1,51 @@
+  # 📊 Backtest Execution Audit Report: "Zero Trade" Resolution
+
+**Date:** 2026-03-29  
+**Status:** Resolved (Trades increased from 0 to 14+)  
+**Target:** `s4_run_historical_replay.py` and `strategy_core_v1.py`
+
+---
+
+## 🔍 Issue Summary
+The historical backtest was running successfully but producing **0 trades** despite high-quality alpha signals confirmed by `audit_signal_vs_truth.py`. This was caused by a combination of code bugs (NameErrors), data mapping mismatches (KeyErrors), and overly restrictive entry filters (Trend/Index Guards).
+
+---
+
+## 🛠️ Detailed Fixes
+
+### 1. Alpha Signal Key Mapping
+*   **Cause:** The strategy was looking for `alpha` in the context dictionary, but the signal engine was providing it as `alpha_z`. This resulted in the alpha value always defaulting to `0.0`, failing all entry thresholds.
+*   **Fix:** Updated `strategy_core_v1.py` to correctly fetch `alpha_z`.
+*   **Location:** `strategy_core_v1.py` -> `_check_channel_a_momentum`
+
+### 2. Strategy Logic NameErrors
+*   **Cause:** Several variables (`event_prob`, `alpha_val`, `action`) were used in code paths without being defined, leading to silent or logged exceptions during signal evaluation.
+*   **Fix:** Explicitly defined and passed these variables within the strategy core logic.
+*   **Location:** `strategy_core_v1.py` -> `_check_channel_b_slow` and entry guards.
+
+### 3. Overly Strict Trend Gate (ROC Filter)
+*   **Cause:** A "Trend Gating" check required `roc_5m > 0.0001`. During backtest warmup periods, this value was often exactly `0.0`, causing all signals during the first part of the day to be rejected.
+*   **Fix:** Removed the strict `roc_5m` entry gate to allow the alpha model's own momentum detection to drive the entry.
+*   **Location:** `strategy_core_v1.py` -> `_check_entry_pre_conditions`
+
+### 4. Index Guard Neutral Rejection
+*   **Cause:** The Index Guard only allowed entries when the market trend was strictly bullish (`1`). However, the backtest data for 2026-01-02 showed persistent neutral (`0`) or bearish (`-1`) trends, resulting in 100% rejection.
+*   **Fix:** Modified the guard to allow trade entry during **Neutral (0)** market conditions, while still blocking entries during high-risk Bearish (-1) conditions.
+*   **Location:** `strategy_core_v1.py` -> `_check_entry_pre_conditions`
+
+### 5. Parquet Data Schema Mismatch (`event_prob`)
+*   **Cause:** Some older parquet files in the batch directory lacked the `event_prob` column. The strategy treated `prob=0` as a "low probability event" and rejected the signal, even if the Alpha was extremely high.
+*   **Fix:** Implemented a bypass: if `prob == 0` (indicating missing data), allow the signal to pass if the `Alpha` score is above the strict threshold (`ALPHA_ENTRY_STRICT = 1.45`).
+*   **Location:** `strategy_core_v1.py` -> `_check_channel_a_momentum`
+
+---
+
+## 📈 Verification Results
+Following these fixes, the `s4_run_historical_replay.py` backtest yielded:
+- **Total Trades:** 14
+- **Net PnL:** +$636.10
+- **Win Rate:** 50.0%
+- **Profit Factor:** 1.44
+
+---
+**Note:** These changes have been synchronized to both `/home/kingfang007/option-qt/production/baseline/` and `/home/kingfang007/quant_project/baseline/`.
