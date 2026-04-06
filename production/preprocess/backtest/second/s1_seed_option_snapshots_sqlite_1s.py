@@ -218,6 +218,10 @@ def process_option_data_1s(sym):
             date_str_from_file = date_str_raw.replace('-', '')
             db_path = DB_DIR / f"market_{date_str_from_file}.db"
             
+            if not DB_DIR.exists(): DB_DIR.mkdir(parents=True, exist_ok=True)
+            if sym == TARGET_SYMBOLS[0]: # 只需要打印一次
+                logging.info(f"🚀 [DB_DEBUG] Writing to absolute path: {db_path.absolute()}")
+            
             if is_data_seeded(db_path, table_name, sym): continue
             
             df_day = pd.read_parquet(p_file)
@@ -246,8 +250,10 @@ def process_option_data_1s(sym):
                     b_id = int(row.bucket_id)
                     if b_id < 0 or b_id > 5: continue
                     
-                    # 适配 calc_offline_1s_greeks 生成的列名
-                    price = float(getattr(row, 'mid_price', getattr(row, 'close', 0.0)))
+                    # 适配 calc_offline_1s_greeks 生成的列名，并向下兼容 raw_1s 的 'price' 字段
+                    price = float(getattr(row, 'mid_price', getattr(row, 'price', getattr(row, 'close', 0.0))))
+                    if symbol == 'AMD' and price < 0.0001:
+                        print(f"🚨 [SEED_DEBUG] Price is 0 for AMD! Available fields: {row._fields}")
                     contracts[b_id] = str(row.ticker)
                     
                     vals = [

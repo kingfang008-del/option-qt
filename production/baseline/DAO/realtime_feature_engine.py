@@ -128,6 +128,9 @@ class RealTimeFeatureEngine:
         """
         if buckets is None or len(buckets) == 0:
             return buckets
+        
+        if symbol == 'NVDA':
+            print(f"🚨 [ENGINE_ENTRY] NVDA Bucket[0,0] Price: {buckets[0, 0]:.4f}")
             
         # 1. 检查是否需要补算 (只要有一个 IV 为 0 且价格有效，就触发整桶检查)
         # 简化逻辑：始终运行以确保 100% 对齐 (b/c live also recalcs)
@@ -150,7 +153,12 @@ class RealTimeFeatureEngine:
                     if m:
                         exp_str = m.group(0)
                         expiry_dt = pd.to_datetime(exp_str, format='%y%m%d').tz_localize('America/New_York') + pd.Timedelta(hours=16)
-                        t_years = max(1e-6, (expiry_dt - ts_anchor).total_seconds() / 31557600.0)
+                        time_diff = (expiry_dt - ts_anchor).total_seconds()
+                        t_years = max(1e-6, time_diff / 31557600.0)
+                        
+                        if t_years < 1e-4:
+                            # 🚨 [TIME_CRITICAL] 如果 T 异常小，打印详细的时间成分
+                            print(f"🚨 [T_ERR_DEBUG] Sym: {symbol} | Now: {ts_anchor} | Expiry: {expiry_dt} | Diff_sec: {time_diff:.2f} | T: {t_years:.8f}")
                         
                         # 🚀 [Parity Fix] 放弃硬编码，透传 timestamp 让数学库自标定
                         calculate_bucket_greeks(
@@ -370,7 +378,8 @@ class RealTimeFeatureEngine:
                            history_5min: Optional[Dict[str, pd.DataFrame]] = None,
                            option_snapshot_5m: Optional[Dict[str, np.ndarray]] = None,
                            feat_resolutions: Optional[Dict[str, str]] = None,
-                           skip_scaling: bool = False) -> Dict[str, Dict]:
+                           skip_scaling: bool = False,
+                           current_ts: Optional[float] = None) -> Dict[str, Dict]:
         results = {}
         all_feats = list(set(fast_feats + slow_feats))
         if not history_1min: return results
@@ -385,7 +394,8 @@ class RealTimeFeatureEngine:
         master_index = master_index.sort_values()
         max_len = len(master_index)
 
-        last_ts = master_index[-1]
+        # 1. 确定锚点时间 (优先使用显式传入的 current_ts)
+        last_ts = pd.Timestamp(current_ts, unit='s', tz='UTC') if current_ts else master_index[-1]
         time_feats = self.time_gen.get_time_features(last_ts, max_len)
         
         # 2. 对齐 SPY/QQQ 等宏观特征
@@ -435,9 +445,11 @@ class RealTimeFeatureEngine:
                       last_row = df_s.iloc[-1]
                       # 🚀 [Parity Fix] 使用传入的 option_contracts 透传给 Greeks 补算
                       if option_contracts and s in option_contracts:
+                          # 🚀 [Parity Fix] 显式透传 current_ts (或 fallback 到 last_ts) 确保到期时间计算正确
+                          target_ts = current_ts if current_ts else last_ts.timestamp()
                           raw_snap = self.supplement_greeks(
                               s, raw_snap, option_contracts[s], 
-                              float(last_row['close']), last_ts.timestamp()
+                              float(last_row['close']), target_ts
                           )
 
                   if raw_snap.shape[0] < 6:
@@ -456,6 +468,7 @@ class RealTimeFeatureEngine:
 
         # --- B. 计算 5min 特征 (如果存在) ---
         batch_res_5m = {}
+        opts_bh_5m = None
         if slow_feats_5m and history_5min:
             # 5min 的 master_index 相对简单，因为输入就是 5min K线
             indices_5m = [df.index for df in history_5min.values() if not df.empty]

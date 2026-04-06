@@ -918,17 +918,17 @@ class FeatureComputeService:
                     if len(self.history_5min[sym]) > 100: self.history_5min[sym] = self.history_5min[sym].iloc[-100:]
                 
     
-                # ========= 替换 process_fused_data 中的期权更新逻辑 =========
                 buckets = payload.get('buckets')
                 if not buckets or len(buckets) == 0:
                     buckets = payload.get('option_buckets')
                 
                 if buckets:
+                     
                     arr = np.array(buckets, dtype=np.float32)
                     # 🚀 [Debug] 打印原始注入的 IV 信息
-                    if sym == 'NVDA' and getattr(self, '_iv_debug_count', 0) < 5:
-                        iv_val = arr[2, 7] if arr.shape[0]>2 and arr.shape[1]>7 else -1
-                        logger.info(f"🧪 [IV_TRACE_1] {sym} | Injected Buckets shape: {arr.shape} | Row2_Col7_IV: {iv_val}")
+                    if (sym == 'NVDA' or sym == 'AMD') and getattr(self, '_iv_debug_count', 0) < 20:
+                        iv_val = arr[0, 0] if arr.shape[0]>0 and arr.shape[1]>0 else -1
+                        logger.info(f"🧪 [PAYLOAD_TRACE] {sym} | Price in Arr[0,0]: {iv_val:.4f} | Row0: {arr[0, :6]}")
                         self._iv_debug_count = getattr(self, '_iv_debug_count', 0) + 1
                     # 维度补齐
                     if arr.shape[1] < 12:
@@ -938,8 +938,9 @@ class FeatureComputeService:
                         arr = np.vstack([arr, np.zeros((6 - arr.shape[0], 12), dtype=np.float32)])
                     
                     # 成交量直接映射 (对齐 step2_thetadata_sniper_v6: 用盘口深度之和代替成交量)
-                    # 🚀 [优化] 即使没有成交量 (Sum=0)，只要不是全 0 (说明有 Bid/Ask 或 IV)，就允许更新快照
-                    if np.any(arr > 0): 
+                    # 🚀 [防弹修复] 绝不能用 np.any(arr > 0)，因为行权价永远 > 0！
+                    # 必须判断期权价格 (第0列) 或深度 (第6列) 大于 0，才能拒绝 09:30:00 的空盘口污染！
+                    if np.sum(arr[:, 0]) > 0.001 or np.sum(arr[:, 6]) > 0.001: 
                         # 确保成交量/深度不为负
                         arr[:, 6] = np.maximum(arr[:, 6], 0.0)
                         self.option_snapshot[sym] = arr
@@ -1311,8 +1312,11 @@ class FeatureComputeService:
         # [Parity & Speed] Only recompute raw features from engine at minute boundaries
         if is_new_minute or getattr(self, 'cached_batch_raw', None) is None:
             # ---------------- 1. 触发 Engine 计算 ----------------
-            sliced_snaps = {s: snap[:, :12] for s, snap in self.option_snapshot.items()}
-            sliced_snaps_5m = {s: snap[:, :12] for s, snap in getattr(self, 'option_snapshot_5m', {}).items()}
+            # 🚀 [SECURITY_FIX] 使用 .copy() 彻底隔断原本 snap 的内存引用。
+            # NumPy 的 [:, :12] 默认是 View，会导致引擎的原地修改污染 Service 的持久化快照，
+            # 从而导致第二秒时价格数据消失。
+            sliced_snaps = {s: snap[:, :12].copy() for s, snap in self.option_snapshot.items()}
+            sliced_snaps_5m = {s: snap[:, :12].copy() for s, snap in getattr(self, 'option_snapshot_5m', {}).items()}
 
             try:
                 results_map = self.engine.compute_all_inputs(
@@ -1323,7 +1327,8 @@ class FeatureComputeService:
                     option_snapshots=sliced_snaps,  
                     option_contracts=self.latest_opt_contracts,
                     option_snapshot_5m=sliced_snaps_5m,
-                    feat_resolutions=getattr(self, 'feat_resolutions', {}) 
+                    feat_resolutions=getattr(self, 'feat_resolutions', {}),
+                    current_ts=data_ts 
                 )
             except Exception as e:
                 logger.error(f"Engine Compute Error: {e}", exc_info=True)
@@ -1550,16 +1555,30 @@ class FeatureComputeService:
                 # =================================================================
                 # 🚀 [架构升维：事前合并期权字典 (Pre-Join)]
                 # =================================================================
+                # =================================================================
+                # 🚀 [架构升维：事前合并期权字典 (Pre-Join)]
+                # =================================================================
                 live_options = {}
+                live_options_5m = {} # 🚀 [修复] 补回丢失的 5m 容器
                 for sym in batch_symbols:
                     live_options[sym] = {
                         'buckets': getattr(self, 'latest_opt_buckets', {}).get(sym, []),
                         'contracts': getattr(self, 'latest_opt_contracts', {}).get(sym, [])
                     }
+                    
+                    # 🚀 [新增] 5m 期权快照组装
+                    from config import USE_5M_OPTION_DATA
+                    if USE_5M_OPTION_DATA:
+                        snap_5m = getattr(self, 'option_snapshot_5m', {}).get(sym)
+                        if snap_5m is not None:
+                            live_options_5m[sym] = {
+                                'buckets': snap_5m.tolist() if isinstance(snap_5m, np.ndarray) else snap_5m,
+                                'contracts': getattr(self, 'latest_opt_contracts', {}).get(sym, [])
+                            }
                 
                 payload = {
-                    'ts': data_ts, # 🚀 必须保持单调递增，否则 Driver 会同步死锁！
-                    'log_ts': data_ts, # 🚀 对齐事实时刻，不再进行 -60s 偏移 (由 S3 脚本在入库 Parquet 时统一处理)
+                    'ts': data_ts, 
+                    'log_ts': data_ts, 
                     'symbols': batch_symbols,
                     'stock_price': batch_prices,
                     'stock_id': np.array(batch_stock_ids),
@@ -1569,6 +1588,7 @@ class FeatureComputeService:
                     'qqq_roc_5min': np.array(batch_qqq_rocs),
                     'features_dict': features_dict,
                     'live_options': live_options,
+                    'live_options_5m': live_options_5m, # 🚀 [修复] 补齐 Payload 字段
                     'is_new_minute': is_new_minute,  
                     'cheat_call': cheat_call, 'cheat_put': cheat_put,
                     'cheat_call_bid': cheat_call_bid, 'cheat_call_ask': cheat_call_ask,

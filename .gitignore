@@ -68,8 +68,9 @@ instance/
 # Scrapy stuff:
 .scrapy
 
-production/backtest/history_sqlite_1m/*
+production/preprocess/backtest/history_sqlite_1m/
 
+production/preprocess/backtest/history_sqlite_1s/
 # Sphinx documentation
 docs/_build/
 

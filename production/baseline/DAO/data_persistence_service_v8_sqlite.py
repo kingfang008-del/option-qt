@@ -65,6 +65,7 @@ class DataPersistenceServiceSQLite:
         # option_buffer[key] = buckets_json_string
         # key = (symbol, minute_ts)
         self.option_buffer = {}
+        self.option_buffer_5m = {} # 🚀 [修复] 增加 5m 专用缓冲区
         
         self.trade_buffer = []
         self.alpha_buffer = [] # [New]
@@ -163,6 +164,16 @@ class DataPersistenceServiceSQLite:
                 PRIMARY KEY (symbol, ts)
             )
         """)
+
+        # 🚀 [新增] 3b. 建表: 5分钟期权快照 (用于模型训练)
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS option_snapshots_5m (
+                symbol TEXT,
+                ts INTEGER,
+                buckets_json TEXT,
+                PRIMARY KEY (symbol, ts)
+            )
+        """)
         
         # [新增] 4. 建表: 归一化特征日志 (用于 EOD 回测和 Debug)
         # 使用 BLOB 存储 float32 数组，节省空间且读写最快
@@ -213,6 +224,16 @@ class DataPersistenceServiceSQLite:
                     )
                     # 可以在这里加一个日志确认入库成功
                     # logger.info(f"💾 Persisted features for {len(rows_to_insert)} symbols")
+
+                # 🚀 [新增] 提取并缓存 5m 算好的期权
+                live_options_5m = payload.get('live_options_5m')
+                if live_options_5m and isinstance(live_options_5m, dict):
+                    minute_5_ts = int(ts // 300 * 300)
+                    for sym, opt_data in live_options_5m.items():
+                        key = (sym, minute_5_ts)
+                        buckets = opt_data.get('buckets')
+                        if isinstance(buckets, np.ndarray): buckets = buckets.tolist()
+                        self.option_buffer_5m[key] = json.dumps({'buckets': buckets, 'contracts': opt_data.get('contracts', [])})
 
             # 兼容旧版
             elif 'symbol' in payload:
@@ -344,6 +365,19 @@ class DataPersistenceServiceSQLite:
                 
                 for k in opt_keys_to_delete:
                     del self.option_buffer[k]
+
+            # 🚀 [新增] 2b. 写入 5m 期权快照
+            if getattr(self, 'option_buffer_5m', None):
+                opts_to_write_5m = []
+                opt_keys_to_delete_5m = []
+                for key, buckets_json in self.option_buffer_5m.items():
+                    opts_to_write_5m.append((key[0], key[1], buckets_json))
+                    if key[1] < current_cutoff:
+                        opt_keys_to_delete_5m.append(key)
+
+                self.cursor.executemany("REPLACE INTO option_snapshots_5m (symbol, ts, buckets_json) VALUES (?, ?, ?)", opts_to_write_5m)
+                for k in opt_keys_to_delete_5m:
+                    del self.option_buffer_5m[k]
 
             # 3. 写入交易 (分表逻辑)
             if self.trade_buffer:

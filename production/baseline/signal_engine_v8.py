@@ -1014,7 +1014,7 @@ class SignalEngineV8:
         
         # [Diagnostic]
         if (IS_BACKTEST or getattr(self, '_alpha_log_count', 0) < 20000) and sym in self.symbols:
-            logger.info(f"🔍 [Alpha Trace] {sym} | Z: {alpha_z:.4f} | ROC: {snap_roc:.4f} | MACD: {macd:.4f} | Dir: {st.correction_mode}")
+            #logger.info(f"🔍 [Alpha Trace] {sym} | Z: {alpha_z:.4f} | ROC: {snap_roc:.4f} | MACD: {macd:.4f} | Dir: {st.correction_mode}")
             self._alpha_log_count = getattr(self, '_alpha_log_count', 0) + 1
         
         metrics = {

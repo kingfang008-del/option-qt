@@ -88,17 +88,23 @@ def calculate_bucket_greeks(buckets: np.ndarray, S: float, T: float, r: float = 
         # 如果依然拿不到利率，记录警告并返回原始 buckets (杜绝运行时异常中断整个特征链路)
         if log_id < 20: print(f">>>> [RFR_WARNING] r is None. Greeks recalculation aborted.")
         return buckets
-    if log_id < 20: 
-        print(f"\n>>>> [MATH_TRACE] File: {__file__}")
+    # 🚀 [优化] 持续采样追踪：不再只打印前 20 条，改为每 1000 个 Bucket 采样打印一次
+    if not hasattr(calculate_bucket_greeks, "_sample_cnt"):
+        calculate_bucket_greeks._sample_cnt = 0
+    
+    show_log = (calculate_bucket_greeks._sample_cnt % 1000 == 0)
+    calculate_bucket_greeks._sample_cnt += 1
+
+    if show_log: 
+        print(f"\n>>>> [MATH_TRACE] File: {__file__} | Sample_ID: {calculate_bucket_greeks._sample_cnt}")
         print(f">>>> [MATH_TRACE] Params: S={S:.2f}, T={T:.8f}, R={r:.4f}, Sample={contracts[:1] if contracts else 'N/A'}")
-        calculate_bucket_greeks._log_cnt = log_id + 1
 
     # 🚀 [FORCE CLEAR] 起手全量清零，杜绝任何 0.5 残留
     buckets[:, IDX_IV] = 0.0
     buckets[:, IDX_DELTA:IDX_STRIKE] = 0.0 
 
     if S < 0.01 or T < 1e-7:
-        if log_id < 20: print(f">>>> [MATH_TRACE] Skipped due to S/T")
+        if show_log: print(f">>>> [MATH_TRACE] Skipped due to S/T")
         return buckets
 
     # 1. 遍历每一行进行重算
@@ -114,10 +120,14 @@ def calculate_bucket_greeks(buckets: np.ndarray, S: float, T: float, r: float = 
         price = float(buckets[i, IDX_PRICE])
         strike = float(buckets[i, IDX_STRIKE])
         
+        # 🧪 [RAW_DATA_DEBUG] 强制打印，看看到底有没有价格进入计算循环
+        if log_id < 10:
+            print(f">>>> [MATH_TRACE] Row {i} Input | Ticker: {ticker} | Price: {price:.4f} | Strike: {strike:.2f}")
+
         if strike < 0.01: continue
         
         iv = 0.0
-        if price > 0.001:
+        if price > 0.0001:
             try:
                 if HAS_VOLLIB:
                     res = vectorized_implied_volatility(
@@ -125,14 +135,16 @@ def calculate_bucket_greeks(buckets: np.ndarray, S: float, T: float, r: float = 
                         np.array([T]), np.array([r]), opt_type, return_as='numpy', on_error='ignore'
                     )
                     iv = float(res[0]) if not np.isnan(res[0]) else 0.0
-                    if np.isnan(res[0]) and log_id < 20:
-                        print(f">>>> [MATH_TRACE] Row {i} IV is NaN for P={price}, K={strike}")
+                    if log_id < 20:
+                        print(f">>>> [MATH_TRACE] Row {i} | Ticker: {ticker} | P: {price:.4f} | S: {S:.2f} | K: {strike:.2f} | T: {T:.8f} | IV: {iv:.4f}")
                 else:
                     iv = find_iv(price, S, strike, T, r, opt_type)
             except Exception as e:
                 if log_id < 20: print(f">>>> [MATH_TRACE] Row {i} Calc Error: {e}")
                 iv = 0.0
         
+        # 🚨 [SECURITY_FIX] 严禁覆写 Index 0 (Price) 或 Index 5 (Strike)
+        # 结果必须精准归位于 Index 7 (IV)
         buckets[i, IDX_IV] = iv
         
         # 希腊值计算
