@@ -25,7 +25,7 @@ DB_DIR       = PROJECT_ROOT / "data" / "history_sqlite_1m"
 # ================= 参数解析 =================
 def parse_args():
     parser = argparse.ArgumentParser(description="Option Snapshot Seeder (V10)")
-    parser.add_argument("--start_date", type=str, default="2026-03-27", help="只处理该日期及之后的数据 (格式: YYYY-MM-DD)")
+    parser.add_argument("--start_date", type=str, default="2026-01-02", help="只处理该日期及之后的数据 (格式: YYYY-MM-DD)")
     parser.add_argument("--end_date", type=str, default="2099-12-31", help="只处理该日期及之前的数据 (格式: YYYY-MM-DD)")
     parser.add_argument("--force", action="store_true", help="强制重新播种，即使数据库中已有数据")
     return parser.parse_args()
@@ -310,11 +310,10 @@ def process_option_data(sym, res_type='1min'):
             resample_freq = '1Min' if res_type == '1min' else '5Min'
             df_focus = df_focus.reset_index().set_index('timestamp')
             
-            # [逻辑修正] 使用 closed='right', label='right' 确保 10:00:01 ~ 10:01:00 的数据归入 10:01:00
-            # 这与大部分数据源的 End-of-Bar 标注逻辑一致，消除 1 分钟延迟。
+             
             df_list = []
             for b_id, group in df_focus.groupby('bucket_id'):
-                resampled = group.resample(resample_freq, closed='right', label='right').last()
+                resampled = group.resample(resample_freq).last()
 
                 resampled['bucket_id'] = b_id
                 resampled = resampled.ffill()

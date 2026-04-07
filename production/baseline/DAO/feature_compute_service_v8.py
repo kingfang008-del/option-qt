@@ -298,6 +298,7 @@ class FeatureComputeService:
         self.option_snapshot = {s: np.zeros((6, 12), dtype=np.float32) for s in symbols}
         self.option_snapshot_5m = {s: np.zeros((6, 12), dtype=np.float32) for s in symbols}
         self.latest_prices = {s: 0.0 for s in symbols}
+        self.last_tick_price = {s: 0.0 for s in symbols} # 🚀 [NEW] 锁存上一秒股价 (用于特征对位)
         self.deriv_history = {s: deque(maxlen=10) for s in symbols}
         self.last_compute_ts = None
         self.warmup_needed = {s: True for s in symbols}
@@ -376,14 +377,14 @@ class FeatureComputeService:
             for name in self.fast_feat_names:
                 if name not in existing_cols_fast:
                     c.execute(f'ALTER TABLE debug_fast ADD COLUMN "{name}" DOUBLE PRECISION')
-            
+
             # 创建日分区
             part_fast = f"debug_fast_{date_str}"
             c.execute(f"""
                 CREATE TABLE IF NOT EXISTS {part_fast} PARTITION OF debug_fast
                 FOR VALUES FROM ({start_ts}) TO ({end_ts});
             """)
-
+            
             # ---------------- 2. Slow Debug (Master) ----------------
             c.execute("""
                 CREATE TABLE IF NOT EXISTS debug_slow (
@@ -404,6 +405,18 @@ class FeatureComputeService:
                 CREATE TABLE IF NOT EXISTS {part_slow} PARTITION OF debug_slow
                 FOR VALUES FROM ({start_ts}) TO ({end_ts});
             """)
+
+            # 🚀 [Surgery 19] 双保险同步：确保分区表本身也补齐了所有特征列
+            # 解决 PostgreSQL 分区同步延迟或现有分区未自动更新的问题
+            for part_name, feat_names in [(part_fast, self.fast_feat_names), (part_slow, self.slow_feat_names)]:
+                existing_partition_cols = get_existing_cols(part_name)
+                for name in feat_names:
+                    if name not in existing_partition_cols:
+                        try:
+                            c.execute(f'ALTER TABLE {part_name} ADD COLUMN "{name}" DOUBLE PRECISION')
+                            logger.info(f"➕ [Schema Sync] Added column '{name}' to partition {part_name}")
+                        except Exception as ae:
+                            logger.warn(f"Failed to add column {name} to {part_name}: {ae}")
                         
             logger.info(f"✅ Debug 表分区化确认完成: debug_fast_{date_str}, debug_slow_{date_str}")
         except Exception as e:
@@ -877,6 +890,7 @@ class FeatureComputeService:
                 dt_utc = datetime.fromtimestamp(ts, timezone.utc)
                 dt_ny = dt_utc.astimezone(NY_TZ)
                 curr_minute = dt_ny.replace(second=0, microsecond=0)
+               
     
                 # ==========================================================
                 # [🔥 升级] 盘前放行与 09:30 准点清洗机制 (Premarket Flush)
@@ -904,6 +918,37 @@ class FeatureComputeService:
                         self._premarket_flushed_date = dt_ny.date()
                         logger.info("🧹 09:30 准点清洗完成！盘前测试数据已剔除，引擎进入纯净实盘(RTH)模式。")
                 # ==========================================================
+                 # =========================================================
+                # [🔥 致命漏洞修复 1: 全局时间界限强制结算 (Global Flush)]
+                # 解决 2 分钟延迟的核心！只要收到新的一分钟的任何一个 Tick，强制归档全市场上一分钟的真实 K 线！
+                # =========================================================
+                if not hasattr(self, 'global_last_minute'):
+                    self.global_last_minute = curr_minute
+                    
+                if curr_minute > self.global_last_minute:
+                    # 🚀 [手术 25b: 全局原子平移] 在所有股票结算前，一次性隔离全市场上一时刻快照
+                    if hasattr(self, 'frozen_option_snapshot'):
+                        self.prev_frozen_option_snapshot = {s: v.copy() for s, v in self.frozen_option_snapshot.items()}
+                        self.prev_frozen_option_snapshot_5m = {s: v.copy() for s, v in self.frozen_option_snapshot_5m.items()}
+                        self.prev_frozen_latest_opt_buckets = {s: list(v) for s, v in self.frozen_latest_opt_buckets.items()}
+                    
+                    # 跨分钟了，把所有股票上一分钟还没结算的 5s Buffer 全部归档
+                    for s in self.symbols:
+                        if self.current_bars_5s[s]:
+                            self._finalize_1min_bar(s, self.global_last_minute, cleanup=True)
+                    self.global_last_minute = curr_minute
+                # =========================================================
+    
+                if not hasattr(self, 'last_processed_minute'):
+                    self.last_processed_minute = {}
+                    
+                if sym not in self.last_processed_minute:
+                    self.last_processed_minute[sym] = curr_minute
+                
+                # 1. 检测个股 Minute Switch
+                if curr_minute > self.last_processed_minute[sym]:
+                    self._finalize_1min_bar(sym, self.last_processed_minute[sym], cleanup=True)
+                    self.last_processed_minute[sym] = curr_minute
                 
                 
                 # 1min Stock
@@ -937,6 +982,11 @@ class FeatureComputeService:
                     if arr.shape[0] < 6: 
                         arr = np.vstack([arr, np.zeros((6 - arr.shape[0], 12), dtype=np.float32)])
                     
+                    # 🚀🚀🚀 [核心修复 2：严格实盘对齐] 🚀🚀🚀
+                    # 绝对不能信任上游传过来的 close，无条件强行用 (bid + ask) / 2 重算 price 列！
+                    valid_quote_mask = (arr[:, 8] > 0) & (arr[:, 9] > 0)
+                    arr[valid_quote_mask, 0] = (arr[valid_quote_mask, 8] + arr[valid_quote_mask, 9]) / 2.0
+
                     # 成交量直接映射 (对齐 step2_thetadata_sniper_v6: 用盘口深度之和代替成交量)
                     # 🚀 [防弹修复] 绝不能用 np.any(arr > 0)，因为行权价永远 > 0！
                     # 必须判断期权价格 (第0列) 或深度 (第6列) 大于 0，才能拒绝 09:30:00 的空盘口污染！
@@ -971,6 +1021,10 @@ class FeatureComputeService:
                             arr = np.hstack([arr, pad])
                         if arr.shape[0] < 6: arr = np.vstack([arr, np.zeros((6 - arr.shape[0], 12), dtype=np.float32)])
                         
+                        # 🚀 [5m 期权同样强行重算]
+                        valid_quote_mask_5m = (arr[:, 8] > 0) & (arr[:, 9] > 0)
+                        arr[valid_quote_mask_5m, 0] = (arr[valid_quote_mask_5m, 8] + arr[valid_quote_mask_5m, 9]) / 2.0
+
                         if np.sum(arr[:, 6]) > 0.0001: 
                             # 🚀 [核心对齐] 5m 桶同样直接使用 Depth 快照
                             minute_vol = arr[:, 6]
@@ -978,43 +1032,29 @@ class FeatureComputeService:
                             arr[:, 6] = minute_vol
                             self.option_snapshot_5m[sym] = arr
     
-                # [Fix] 优化 1min Bar 归档逻辑 - 移动到 append 之前以防污染
+                # =========================================================
+                # 🚀 [终极隔离防线] 分钟物理跨越检测与强制垃圾回收
+                # 目标：当抵达 :00 秒时，必须先将上一分钟的数据 [00, 59] 封存入档，
+                # 并在其污染下一分钟前将其物理清核 (cleanup=True)！
+                # =========================================================
+                # 检测当前秒数。如果是 0 秒，说明这是新分钟的第一个物理 Tick。
+                is_exact_boundary = (dt_ny.second == 0)
                 
-                # =========================================================
-                # [🔥 致命漏洞修复 1: 全局时间界限强制结算 (Global Flush)]
-                # 解决 2 分钟延迟的核心！只要收到新的一分钟的任何一个 Tick，强制归档全市场上一分钟的真实 K 线！
-                # =========================================================
-                if not hasattr(self, 'global_last_minute'):
-                    self.global_last_minute = curr_minute
-                    
-                if curr_minute > self.global_last_minute:
-                    # 跨分钟了，把所有股票上一分钟还没结算的 5s Buffer 全部归档
-                    for s in self.symbols:
-                        if self.current_bars_5s[s]:
-                            self._finalize_1min_bar(s, self.global_last_minute, cleanup=True)
-                    self.global_last_minute = curr_minute
-                # =========================================================
-    
-                if not hasattr(self, 'last_processed_minute'):
-                    self.last_processed_minute = {}
-                    
-                if sym not in self.last_processed_minute:
-                    self.last_processed_minute[sym] = curr_minute
-                
-                # 1. 检测个股 Minute Switch
-                if curr_minute > self.last_processed_minute[sym]:
-                    self._finalize_1min_bar(sym, self.last_processed_minute[sym], cleanup=True)
-                    self.last_processed_minute[sym] = curr_minute
-    
-                # 2. Append 当前 tick 到 buffer
+                # 1. 如果是边界点，必须 [在 append 当前 Tick 之前]，结算并清空旧纪元。
+                if is_exact_boundary and self.current_bars_5s[sym]:
+                     # 这里使用上一分钟的时间作为入档时间点，以便在 DataFrame 中完美对齐
+                     prev_minute = curr_minute - pd.Timedelta(minutes=1)
+                     self._finalize_1min_bar(sym, prev_minute, cleanup=True)
+                     
+                # 2. Append 当前 tick 到 buffer。
+                # 如果刚才触发了 cleanup=True，这个 Tick 将成为新缓冲池的“开天辟地第一笔”
                 self.current_bars_5s[sym].append(stock)
                 
                 # 3. 实时性优化 (Early Update): 在 :55秒及之后强制刷新当前分钟 Bar (Cleanup=False)
                 # 这样保证 history_1min 能看到当前的最新状态，但不清空 buffer，防止后续 tick 丢失 Vol
-                if dt_ny.second >= 55:
+                if not is_exact_boundary and dt_ny.second >= 55:
                      self._finalize_1min_bar(sym, curr_minute, cleanup=False)
-    
-                
+
             # # [Core] 计算/发布特征 (Fast Channel - 5s)
             # inputs = self.engine.compute_all_inputs(
             #     self.history_1min,
@@ -1070,6 +1110,7 @@ class FeatureComputeService:
                      stock_data = payload.get('stock', {})
                      if stock_data and stock_data.get('close'):
                          self.latest_prices[sym] = float(stock_data.get('close', 0.0))
+                         self.last_tick_price[sym] = self.latest_prices[sym]
 
         except Exception as e:
             logger.error(f"Process Error: {e}")
@@ -1082,7 +1123,10 @@ class FeatureComputeService:
         o = float(bars[0].get('open', bars[0].get('o', 0)))
         h = max(float(b.get('high', b.get('h', 0))) for b in bars)
         l = min(float(b.get('low', b.get('l', 0))) for b in bars)
-        c = float(bars[-1].get('close', bars[-1].get('c', 0)))
+        c_raw = float(bars[-1].get('close', bars[-1].get('c', 0)))
+        # 🚀 [终极特征对位] 如果当前是分钟边界 (:00 秒)，强制使用上一秒 (:59) 的价格作为 Bar Close
+        # 这样确保了喂给 PyTorch 模型的特征 Tensor 与离线 1m 基准完全对齐
+        c = self.last_tick_price.get(sym, c_raw) if dt.second == 0 else c_raw
         v = sum(max(0.0, float(b.get('volume', b.get('v', 0)))) for b in bars)
         
         bar_time = dt.replace(second=0, microsecond=0)
@@ -1116,10 +1160,30 @@ class FeatureComputeService:
         # =========================================================
         df_1m = self.history_1min[sym]
         if not df_1m.empty:
-            df_5m = df_1m.resample('5min', closed='left', label='right').agg({
+            df_5m = df_1m.resample('5min',closed='left', label='left').agg({
                 'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
             }).dropna()
             self.history_5min[sym] = df_5m.iloc[-100:]
+        
+        # =====================================================================
+        # 🚀 [手术 2：冻结时光机 + 手术 25：双平移缓冲区]
+        # 目标：物理时间 T+60 结算逻辑时刻 T 时，必须引用物理时刻 T 时的历史快照！
+        # =====================================================================
+        if not hasattr(self, 'frozen_option_snapshot'):
+            self.frozen_option_snapshot = {s: np.zeros((6, 12), dtype=np.float32) for s in self.symbols}
+            self.frozen_option_snapshot_5m = {s: np.zeros((6, 12), dtype=np.float32) for s in self.symbols}
+            self.frozen_latest_opt_buckets = {}
+            # 初始化对位缓冲区
+            self.prev_frozen_option_snapshot = {s: np.zeros((6, 12), dtype=np.float32) for s in self.symbols}
+            self.prev_frozen_option_snapshot_5m = {s: np.zeros((6, 12), dtype=np.float32) for s in self.symbols}
+            self.prev_frozen_latest_opt_buckets = {}
+        
+        # 🚀 [Surgery 25c] 移除局部平移逻辑，改由 Global Flush 统一调配！
+        # 更新当前冻结库 (供下一分钟使用)
+        self.frozen_option_snapshot[sym] = self.option_snapshot[sym].copy()
+        if USE_5M_OPTION_DATA:
+            self.frozen_option_snapshot_5m[sym] = self.option_snapshot_5m[sym].copy()
+        self.frozen_latest_opt_buckets[sym] = self.latest_opt_buckets.get(sym, [])
                 
         if cleanup:
             self.current_bars_5s[sym] = []
@@ -1313,10 +1377,15 @@ class FeatureComputeService:
         if is_new_minute or getattr(self, 'cached_batch_raw', None) is None:
             # ---------------- 1. 触发 Engine 计算 ----------------
             # 🚀 [SECURITY_FIX] 使用 .copy() 彻底隔断原本 snap 的内存引用。
-            # NumPy 的 [:, :12] 默认是 View，会导致引擎的原地修改污染 Service 的持久化快照，
-            # 从而导致第二秒时价格数据消失。
-            sliced_snaps = {s: snap[:, :12].copy() for s, snap in self.option_snapshot.items()}
-            sliced_snaps_5m = {s: snap[:, :12].copy() for s, snap in getattr(self, 'option_snapshot_5m', {}).items()}
+            
+            # 👇 [手术 3 替换开始 + 手术 25 双缓冲对齐]
+            # 逻辑时刻 T 的结算推理，必须使用物理时刻 T 冻结的 prev_frozen 快照！
+            source_snap = getattr(self, 'prev_frozen_option_snapshot', self.option_snapshot) if is_new_minute else self.option_snapshot
+            source_snap_5m = getattr(self, 'prev_frozen_option_snapshot_5m', getattr(self, 'option_snapshot_5m', {})) if is_new_minute else getattr(self, 'option_snapshot_5m', {})
+            
+            sliced_snaps = {s: snap[:, :12].copy() for s, snap in source_snap.items()}
+            sliced_snaps_5m = {s: snap[:, :12].copy() for s, snap in source_snap_5m.items()}
+            # 👆 [手术 3 替换结束]
 
             try:
                 results_map = self.engine.compute_all_inputs(
@@ -1354,6 +1423,9 @@ class FeatureComputeService:
                     # 🚀 [🔥 终极闭环修复] 将引擎中算出的正确希腊值阵列，回写覆盖系统级快照！
                     if res_sym.get('updated_buckets') is not None:
                         self.latest_opt_buckets[sym] = res_sym['updated_buckets']
+                        # 👇 [手术 3 追加 + 手术 25] 同时更新对位缓冲区中的数据，保证 payload 获取的这批包含完美计算后的 IV
+                        if is_new_minute and hasattr(self, 'prev_frozen_latest_opt_buckets'):
+                            self.prev_frozen_latest_opt_buckets[sym] = res_sym['updated_buckets']
                     
                     if res_sym.get('fast_1m') is not None:
                         fast_latest = res_sym['fast_1m'][0, :, -1].cpu().numpy()
@@ -1496,20 +1568,18 @@ class FeatureComputeService:
                 valid_b_indices.append(b_idx)
                 batch_symbols.append(sym)
                 
-                # 🚀 [终极时序对齐：匹配回测约定]
-                # 在分钟切换瞬间 (is_new_minute)，我们其实是在结算上一分钟的数据。
-                # 此时 data_ts 是当前整点 (如 10:12:00)，但我们要存入的是上一分钟的 Bar Close。
+                # 🚀 [Surgery 23] 逻辑价格对齐：区分整分结算与秒级Tick
                 if is_new_minute:
-                    # 获取上一分钟结算 Bar 的收盘价 (这个价格才符合回测的 'close' 定义)
+                    # 既然 payload_ts 是 data_ts - 60s (如 10:00:00)，我们就取该时刻结算收盘价
                     from datetime import timedelta
-                    target_time_prev = target_time.replace(second=0, microsecond=0) - timedelta(minutes=1)
+                    target_time_logi = target_time.replace(second=0, microsecond=0) - timedelta(minutes=1)
                     try:
-                        p_close = self.history_1min[sym].at[target_time_prev, 'close']
+                        p_close = self.history_1min[sym].at[target_time_logi, 'close']
                     except:
                         p_close = self.latest_prices.get(sym, 0.0)
                     batch_prices.append(float(p_close))
                 else:
-                    # 秒级采样时，使用实时最准价格 (latest_prices)
+                    # 秒级采样时，使用实时最准价格
                     batch_prices.append(self.latest_prices.get(sym, 0.0))
                 
                 batch_stock_ids.append(b_idx)
@@ -1522,10 +1592,12 @@ class FeatureComputeService:
                 idx_vol = self.feat_name_to_idx.get('fast_vol')
                 batch_fast_vols.append(raw_mat[b_idx, idx_vol] if idx_vol is not None else 0.0)
                 
-                # 🚀 [🔥 终极闭环修复] 提取期权快照供回测：优先使用经过 Greeks 补算的 buckets！
-                # 以前直接取 self.option_snapshot (原始行情)，会导致补算后的 IV 无法传导给 Orchestrator/AlphaLogs!
-                snap = getattr(self, 'latest_opt_buckets', {}).get(sym)
-                if snap is None: snap = self.option_snapshot.get(sym)
+                # 👇 [手术 4a + 手术 25 双缓冲对齐] 使用上一物理时刻冻结的快照生成逻辑时刻 T 的回测日志
+                source_opt_buckets = getattr(self, 'prev_frozen_latest_opt_buckets', self.latest_opt_buckets) if is_new_minute else self.latest_opt_buckets
+                source_snap_for_payload = getattr(self, 'prev_frozen_option_snapshot', self.option_snapshot) if is_new_minute else self.option_snapshot
+
+                snap = source_opt_buckets.get(sym)
+                if snap is None: snap = source_snap_for_payload.get(sym)
 
                 if snap is not None and isinstance(snap, np.ndarray) and snap.shape[0] >= 6:
                     c_iv = snap[2, 7]
@@ -1558,26 +1630,37 @@ class FeatureComputeService:
                 # =================================================================
                 # 🚀 [架构升维：事前合并期权字典 (Pre-Join)]
                 # =================================================================
+               # 👇 [手术 4b + 手术 25] Payload 中的 live_options 也要换成逻辑对位源
                 live_options = {}
-                live_options_5m = {} # 🚀 [修复] 补回丢失的 5m 容器
+                live_options_5m = {} 
+                
+                source_snap_5m_for_payload = getattr(self, 'prev_frozen_option_snapshot_5m', getattr(self, 'option_snapshot_5m', {})) if is_new_minute else getattr(self, 'option_snapshot_5m', {})
+
                 for sym in batch_symbols:
                     live_options[sym] = {
-                        'buckets': getattr(self, 'latest_opt_buckets', {}).get(sym, []),
+                        'buckets': source_opt_buckets.get(sym, []),
                         'contracts': getattr(self, 'latest_opt_contracts', {}).get(sym, [])
                     }
-                    
-                    # 🚀 [新增] 5m 期权快照组装
-                    from config import USE_5M_OPTION_DATA
                     if USE_5M_OPTION_DATA:
-                        snap_5m = getattr(self, 'option_snapshot_5m', {}).get(sym)
+                        snap_5m = source_snap_5m_for_payload.get(sym)
+
                         if snap_5m is not None:
                             live_options_5m[sym] = {
                                 'buckets': snap_5m.tolist() if isinstance(snap_5m, np.ndarray) else snap_5m,
                                 'contracts': getattr(self, 'latest_opt_contracts', {}).get(sym, [])
                             }
                 
+                # =================================================================
+                # 🚀 [核心修复：消除 1 分钟标签相位偏移]
+                # 在 10:01:00 触发整分结算时，我们刚刚把 10:00:00 ~ 10:00:59 的完整数据送入模型。
+                # 算出的 Alpha 在数学上属于 10:00:00。
+                # 必须回拨 60 秒的标签，才能与离线数据严格同频！
+                # =================================================================
+                payload_ts = data_ts - 60.0 if is_new_minute else data_ts
+              
+                
                 payload = {
-                    'ts': data_ts, 
+                    'ts': payload_ts, 
                     'log_ts': data_ts, 
                     'symbols': batch_symbols,
                     'stock_price': batch_prices,
@@ -1590,6 +1673,7 @@ class FeatureComputeService:
                     'live_options': live_options,
                     'live_options_5m': live_options_5m, # 🚀 [修复] 补齐 Payload 字段
                     'is_new_minute': is_new_minute,  
+                    
                     'cheat_call': cheat_call, 'cheat_put': cheat_put,
                     'cheat_call_bid': cheat_call_bid, 'cheat_call_ask': cheat_call_ask,
                     'cheat_put_bid': cheat_put_bid, 'cheat_put_ask': cheat_put_ask,
@@ -1598,6 +1682,7 @@ class FeatureComputeService:
 
                 if return_payload:
                     return payload
+ 
 
                 try:
                      self.r.xadd(self.redis_cfg['output_stream'], {'data': ser.pack(payload)}, maxlen=100)
@@ -1680,7 +1765,9 @@ class FeatureComputeService:
                             
                             self.r.xack(self.redis_cfg['raw_stream'], self.redis_cfg['group'], mid)
                 
-                await asyncio.sleep(0.001)
+                from config import IS_SIMULATED
+                if not IS_SIMULATED:
+                    await asyncio.sleep(0.001)
                 
             except redis.exceptions.ResponseError as e:
                 if "NOGROUP" in str(e):

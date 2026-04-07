@@ -178,7 +178,7 @@ def process_stock_data_1s(sym):
                 table_res = f'market_bars_{res_suffix}'
                 if is_data_seeded(db_path, table_res, sym): continue
                 
-                df_res = df_stock.set_index('timestamp').resample(f'{res_min}T', closed='right', label='right').agg({
+                df_res = df_stock.set_index('timestamp').resample(f'{res_min}T' ).agg({
                     'open': 'first', 'high': 'max', 'low': 'min', target_col: 'last', 'volume': 'sum'
                 }).dropna().reset_index()
                 
@@ -284,7 +284,7 @@ def process_option_data_1s(sym):
                 if is_data_seeded(db_path, table_res, sym): continue
                 
                 # 期权快照通常取周期内的最后一次
-                df_res = df_focus.set_index('timestamp').resample(f'{res_min}T', closed='right', label='right').last().dropna().reset_index()
+                df_res = df_focus.set_index('timestamp').resample(f'{res_min}T' ).last().dropna().reset_index()
                 res_records = []
                 for ts_idx, sec_df in df_res.groupby('timestamp'):
                     # 这里我们需要从原始 df_focus 中再次聚合该分钟的快照 (通常取最后一次完整的快照)

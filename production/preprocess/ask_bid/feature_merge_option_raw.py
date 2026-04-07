@@ -498,14 +498,16 @@ class FeatureEngineer:
     def compute_features_raw(self, df: pd.DataFrame, resolution: str):
         df = df.copy()
 
-
+        # 🚀 [Surgery 15] 强制列名标准化，防止 'VWAP' 或 'vwap ' 导致判断失败
+        df.columns = [str(c).lower().strip() for c in df.columns]
 
         # --- 保证 VWAP 存在 ---
         if 'vwap' in df.columns:
             df['vwap'] = df['vwap'].ffill()
         else:
             # 只有当原始数据真没有 vwap 时，才迫不得已用 close 估算
-            logging.warning(f"数据缺少真实 'vwap' 列，将使用 close 估算。")
+            # 打印当前列名以便诊断到底是谁冲突了或确实缺失
+            logging.warning(f"数据缺少真实 'vwap' 列 (分辨率: {resolution})，将使用 close 估算。现有列: {df.columns.tolist()}")
             daily_groups = df.groupby(df['timestamp'].dt.date)
             df['vwap'] = (df['close'] * df['volume']).groupby(daily_groups.grouper).cumsum() / \
                          (df['volume'].groupby(daily_groups.grouper).cumsum() + 1e-9)
@@ -525,7 +527,7 @@ class FeatureEngineer:
         # --- 【核心修正】: 极度稳健的数据准备阶段 ---
     
         # 1. 定义最基础的列，这些是模型的生命线
-        base_price_cols = ['open', 'high', 'low', 'close']
+        base_price_cols = ['open', 'high', 'low', 'close', 'vwap']
         
         # 2. 保证 'close' 列存在且基本有效
         #    'close' 是最重要的回退值（fallback），我们优先处理它
@@ -700,7 +702,7 @@ class FeatureEngineer:
                     cum_volume = daily_groups['volume'].cumsum()
                     df['vwap'] = cum_value / (cum_volume + 1e-9)
                     
-                    df['vwap_diff'] = df['close'] - df['vwap'] / (df['vwap'] + 1e-9)
+                    df['vwap_diff'] = (df['close'] - df['vwap'])/ (df['vwap'] + 1e-9)
                     df.drop(columns=['price_x_vol'], inplace=True) # 清理辅助列
                 
                
@@ -1191,11 +1193,17 @@ def process_stock_month(symbol: str, year_month: str, config: dict ):
             # --- 【修正结束】---
 
             # --- 【核心修正】---
+            # 🚀 [Surgery 14] 扩展重命名列表，彻底防止 option 数据中的 OHLV/VWAP 污染 stock 主表
             # 在合并前，主动、明确地重命名 option_df 中与 stock_df 冲突的列
             # 这样可以完全避免 suffixes 参数可能带来的歧义和冲突
             rename_dict = {
-                
-                'volume': 'volume_option'
+                'open': 'open_option',
+                'high': 'high_option',
+                'low': 'low_option',
+                'close': 'close_option',
+                'vwap': 'vwap_option',
+                'volume': 'volume_option',
+                'transactions': 'transactions_option'
             }
 
             # 只重命名实际存在的列，避免因列不存在而报错
@@ -1234,6 +1242,8 @@ def process_stock_month(symbol: str, year_month: str, config: dict ):
 
                     processed_count += 1
                     stock_df = pd.read_parquet(stock_file)
+                    # 🚀 [Diagnostic] 检查 spnq_train_resampled 原始文件的列名
+                    #logging.info(f"Loaded stock_df from {stock_file}. Columns: {stock_df.columns.tolist()}")
                     stock_df['timestamp'] = pd.to_datetime(stock_df['timestamp'])
 
 
@@ -1391,7 +1401,8 @@ def generate_vix_level_global(config: dict):
         
         for year_month, df_month in tqdm(df_all.groupby('year_month'), desc=f"Saving VIX {res}"):
             file_path = vix_dir / f"{year_month}.parquet"
-            cols_to_keep = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'vix_proxy_close', 'vix_z', 'vix_level', 'is_vix_jump', 'vixy_detrended_level']
+            # 🚀 [Surgery 16] 修复列丢失漏洞：补全 vwap 和 transactions
+            cols_to_keep = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'vwap', 'transactions', 'vix_proxy_close', 'vix_z', 'vix_level', 'is_vix_jump', 'vixy_detrended_level']
             df_to_save = df_month.reset_index()
             final_cols = [col for col in cols_to_keep if col in df_to_save.columns]
             df_to_save[final_cols].to_parquet(file_path, index=False, compression='zstd', compression_level=9)
@@ -1402,8 +1413,8 @@ def generate_vix_level_global(config: dict):
         if zero_count > 0:
             logging.warning(f"告警: {year_month} 有 {zero_count} 行 vix_level=0。")
 
-        # --- 【核心修改】: 在保存的列中，增加 is_vix_jump ,vix_level已经标准化，就不用再标准化---
-        cols_to_keep = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'vix_proxy_close', 'vix_z', 'vix_level', 'is_vix_jump', 'vixy_detrended_level']
+        # --- 【核心修改】: 在保存的列中，增加 vwap, transactions, is_vix_jump ---
+        cols_to_keep = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'vwap', 'transactions', 'vix_proxy_close', 'vix_z', 'vix_level', 'is_vix_jump', 'vixy_detrended_level']
         df_to_save = df_month.reset_index()
         
         final_cols = [col for col in cols_to_keep if col in df_to_save.columns]

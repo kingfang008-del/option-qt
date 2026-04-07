@@ -1052,14 +1052,13 @@ class V8Orchestrator:
             elif st.position == -1: 
                 curr_iv = opt_data['put_iv']
             else: 
-                # 无持仓时：比较 Spread，谁的流动性好（价差窄），全局基准 IV 就信谁的
-                c_spread = opt_data['call_ask'] - opt_data['call_bid'] if opt_data['call_ask'] > opt_data['call_bid'] > 0 else 999.0
-                p_spread = opt_data['put_ask'] - opt_data['put_bid'] if opt_data['put_ask'] > opt_data['put_bid'] > 0 else 999.0
-                
-                if c_spread < 999.0 or p_spread < 999.0:
-                    curr_iv = opt_data['call_iv'] if c_spread <= p_spread else opt_data['put_iv']
-                else:
+                # 🚀 [对齐修复] 强制使用均值 IV，确保与 1m 基准 100% 对位
+                if opt_data.get('call_iv', 0) > 0 and opt_data.get('put_iv', 0) > 0:
                     curr_iv = (opt_data['call_iv'] + opt_data['put_iv']) / 2.0
+                elif opt_data.get('call_iv', 0) > 0:
+                    curr_iv = opt_data['call_iv']
+                else:
+                    curr_iv = opt_data['put_iv']
                     
             if curr_iv > 0.01: st.last_valid_iv = curr_iv
 
@@ -1383,8 +1382,11 @@ class V8Orchestrator:
         return None
 
     async def process_batch(self, batch: dict):
-          
-        
+        # 🚀 [Surgery 16] 处理同步心跳包：不做任何交易动作，直接返回。
+        # 核心在于让调用方 run() 中的 current_ts_to_sync 得到更新，从而触发 sync:orch_done 的 ACK。
+        if batch.get('action') == 'HEARTBEAT':
+            return
+
         # 1. 统一时间基准与 EOD 处理
         ny_now, curr_ts = self._prepare_ny_time(batch)
         if ny_now is None:
@@ -1913,7 +1915,22 @@ class V8Orchestrator:
                 last_heartbeat = time.time()
                 
                 if not resp: 
-                    # logger.debug("Waiting for data...")
+                    # 🚀 [Surgery 18] 主动追赶逻辑 (杜绝死锁)
+                    # 在回放模式下，如果读不到信号，但特征引擎已经跑在前面了，
+                    # 说明这一分钟没有信号，或者心跳包漏了，主动同步时轴以防死锁。
+                    from config import IS_SIMULATED
+                    if IS_SIMULATED:
+                        feat_done = self.r.get("sync:feature_calc_done")
+                        if feat_done:
+                            feat_ts = float(feat_done)
+                            # 获取当前 Orch 的水位（本地记录或 Redis 获取）
+                            last_orch_done_raw = self.r.get("sync:orch_done")
+                            last_orch_done = float(last_orch_done_raw) if last_orch_done_raw else 0
+                            
+                            if feat_ts > last_orch_done:
+                                # logger.info(f"⏭️  [Catchup] Moving Orch Sync to {feat_ts} (Feat: {feat_ts} > Orch: {last_orch_done})")
+                                self.r.set("sync:orch_done", str(feat_ts))
+                    
                     await asyncio.sleep(0.01)
                     continue
                 

@@ -1,0 +1,450 @@
+{
+  "symbols": [
+    "AAPL",
+    "MSFT",
+    "GOOGL"
+  ],
+  "resample_freq": {
+    "regular": {
+      "09:30-16:00": [
+        "1min",
+        "5min"
+      ]
+    }
+  },
+  "loss_weights": {
+    "risk_adjusted_return": 1.0,
+    "volatility": 0.3,
+    "event": 0.5,
+    "turnover": 0.1
+  },
+  "parameters": {
+    "labeling": {
+      "k_option": 10,
+      "atm_delta_tolerance": 0.1,
+      "option_agg_window": "5T",
+      "option_agg_func": "mean",
+      "method": "multi_task",
+      "targets": [
+        "direction",
+        "volatility",
+        "event"
+      ],
+      "volatility_k": 10,
+      "event_k": 10,
+      "resolutions": {
+        "5s": {
+          "horizon": 60,
+          "entry_threshold": 0.0005,
+          "upper_threshold": 0.0005,
+          "lower_threshold": -0.0005,
+          "vol_multiplier": 2.0
+        },
+        "10s": {
+          "horizon": 45,
+          "entry_threshold": 0.0007,
+          "upper_threshold": 0.0007,
+          "lower_threshold": -0.0007,
+          "vol_multiplier": 2.0
+        },
+        "15s": {
+          "horizon": 30,
+          "entry_threshold": 0.0008,
+          "upper_threshold": 0.0008,
+          "lower_threshold": -0.0008,
+          "vol_multiplier": 2.0
+        },
+        "30s": {
+          "horizon": 20,
+          "entry_threshold": 0.001,
+          "upper_threshold": 0.001,
+          "lower_threshold": -0.001,
+          "vol_multiplier": 2.0
+        },
+        "1min": {
+          "horizon": 10,
+          "entry_threshold": 0.0015,
+          "upper_threshold": 0.0015,
+          "lower_threshold": -0.0015,
+          "vol_multiplier": 2.0
+        },
+        "5min": {
+          "horizon": 3,
+          "entry_threshold": 0.0025,
+          "upper_threshold": 0.0025,
+          "lower_threshold": -0.0025,
+          "vol_multiplier": 2.0
+        }
+      }
+    },
+    "pre_post_dropout_rate": 0.15,
+    "expert_dropout_rate": 0.25,
+    "backbone_dropout_rate": 0.3,
+    "5s": {
+      "sequence_length": 20,
+      "hidden_dim": 32,
+      "learning_rate": 0.001,
+      "epochs": 20
+    },
+    "10s": {
+      "sequence_length": 30,
+      "hidden_dim": 48,
+      "learning_rate": 0.0008,
+      "epochs": 30
+    },
+    "15s": {
+      "sequence_length": 40,
+      "hidden_dim": 48,
+      "learning_rate": 0.0007,
+      "epochs": 35
+    },
+    "30s": {
+      "sequence_length": 20,
+      "hidden_dim": 48,
+      "learning_rate": 0.0005,
+      "epochs": 40
+    },
+    "1min": {
+      "sequence_length": 60,
+      "hidden_dim": 64,
+      "learning_rate": 0.0001,
+      "epochs": 50
+    },
+    "5min": {
+      "sequence_length": 24,
+      "hidden_dim": 80,
+      "learning_rate": 0.0001,
+      "epochs": 45
+    }
+  },
+  "scheduler_config": {
+    "type": "ReduceLROnPlateau",
+    "factor": 0.5,
+    "patience": 5,
+    "min_lr": 1e-06
+  },
+  "max_leverage": 2.0,
+  "features": [
+    { "name": "open", "type": "real", "calc": "raw", "use_for_anomaly": false },
+    { "name": "high", "type": "real", "calc": "raw", "use_for_anomaly": false },
+    { "name": "low", "type": "real", "calc": "raw", "use_for_anomaly": false },
+    { "name": "close", "type": "real", "calc": "raw", "use_for_anomaly": false },
+    { "name": "volume", "type": "real", "calc": "raw", "use_for_anomaly": false },
+    { "name": "vwap", "type": "real", "calc": "raw", "use_for_anomaly": false },
+    { "name": "high_log_return", "type": "real", "calc": "custom" },
+    { "name": "low_log_return", "type": "real", "calc": "custom" },
+    { "name": "close_log_return", "type": "real", "calc": "custom" },
+    {"name": "vwap_log_return", "type": "real", "calc": "custom", "resolution": "1min"},
+    { "name": "volume_log", "type": "real", "calc": "custom" },
+    { "name": "chaikin_vol", "type": "real", "calc": "leading", "use_for_anomaly": false },
+    { "name": "vwap_diff", "type": "real", "calc": "vwap_diff" },
+    { "name": "price_z_score", "type": "real", "calc": "price_z_score" },
+    { "name": "volume_ratio", "type": "real", "calc": "volume_ratio" },
+    { "name": "rsi", "type": "real", "calc": "RSIIndicator(close, window=14).rsi()" },
+    { "name": "adx", "type": "real", "calc": "ADXIndicator(high, low, close, window=14).adx()" },
+    { "name": "garch_vol", "type": "real", "calc": "garch_vol", "use_for_anomaly": false },
+    { "name": "macd", "type": "real", "calc": "ta.macd() / close" },
+    { "name": "bb_width", "type": "real", "calc": "BollingerBands(close, window=20, window_dev=2).bollinger_width()", "description": "Normalized Bollinger Band width" },
+    { "name": "macd_ratio", "type": "real", "calc": "ta.macd() / close" },
+    { "name": "macd_diff_ratio", "type": "real", "calc": "ta.macd_diff() / close" },
+    { "name": "k", "type": "real", "calc": "StochasticOscillator(high, low, close, window=9, smooth_window=3).stoch()" },
+    { "name": "cci", "type": "real", "calc": "CCIIndicator(high, low, close, window=20).cci()" },
+    { "name": "is_vix_jump", "type": "categorical", "calc": "vix", "cardinality": 2 },
+    { "name": "vix_level", "type": "real", "calc": "vix_gate" },
+    { "name": "vix_z", "type": "real", "calc": "vix_gate" },
+    { "name": "vixy_detrended_level", "type": "real", "calc": "vix_gate" },
+    { "name": "vp_corr_15", "type": "real", "calc": "vp_corr_15" },
+    { "name": "rvi", "type": "real", "calc": "leading" },
+    { "name": "vol_roc", "type": "real", "calc": "vol_roc" },
+    { "name": "session", "type": "categorical", "calc": "time.session", "cardinality": 5 },
+    { "name": "day_of_week", "type": "categorical", "calc": "time.day_of_week", "cardinality": 7 },
+    { "name": "hour", "type": "categorical", "calc": "time.hour", "cardinality": 24 },
+    { "name": "is_holiday", "type": "categorical", "calc": "time.is_holiday", "cardinality": 2 },
+    { "name": "day_of_month", "type": "categorical", "calc": "time.day_of_month", "cardinality": 32 },
+    { "name": "is_month_end", "type": "categorical", "calc": "time.is_month_end", "cardinality": 2 },
+    { "name": "is_opex_week", "type": "categorical", "calc": "time.is_opex_week", "cardinality": 2 },
+    { "name": "is_fomc_week", "type": "categorical", "calc": "time.is_fomc_week", "cardinality": 2 },
+    { "name": "month", "type": "categorical", "calc": "time.month", "cardinality": 13 },
+    { "name": "is_nfp_day", "type": "categorical", "calc": "time.is_nfp_day", "cardinality": 2 },
+    { "name": "is_cpi_day", "type": "categorical", "calc": "time.is_cpi_day", "cardinality": 2 },
+    { "name": "is_ppi_day", "type": "categorical", "calc": "time.is_ppi_day", "cardinality": 2 },
+    { "name": "sma_ratio_30", "type": "real", "calc": "sma_ratio_30" },
+    { "name": "vol_band_20", "type": "real", "calc": "vol_band_20" },
+    { "name": "adx_smooth_10", "type": "real", "calc": "adx_smooth_10" },
+    { "name": "poc_deviation", "type": "real", "calc": "leading", "use_for_anomaly": false },
+    { "name": "vol_contraction_ratio", "type": "real", "calc": "leading", "use_for_anomaly": false },
+    { "name": "garman_klass_vol", "type": "real", "calc": "leading", "use_for_anomaly": false },
+    { "name": "price_vol_ratio", "type": "real", "calc": "leading", "use_for_anomaly": false },
+    { "name": "intraday_vol_forecast", "type": "real", "calc": "leading", "use_for_anomaly": false },
+
+    { "name": "net_gex", "type": "real", "calc": "leading", "use_for_anomaly": false },
+    { "name": "net_vanna", "type": "real", "calc": "leading", "use_for_anomaly": false }, 
+    { "name": "net_charm", "type": "real", "calc": "leading", "use_for_anomaly": false }, 
+    { "name": "vanna_flow", "type": "real", "calc": "leading", "use_for_anomaly": false }, 
+     
+     {"name": "vwap_diff_short", "type": "real", "calc": "vwap_diff_short", "resolution": "1min"},
+    {"name": "cross_sect_mom_z", "type": "real", "calc": "cross_sectional", "resolution": "1min"},
+    {"name": "return_divergence", "type": "real", "calc": "zscore", "alpha_sign": -1, "resolution": "1min"},
+
+
+    { "name": "options_vw_iv", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_vw_delta", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_vw_gamma", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_vw_vega", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_vw_theta", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_vw_vanna", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_vw_charm", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_pcr_volume", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_flow_skew", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_iv_momentum", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_gamma_accel", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_iv_divergence", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_vw_spread", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_vw_imbalance", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_struc_atm_iv", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_struc_skew", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_struc_term", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "price_dist_from_ma_atr", "type": "real", "calc": "atr_normalized", "use_for_anomaly": false },
+    { "name": "bb_width_over_atr", "type": "real", "calc": "atr_normalized", "use_for_anomaly": false },
+    { "name": "price_slope_norm_by_atr", "type": "real", "calc": "atr_normalized", "use_for_anomaly": false },
+    { "name": "upper_wick_over_atr", "type": "real", "calc": "atr_normalized", "use_for_anomaly": false },
+    { "name": "lower_wick_over_atr", "type": "real", "calc": "atr_normalized", "use_for_anomaly": false }
+
+  ],
+  "thresholds": {
+    "anomaly_threshold": 0.7,
+    "trade_threshold": {
+      "type": "static",
+      "value": 0.5
+    },
+    "k": {
+      "type": "dynamic",
+      "value": "70 if garch_vol > 0.02 else 80"
+    },
+    "adx": {
+      "type": "dynamic",
+      "value": "5 if pre_relative_volume > 1.5 else 10"
+    },
+    "bb_width": {
+      "type": "dynamic",
+      "value": "0.05 * garch_vol"
+    },
+    "macd": {
+      "type": "dynamic",
+      "value": "-0.5 if garch_vol > 0.02 else -0.25"
+    },
+    "slope": {
+      "type": "dynamic",
+      "value": "-0.5 if garch_vol > 0.02 else -0.2"
+    },
+    "surge": {
+      "type": "dynamic",
+      "value": "1.5 if garch_vol > 0.02 else 2.0"
+    },
+    "crash": {
+      "type": "dynamic",
+      "value": "-1.5 if garch_vol > 0.02 else -2.0"
+    },
+    "cci_overbought": {
+      "type": "dynamic",
+      "value": "150 if garch_vol > 0.02 else 100"
+    },
+    "cci_oversold": {
+      "type": "dynamic",
+      "value": "-150 if garch_vol > 0.02 else -100"
+    }
+  },
+  "trading_rules": {
+    "surge_conditions": [
+      {
+        "feature": "price_dist_from_ma_atr",
+        "operator": ">",
+        "value": 0.1,
+        "weight": 1.0
+      },
+      {
+        "feature": "gap_over_atr",
+        "operator": ">",
+        "value": 0.3,
+        "weight": 1.5
+      },
+      {
+        "feature": "price_slope_norm_by_atr",
+        "operator": ">",
+        "value": 0.5,
+        "weight": 1.0
+      },
+      {
+        "feature": "body_size_over_atr",
+        "operator": ">",
+        "value": 0.7,
+        "weight": 1.2
+      },
+      {
+        "feature": "lower_wick_over_atr",
+        "operator": ">",
+        "value": 0.2,
+        "weight": 0.8
+      },
+      {
+        "feature": "vol_contraction_ratio",
+        "operator": "<",
+        "value": 1.2,
+        "weight": 1.5
+      },
+      {
+        "feature": "pcr_volume",
+        "operator": "<",
+        "value": 0.8,
+        "weight": 1.5
+      },
+      {
+        "feature": "iv_skew",
+        "operator": "<",
+        "value": 0.05,
+        "weight": 1.2
+      }
+    ],
+    "crash_conditions": [
+      {
+        "feature": "price_dist_from_ma_atr",
+        "operator": "<",
+        "value": -0.1,
+        "weight": 1.0
+      },
+      {
+        "feature": "gap_over_atr",
+        "operator": "<",
+        "value": -0.3,
+        "weight": 1.5
+      },
+      {
+        "feature": "price_slope_norm_by_atr",
+        "operator": "<",
+        "value": -0.5,
+        "weight": 1.0
+      },
+      {
+        "feature": "body_size_over_atr",
+        "operator": ">",
+        "value": 0.7,
+        "weight": 1.2
+      },
+      {
+        "feature": "upper_wick_over_atr",
+        "operator": ">",
+        "value": 0.2,
+        "weight": 0.8
+      },
+      {
+        "feature": "vol_contraction_ratio",
+        "operator": "<",
+        "value": 1.2,
+        "weight": 1.5
+      },
+      {
+        "feature": "pcr_volume",
+        "operator": ">",
+        "value": 1.2,
+        "weight": 1.5
+      },
+      {
+        "feature": "iv_skew",
+        "operator": ">",
+        "value": 0.1,
+        "weight": 1.2
+      }
+    ],
+    "close_long_conditions": [
+      {
+        "feature": "price_dist_from_ma_atr",
+        "operator": ">",
+        "value": 2.5,
+        "weight": 1.5
+      },
+      {
+        "feature": "price_slope_norm_by_atr",
+        "operator": "<",
+        "value": 0.1,
+        "weight": 1.0
+      },
+      {
+        "feature": "upper_wick_over_atr",
+        "operator": ">",
+        "value": 0.8,
+        "weight": 1.2
+      },
+      {
+        "feature": "body_size_over_atr",
+        "operator": "<",
+        "value": 0.1,
+        "weight": 0.8
+      },
+      {
+        "feature": "iv_skew",
+        "operator": ">",
+        "value": 0.15,
+        "weight": 2.0
+      }
+    ],
+    "close_short_conditions": [
+      {
+        "feature": "price_dist_from_ma_atr",
+        "operator": "<",
+        "value": -2.5,
+        "weight": 1.5
+      },
+      {
+        "feature": "price_slope_norm_by_atr",
+        "operator": ">",
+        "value": -0.1,
+        "weight": 1.0
+      },
+      {
+        "feature": "lower_wick_over_atr",
+        "operator": ">",
+        "value": 0.8,
+        "weight": 1.2
+      },
+      {
+        "feature": "body_size_over_atr",
+        "operator": "<",
+        "value": 0.1,
+        "weight": 0.8
+      },
+      {
+        "feature": "iv_skew",
+        "operator": "<",
+        "value": 0.0,
+        "weight": 2.0
+      }
+    ],
+    "min_conditions": {
+      "surge": 4,
+      "crash": 4,
+      "close_long": 2,
+      "close_short": 2
+    },
+    "weight_threshold": {
+      "surge": 4.0,
+      "crash": 4.0,
+      "close_long": 2.5,
+      "close_short": 2.5
+    },
+    "position_size": {
+      "base_size": "balance * leverage / current_price.sum()",
+      "liquidity_factor": "sigmoid(pre_relative_volume - 1.0)",
+      "max_volume_ratio": 0.1
+    },
+    "reward_weights": {
+      "portfolio_return": 1.0,
+      "max_drawdown": -0.1,
+      "sharpe_ratio": 0.05,
+      "trade_cost": -1.0,
+      "short_penalty": -1.0,
+      "trend_bonus": 0.2,
+      "close_bonus": 0.2,
+      "close_penalty": -0.1
+    }
+  }
+}

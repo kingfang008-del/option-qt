@@ -122,31 +122,38 @@ class RealTimeFeatureEngine:
         except: return {}
 
     def supplement_greeks(self, symbol: str, buckets: np.ndarray, contracts: list, stock_price: float, timestamp: float):
-        """
-        🚀 [核心增强] 如果数据中缺失希腊值（IV=0），则使用统一逻辑进行补算。
-        确保离线回放原始 Quote 时，生成的希腊值与实盘逻辑 100% 对齐。
-        """
         if buckets is None or len(buckets) == 0:
             return buckets
         
-        if symbol == 'NVDA':
-            print(f"🚨 [ENGINE_ENTRY] NVDA Bucket[0,0] Price: {buckets[0, 0]:.4f}")
-            
-        # 1. 检查是否需要补算 (只要有一个 IV 为 0 且价格有效，就触发整桶检查)
-        # 简化逻辑：始终运行以确保 100% 对齐 (b/c live also recalcs)
-        
-        # 2. 计算 T (对齐分钟初 floor '1min')
         try:
             ts_ny = pd.Timestamp(timestamp, unit='s', tz='UTC').tz_convert('America/New_York')
+            # 🚀 [Surgery 8] IV 锚点精准对齐
+            # 注意：在 1s 结算帧中，timestamp 已经过 Surgery 4 回刷 60s (如 10:01:00 -> 10:00:00)
+            # 这里 floor('1min') 确保即使 timestamp 带微妙秒，也会严格锁定在分钟起始点。
             ts_anchor = ts_ny.floor('1min')
             
-            # 这里的日期处理需要快速，暂不处理复杂的 expiration_date 提取，
-            # 假设 calculate_bucket_greeks 内部会根据 ticker 处理。
-            # 我们需要计算 T_years。
-            # 为了获取到期日，我们可以从第一个有效 ticker 解析
+            # 🚀 [核心修复 3：动态读取真实的无风险利率 RFR，消除 0.347 vs 0.350 的偏差]
+            r_val = None
+            date_str = ts_ny.strftime('%Y%m%d')
+            if not hasattr(self, 'rfr_cache'): self.rfr_cache = {}
+            
+            if date_str in self.rfr_cache:
+                r_val = self.rfr_cache[date_str]
+            else:
+                rfr_file = '/home/kingfang007/risk_free_rates.parquet'
+                if os.path.exists(rfr_file):
+                    
+                    df_rfr = pd.read_parquet(rfr_file)
+                    search_date = ts_ny.replace(hour=0, minute=0, second=0, microsecond=0).tz_localize(None)
+                    idx = df_rfr.index.searchsorted(search_date)
+                    idx = np.clip(idx, 0, len(df_rfr) - 1)
+                    latest_r = float(df_rfr['DGS3MO'].iloc[idx])
+                    if latest_r > 1.0: latest_r /= 100.0
+                    self.rfr_cache[date_str] = latest_r
+                    r_val = latest_r
+
             for tkr in contracts:
                 if tkr and len(tkr) > 15:
-                    # 提取到期日 (O:NVDA240105C00150000 -> 240105)
                     ext = tkr.replace('O:', '')
                     import re
                     m = re.search(r'\d{6}', ext)
@@ -156,16 +163,11 @@ class RealTimeFeatureEngine:
                         time_diff = (expiry_dt - ts_anchor).total_seconds()
                         t_years = max(1e-6, time_diff / 31557600.0)
                         
-                        if t_years < 1e-4:
-                            # 🚨 [TIME_CRITICAL] 如果 T 异常小，打印详细的时间成分
-                            print(f"🚨 [T_ERR_DEBUG] Sym: {symbol} | Now: {ts_anchor} | Expiry: {expiry_dt} | Diff_sec: {time_diff:.2f} | T: {t_years:.8f}")
-                        
-                        # 🚀 [Parity Fix] 放弃硬编码，透传 timestamp 让数学库自标定
                         calculate_bucket_greeks(
                             buckets, 
                             stock_price, 
                             t_years, 
-                            r=None, 
+                            r=r_val, # 👈 传入真实的无风险利率！
                             contracts=contracts, 
                             current_ts=timestamp
                         )
@@ -242,23 +244,37 @@ class RealTimeFeatureEngine:
         close_ff = df['close'].replace(0, np.nan).ffill()
         open_ff = df['open'].replace(0, np.nan).ffill()
         
-        # 1. 基础差分收益率
+        # 1. 基础差分收益率 (对齐离线：分母统一使用 prev_close)
+        prev_close = close_ff.shift(1).replace(0, np.nan)
+        
         if 'close_log_return' in active_feats:
-            df['close_log_return'] = np.log((close_ff) / (close_ff.shift(1))).fillna(0.0)
+            df['close_log_return'] = np.log(close_ff / prev_close).fillna(0.0)
         
         if 'open_log_return' in active_feats:
-            df['open_log_return'] = np.log((open_ff) / (close_ff.shift(1))).fillna(0.0)
+            df['open_log_return'] = np.log(open_ff / prev_close).fillna(0.0)
 
-        # 2. VWAP 偏离度 & POC 筹码重心偏离度
-        if 'vwap_diff' in active_feats or 'poc_deviation' in active_feats:
+        # 2. VWAP 相关特征 (偏离度, 对数收益率, 背离度)
+        needs_vwap = any(f in active_feats for f in ['vwap_diff', 'vwap_log_return', 'return_divergence', 'poc_deviation'])
+        if needs_vwap:
             vwap = (df['close'] * df['volume']).cumsum() / (df['volume'].cumsum() + self.epsilon)
-            vwap_diff_val =  df['close'] - vwap  / (vwap + self.epsilon)
             
-            if 'vwap_diff' in active_feats: df['vwap_diff'] = vwap_diff_val
+            if 'vwap_diff' in active_feats: 
+                df['vwap_diff'] = (df['close'] - vwap) / (vwap + self.epsilon)
+            
+            if 'vwap_log_return' in active_feats:
+                df['vwap_log_return'] = np.log(vwap / prev_close).fillna(0.0)
+                
+            if 'return_divergence' in active_feats:
+                # 确保依赖项已计算（即使用户没选 close_log_return，也要在内部计算出用于相减）
+                c_log_ret = df['close_log_return'] if 'close_log_return' in df.columns else np.log(close_ff / prev_close).fillna(0.0)
+                v_log_ret = df['vwap_log_return'] if 'vwap_log_return' in df.columns else np.log(vwap / prev_close).fillna(0.0)
+                df['return_divergence'] = c_log_ret - v_log_ret
             
             # [🔥 修正] 重新对齐训练集 POC 逻辑：50窗口 + 50价格桶
             if 'poc_deviation' in active_feats:
                 df['poc_deviation'] = self._calculate_poc_realtime(df)
+        
+        
         
         
         # 3. 量比 (Volume Ratio)

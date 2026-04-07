@@ -113,6 +113,10 @@ class SymbolState:
         self.symbol = symbol
         self.cfg = config if config else StrategyConfig()
         self.prices = deque(maxlen=60)
+        self.last_tick_price = None  # 🚀 [NEW] 锁存上一秒股价 (用于分钟对位)
+        self.last_tick_opt_data = None # 🚀 [NEW] 锁存上一秒期权快照 (用于分钟对位)
+        
+        # 止损/PnL 辅助
         self.alpha_history = deque(maxlen=self.cfg.ROLLING_WINDOW_MINS + 10)
         self.pct_history = deque(maxlen=self.cfg.ROLLING_WINDOW_MINS + 10)
         self.correction_mode = "NORMAL"
@@ -193,9 +197,9 @@ class SymbolState:
         if bid is not None: self.bid_price = float(bid)
         if ask is not None: self.ask_price = float(ask)
         # 🚨 [CRITICAL BUG FIX] 不要在这里更新 self.prices[-1]！
-        # 否则分钟级的 update_minute_indicators 会因为 prices[-1] 已经变成现价而导致 ROC 永远为 0。
+        # 否则分钟级的 update_indicators 会因为 prices[-1] 已经变成现价而导致 ROC 永远为 0。
 
-    def update_minute_indicators(self, price, raw_alpha_val, ts=None, use_precalc_feed=False):
+    def update_indicators(self, price, raw_alpha_val, ts=None, use_precalc_feed=False):
         """更新分钟级指标 (MACD, Alpha History, ROC)"""
         # [Fix A] 强制分钟级幂等性，防止 1s 驱动重复追加
         if ts is not None:
@@ -952,19 +956,28 @@ class SignalEngineV8:
             #  
         return res
 
-    def _prep_symbol_metrics(self, i, sym, stock_prices, raw_alphas, raw_vols, use_precalc_feed, metrics_batch={}):
-        """[Refactor] 统一更新指标与 Alpha 缩放 (仅在分钟边界调用)"""
+    def _prep_symbol_metrics(self, i, sym, stock_prices, raw_alphas, opt_data, metrics_batch, use_precalc_feed=False, metrics_batch_manual=None):
+        """[核心] 为单个标的准备分钟级指标，支持分钟边界的价格与期权采样纠偏"""
         if sym in ['SPY', 'QQQ']: return None # VIXY 不再排除，用于 Regime Guard
         if sym not in self.states:
             if self.mode == 'backtest': self.states[sym] = SymbolState(sym)
             else: return None
 
         st = self.states[sym]
-        price = float(stock_prices[i])
-        raw_alpha_val = float(raw_alphas[i])
         
-        # 1. 更新技术指标 (MACD, ROC)
-        st.update_minute_indicators(price, raw_alpha_val, ts=metrics_batch.get('curr_ts'), use_precalc_feed=use_precalc_feed)
+        # --- [NEW] 强行修正分钟边界的价格与期权采样 ---
+        # 实时回放进入 :00 秒时，必须强制读取并使用上一分末秒 (:59) 的盘口状态，以对齐 1m 基准表
+        price = float(stock_prices[i])
+        calc_price = st.last_tick_price if st.last_tick_price is not None else price
+        
+        # 期权对位：使用上一秒缓存的期权快照
+        calc_opt_data = st.last_tick_opt_data if st.last_tick_opt_data is not None else opt_data
+        
+        raw_alpha_val = float(raw_alphas[i])
+        raw_vols = metrics_batch.get('fast_vol', [0.0] * (i + 1))
+        
+        # 1. 更新指标状态 (MACD, ROC)
+        st.update_indicators(calc_price, raw_alpha_val, ts=metrics_batch.get('curr_ts'), use_precalc_feed=use_precalc_feed)
         
         # 🧪 [策略接口] 获取稳定的分钟级指标
         roc_5m, macd, macd_slope, snap_roc = st.get_strategy_metrics()
@@ -1036,33 +1049,29 @@ class SignalEngineV8:
         """[Refactor] 核心策略评价 logic (平仓与开仓信号收集) - 修复空仓不交易BUG"""
         from config import USE_BID_ASK_PRICING
         st = metrics['st']
+        
+        # 🚀 [终极期权对位] 
+        # 如果当前是分钟边界 (:00 秒触发的决策)，为了对齐 1m 基准表，必须使用上一秒缓存的期权快照 (:59)
+        real_opt_data = opt_data
+        if int(curr_ts) % 60 == 0 and st.last_tick_opt_data is not None:
+            real_opt_data = st.last_tick_opt_data
+        
         price = metrics['price']
         final_alpha = metrics['final_alpha']
-        
-        # 1. 更新 IV 状态：消除均值污染，采用流动性择优法则
-        if opt_data['has_feed']:
+         # 1. 更新 IV 状态：消除均值污染，采用流动性择优法则
+        if real_opt_data['has_feed']:
             if st.position == 1: 
-                curr_iv = opt_data['call_iv']
+                curr_iv = real_opt_data['call_iv']
             elif st.position == -1: 
-                curr_iv = opt_data['put_iv']
+                curr_iv = real_opt_data['put_iv']
             else: 
-                # 无持仓时：比较 Spread，谁的流动性好（价差窄），全局基准 IV 就信谁的
-                c_spread = opt_data['call_ask'] - opt_data['call_bid'] if opt_data['call_ask'] > opt_data['call_bid'] > 0 else 999.0
-                p_spread = opt_data['put_ask'] - opt_data['put_bid'] if opt_data['put_ask'] > opt_data['put_bid'] > 0 else 999.0
-                
-                if c_spread < 999.0 or p_spread < 999.0:
-                    curr_iv = opt_data['call_iv'] if c_spread <= p_spread else opt_data['put_iv']
+                # 🚀 [对齐修复] 强制使用均值 IV，确保与 1m 基准 100% 对位
+                if real_opt_data.get('call_iv', 0) > 0 and real_opt_data.get('put_iv', 0) > 0:
+                    curr_iv = (real_opt_data['call_iv'] + real_opt_data['put_iv']) / 2.0
+                elif real_opt_data.get('call_iv', 0) > 0:
+                    curr_iv = real_opt_data['call_iv']
                 else:
-                    cv = opt_data['call_iv']
-                    pv = opt_data['put_iv']
-                    if cv > 0.01 and pv > 0.01:
-                        curr_iv = (cv + pv) / 2.0
-                    elif cv > 0.01:
-                        curr_iv = cv
-                    elif pv > 0.01:
-                        curr_iv = pv
-                    else:
-                        curr_iv = 0.0
+                    curr_iv = real_opt_data['put_iv']
                     
             if curr_iv > 0.01: st.last_valid_iv = curr_iv
 
@@ -1070,13 +1079,13 @@ class SignalEngineV8:
         # 如果空仓，我们利用 Alpha 的方向预判策略想看哪个盘口，避免传入 0.0 导致策略的风险校验拒单！
         eval_dir = st.position if st.position != 0 else (1 if final_alpha > 0 else -1)
         
-        ctx_bid = opt_data['call_bid'] if eval_dir == 1 else opt_data['put_bid']
-        ctx_ask = opt_data['call_ask'] if eval_dir == 1 else opt_data['put_ask']
-        market_opt_price = opt_data['call_price'] if eval_dir == 1 else opt_data['put_price']
+        ctx_bid = real_opt_data['call_bid'] if eval_dir == 1 else real_opt_data['put_bid']
+        ctx_ask = real_opt_data['call_ask'] if eval_dir == 1 else real_opt_data['put_ask']
+        market_opt_price = real_opt_data['call_price'] if eval_dir == 1 else real_opt_data['put_price']
         
         # 计算 Context 中的公允价
         ctx_curr_price = 0.0
-        if opt_data['has_feed']:
+        if real_opt_data['has_feed']:
             # 🚀 [诊断日志] 打印 Signal Engine 接收到的期权数据细节
             if sym == 'NVDA' and getattr(self, '_iv_se_loud_count', 0) < 3:
                 logger.info(f"📢 [SE_LOUD_TRACE] {sym} | IV_from_OptData: {opt_data.get('call_iv', -1):.4f} | Has_Feed: {opt_data['has_feed']}")
@@ -1111,6 +1120,12 @@ class SignalEngineV8:
             'regime_reversal_count': global_regime_reversal_cnt,     # For V0 compatibility
             'state': st
         }
+        
+        # 🚨 [IMPORTANT] 在整个信号处理流的末尾，缓存当前价格与期权
+        # 给下一秒 (:00) 的分钟指标计算锁定物理截面
+        st.last_tick_price = price
+        st.last_tick_opt_data = opt_data
+ 
         
         # 补齐 Spread Divergence 与 ROI 更新 (仅持仓时进行计算，防止污染空仓环境)
         if st.position != 0:
@@ -1606,7 +1621,6 @@ class SignalEngineV8:
         if 'event_prob' in batch:
             for idx_p, s_p in enumerate(symbols):
                  self.cached_event_probs[s_p] = float(batch['event_prob'][idx_p])
-                 
         raw_vols = batch.get('fast_vol', np.zeros(len(symbols)))
         
         # 👑 每次处理 K 线前，先同步真实账本！
@@ -1623,10 +1637,16 @@ class SignalEngineV8:
         self.last_process_ts_for_gating = curr_ts
 
         # 分钟级回测模式：每一帧都是 should_update_full，确保计算不被缓存拦截
-        # 秒级模式：只有在 is_new_min_crossing 时才是 should_update_full (保护 MACD/EMA/Z-Score 不崩塌)
-        should_update_full = is_new_min_crossing if is_high_freq else True
-        
-        if is_new_min_crossing and is_high_freq:
+        # 秒级模式 (LIVEREPLAY)：只有在 is_new_minute 为 True 时才是 should_update_full (由特征服务结算驱动)
+        if is_high_freq:
+            # 🚨 [关键修复]：高频回放模式下，强制信任来自特征服务的结算信号！
+            # 防止因为 ts 抖动 (10:00:00 -> 10:01:01) 导致的二次误触发。
+            should_update_full = is_new_minute or (last_t == 0)
+        else:
+            # 分钟级回测/普通模式：沿用 K 线跨越检查
+            should_update_full = is_new_min_crossing
+
+        if should_update_full and is_high_freq:
             logger.info(f"🆕 [Minute Boundary] {ny_now} | ts: {curr_ts} | Symbols: {len(symbols)}")
         
         # ✅ [核心重构] 第一阶段：秒级更新（始终执行）
@@ -1652,7 +1672,8 @@ class SignalEngineV8:
         # 🚀 以下逻辑仅在分钟整点运行 🚀
         
         # 3. 记录行情数据 (为 Alpha 日志准备时间戳)
-        self.current_log_ts = batch.get('log_ts', curr_ts)
+        # 🚀 [Surgery 24] 逻辑时间戳对齐：如果是整分结算，强制用 ts (逻辑上代表的那一分钟)，否则用 log_ts (物理时间)
+        self.current_log_ts = batch.get('ts' if is_new_minute else 'log_ts', curr_ts)
         current_time = ny_now.time()
         current_date = ny_now.date()
 
@@ -1733,9 +1754,23 @@ class SignalEngineV8:
         final_alphas_for_ic = np.zeros(len(symbols))
         
         for i, sym in enumerate(symbols):
-            metrics = self._prep_symbol_metrics(i, sym, stock_prices, raw_alphas, raw_vols, use_precalc_feed, metrics_batch)
-            if not metrics: continue
+            # 1. 优先获取期权合约数据 (用于指标计算时的对位缓存)
+            st = self.states.get(sym)
+            if not st and self.mode == 'backtest':
+                st = self.states[sym] = SymbolState(sym)
             
+            if st:
+                if self.mode == 'realtime' or os.environ.get('RUN_MODE') == 'LIVEREPLAY':
+                    opt_data = self._get_opt_data_realtime(sym, st, ny_now, stock_prices[i], batch)
+                else:
+                    opt_data = self._get_opt_data_backtest(batch, i, sym, st)
+            else:
+                opt_data = {'has_feed': False}
+
+            # 2. 准备分钟级指标 (此时已具备 opt_data)
+            metrics = self._prep_symbol_metrics(i, sym, stock_prices, raw_alphas, opt_data, metrics_batch, use_precalc_feed)
+            if not metrics: continue
+
             final_alphas_for_ic[i] = metrics['final_alpha']
             st = metrics['st']
             
@@ -1743,12 +1778,6 @@ class SignalEngineV8:
             if IS_BACKTEST:
                 with open(self.audit_log_path, 'a', encoding='utf-8') as f:
                     f.write(f"{curr_ts},{sym},{metrics['price']:.4f},{metrics['final_alpha']:.4f},{metrics['cs_alpha_z']:.4f},{self.cached_event_probs.get(sym, 0.0):.4f},{metrics['vol_z']:.4f},{metrics['roc_5m']:.6f}\n")
-            
-            # 获取期权合约数据
-            if self.mode == 'realtime' or os.environ.get('RUN_MODE') == 'LIVEREPLAY':
-                opt_data = self._get_opt_data_realtime(sym, st, ny_now, metrics['price'], batch)
-            else:
-                opt_data = self._get_opt_data_backtest(batch, i, sym, st)
 
             entry_sig = await self._evaluate_symbol_signals(
                 i, sym, metrics, opt_data, ny_now, curr_ts, spy_rocs[i], qqq_rocs[i], 
@@ -1790,6 +1819,14 @@ class SignalEngineV8:
         # 11. 同步与结算
         if IS_LIVEREPLAY:
              await self._report_pnl_status_logic(curr_ts, "LIVEREPLAY_SYNC")
+
+        # 🚀 [Surgery 16] 回放同步锁解除逻辑
+        # 发送心跳以防在没有信号的分钟内导致 Orchestrator 停滞
+        from config import IS_SIMULATED
+        if IS_SIMULATED:
+            heartbeat_payload = {'ts': curr_ts, 'action': 'HEARTBEAT'}
+            self.r.xadd('orch_trade_signals', {'data': ser.pack(heartbeat_payload)}, maxlen=5000)
+
         await self._oms_sync(curr_ts)
 
     async def _process_exits(self, batch: dict):

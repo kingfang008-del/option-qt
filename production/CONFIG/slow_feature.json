@@ -61,9 +61,12 @@
       "09:30-16:00": ["1min", "5min"]
     }
   },
-  "OHLV": ["open", "high", "low", "close", "volume"],
+  "OHLV": ["open", "high", "low", "close", "volume", "vwap"],
   "features": [
     {"name": "close_log_return", "type": "real", "calc": "custom", "resolution": "1min"},
+    {"name": "vwap_log_return", "type": "real", "calc": "custom", "resolution": "1min"},
+
+
     {"name": "volume_log", "type": "real", "calc": "custom", "resolution": "1min"},
     {"name": "volume_ratio", "type": "real", "calc": "volume_ratio", "resolution": "1min"},
     {"name": "vwap_diff", "type": "real", "calc": "zscore", "alpha_sign": -1, "resolution": "1min"},
@@ -81,6 +84,9 @@
     {"name": "hour", "type": "categorical", "calc": "time.hour", "cardinality": 24, "resolution": "5min"},
     {"name": "day_of_week", "type": "categorical", "calc": "time.day_of_week", "cardinality": 7, "resolution": "5min"},
 
+    {"name": "return_divergence", "type": "real", "calc": "zscore", "alpha_sign": -1, "resolution": "1min"},
+
+    
    
     {"name": "options_vw_spread", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
     {"name": "options_vw_imbalance", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},

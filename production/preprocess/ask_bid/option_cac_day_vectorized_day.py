@@ -214,8 +214,17 @@ def compute_single_day_file(args):
         search_keys = current_ts_idx.normalize().tz_localize(None)
         r_idx = G_RFR_SERIES.index.searchsorted(search_keys)
         r_idx = np.clip(r_idx, 0, len(G_RFR_SERIES) - 1)
+        
+        # 🚀 [Surgery 12] 严格校验查找回来的 RFR 日期是否匹配
+        found_dates = G_RFR_SERIES.index[r_idx]
+        if not (found_dates == search_keys).all():
+            first_mismatch = search_keys[found_dates != search_keys][0]
+            raise ValueError(f"❌ RFR 利率文件缺失关键日期数据: {first_mismatch}. 请先更新 risk_free_rates.parquet")
+
         r = G_RFR_SERIES.values[r_idx]
-        r = np.nan_to_num(r, nan=0.04)
+        if np.isnan(r).any():
+            first_nan = search_keys[np.isnan(r)][0]
+            raise ValueError(f"❌ RFR 利率在 {first_nan} 包含无效值 (NaN)")
 
         is_call = (df_merged['contract_type'] == 'c').values
         is_put = (df_merged['contract_type'] == 'p').values
@@ -305,49 +314,82 @@ class OptionIVCalculator:
         self.risk_free_cache_file = '/home/kingfang007/risk_free_rates.parquet'
         os.makedirs(os.path.dirname(self.risk_free_cache_file), exist_ok=True)
 
-    def _load_risk_free_rates(self, start_date: datetime.date, end_date: datetime.date):
-        fetch_start = pd.Timestamp(start_date).normalize() - pd.Timedelta(days=14)
-        fetch_end = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=14)
-        
-        if self.risk_free_cache is not None:
-            if self.risk_free_cache.index.min() <= fetch_start and self.risk_free_cache.index.max() >= fetch_end:
-                return self.risk_free_cache
-
-        rfr_df = pd.DataFrame()
-        need_download = True
-
+    def _load_risk_free_rates(self):
+        """仅负责从原始文件或网络读取基础数据，不再进行静默填充"""
         if os.path.exists(self.risk_free_cache_file):
             try:
                 df_cache = pd.read_parquet(self.risk_free_cache_file)
                 df_cache.index = pd.to_datetime(df_cache.index).normalize()
                 if not df_cache.empty:
-                    rfr_df = df_cache
-                    need_download = False
-            except Exception: pass
+                    self.risk_free_cache = df_cache
+                    return self.risk_free_cache
+            except Exception as e:
+                logger.warning(f"Read RFR cache failed: {e}")
 
-        if need_download:
-            try:
-                logger.info("Downloading RFR...")
-                new_data = web.DataReader('DGS3MO', 'fred', fetch_start, fetch_end)
-                new_data.index = pd.to_datetime(new_data.index).normalize()
-                new_data = new_data / 100.0
-                if not rfr_df.empty:
-                    rfr_df = new_data.combine_first(rfr_df)
-                else:
-                    rfr_df = new_data
-                rfr_df = rfr_df.resample('D').ffill()
-                if rfr_df.isnull().any().any():
-                    logger.warning("⚠️ RFR data has holes/nans AFTER ffill. Using 4% fallback for missing gaps.")
-                rfr_df = rfr_df.fillna(0.04)
-                rfr_df.to_parquet(self.risk_free_cache_file)
-            except Exception: pass
+        # 如果缓存不存在或读取失败，尝试下载
+        try:
+            logger.info("Attempting to download latest RFR from FRED...")
+            # 默认获取过去几年的数据
+            start = datetime.date(2020, 1, 1)
+            end = datetime.date.today()
+            df_new = web.DataReader('DGS3MO', 'fred', start, end)
+            df_new.index = pd.to_datetime(df_new.index).normalize()
+            df_new = df_new / 100.0
             
-        if rfr_df.empty:
-             idx = pd.date_range(fetch_start, fetch_end, freq='D').normalize()
-             rfr_df = pd.DataFrame(index=idx, data={'DGS3MO': 0.04})
-
-        self.risk_free_cache = rfr_df
+            self.risk_free_cache = df_new
+            df_new.to_parquet(self.risk_free_cache_file)
+            return self.risk_free_cache
+        except Exception as e:
+            logger.error(f"❌ Critical: Failed to download RFR: {e}")
+            if self.risk_free_cache is None:
+                raise RuntimeError("RFR data is completely missing and download failed.")
+        
         return self.risk_free_cache
+
+    def _audit_and_prepare_rfr(self, required_dates: pd.DatetimeIndex, max_consecutive_missing=3):
+        """🕵️ RFR 质量审计核心逻辑"""
+        if self.risk_free_cache is None or self.risk_free_cache.empty:
+            raise RuntimeError("RFR cache is empty cannot audit.")
+
+        # 1. 对齐所需日期
+        # 确保 required_dates 是 DatetimeIndex
+        rfr_audit = self.risk_free_cache.reindex(required_dates)
+        missing_mask = rfr_audit['DGS3MO'].isnull()
+        missing_count = missing_mask.sum()
+        
+        if missing_count == 0:
+            logger.info(f"✅ RFR 数据完整性校验通过 (共 {len(required_dates)} 天)")
+            return rfr_audit['DGS3MO']
+
+        # 2. 检测连续缺失长度
+        is_missing = missing_mask.astype(int)
+        groups = (is_missing != is_missing.shift()).cumsum()
+        consecutive_missing_lengths = is_missing.groupby(groups).sum()
+        max_lens = consecutive_missing_lengths.max()
+
+        # 打印审计报告
+        missing_dates = required_dates[missing_mask]
+        logger.info("=" * 50)
+        logger.info(f"📊 RFR 数据健康报告:")
+        logger.info(f"   - 所需总天数: {len(required_dates)}")
+        logger.info(f"   - 缺失天数:   {missing_count}")
+        logger.info(f"   - 最大连续缺失: {max_lens} 天")
+        logger.info("=" * 50)
+
+        if max_lens > max_consecutive_missing:
+            logger.error(f"❌ 审计发现系统性数据缺失！连续 {max_lens} 天无利率数据 (上限 {max_consecutive_missing} 天)。")
+            logger.error(f"   缺失起始日期示例: {missing_dates[:5].tolist()}")
+            raise RuntimeError(f"RFR systematic gap detected ({max_lens} days). Aborting to prevent IV parity drift.")
+
+        # 3. 执行容错修复 (Forward Fill)
+        logger.warning(f"⚠️ 检测到偶尔的数据缺口 ({missing_count} 天)，正在执行前向填充 (ffill)...")
+        rfr_fixed = rfr_audit['DGS3MO'].ffill()
+        
+        # 如果第一天就没数据，bfill 一次防止开头 NaN
+        if rfr_fixed.isnull().any():
+             rfr_fixed = rfr_fixed.bfill()
+             
+        return rfr_fixed
 
     def get_target_symbols(self) -> list[str]:
         conn = sqlite3.connect(self.db_path)
@@ -362,9 +404,20 @@ class OptionIVCalculator:
         return symbols
 
     def _get_underlying_df(self, symbol: str) -> pd.DataFrame | None:
+        """
+        🚀 [Surgery 13] 严格锁定 1min 分辨率。
+        之前因为路径中使用 ** 会读取 5min 分支，导致股价引用错误。
+        """
         try:
-            pattern = os.path.join(self.data_root, symbol, "**", "*.parquet")
+            # 搜索包含 /1min/ 子目录的 parquet
+            pattern = os.path.join(self.data_root, symbol, "**/1min/*.parquet")
             files = glob.glob(pattern, recursive=True)
+            if not files:
+                 # 备选：如果有些结构没有 regular 目录，尝试 fallback
+                 logger.warning(f"No 1min data in standard path for {symbol}, trying generic search...")
+                 pattern = os.path.join(self.data_root, symbol, "**", "1min", "*.parquet")
+                 files = glob.glob(pattern, recursive=True)
+                 
             if not files: return None
             
             dfs = [pd.read_parquet(f) for f in files]
@@ -420,14 +473,33 @@ class OptionIVCalculator:
         symbols = self.get_target_symbols()
         if not symbols: return
     
-        rfr_df = self._load_risk_free_rates(datetime.date(2020, 1, 1), datetime.date.today())
-        rfr_series = rfr_df['DGS3MO']
+        # 🚀 [Step 1] 扫描所有文件日期，确定审计范围
+        logger.info("🔍 Pre-scanning file dates for RFR audit...")
+        all_required_dates = set()
+        for symbol in symbols:
+            opt_dir = os.path.join(self.option_root, symbol)
+            if os.path.exists(opt_dir):
+                files = glob.glob(os.path.join(opt_dir, f"{symbol}_*.parquet"))
+                for f in files:
+                    # Extract 2026-01-02
+                    d_str = os.path.basename(f).replace('.parquet', '').split('_')[-1]
+                    all_required_dates.add(d_str)
+        
+        if not all_required_dates:
+            logger.warning("No files found to process.")
+            return
+
+        sorted_dates = pd.to_datetime(sorted(list(all_required_dates))).normalize()
+
+        # 🚀 [Step 2] 加载并审计 RFR
+        self._load_risk_free_rates()
+        r_series = self._audit_and_prepare_rfr(sorted_dates)
 
         logger.info(f"Starting ProcessPool with {max_concurrent_stocks} workers for {len(symbols)} symbols...")
         
         with ProcessPoolExecutor(max_workers=max_concurrent_stocks, 
                                  initializer=init_worker_rfr, 
-                                 initargs=(rfr_series,)) as executor:
+                                 initargs=(r_series,)) as executor:
             
             futures = {executor.submit(self.process_symbol_task_entry, sym): sym for sym in symbols}
             

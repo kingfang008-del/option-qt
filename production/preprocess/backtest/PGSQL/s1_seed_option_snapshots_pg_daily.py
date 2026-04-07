@@ -259,12 +259,11 @@ def process_option_data(sym, res_type='1min'):
             # 1. 设置索引并进行 GroupBy
             df_focus = df_focus.reset_index().set_index('timestamp')
             
-            # [逻辑修正] 使用 closed='right', label='right' 确保 10:00:01 ~ 10:01:00 的数据归入 10:01:00
-            # 这与正股及大部分数据源的 End-of-Bar 标注逻辑一致
+             
             df_list = []
             for b_id, group in df_focus.groupby('bucket_id'):
                 # 对单个 bucket 进行重采样
-                resampled = group.resample(resample_freq, closed='right', label='right').last()
+                resampled = group.resample(resample_freq ).last()
                 # 重新填充丢失的 bucket_id
                 resampled['bucket_id'] = b_id
                 # 🚨 [关键修复] 不要执行 ffill()！

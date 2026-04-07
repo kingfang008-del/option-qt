@@ -36,7 +36,7 @@ except ImportError:
 # ================= 参数解析 =================
 def parse_args():
     parser = argparse.ArgumentParser(description="Option Snapshot Seeder (1s High-Frequency Edition)")
-    parser.add_argument("--start_date", type=str, default="2022-01-01", help="只处理该日期及之后的数据")
+    parser.add_argument("--start_date", type=str, default="2026-01-02", help="只处理该日期及之后的数据")
     parser.add_argument("--end_date", type=str, default="2099-12-31", help="只处理该日期及之前的数据")
     return parser.parse_args()
 
@@ -178,7 +178,7 @@ def process_stock_data_1s(sym):
                 table_res = f'market_bars_{res_suffix}'
                 if is_data_seeded(db_path, table_res, sym): continue
                 
-                df_res = df_stock.set_index('timestamp').resample(f'{res_min}T', closed='right', label='right').agg({
+                df_res = df_stock.set_index('timestamp').resample(f'{res_min}T').agg({
                     'open': 'first', 'high': 'max', 'low': 'min', target_col: 'last', 'volume': 'sum'
                 }).dropna().reset_index()
                 
@@ -236,11 +236,28 @@ def process_option_data_1s(sym):
             df_focus = df_day.set_index('timestamp').between_time('09:30', '16:05').reset_index()
             if df_focus.empty: continue
 
-            # 秒级数据我们直接按 `timestamp` 分组（假设前面生成时已经对齐好了）
+            # 🚀 [Surgery 21] 统一秒级网格修复：解决高频数据中 6 合约非平稳到达导致的空洞
+            all_seconds = pd.date_range(start=df_focus['timestamp'].min(), 
+                                       end=df_focus['timestamp'].max(), 
+                                       freq='1S')
+            
+            df_list = []
+            # 识别列名以便保留
+            keep_cols = ['mid_price', 'price', 'close', 'ticker', 'strike_price', 'strike', 'volume', 'bid', 'ask', 'bid_size', 'ask_size']
+            existing_cols = [c for c in keep_cols if c in df_focus.columns]
+            
+            for b_id, group in df_focus.groupby('bucket_id'):
+                resampled = group.set_index('timestamp')[existing_cols].resample('1S').last().reindex(all_seconds).ffill()
+                resampled['bucket_id'] = b_id
+                df_list.append(resampled.reset_index())
+            
+            df_aligned = pd.concat(df_list).rename(columns={'index': 'timestamp'})
+            
+            # 秒级数据我们直接按 `timestamp` 分组
             records = []
             
-            # 分钟级数据量少可逐行，但秒级一天 23400 秒，我们必须提速
-            for ts_idx, sec_df in df_focus.groupby('timestamp'):
+            # 遍历对齐后的秒级时间网格
+            for ts_idx, sec_df in df_aligned.groupby('timestamp'):
                 ts_unix = int(ts_idx.timestamp())
                 buckets = np.zeros((6, 12), dtype=float)
                 contracts = [""] * 6
@@ -248,23 +265,18 @@ def process_option_data_1s(sym):
                 # 遍历这 1 秒内的多个合约
                 for row in sec_df.itertuples(index=False):
                     b_id = int(row.bucket_id)
-                    if b_id < 0 or b_id > 5: continue
+                    if not (0 <= b_id <= 5): continue
                     
-                    # 适配 calc_offline_1s_greeks 生成的列名，并向下兼容 raw_1s 的 'price' 字段
+                    # 价格逻辑增强： mid_price > price > close
                     price = float(getattr(row, 'mid_price', getattr(row, 'price', getattr(row, 'close', 0.0))))
-                    if symbol == 'AMD' and price < 0.0001:
-                        print(f"🚨 [SEED_DEBUG] Price is 0 for AMD! Available fields: {row._fields}")
                     contracts[b_id] = str(row.ticker)
                     
                     vals = [
                         price, 
-                        0.0, # delta
-                        0.0, # gamma
-                        0.0, # vega
-                        0.0, # theta
+                        0.0, 0.0, 0.0, 0.0, # delta, gamma, vega, theta 占位
                         float(getattr(row, 'strike_price', getattr(row, 'strike', 0.0))),
                         float(getattr(row, 'volume', 0.0)), 
-                        0.0, # iv
+                        0.0, # iv 占位
                         float(getattr(row, 'bid', price)), 
                         float(getattr(row, 'ask', price)),
                         float(getattr(row, 'bid_size', 100.0)), 
@@ -279,51 +291,74 @@ def process_option_data_1s(sym):
                 ))
             
             if records:
-                logging.info(f"🔍 [Sample Option] First 3 records for {sym}:")
-                for r in records[:3]: logging.info(f"   {sym} | {r[1]} | {datetime.fromtimestamp(r[1], NY_TZ)}")
+                # 重新将 df_aligned 赋值给 df_focus 供后续 1m/5m 降采样使用 (它们将天然获得对齐后的数据)
+                df_focus = df_aligned.copy() 
+                # [DEBUG] Sample check
+                logging.info(f"✅ [Option 1s] Converted to Aligned Grid: {len(records)} seconds for {sym}")
                 write_data_to_sqlite(db_path, 'option_snapshots_1s', records)
 
-            # [新增] 自动降采样同步 1m/5m 期权快照
+            # =========================================================
+            # 🚀 [核心修复] 期权快照 1m/5m 降采样：精准提取"最后一秒"
+            # =========================================================
             for res_min in [1, 5]:
                 res_suffix = f'{res_min}m'
                 table_res = f'option_snapshots_{res_suffix}'
                 if is_data_seeded(db_path, table_res, sym): continue
                 
-                # 期权快照通常取周期内的最后一次
-                df_res = df_focus.set_index('timestamp').resample(f'{res_min}T', closed='right', label='right').last().dropna().reset_index()
+                # 1. 给原始秒级数据打上分钟标签 (Left-Closed, Left-Labeled)
+                # 例如：09:30:59 会被打上 09:30:00 的标签
+                df_focus['bin_label'] = df_focus['timestamp'].dt.floor(f'{res_min}min')
+                
+                # 2. 🚀 [致命Bug修复] 找到每个周期内真实存在的最大时间戳 (e.g., 09:30:59)
+                last_timestamps = df_focus.groupby('bin_label')['timestamp'].max()
+                
                 res_records = []
-                for ts_idx, sec_df in df_res.groupby('timestamp'):
-                    # 这里我们需要从原始 df_focus 中再次聚合该分钟的快照 (通常取最后一次完整的快照)
-                    # 简化处理：直接取该分钟最后一秒的记录
-                    ts_unix = int(ts_idx.timestamp())
-                    # 查找对应时间戳的原始记录
-                    last_sec = df_focus[df_focus['timestamp'] == ts_idx]
+                for bin_lbl, actual_last_ts in last_timestamps.items():
+                    # 入库的时间戳必须是整点标签 (09:30:00)
+                    ts_unix = int(bin_lbl.timestamp())
+                    
+                    # 🚀 必须用 actual_last_ts (09:30:59) 去提取原始记录，绝不能用 bin_lbl！
+                    last_sec = df_focus[df_focus['timestamp'] == actual_last_ts]
                     if last_sec.empty: continue
                     
                     buckets = np.zeros((6, 12), dtype=float)
                     contracts = [""] * 6
+                    
                     for row in last_sec.itertuples(index=False):
                         b_id = int(row.bucket_id)
                         if b_id < 0 or b_id > 5: continue
-                        price = float(getattr(row, 'mid_price', getattr(row, 'close', 0.0)))
+                        
                         contracts[b_id] = str(row.ticker)
+                        
+                        # [健壮性增强] 如果原生价格是 0，自动用 bid/ask 算中间价
+                        raw_price = float(getattr(row, 'mid_price', getattr(row, 'close', getattr(row, 'price', 0.0))))
+                        bid = float(getattr(row, 'bid', 0.0))
+                        ask = float(getattr(row, 'ask', 0.0))
+                        if raw_price < 0.001 and bid > 0 and ask > 0:
+                            raw_price = (bid + ask) / 2.0
+                            
                         vals = [
-                            price, 0.0, # delta
-                            0.0, 0.0, # gamma, vega
-                            0.0, float(getattr(row, 'strike_price', getattr(row, 'strike', 0.0))),
-                            float(getattr(row, 'volume', 0.0)), 0.0, # iv
-                            float(getattr(row, 'bid', price)), float(getattr(row, 'ask', price)),
+                            raw_price, 
+                            0.0, 0.0, 0.0, 0.0, # greeks占位
+                            float(getattr(row, 'strike_price', getattr(row, 'strike', 0.0))),
+                            float(getattr(row, 'volume', 0.0)), 
+                            0.0, # iv占位
+                            bid, ask,
                             float(getattr(row, 'bid_size', 100.0)), float(getattr(row, 'ask_size', 100.0))
                         ]
                         buckets[b_id] = [v if pd.notnull(v) else 0.0 for v in vals]
+                        
                     res_records.append((
                         sym, ts_unix, 
-                        ts_idx.strftime('%Y-%m-%d %H:%M:%S'),
+                        bin_lbl.strftime('%Y-%m-%d %H:%M:%S'),
                         json.dumps({'buckets': buckets.tolist(), 'contracts': contracts})
                     ))
 
                 if res_records:
                     write_data_to_sqlite(db_path, table_res, res_records)
+                    
+                # 清理辅助列
+                df_focus.drop(columns=['bin_label'], inplace=True)
 
             del df_day, df_focus; gc.collect()
         except Exception as e:

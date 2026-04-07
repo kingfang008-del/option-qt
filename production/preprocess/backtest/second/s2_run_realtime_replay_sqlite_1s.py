@@ -19,7 +19,6 @@ import sys
 import copy
 from pathlib import Path
 import pandas as pd
-from tqdm import tqdm
 import pytz
 import datetime as dt
 import argparse
@@ -184,7 +183,7 @@ class BatchSQLiteDriver1s:
             last_5m_state = {}
             count = 0
             
-            for ts_val in tqdm(all_ts, desc=f"Inferring {db_path.name}"):
+            for ts_val in all_ts:
                 self.r.set("replay:current_ts", str(ts_val)) 
                 
                 # 预获取当前时间戳的引用
@@ -437,8 +436,7 @@ class BatchSQLiteDriver1s:
             last_known_payloads = {sym: {'ts': 0, 'symbol': sym, 'stock': {'open': 0, 'high': 0, 'low': 0, 'close': 0, 'volume': 0}, 'option_buckets': [], 'option_contracts': []} for sym in TARGET_SYMBOLS}
             last_5m_state = {}
             
-            from tqdm import tqdm
-            for ts_val in tqdm(all_ts, desc="Turbo Inference"):
+            for ts_val in all_ts:
                 # 1. 组装 1s Tick Batch
                 b1_ts = map_b1.get(ts_val, {})
                 o1_ts = map_o1.get(ts_val, {})
