@@ -253,10 +253,10 @@ class RealTimeFeatureEngine:
         if 'open_log_return' in active_feats:
             df['open_log_return'] = np.log(open_ff / prev_close).fillna(0.0)
 
-        # 2. VWAP 相关特征 (偏离度, 对数收益率, 背离度)
         needs_vwap = any(f in active_feats for f in ['vwap_diff', 'vwap_log_return', 'return_divergence', 'poc_deviation'])
         if needs_vwap:
-            vwap = (df['close'] * df['volume']).cumsum() / (df['volume'].cumsum() + self.epsilon)
+            # 🚀 [终极对齐] 如果输入中已经有聚合好的精确 vwap (由 FCS 实时产生或从 DB 读取)，则直接使用，否则降级重算
+            vwap = df['vwap'] if 'vwap' in df.columns else (df['close'] * df['volume']).cumsum() / (df['volume'].cumsum() + self.epsilon)
             
             if 'vwap_diff' in active_feats: 
                 df['vwap_diff'] = (df['close'] - vwap) / (vwap + self.epsilon)
@@ -571,6 +571,10 @@ class RealTimeFeatureEngine:
                 'opts_bh_5m': opts_bh_5m[i:i+1] if opts_bh_5m is not None else None, 
                 'updated_buckets': option_snapshots[s] if option_snapshots and s in option_snapshots else None
             }
+        
+        # 🚀 [SDS 2.0 计算屏障] 希腊值/IV 计算已全部入库，现在可以由于安全物理执行延迟结算
+        if hasattr(self, 'service'):
+            self.service.finalization_barrier()
             
         return results
 

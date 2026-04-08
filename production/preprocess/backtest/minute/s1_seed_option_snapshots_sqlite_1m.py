@@ -56,7 +56,7 @@ def init_full_db_schema(db_path):
     
     c.execute("""
         CREATE TABLE IF NOT EXISTS market_bars_1m (
-            symbol TEXT, ts INTEGER, open REAL, high REAL, low REAL, close REAL, volume REAL,
+            symbol TEXT, ts INTEGER, open REAL, high REAL, low REAL, close REAL, volume REAL, vwap REAL,
             PRIMARY KEY (symbol, ts)
         )
     """)
@@ -72,7 +72,7 @@ def init_full_db_schema(db_path):
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS market_bars_5m (
-            symbol TEXT, ts INTEGER, open REAL, high REAL, low REAL, close REAL, volume REAL,
+            symbol TEXT, ts INTEGER, open REAL, high REAL, low REAL, close REAL, volume REAL, vwap REAL,
             PRIMARY KEY (symbol, ts)
         )
     """)
@@ -215,7 +215,8 @@ def process_stock_data(sym, res_type='1min'):
                         sym, int(row['timestamp'].timestamp()), 
                         float(row['open']), float(row['high']), 
                         float(row['low']), float(row['close']), 
-                        float(row['volume'])
+                        float(row['volume']),
+                        float(row.get('vwap', row['close'])) # 🚀 [Fix] 优先提取 vwap，缺失则用 close
                     ))
                 
                 if records:
@@ -335,7 +336,14 @@ def process_option_data(sym, res_type='1min'):
                     b_id = int(row_data['bucket_id'])
                     if b_id < 0 or b_id > 5: continue
                     
-                    price = float(row_data.get('close', 0.0))
+                    bid = float(row_data.get('bid', 0.0))
+                    ask = float(row_data.get('ask', 0.0))
+                    # 🚀 [High Fidelity] 优先使用 Mid Price (Bid/Ask 均价) 作为期权快照锚点，对齐实盘基准
+                    if bid > 0 and ask > 0:
+                        price = (bid + ask) / 2.0
+                    else:
+                        price = float(row_data.get('close', 0.0))
+
                     contracts[b_id] = str(row_data.get('ticker', ''))
                     
                     vals = [

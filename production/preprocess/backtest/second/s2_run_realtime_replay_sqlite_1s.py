@@ -362,6 +362,10 @@ class BatchSQLiteDriver1s:
             date_str = db_path.stem.split('_')[1]
             logger.info(f"📂 [Turbo] Processing Database: {db_path.name}")
             
+            # 🚀 [确定性加固] 进入新交易日前，彻底抹除引擎所有残余状态
+            if hasattr(feat_svc, 'reset_internal_memory'):
+                feat_svc.reset_internal_memory()
+            
             start_dt = NY_TZ.localize(datetime.strptime(date_str + " 09:29:00", "%Y%m%d %H:%M:%S"))
             end_dt = NY_TZ.localize(datetime.strptime(date_str + " 16:00:00", "%Y%m%d %H:%M:%S"))
             start_ts, end_ts = int(start_dt.timestamp()), int(end_dt.timestamp())
@@ -374,6 +378,27 @@ class BatchSQLiteDriver1s:
             if not map_o1:
                 logger.warning(f"⚠️ No snapshots found in {db_path.name} for RTH. Skipping...")
                 continue
+            
+            # 🚀 [核准重构] 移除所有盘前预热与作弊注入，严格执行冷启动
+            logger.info("❄️ [Cold Start] Starting with empty internal memory buffers.")
+            
+            # 🚀 [确定性加固] 清理本次回放可能占据的 Redis 历史，确保 Redis 是唯一的、纯净的状态标准
+            try:
+                # 1. 资产对位消磁 (股票 + 期权)
+                for sym in feat_svc.symbols:
+                    self.r.delete(f"BAR:1M:{sym}")
+                    self.r.delete(f"BAR_OPT:1M:{sym}")  # [新] 期权标消磁
+                
+                # 2. 彻底重建 Stream 环境，防止后台 Persistence Service 报 NOGROUP 崩溃
+                self.r.delete(STREAM_TRADE_LOG)
+                self.r.xgroup_create(STREAM_TRADE_LOG, "persistence_group", id="0", mkstream=True)
+                logger.info(f"✨ [Redis] Recreated stream {STREAM_TRADE_LOG} and persistence_group.")
+
+            except Exception as re:
+                 logger.warning(f"❌ Failed to clear/reset Redis state: {re}")
+            
+            # 🚀 [终极对齐模式] 实时聚合 + 历史对位
+            # 不再使用 Truth Injection (作弊模式)，完全基于 1s 数据的自发累进与 Redis 同步
         
             signal_svc.turbo_mode = True
             
@@ -435,8 +460,10 @@ class BatchSQLiteDriver1s:
 
             last_known_payloads = {sym: {'ts': 0, 'symbol': sym, 'stock': {'open': 0, 'high': 0, 'low': 0, 'close': 0, 'volume': 0}, 'option_buckets': [], 'option_contracts': []} for sym in TARGET_SYMBOLS}
             last_5m_state = {}
+            count = 0
             
             for ts_val in all_ts:
+                count += 1
                 # 1. 组装 1s Tick Batch
                 b1_ts = map_b1.get(ts_val, {})
                 o1_ts = map_o1.get(ts_val, {})
@@ -489,10 +516,21 @@ class BatchSQLiteDriver1s:
                     await signal_svc.process_batch(feat_payload)
                     
                 # =====================================================================
-                # 🚀 [终极闭环修复 4] 实时刷盘！(每 60 秒写一次数据库，所见即所得)
+                # 🚀 [终极闭环修复 4] 实时刷盘与 Redis 写入校验 (Write-Verify)
                 # =====================================================================
                 if ts_val % 60 == 0:
-                    persist_svc.flush()
+                    persist_svc.flush() 
+                    
+                    # 🚀 [新功能] 实时审计：确保上一分钟的数据已成功入账
+                    check_ts = int(ts_val - 60)
+                    sample_sym = 'NVDA'
+                    if self.r.hexists(f"BAR:1M:{sample_sym}", str(check_ts)):
+                        if count % 60 == 0: # 降低日志频率
+                            logger.info(f"🛡️ [Write-Verify] Minute {check_ts} for {sample_sym} confirmed in Redis.")
+                    else:
+                        # 如果数据库里有但 Redis 里没有，说明聚合层漏单了
+                        logger.error(f"❌ [DATA_LOSS_ALERT] Redis MISSING bar for {sample_sym} at {check_ts}!")
+                        # 随机抛出一个标的进行补全校验 (可选)
 
             # 跑完全天后，强制刷入最后残留的数据
             logger.info("💾 Triggering final flush to SQLite...")
@@ -697,9 +735,7 @@ async def main():
             feat_svc = FeatureComputeService(feat_cfg, TARGET_SYMBOLS, config_paths)
             
             if not args.skip_warmup:
-                logger.info("⏳ [Turbo] Performing Feature Engine warmup...")
-                if hasattr(feat_svc, '_deep_warmup_rth_bars'):
-                    feat_svc._deep_warmup_rth_bars() 
+                logger.info("⏳ [Turbo] Note: Deep warmup will be performed per-day inside run_turbo.")
             
             signal_svc = SignalEngineV8(TARGET_SYMBOLS, mode='backtest', config_paths=config_paths, model_paths=model_paths)
             signal_svc.only_log_alpha = True

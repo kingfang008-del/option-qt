@@ -300,50 +300,38 @@ def process_option_data_1s(sym):
             # =========================================================
             # 🚀 [核心修复] 期权快照 1m/5m 降采样：精准提取"最后一秒"
             # =========================================================
+            # [新增] 自动降采样同步 1m/5m 期权快照 (完美修复最后一秒脱轨问题)
             for res_min in [1, 5]:
                 res_suffix = f'{res_min}m'
                 table_res = f'option_snapshots_{res_suffix}'
                 if is_data_seeded(db_path, table_res, sym): continue
                 
-                # 1. 给原始秒级数据打上分钟标签 (Left-Closed, Left-Labeled)
-                # 例如：09:30:59 会被打上 09:30:00 的标签
+                # 🚀 1. 给每秒数据打上左闭合的分钟标签 (10:13:59 -> 10:13:00)
                 df_focus['bin_label'] = df_focus['timestamp'].dt.floor(f'{res_min}min')
                 
-                # 2. 🚀 [致命Bug修复] 找到每个周期内真实存在的最大时间戳 (e.g., 09:30:59)
+                # 🚀 2. 找到每分钟内真实存在的绝对最后一秒 (比如 10:13:59)
                 last_timestamps = df_focus.groupby('bin_label')['timestamp'].max()
                 
                 res_records = []
                 for bin_lbl, actual_last_ts in last_timestamps.items():
-                    # 入库的时间戳必须是整点标签 (09:30:00)
                     ts_unix = int(bin_lbl.timestamp())
                     
-                    # 🚀 必须用 actual_last_ts (09:30:59) 去提取原始记录，绝不能用 bin_lbl！
+                    # 🚀 3. 用真实存在的最后一秒 (actual_last_ts) 去提取快照！
                     last_sec = df_focus[df_focus['timestamp'] == actual_last_ts]
                     if last_sec.empty: continue
                     
                     buckets = np.zeros((6, 12), dtype=float)
                     contracts = [""] * 6
-                    
                     for row in last_sec.itertuples(index=False):
                         b_id = int(row.bucket_id)
                         if b_id < 0 or b_id > 5: continue
-                        
+                        price = float(getattr(row, 'mid_price', getattr(row, 'close', 0.0)))
                         contracts[b_id] = str(row.ticker)
-                        
-                        # [健壮性增强] 如果原生价格是 0，自动用 bid/ask 算中间价
-                        raw_price = float(getattr(row, 'mid_price', getattr(row, 'close', getattr(row, 'price', 0.0))))
-                        bid = float(getattr(row, 'bid', 0.0))
-                        ask = float(getattr(row, 'ask', 0.0))
-                        if raw_price < 0.001 and bid > 0 and ask > 0:
-                            raw_price = (bid + ask) / 2.0
-                            
                         vals = [
-                            raw_price, 
-                            0.0, 0.0, 0.0, 0.0, # greeks占位
+                            price, 0.0, 0.0, 0.0, 0.0, 
                             float(getattr(row, 'strike_price', getattr(row, 'strike', 0.0))),
-                            float(getattr(row, 'volume', 0.0)), 
-                            0.0, # iv占位
-                            bid, ask,
+                            float(getattr(row, 'volume', 0.0)), 0.0, 
+                            float(getattr(row, 'bid', price)), float(getattr(row, 'ask', price)),
                             float(getattr(row, 'bid_size', 100.0)), float(getattr(row, 'ask_size', 100.0))
                         ]
                         buckets[b_id] = [v if pd.notnull(v) else 0.0 for v in vals]
@@ -357,7 +345,6 @@ def process_option_data_1s(sym):
                 if res_records:
                     write_data_to_sqlite(db_path, table_res, res_records)
                     
-                # 清理辅助列
                 df_focus.drop(columns=['bin_label'], inplace=True)
 
             del df_day, df_focus; gc.collect()

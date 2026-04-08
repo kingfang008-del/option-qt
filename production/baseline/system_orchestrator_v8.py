@@ -1574,6 +1574,15 @@ class V8Orchestrator:
                 'minute': torch.full((len(symbols),), ny_now.minute, dtype=torch.long).to(self.device)
             }
             with torch.no_grad():
+                # 🚀 [Fingerprint Audit] Trace NVDA at 10:00:00 (Baseline Side)
+                if "NVDA" in symbols and ny_now.hour == 10 and ny_now.minute == 0 and ny_now.second == 0:
+                    idx_nvda = symbols.index("NVDA")
+                    stk_sample = x_stk[idx_nvda:idx_nvda+1]
+                    logger.info(f"📊 [TRACE-NVDA-BASE] Tensor Fingerprint | Mean: {stk_sample.mean():.6f} | Std: {stk_sample.std():.6f} | Max: {stk_sample.max():.6f}")
+                    # 🧪 [NEW] 保存全量基准矩阵，用于像素级对碰
+                    np.save("nvda_baseline_1000.npy", stk_sample.cpu().numpy())
+                    logger.info("💾 [TRACE-NVDA-BASE] Full Matrix saved to nvda_baseline_1000.npy")
+                
                 out = self.slow_model(x_stk, x_opt, s_mock)
                 raw_alphas = out['rank_score'].cpu().numpy().flatten()
 

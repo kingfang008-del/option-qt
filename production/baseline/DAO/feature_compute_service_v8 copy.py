@@ -851,133 +851,170 @@ class FeatureComputeService:
     async def process_market_data(self, batch, current_replay_ts=None, return_payload=False):
         self.msg_count += 1
         try:
+            if not hasattr(self, 'last_finalized_minute'): self.last_finalized_minute = {}
+            if not hasattr(self, 'pending_finalization'): self.pending_finalization = {}
+            if not hasattr(self, 'finalization_snapshots'): self.finalization_snapshots = {}
+
             for payload in batch:
                 sym = payload.get('symbol')
-                if not sym: continue
-                
-                # 1. 提取时间
-                ts = float(payload['ts'])
-                from datetime import datetime, timezone, timedelta, time as dt_time
-                dt_utc = datetime.fromtimestamp(ts, timezone.utc)
-                dt_ny = dt_utc.astimezone(NY_TZ)
-                curr_minute = dt_ny.replace(second=0, microsecond=0)
-                
-                # =========================================================
-                # 🚀 绝对时序隔离：在吃入新的一秒前，坚决结算上一分钟！
-                # 即使中间有彻底无数据的断流分钟，也要用 while 循环把缺失的分钟完美补齐！
-                # =========================================================
-                if not hasattr(self, 'global_last_minute'):
-                    self.global_last_minute = curr_minute
-                    
-                if curr_minute > self.global_last_minute:
-                    while self.global_last_minute < curr_minute:
-                        # 跨越分钟！此时所有状态完美停留在上一秒 (冻结时光机)
-                        for s in self.symbols:
-                            if not hasattr(self, 'frozen_option_snapshot'):
-                                self.frozen_option_snapshot = {}
-                                self.frozen_option_snapshot_5m = {}
-                                self.frozen_latest_opt_buckets = {}
-                                self.frozen_latest_opt_contracts = {} # 🚀 必须包含合约字典冻结
-                                
-                            # 安全拷贝快照，防止被新一秒污染
-                            current_snap = self.option_snapshot.get(s)
-                            if current_snap is not None:
-                                self.frozen_option_snapshot[s] = current_snap.copy()
-                            else:
-                                self.frozen_option_snapshot[s] = np.zeros((6, 12), dtype=np.float32)
-                                
-                            from config import USE_5M_OPTION_DATA
-                            if USE_5M_OPTION_DATA:
-                                current_snap_5m = getattr(self, 'option_snapshot_5m', {}).get(s, current_snap)
-                                if current_snap_5m is not None:
-                                    self.frozen_option_snapshot_5m[s] = current_snap_5m.copy()
-                                else:
-                                    self.frozen_option_snapshot_5m[s] = np.zeros((6, 12), dtype=np.float32)
-                                    
-                            self.frozen_latest_opt_buckets[s] = self.latest_opt_buckets.get(s, [])
-                            self.frozen_latest_opt_contracts[s] = self.latest_opt_contracts.get(s, []) # 🚀 物理级对齐
-                            
-                            # 结算并生成 K 线 (包含0成交延续逻辑和正确的Volume累加)
-                            self._finalize_1min_bar(s, self.global_last_minute, cleanup=True)
-                        
-                        # 逐分钟递增，严密填补断流鸿沟
-                        self.global_last_minute += timedelta(minutes=1)
-
-                # =========================================================
-                # 🚀 现在安全了，正式吸收属于新一秒的数据
-                # =========================================================
-                
-                b_raw = payload.get('buckets', payload.get('option_buckets'))
-                if isinstance(b_raw, dict): b_data = b_raw.get('buckets', [])
-                else: b_data = b_raw
-                if b_data and len(b_data) > 0: self.latest_opt_buckets[sym] = b_data
-                    
-                c_raw = payload.get('contracts', payload.get('option_contracts'))
-                if isinstance(c_raw, dict): c_data = c_raw.get('contracts', [])
-                else: c_data = c_raw
-                if c_data and len(c_data) > 0: self.latest_opt_contracts[sym] = c_data
-
                 if sym not in self.symbols: continue
                 
-                # 盘前过滤与 09:30 大扫除
+                ts = float(payload.get('ts', 0))
+                dt_ny = datetime.fromtimestamp(ts, timezone.utc).astimezone(NY_TZ)
+                curr_minute = dt_ny.replace(second=0, microsecond=0)
+                
+                # 初始个股时钟
+                if sym not in self.last_finalized_minute:
+                    self.last_finalized_minute[sym] = curr_minute
+
+                # 🚀 [SDS 2.0 核心拦截] 
+                # 当报文 TS 跨分时，触发“计算屏障”锁定，而非立即结算。
+                # 这样可以确保当前的 option_snapshot (属于上一分钟末秒) 在被 10:14 报文污染前被物理冻结。
+                while curr_minute > self.last_finalized_minute[sym]:
+                    target_dt = self.last_finalized_minute[sym]
+                    # 🔐 [Snapshot Lock] 深度拷贝当前所有期权状态，物理阻断未来数据
+                    self.finalization_snapshots[sym] = {
+                        'buckets': copy.deepcopy(self.latest_opt_buckets.get(sym, [])),
+                        'contracts': copy.deepcopy(self.latest_opt_contracts.get(sym, [])),
+                        'snapshot': self.option_snapshot.get(sym).copy() if self.option_snapshot.get(sym) is not None else None
+                    }
+                    self.pending_finalization[sym] = target_dt
+                    self.last_finalized_minute[sym] += timedelta(minutes=1)
+                    logger.info(f"❄️ [SDS 2.0 Lock] Queueing {sym} @ {target_dt.strftime('%H:%M:%S')} for Barrier Finalization")
+
+                is_exact_boundary = (dt_ny.second == 0)
+                if is_exact_boundary and self.current_bars_5s[sym]:
+                    prev_minute = curr_minute - timedelta(minutes=1)
+                    if prev_minute >= self.last_finalized_minute[sym] - timedelta(minutes=1):
+                         # 这里的 prev_minute 结算同样进入 Barrier 逻辑，确保 IV 补算完成
+                         if sym not in self.pending_finalization:
+                            self.finalization_snapshots[sym] = {
+                                'buckets': copy.deepcopy(self.latest_opt_buckets.get(sym, [])),
+                                'contracts': copy.deepcopy(self.latest_opt_contracts.get(sym, [])),
+                                'snapshot': self.option_snapshot.get(sym).copy() if self.option_snapshot.get(sym) is not None else None
+                            }
+                            self.pending_finalization[sym] = prev_minute
+
+                # 2. [快照同步] 结算完成后，更新期权快照缓存
+                b_raw = payload.get('buckets', payload.get('option_buckets'))
+                if b_raw:
+                    b_data = b_raw.get('buckets', []) if isinstance(b_raw, dict) else b_raw
+                    if b_data and len(b_data) > 0: self.latest_opt_buckets[sym] = b_data
+                        
+                c_raw = payload.get('contracts', payload.get('option_contracts'))
+                if c_raw:
+                    c_data = c_raw.get('contracts', []) if isinstance(c_raw, dict) else c_raw
+                    if c_data and len(c_data) > 0: self.latest_opt_contracts[sym] = c_data
+                
+    # ==========================================================
+                # [🔥 升级] 盘前放行与 09:30 准点清洗机制 (Premarket Flush)
+                # ==========================================================
+                from datetime import time as dt_time
                 current_time = dt_ny.time()
-                if current_time > dt_time(16, 15): continue
+                
+                # 1. 屏蔽 16:15 之后的盘后冗余数据 (防止撑爆硬盘)
+                if current_time > dt_time(16, 15):
+                    continue
+                    
+                # 2. [核心] 09:30 准点大扫除！
+                # 作用: 把今天 00:00 到 09:29 的所有脏 K 线从内存中剔除，
+                # 保证接下来的 VWAP/SMA 等指标与回测历史完美对齐！
                 if current_time >= dt_time(9, 30):
                     if getattr(self, '_premarket_flushed_date', None) != dt_ny.date():
                         today_start = dt_ny.replace(hour=0, minute=0, second=0, microsecond=0)
                         rth_start = dt_ny.replace(hour=9, minute=30, second=0, microsecond=0)
                         for s in self.symbols:
-                            df = self.history_1min.get(s, pd.DataFrame())
+                            df = self.history_1min[s]
                             if not df.empty:
+                                # 仅保留: 昨天之前的历史数据，以及今天 09:30 之后的数据
                                 mask = (df.index < today_start) | (df.index >= rth_start)
                                 self.history_1min[s] = df[mask]
                         self._premarket_flushed_date = dt_ny.date()
-                        logger.info("🧹 09:30 准点清洗完成！引擎进入纯净实盘模式。")
+                        logger.info("🧹 09:30 准点清洗完成！盘前测试数据已剔除，引擎进入纯净实盘(RTH)模式。")
+                # ==========================================================
+                 # =========================================================
+    
+                if not hasattr(self, 'last_processed_minute'):
+                    self.last_processed_minute = {}
+                    
+                if sym not in self.last_processed_minute:
+                    self.last_processed_minute[sym] = curr_minute
+                
+                # 1. 检测个股 Minute Switch
+                # 🚀 [架构由于瘦身] 个股对位已由 global_last_minute 统一处理，此处仅作为占位
+                pass
+                
+                
+                # 🚀 [SDS 5.0 绝对放行] 取消 if stock 过滤器，物理由于确保全量 Ticks (含由于期权) 100% 入库
+                self.current_bars_5s[sym].append(copy.deepcopy(payload)) 
                 
                 stock = payload.get('stock', {})
-                if stock: 
-                    # 🚀 [兼容修复] 兼容 'c' 字段
-                    c_val = float(stock.get('close', stock.get('c', 0.0)))
-                    if c_val > 0:
-                        self.latest_prices[sym] = c_val
-                        self.last_tick_price[sym] = c_val
+                if stock:
+                    self.latest_prices[sym] = float(stock.get('close', 0.0))
+                    self.last_tick_price[sym] = self.latest_prices[sym]
                 
+                # 5min Stock (仅在 5 分钟整数倍时间点入库，防止状态保持导致的历史污染)
                 stock_5m = payload.get('stock_5m')
                 if stock_5m and dt_ny.minute % 5 == 0:
                     o, h, l, c, v = stock_5m['open'], stock_5m['high'], stock_5m['low'], stock_5m['close'], stock_5m['volume']
                     self.history_5min[sym].loc[curr_minute, ['open', 'high', 'low', 'close', 'volume']] = [o, h, l, c, v]
                     if len(self.history_5min[sym]) > 100: self.history_5min[sym] = self.history_5min[sym].iloc[-100:]
                 
-                # 1m 期权快照处理
-                buckets = payload.get('buckets', payload.get('option_buckets'))
-                if buckets:
-                    arr = np.array(buckets, dtype=np.float32)
-                    if arr.shape[1] < 12:
-                        pad = np.zeros((arr.shape[0], 12 - arr.shape[1]), dtype=np.float32)
-                        arr = np.hstack([arr, pad])
-                    if arr.shape[0] < 6: 
-                        arr = np.vstack([arr, np.zeros((6 - arr.shape[0], 12), dtype=np.float32)])
-                    
-                    # 🚀 [对齐算价] 强制用 (bid + ask) / 2 覆盖污染数据的 close
-                    valid_quote_mask = (arr[:, 8] > 0) & (arr[:, 9] > 0)
-                    arr[valid_quote_mask, 0] = (arr[valid_quote_mask, 8] + arr[valid_quote_mask, 9]) / 2.0
-
-                    if np.sum(arr[:, 0]) > 0.001 or np.sum(arr[:, 6]) > 0.001: 
-                        arr[:, 6] = np.maximum(arr[:, 6], 0.0)
-                        self.option_snapshot[sym] = arr
-                        from config import USE_5M_OPTION_DATA
-                        if USE_5M_OPTION_DATA:
-                            if not hasattr(self, 'option_snapshot_5m'): self.option_snapshot_5m = {}
-                            self.option_snapshot_5m[sym] = arr.copy()
-                        self.warmup_needed[sym] = False
     
-                # 5m 期权快照处理
-                from config import USE_5M_OPTION_DATA
+                buckets = payload.get('buckets')
+                if not buckets or len(buckets) == 0:
+                    buckets = payload.get('option_buckets')
+                
+                if buckets:
+                     
+                    # 🚀🚀🚀 [核心修复 3：存量保护逻辑] 🚀🚀🚀
+                    # 绝对不能直接覆写！因为 1s 流可能只带了价格和深度，会抹除初始化时的 Strike 信息。
+                    new_arr = np.array(buckets, dtype=np.float32)
+                    
+                    # 维度补齐 (对齐到 12 列)
+                    if new_arr.shape[1] < 12:
+                        pad = np.zeros((new_arr.shape[0], 12 - new_arr.shape[1]), dtype=np.float32)
+                        new_arr = np.hstack([new_arr, pad])
+                    
+                    # 取出存量快照作为底座
+                    old_snap = self.option_snapshot.get(sym)
+                    if old_snap is None:
+                        old_snap = np.zeros((6, 12), dtype=np.float32)
+                    
+                    # 仅更新 Row 0~5 的 Price(0), Volume(6), Bid(8), Ask(9)
+                    # 保留 Strike(5) 和 Expiry/Greeks 等存量
+                    for i in range(min(len(new_arr), 6)):
+                        # 强行重算 Price (bid+ask)/2
+                        bid, ask = new_arr[i, 8], new_arr[i, 9]
+                        if bid > 0 and ask > 0:
+                            new_arr[i, 0] = (bid + ask) / 2.0
+                        
+                        # 物理合并
+                        old_snap[i, 0] = new_arr[i, 0]       # Price
+                        old_snap[i, 6] = max(0.0, new_arr[i, 6]) # Volume/Depth
+                        old_snap[i, 8] = new_arr[i, 8]       # Bid
+                        old_snap[i, 9] = new_arr[i, 9]       # Ask
+                        # Index 1-4, 5, 7, 10, 11 保持不变 (由引擎后续计算填充)
+                    
+                    self.option_snapshot[sym] = old_snap
+                    if USE_5M_OPTION_DATA:
+                        self.option_snapshot_5m[sym] = old_snap.copy()
+                    
+                    self.warmup_needed[sym] = False
+    
+                # 5min Options (仅在 5 分钟整数倍时间点入库)
+                # 🚀 [Fix] 如果缺失 5m 专用桶数据，自动复用 1m 桶数据作为 Fallback
                 if USE_5M_OPTION_DATA:
-                    buckets_5m = payload.get('buckets_5m', payload.get('option_buckets_5m'))
+                    buckets_5m = payload.get('buckets_5m')
+                    if not buckets_5m or len(buckets_5m) == 0:
+                        buckets_5m = payload.get('option_buckets_5m')
+                        
                     if not buckets_5m or len(buckets_5m) == 0:
                         if dt_ny.minute % 5 == 0:
-                            buckets_5m = payload.get('buckets', payload.get('option_buckets'))
+                            buckets_5m = payload.get('buckets')
+                            if not buckets_5m or len(buckets_5m) == 0:
+                                buckets_5m = payload.get('option_buckets')
+                        
                     if buckets_5m and len(buckets_5m) > 0 and dt_ny.minute % 5 == 0:
                         arr = np.array(buckets_5m, dtype=np.float32)
                         if arr.shape[1] < 12:
@@ -985,35 +1022,40 @@ class FeatureComputeService:
                             arr = np.hstack([arr, pad])
                         if arr.shape[0] < 6: arr = np.vstack([arr, np.zeros((6 - arr.shape[0], 12), dtype=np.float32)])
                         
+                        # 🚀 [5m 期权同样强行重算]
                         valid_quote_mask_5m = (arr[:, 8] > 0) & (arr[:, 9] > 0)
                         arr[valid_quote_mask_5m, 0] = (arr[valid_quote_mask_5m, 8] + arr[valid_quote_mask_5m, 9]) / 2.0
 
                         if np.sum(arr[:, 6]) > 0.0001: 
+                            # 🚀 [核心对齐] 5m 桶同样直接使用 Depth 快照
                             minute_vol = arr[:, 6]
                             self.last_cum_volume_5m[sym] = minute_vol.copy()
                             arr[:, 6] = minute_vol
-                            if not hasattr(self, 'option_snapshot_5m'): self.option_snapshot_5m = {}
                             self.option_snapshot_5m[sym] = arr
     
-                # 🚀 7. 安全收录：只有在上一分钟被完美结转后，新 Tick 的成交才会进入收集器
-                stock_close = float(stock.get('close', stock.get('c', 0.0))) if stock else 0.0
-                if stock_close > 0:
-                    self.current_bars_5s[sym].append(stock)
-                
-                # 8. 尾部透出更新，不清理（为 55 秒后的推断准备最新快照）
-                if dt_ny.second >= 55:
-                     self._finalize_1min_bar(sym, curr_minute, cleanup=False)
+                # 4. [实时更新] :55 秒早起预刷新
+                if not is_exact_boundary and dt_ny.second >= 55:
+                    self._finalize_1min_bar(sym, curr_minute, cleanup=False)
+
+            
+            # [Fix] 删除遗留的 payload.get('last', 0) 覆写 Bug
+            # 改为从安全的 stock 字典中再次兜底读取，或者干脆什么都不做
+                if sym in self.latest_prices:
+                     stock_data = payload.get('stock', {})
+                     if stock_data and stock_data.get('close'):
+                         self.latest_prices[sym] = float(stock_data.get('close', 0.0))
+                         self.last_tick_price[sym] = self.latest_prices[sym]
 
         except Exception as e:
-            logger.error(f"Process Error: {e}", exc_info=True)
+            logger.error(f"Process Error: {e}")
 
     def _get_dynamic_atm_iv(self, snap, price):
         """🚀 [SDS 5.0 动态探测] 函数式提取最接近现价的 ATM IV 对"""
         if snap is None or len(snap) < 2: return 0.0, 0.0
         
         try:
-            # 注意：期权矩阵列定义中 Col 5 才是 strike，Col 0 是期权价格。
-            strikes = np.array([snap[0, 5], snap[2, 5], snap[4, 5]], dtype=np.float32)
+            # 1. 物理由于由于由于提取所有 Strike (Row 0, 2, 4 的 Col 0)
+            strikes = np.array([snap[0, 0], snap[2, 0], snap[4, 0]])
             # 2. 物理由于由于寻找最近行索引 k
             k_idx = np.argmin(np.abs(strikes - price))
             row_start = k_idx * 2
@@ -1031,111 +1073,73 @@ class FeatureComputeService:
             logger.warning(f"⚠️ [ATM Pick Error]: {e}")
             return 0.0, 0.0
 
-    def _extract_semantic_atm_iv(self, buckets, contracts, spot_price):
-        """按合约语义和最近 strike 提取 ATM Call/Put IV，避免依赖固定行号。"""
-        if buckets is None:
-            return 0.0, 0.0
-
-        try:
-            arr = buckets if isinstance(buckets, np.ndarray) else np.array(buckets, dtype=np.float32)
-            if arr.ndim != 2 or arr.shape[0] == 0:
-                return 0.0, 0.0
-
-            contracts = contracts.tolist() if isinstance(contracts, np.ndarray) else (contracts or [])
-
-            call_iv = 0.0
-            put_iv = 0.0
-            call_diff = float('inf')
-            put_diff = float('inf')
-
-            for i in range(arr.shape[0]):
-                row = arr[i]
-                if row.shape[0] <= 7:
-                    continue
-
-                contract_name = str(contracts[i]) if i < len(contracts) else ""
-                is_put = 'P' in contract_name
-                is_call = 'C' in contract_name
-
-                if not is_put and not is_call:
-                    is_put = i in [0, 1, 4]
-                    is_call = i in [2, 3, 5]
-
-                strike = float(row[5]) if row.shape[0] > 5 else 0.0
-                iv = float(row[7])
-                diff = abs(strike - float(spot_price))
-
-                if is_call and diff < call_diff:
-                    call_diff = diff
-                    call_iv = iv
-                if is_put and diff < put_diff:
-                    put_diff = diff
-                    put_iv = iv
-
-            return call_iv, put_iv
-        except Exception as e:
-            logger.warning(f"⚠️ [Semantic ATM IV Error]: {e}")
-            return 0.0, 0.0
-
-    def _extract_tagged_atm_iv(self, buckets):
-        """按固定 bucket 槽位提取 PUT_ATM/CALL_ATM IV，与 config.BUCKET_SPECS 一致。"""
-        if buckets is None:
-            return 0.0, 0.0
-
-        try:
-            arr = buckets if isinstance(buckets, np.ndarray) else np.array(buckets, dtype=np.float32)
-            if arr.ndim != 2 or arr.shape[0] == 0:
-                return 0.0, 0.0
-
-            c_iv = float(arr[2, 7]) if arr.shape[0] > 2 and arr.shape[1] > 7 else 0.0
-            p_iv = float(arr[0, 7]) if arr.shape[0] > 0 and arr.shape[1] > 7 else 0.0
-            return c_iv, p_iv
-        except Exception as e:
-            logger.warning(f"⚠️ [Tagged ATM IV Error]: {e}")
-            return 0.0, 0.0
-    
     def _finalize_1min_bar(self, sym, dt, cleanup=True):
+        """🚀 [SDS 5.0 终极确定性管道] 全量缓冲区聚合 -> 动态 ATM 探测 -> 差分成交量对位"""
         bars = self.current_bars_5s.get(sym, [])
         
-        # 🚀 [终极修复]：灵活兼容！如果 b 里面没有 'stock' 键，说明 b 本身就是 stock 字典！
+        # 1. 指纹提取助手
         def gvx(b, k, alt, default=0): 
-            s_data = b.get('stock', b) 
+            s_data = b.get('stock', {})
             return float(s_data.get(k, s_data.get(alt, default)))
             
-        valid_ticks = [b for b in bars if gvx(b, 'close', 'c') > 0]
-        bar_time = dt.replace(second=0, microsecond=0)
+        # 2. 确定性采样段 (Last-Tick Sequence)
+        # 筛选有效 Ticks (即便没有成交，replayer 也会带 close 价)
+        valid_ticks = [b for b in bars if b.get('stock') and gvx(b, 'close', 'c') > 0]
         
         if not valid_ticks:
+            # [市场静默逻辑 - 保持价格连续性]
             c_raw = self.last_tick_price.get(sym, 0.0)
             if c_raw == 0: c_raw = self.latest_prices.get(sym, 0.0)
             if c_raw == 0: return 
             o = h = l = c_raw
             v = 0.0
             vwap = c_raw
+            last_minute_accum = self.last_total_volume.get(sym, 0.0)
         else:
+            # 🚀 [SDS 5.0 物理对锁] 取分钟缓冲区最后一帧作为结算基准
             last_tick = valid_ticks[-1]
             o = gvx(valid_ticks[0], 'open', 'o')
             c_raw = gvx(last_tick, 'close', 'c')
             h = max(max(gvx(b, 'high', 'h', c_raw), gvx(b, 'close', 'c', c_raw)) for b in valid_ticks)
             l = min(min(gvx(b, 'low', 'l', c_raw), gvx(b, 'close', 'c', c_raw)) for b in valid_ticks)
             
-            # 🚀 Volume 终于可以完美累加了！
-            v = sum(max(0.0, gvx(b, 'volume', 'v', 0.0)) for b in valid_ticks)
-            pv_sum = sum(gvx(b, 'close', 'c', c_raw) * max(0.0, gvx(b, 'volume', 'v', 0.0)) for b in valid_ticks)
+            # 🚀 [🔥 成交量精度复位] 物理计算当日累积量的区间差值
+            # 注意：Polygon 1s 原始回放中 volume 字段是当日累计量
+            current_total_vol = gvx(last_tick, 'volume', 'v')
+            # 只有在初次运行且没有 last_total_volume 时才使用 last_accum 作为基准
+            prev_total_vol = self.last_total_volume.get(sym, current_total_vol)
+            v = max(0.0, current_total_vol - prev_total_vol)
+            
+            # 记录此时刻的累积成交量，用于下一分钟差分
+            last_minute_accum = current_total_vol
+            
+            # VWAP 物理由于计算
+            pv_sum = sum(gvx(b, 'vwap', 'close', gvx(b, 'c', c_raw)) * max(1e-10, gvx(b, 'volume', 'v', 0) - gvx(valid_ticks[i-1], 'volume', 'v', 0) if i > 0 else 0) for i, b in enumerate(valid_ticks))
             vwap = pv_sum / (v + 1e-10) if v > 0 else c_raw
 
+        # 3. 期权特征动态映射 (ATM Selection Parity)
+        # 逆向搜索缓冲区，找到这一分钟最后一条报文
         last_opt_tick = next((b for b in reversed(bars) if b.get('buckets') or b.get('option_buckets')), None)
+        
         if last_opt_tick:
             o_buckets_raw = last_opt_tick.get('buckets', last_opt_tick.get('option_buckets', []))
             o_contracts = last_opt_tick.get('contracts', last_opt_tick.get('option_contracts', []))
         else:
-            o_buckets_raw = getattr(self, 'frozen_latest_opt_buckets', self.latest_opt_buckets).get(sym, [])
-            o_contracts = getattr(self, 'frozen_latest_opt_contracts', self.latest_opt_contracts).get(sym, [])
+            o_buckets_raw = self.latest_opt_buckets.get(sym, [])
+            o_contracts = self.latest_opt_contracts.get(sym, [])
 
-        snap = getattr(self, 'frozen_option_snapshot', self.option_snapshot).get(sym)
-        atm_c_iv, atm_p_iv = self._extract_tagged_atm_iv(snap)
+        # 🚀 [SDS 5.0 核心探测器] 动态由于寻找最接近现价的行索引，终结 0.81x 常态偏位
+        snap = self.option_snapshot.get(sym)
+        atm_c_iv, atm_p_iv = self._get_dynamic_atm_iv(snap, c_raw)
         
-        ts_key = int(bar_time.timestamp())
+        if sym == 'NVDA':
+            logger.info(f"📈 [SDS 5.0 Parity] {dt.strftime('%H:%M:%S')} | c: {c_raw:.2f} | v: {v:.0f} | p_iv: {atm_p_iv:.4f} | c_iv: {atm_c_iv:.4f}")
+
+        # 持久化成交量游标
+        self.last_total_volume[sym] = last_minute_accum
+        
+        # 4. 指纹组装与 Redis 持久化
+        ts_key = int(dt.replace(second=0, microsecond=0).timestamp())
         o_buckets = o_buckets_raw.tolist() if hasattr(o_buckets_raw, 'tolist') else o_buckets_raw
         if isinstance(o_contracts, np.ndarray): o_contracts = o_contracts.tolist()
 
@@ -1150,39 +1154,66 @@ class FeatureComputeService:
             'atm_p_iv': atm_p_iv
         }
 
+        # 4. 写入 Redis 真相账本
         success = False
         try:
-            self.r.hset(f"BAR:1M:{sym}", str(ts_key), json.dumps(bar_payload))
-            self.r.hset(f"BAR_OPT:1M:{sym}", str(ts_key), json.dumps(opt_payload))
+            r1 = self.r.hset(f"BAR:1M:{sym}", str(int(ts_key)), json.dumps(bar_payload))
+            r2 = self.r.hset(f"BAR_OPT:1M:{sym}", str(int(ts_key)), json.dumps(opt_payload))
+            self.r.expire(f"BAR:1M:{sym}", 172800)
+            self.r.expire(f"BAR_OPT:1M:{sym}", 172800)
             success = True
-        except Exception: pass
+            if sym == 'NVDA' and ts_key % 300 == 0:
+                logger.info(f"✅ [Redis Flush] Persisted 1m bar for {sym} at {ts_key}")
+        except Exception as se:
+            logger.warning(f"❌ [Redis Write Error] Failed to write 1m/opt bars for {sym}: {se}")
 
-        should_full_sync = not success or self.history_1min.get(sym, pd.DataFrame()).empty
-        if not should_full_sync:
+        # 5. [🚀 极速对位] 增量更新内存状态，取代昂贵的全量回读
+        should_full_sync = False
+        if not success:
+            should_full_sync = True
+        elif self.history_1min[sym].empty:
+            should_full_sync = True
+        else:
+            # 检查内存中的最后一个时间戳，如果有 Gap (漏单)，必须强制同步
             last_ts_loc = self.history_1min[sym].index[-1].timestamp()
-            if ts_key - last_ts_loc > 65: should_full_sync = True
+            if ts_key - last_ts_loc > 65: # 允许少量偏移，但不能跳过整分钟
+                should_full_sync = True
 
         if should_full_sync:
+            # [异常路径] 触发昂贵的全量回读解析
             self._sync_history_from_redis(sym)
             self._sync_option_history_from_redis(sym)
         else:
+            # [极速路径] 直接增量更新内存 DataFrame，开销忽略不计
             new_ts = pd.Timestamp(ts_key, unit='s', tz=NY_TZ)
-            for k, val in bar_payload.items():
-                self.history_1min[sym].loc[new_ts, k] = val
+            for k, v in bar_payload.items():
+                self.history_1min[sym].loc[new_ts, k] = v
+            # 限制长度
             if len(self.history_1min[sym]) > 500:
                 self.history_1min[sym] = self.history_1min[sym].iloc[-500:]
-
+            
+            # 期权快照已在 process_market_data 中实时通过 option_snapshot 更新，
+            # 且刚才已经物理 reconstruct 过了（如果需要同步），此处对位已完成。
+        
+        # 6. 生成 5min K 线 (Resample)
         df_1m = self.history_1min[sym]
         if not df_1m.empty and len(df_1m) >= 5:
+            # 🚀 [优化] 只有在跨 5 分钟边界或 1min 更新后触发生
             df_5m = df_1m.resample('5min', closed='left', label='left').agg({
                 'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
             }).dropna()
             self.history_5min[sym] = df_5m.iloc[-100:]
+            
+        # 7. 物理内存回收到到到 (SDS 4.0 Cleanup)
+        if cleanup:
+            self.current_bars_5s[sym] = []
+            self.finalization_snapshots.pop(sym, None)
+            self.pending_finalization.pop(sym, None)
+        
+        return True
 
         if cleanup:
             self.current_bars_5s[sym] = []
-        
-        return True
 
     def finalization_barrier(self):
         """🚀 [SDS 2.0 结算屏障] 确保在希腊值计算全部完成后执行分钟级 K 线落盘"""
@@ -1348,16 +1379,14 @@ class FeatureComputeService:
             self.last_model_minute_ts = current_minute_ts
             
         return alpha_label_ts, data_ts, is_new_minute, ready_trading_symbols, sync_ts
-    
+
     def _step_engine_compute(self, data_ts, is_new_minute, alpha_label_ts):
         """[V8 Helper] 引擎计算层：执行底层指标运算与 Redis 同步"""
+        # 只有在整分，或者缓存失效时重新计算 engine
         if is_new_minute or getattr(self, 'cached_batch_raw', None) is None:
-            # 🚀 [致命修复] 严防未来数据污染！
-            # 必须使用被严格对齐在上一分钟末秒的 frozen_snapshot 作为 BSM 计算基底！
-            source_snap = getattr(self, 'frozen_option_snapshot', self.option_snapshot) if is_new_minute else self.option_snapshot
-            source_snap_5m = getattr(self, 'frozen_option_snapshot_5m', getattr(self, 'option_snapshot_5m', {})) if is_new_minute else getattr(self, 'option_snapshot_5m', {})
-            source_contracts = getattr(self, 'frozen_latest_opt_contracts', self.latest_opt_contracts) if is_new_minute else self.latest_opt_contracts
-            
+            source_snap = self.option_snapshot 
+            source_snap_5m = getattr(self, 'option_snapshot_5m', {})
+            # 物理截断前 12 列，防止维数震荡
             sliced_snaps = {s: snap[:, :12].copy() for s, snap in source_snap.items()}
             sliced_snaps_5m = {s: (snap[:, :12].copy() if isinstance(snap, np.ndarray) else np.zeros((6,12))) for s, snap in source_snap_5m.items()}
 
@@ -1365,8 +1394,7 @@ class FeatureComputeService:
                 results_map = self.engine.compute_all_inputs(
                     history_1min=self.history_1min, history_5min=getattr(self, 'history_5min', {}),
                     fast_feats=self.fast_feat_names, slow_feats=self.slow_feat_names,
-                    option_snapshots=sliced_snaps,  
-                    option_contracts=source_contracts,  # 🚀 传入严格冻结版的合约，确保 100% 对齐
+                    option_snapshots=sliced_snaps,  option_contracts=self.latest_opt_contracts,
                     option_snapshot_5m=sliced_snaps_5m, feat_resolutions=getattr(self, 'feat_resolutions', {}),
                     current_ts=data_ts 
                 )
@@ -1379,21 +1407,18 @@ class FeatureComputeService:
                 is_valid = False
                 if sym in results_map:
                     res_sym = results_map[sym]; is_valid = True
+                    # 🚀 [🔥 终极闭环修复] 回写与同步 IV/Greeks
                     if res_sym.get('updated_buckets') is not None:
                         enriched = res_sym['updated_buckets']
                         self.latest_opt_buckets[sym] = enriched
-                        
-                        # 🚀 [核心补漏] 必须同步更新 Frozen 字典，这样 downstream 的 payload 才能吃到被补算了 Greeks 的版本！
-                        if is_new_minute and hasattr(self, 'frozen_latest_opt_buckets'):
-                            self.frozen_latest_opt_buckets[sym] = enriched
-
                         try:
+                            # 🚀 [🔥 终极报文扩容] 显式由于由于由于提取并写入原子化字段，方便 verify_parity 对位
                             atm_c_iv = float(enriched[2, 7]) if enriched.shape[0] > 2 else 0.0
                             atm_p_iv = float(enriched[0, 7]) if enriched.shape[0] > 0 else 0.0
                             
                             payload = {
                                 'buckets': enriched.tolist() if hasattr(enriched, 'tolist') else enriched, 
-                                'contracts': source_contracts.get(sym, []), # 🚀 使用严密对应的合约
+                                'contracts': self.latest_opt_contracts.get(sym, []),
                                 'atm_c_iv': atm_c_iv,
                                 'atm_p_iv': atm_p_iv
                             }
@@ -1401,6 +1426,7 @@ class FeatureComputeService:
                         except Exception as e:
                             logger.error(f"❌ [Redis Write Error] Failed to write optic bar for {sym}: {e}")
                     
+                    # 提取特征并物理回写至 history_1min
                     for ftype in ['fast_1m', 'slow_1m']:
                         if res_sym.get(ftype) is not None:
                             latest = res_sym[ftype][0, :, -1].cpu().numpy()
@@ -1409,16 +1435,19 @@ class FeatureComputeService:
                                 if i < len(latest): 
                                     val = float(latest[i])
                                     raw_vec[self.feat_name_to_idx[fname]] = val
+                                    # 🚀 [核心对冲] 同步指标回 DataFrame，确保下游能取到 EMA_ROC 等特征
                                     if is_new_minute:
                                         ts_logi = pd.Timestamp(alpha_label_ts, unit='s', tz=NY_TZ)
                                         self.history_1min[sym].loc[ts_logi, fname] = val
 
+                # 🚀 [回填基线] 每分钟的基础期权数据物理落盘
                 if is_new_minute:
                     row_ts = pd.Timestamp(alpha_label_ts, unit='s', tz=NY_TZ)
                     if row_ts in self.history_1min[sym].index:
                         for fname in self.slow_feat_names:
                             if 'options_' in fname: self.history_1min[sym].at[row_ts, fname] = raw_vec[self.feat_name_to_idx[fname]]
 
+                # 时序导数计算 (Momentum/Accel)
                 self._inject_temporal_derivatives(sym, raw_vec, is_new_minute=is_new_minute)
                 batch_raw.append(raw_vec); valid_mask.append(is_valid)
 
@@ -1550,25 +1579,23 @@ class FeatureComputeService:
             for fname in self.slow_feat_names
         }
 
-        # 🚀 [架构升维：事前合并期权字典 (Pre-Join)]
         live_options = {}
         live_options_5m = {} 
         
         from config import USE_5M_OPTION_DATA
         source_snap_5m_for_payload = getattr(self, 'frozen_option_snapshot_5m', getattr(self, 'option_snapshot_5m', {})) if is_new_minute else getattr(self, 'option_snapshot_5m', {})
-        source_contracts = getattr(self, 'frozen_latest_opt_contracts', self.latest_opt_contracts) if is_new_minute else self.latest_opt_contracts # 🚀
 
         for sym in batch_symbols:
             live_options[sym] = {
                 'buckets': source_opt_buckets.get(sym, []),
-                'contracts': source_contracts.get(sym, []) # 🚀 强绑定
+                'contracts': getattr(self, 'latest_opt_contracts', {}).get(sym, [])
             }
             if USE_5M_OPTION_DATA:
                 snap_5m = source_snap_5m_for_payload.get(sym)
                 if snap_5m is not None:
                     live_options_5m[sym] = {
                         'buckets': snap_5m.tolist() if isinstance(snap_5m, np.ndarray) else snap_5m,
-                        'contracts': getattr(self, 'latest_opt_contracts', {}).get(sym, []) # 5m暂保持宽松要求
+                        'contracts': getattr(self, 'latest_opt_contracts', {}).get(sym, [])
                     }
         
         # 🚀 [动态预热识别] 基于底层 Normalizer 的实际投喂次数
@@ -1598,236 +1625,41 @@ class FeatureComputeService:
         }
         
         return payload
-    
+          
     async def run_compute_cycle(self, ts_from_payload=None, return_payload=False):
-        current_replay_ts = ts_from_payload if ts_from_payload else self.r.get("replay:current_ts")
-        sync_ts = float(current_replay_ts) if current_replay_ts else time.time()
+        """[V8 终极模块化版] 特征计算主循环"""
+        # 1. 时序对齐与预热审计
+        t_ctx = self._align_inference_timing(ts_from_payload)
+        if not t_ctx:
+            f_ts = ts_from_payload if ts_from_payload else time.time()
+            self.r.set("sync:feature_calc_done", f_ts); self.r.set("sync:orch_done", f_ts); return None
+        alpha_label_ts, data_ts, is_new_minute, ready_symbols, sync_ts = t_ctx
         
-        from datetime import datetime, timedelta
-        target_time = datetime.fromtimestamp(sync_ts, NY_TZ)
-        current_minute_ts = int(sync_ts // 60) * 60
-        curr_minute_dt = target_time.replace(second=0, microsecond=0)
-        
-        if not hasattr(self, 'global_last_minute'):
-            self.global_last_minute = curr_minute_dt
-            
-        if self.global_last_minute < curr_minute_dt:
-            while self.global_last_minute < curr_minute_dt:
-                for s in self.symbols:
-                    if not hasattr(self, 'frozen_option_snapshot'):
-                        self.frozen_option_snapshot = {}
-                        self.frozen_option_snapshot_5m = {}
-                        self.frozen_latest_opt_buckets = {}
-                        self.frozen_latest_opt_contracts = {}
-                        
-                    current_snap = self.option_snapshot.get(s)
-                    self.frozen_option_snapshot[s] = current_snap.copy() if current_snap is not None else np.zeros((6, 12), dtype=np.float32)
-                    
-                    from config import USE_5M_OPTION_DATA
-                    if USE_5M_OPTION_DATA:
-                        current_snap_5m = getattr(self, 'option_snapshot_5m', {}).get(s, current_snap)
-                        self.frozen_option_snapshot_5m[s] = current_snap_5m.copy() if current_snap_5m is not None else np.zeros((6, 12), dtype=np.float32)
-                        
-                    self.frozen_latest_opt_buckets[s] = self.latest_opt_buckets.get(s, [])
-                    self.frozen_latest_opt_contracts[s] = self.latest_opt_contracts.get(s, [])
-                    
-                    self._finalize_1min_bar(s, self.global_last_minute, cleanup=True)
-                
-                self.global_last_minute += timedelta(minutes=1)
+        # 2. 引擎计算
+        engine_ctx = self._step_engine_compute(data_ts, is_new_minute, alpha_label_ts)
+        if not engine_ctx: return None
+        batch_raw, valid_mask, results_map = engine_ctx
 
-        ready_symbols = [s for s in self.symbols if not self.history_1min.get(s, pd.DataFrame()).empty]
-        if not ready_symbols: return None
-            
-        sample_s = ready_symbols[0]
-        curr_len = len(self.history_1min[sample_s])
-        required_len = 1
-        
-        if curr_len < required_len: return None
+        # 3. 归一化与 30 帧缓存维护
+        norm_seq_30 = self._apply_normalization_sequence(batch_raw, valid_mask, data_ts, is_new_minute)
 
-        data_ts = float(current_replay_ts) if current_replay_ts else target_time.timestamp()
-        
-        is_new_minute = False
-        is_boundary = (int(sync_ts) % 60 == 0)
-        
-        if getattr(self, 'last_model_minute_ts', 0) == 0 and not is_boundary: return None
-
-        if is_boundary and getattr(self, 'last_model_minute_ts', 0) < current_minute_ts:
-            is_new_minute = True
-            self.last_model_minute_ts = current_minute_ts
-            
-        alpha_label_ts = data_ts - 60.0 if is_new_minute else data_ts
-
-        if is_new_minute or getattr(self, 'cached_batch_raw', None) is None:
-            source_snap = getattr(self, 'frozen_option_snapshot', self.option_snapshot) if is_new_minute else self.option_snapshot
-            source_snap_5m = getattr(self, 'frozen_option_snapshot_5m', getattr(self, 'option_snapshot_5m', {})) if is_new_minute else getattr(self, 'option_snapshot_5m', {})
-            source_contracts = getattr(self, 'frozen_latest_opt_contracts', self.latest_opt_contracts) if is_new_minute else self.latest_opt_contracts
-            
-            sliced_snaps = {s: snap[:, :12].copy() for s, snap in source_snap.items()}
-            sliced_snaps_5m = {s: snap[:, :12].copy() for s, snap in source_snap_5m.items()}
-
-            try:
-                results_map = self.engine.compute_all_inputs(
-                    history_1min=self.history_1min,
-                    history_5min=getattr(self, 'history_5min', {}),
-                    fast_feats=self.fast_feat_names,
-                    slow_feats=self.slow_feat_names,
-                    option_snapshots=sliced_snaps,  
-                    option_contracts=source_contracts,
-                    option_snapshot_5m=sliced_snaps_5m,
-                    feat_resolutions=getattr(self, 'feat_resolutions', {}),
-                    current_ts=alpha_label_ts
-                )
-            except Exception as e:
-                return None
-
-            batch_raw, valid_mask = [], []
-            for sym in self.symbols:
-                raw_vec = np.zeros(len(self.all_feat_names), dtype=np.float32)
-                is_valid = False
-                
-                if sym in results_map:
-                    res_sym = results_map[sym]
-                    is_valid = True
-                    
-                    # 🚀 引擎返回了经过 supplement_greeks 重新计算的矩阵！
-                    if res_sym.get('updated_buckets') is not None:
-                        enriched = res_sym['updated_buckets']
-                        
-                        # 更新内存状态
-                        self.latest_opt_buckets[sym] = enriched
-                        if is_new_minute and hasattr(self, 'frozen_latest_opt_buckets'):
-                            self.frozen_latest_opt_buckets[sym] = enriched
-                            
-                        # ==========================================================
-                        # 🚀 [真理级对齐核心]：用 Engine 算好的 IV，回写并覆盖 Redis！
-                        # 彻底抛弃上游的流式 IV，保证 100% 的离线/实盘算法同构！
-                        # ==========================================================
-                        if is_new_minute:
-                            try:
-                                real_c_iv, real_p_iv = self._extract_tagged_atm_iv(enriched)
-                                
-                                redis_key = f"BAR_OPT:1M:{sym}"
-                                ts_field = str(int(alpha_label_ts))
-                                
-                                # 从 Redis 取出之前 _finalize_1min_bar 写入的“生肉”字典
-                                existing_json = self.r.hget(redis_key, ts_field)
-                                if existing_json:
-                                    opt_dict = json.loads(existing_json)
-                                    
-                                    # 覆写 IV 和 Buckets 矩阵
-                                    opt_dict['atm_c_iv'] = real_c_iv
-                                    opt_dict['atm_p_iv'] = real_p_iv
-                                    opt_dict['buckets'] = enriched.tolist() if hasattr(enriched, 'tolist') else enriched
-                                    opt_dict['contracts'] = source_contracts.get(sym, [])
-                                    
-                                    # 强行重新写入 Redis，完成闭环！
-                                    self.r.hset(redis_key, ts_field, json.dumps(opt_dict))
-                            except Exception as e:
-                                logger.error(f"❌ Failed to overwrite Engine IV to Redis: {e}")
-                    
-                    if res_sym.get('fast_1m') is not None:
-                        fast_latest = res_sym['fast_1m'][0, :, -1].cpu().numpy()
-                        for i, fname in enumerate(self.fast_feat_names):
-                            if i < len(fast_latest): raw_vec[self.feat_name_to_idx[fname]] = float(fast_latest[i])
-                                
-                    if res_sym.get('slow_1m') is not None:
-                        slow_latest = res_sym['slow_1m'][0, :, -1].cpu().numpy()
-                        for i, fname in enumerate(self.slow_feat_names):
-                            if i < len(slow_latest): raw_vec[self.feat_name_to_idx[fname]] = float(slow_latest[i])
-                
-                self._inject_temporal_derivatives(sym, raw_vec, is_new_minute=is_new_minute)
-                batch_raw.append(raw_vec)
-                valid_mask.append(is_valid)
-                
-                # 🚀 [终极绝杀]：直接从送给神经网络的 raw_vec 里面把算好的 IV 扣出来，强行覆写 Redis！
-                # 彻底摆脱对 updated_buckets 的依赖，保证 Redis 记录和模型输入 1000% 一模一样！
-                if is_new_minute and is_valid:
-                    try:
-                        idx_c = self.feat_name_to_idx.get('options_atm_c_iv')
-                        idx_p = self.feat_name_to_idx.get('options_atm_p_iv')
-                        if idx_c is not None and idx_p is not None:
-                            real_c_iv = float(raw_vec[idx_c])
-                            real_p_iv = float(raw_vec[idx_p])
-                            
-                            redis_key = f"BAR_OPT:1M:{sym}"
-                            ts_field = str(int(alpha_label_ts))
-                            
-                            existing_json = self.r.hget(redis_key, ts_field)
-                            if existing_json:
-                                opt_dict = json.loads(existing_json)
-                                opt_dict['atm_c_iv'] = real_c_iv
-                                opt_dict['atm_p_iv'] = real_p_iv
-                                self.r.hset(redis_key, ts_field, json.dumps(opt_dict))
-                    except Exception as e:
-                        pass
-
-            self.cached_results_map = results_map
-            self.cached_batch_raw = batch_raw
-            self.cached_valid_mask = valid_mask
-        else:
-            results_map = self.cached_results_map
-            batch_raw = self.cached_batch_raw
-            valid_mask = self.cached_valid_mask
-
-        if batch_raw is None: return None
-
-        dt_ny_payload = datetime.fromtimestamp(alpha_label_ts, NY_TZ)
-        current_minutes = dt_ny_payload.hour * 60 + dt_ny_payload.minute
-        is_rth = (570 <= current_minutes < 960) 
-        
-        batch_norm = []
-        if not hasattr(self, 'norm_history_30'): self.norm_history_30 = []
-        
-        for b_idx, sym in enumerate(self.symbols):
-            raw_vec = batch_raw[b_idx]
-            is_valid = valid_mask[b_idx]
-            norm = self.normalizers[sym]
-            
-            if is_valid and is_rth and is_new_minute: 
-                norm_vec = norm.process_frame(raw_vec)
-            else: 
-                norm_vec = norm.normalize_only(raw_vec)
-                
-            batch_norm.append(norm_vec)
-            
-        norm_mat = np.stack(batch_norm) 
-        
-        if is_new_minute:
-            self.norm_history_30.append(norm_mat)
-            if len(self.norm_history_30) > 30: self.norm_history_30.pop(0)
-        else:
-            if len(self.norm_history_30) > 0: self.norm_history_30[-1] = norm_mat
-            else: self.norm_history_30.append(norm_mat)
-            
-        if len(self.norm_history_30) == 0: return None
-            
-        pad_len = 30 - len(self.norm_history_30)
-        if pad_len > 0: 
-            padded_history = [self.norm_history_30[0]] * pad_len + self.norm_history_30
-        else: 
-            padded_history = self.norm_history_30
-            
-        norm_seq_30 = np.stack(padded_history, axis=1) 
-
-        payload = self._assemble_compute_payload(
-            norm_seq_30=norm_seq_30, 
-            batch_raw=batch_raw, 
-            valid_mask=valid_mask, 
-            results_map=results_map, 
-            alpha_label_ts=alpha_label_ts, 
-            data_ts=data_ts, 
-            is_new_minute=is_new_minute, 
-            ready_symbols=ready_symbols
-        )
-        
+        # 4. 组装推流 Payload
+        payload = self._assemble_compute_payload(norm_seq_30, batch_raw, valid_mask, results_map, alpha_label_ts, data_ts, is_new_minute, ready_symbols)
         if not payload: return None
-
-        if payload.get('is_new_minute'):
-            try:
-                self.r.xadd(self.redis_cfg['output_stream'], {'data': ser.pack(payload)}, maxlen=100)
-            except Exception as e: pass
-
         if return_payload: return payload
+        
+        # 5. Redis 发送与状态同步
+        payload_sent = False
+        try:
+            self.r.xadd(self.redis_cfg['output_stream'], {'data': ser.pack(payload)}, maxlen=100)
+            payload_sent = True 
+        except Exception as e: logger.error(f"❌ Redis XADD Error: {e}")
+            
+        from config import IS_SIMULATED
+        if IS_SIMULATED:
+            self.r.set("sync:feature_calc_done", sync_ts)
+            if not payload_sent: self.r.set("sync:orch_done", sync_ts)
+
         return None
 
     async def run_compute_cycle_raw(self, ts_from_payload=None, return_payload=False):
@@ -1958,12 +1790,9 @@ class FeatureComputeService:
                         # 🚀 [核心对位] IV 算完后，必须立刻把带希腊值的快照同步回 Redis
                         # 否则 Redis 里的 Bar 永远只有原始价格。
                         try:
-                            real_c_iv, real_p_iv = self._extract_tagged_atm_iv(enriched_buckets)
                             opt_p = {
-                                'buckets': enriched_buckets.tolist() if hasattr(enriched_buckets, 'tolist') else enriched_buckets,
-                                'contracts': self.latest_opt_contracts.get(sym, []),
-                                'atm_c_iv': real_c_iv,
-                                'atm_p_iv': real_p_iv
+                                'buckets': enriched_buckets,
+                                'contracts': self.latest_opt_contracts.get(sym, [])
                             }
                             # alpha_label_ts 通常是分钟边界起始点 (如 10:00:00)
                             self.r.hset(f"BAR_OPT:1M:{sym}", str(int(alpha_label_ts)), json.dumps(opt_p))

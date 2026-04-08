@@ -21,8 +21,8 @@ BUCKET_NAME = "flatfiles"
 
 # [下载设置] - 改为 Quotes 目录
 S3_PREFIX = "us_options_opra/quotes_v1"
-START_DATE = datetime.date(2023, 3, 1)
-END_DATE = datetime.date(2025, 12, 31)
+START_DATE = datetime.date(2026, 1, 1)
+END_DATE = datetime.date(2026, 2, 28)
 
 # [时间与期限约束] (继承自 thetadata 逻辑)
 DTE_MIN = 3
@@ -36,16 +36,7 @@ try:
     from config import TARGET_SYMBOLS
 except ImportError:
     # 默认目标
-    TARGET_SYMBOLS =  [
-      'SPY', 'QQQ', 
-           # --- Tier 1: 巨无霸 ---
-    'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'UNH', 'AMZN', 'AMD', 'MSTR', 'COIN',
-    # --- Tier 2: 核心蓝筹 ---
-    'NFLX', 'CRWV', 'AVGO', 'MSFT', 'HOOD', 'MU', 'APP', 'GOOGL', 'GS',  'WMT',
-    # --- Tier 3: 高流动性 --- 
-    'SMCI', 'ADBE', 'CRM', 'ORCL', 'NKE', 'XOM', 'INTC', 'DELL', 'IWM', 'GLD'
-    # --- Indices & Macro ---
-        ]
+    TARGET_SYMBOLS =   TARGET_SYMBOLS
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)

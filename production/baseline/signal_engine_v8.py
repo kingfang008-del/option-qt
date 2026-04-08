@@ -681,6 +681,7 @@ class SignalEngineV8:
             if opt_buckets and opt_contracts:
                 try:
                     snap_payload = {
+                        'real_history_len': elapsed_minutes,
                         'symbol': sym,
                         'ts': payload.get('ts'),
                         'buckets': opt_buckets,
@@ -1058,6 +1059,28 @@ class SignalEngineV8:
         
         price = metrics['price']
         final_alpha = metrics['final_alpha']
+        alpha_log_iv = st.last_valid_iv
+
+        # Alpha 日志固定记录“当前 batch 自带的分钟快照 IV”，
+        # 不跟随 real_opt_data 的 :59 回退逻辑，避免表里看起来慢一拍。
+        if opt_data['has_feed']:
+            if st.position == 1:
+                log_iv_candidate = opt_data.get('call_iv', 0.0)
+            elif st.position == -1:
+                log_iv_candidate = opt_data.get('put_iv', 0.0)
+            else:
+                log_call_iv = opt_data.get('call_iv', 0.0)
+                log_put_iv = opt_data.get('put_iv', 0.0)
+                if log_call_iv > 0.01 and log_put_iv > 0.01:
+                    log_iv_candidate = (log_call_iv + log_put_iv) / 2.0
+                elif log_call_iv > 0.01:
+                    log_iv_candidate = log_call_iv
+                else:
+                    log_iv_candidate = log_put_iv
+
+            if log_iv_candidate > 0.01:
+                alpha_log_iv = log_iv_candidate
+
          # 1. 更新 IV 状态：消除均值污染，采用流动性择优法则
         if real_opt_data['has_feed']:
             if st.position == 1: 
@@ -1073,7 +1096,8 @@ class SignalEngineV8:
                 else:
                     curr_iv = real_opt_data['put_iv']
                     
-            if curr_iv > 0.01: st.last_valid_iv = curr_iv
+            if curr_iv > 0.01:
+                st.last_valid_iv = curr_iv
 
         # 🚀 [终极修复]：动态方向推断 (Dynamic Direction Inference)
         # 如果空仓，我们利用 Alpha 的方向预判策略想看哪个盘口，避免传入 0.0 导致策略的风险校验拒单！
@@ -1153,7 +1177,7 @@ class SignalEngineV8:
                 'action': 'ALPHA', 
                 'ts': getattr(self, 'current_log_ts', curr_ts), # Use logical log_ts for DB storage
                 'symbol': sym,
-                'alpha': final_alpha, 'iv': st.last_valid_iv, 'price': price, 'vol_z': metrics['vol_z'],
+                'alpha': final_alpha, 'iv': alpha_log_iv, 'price': price, 'vol_z': metrics['vol_z'],
                 'event_prob': self.cached_event_probs.get(sym, 0.0), 
                 'index_trend': index_trend 
             })
@@ -1262,6 +1286,25 @@ class SignalEngineV8:
         st = metrics['st']
         price = metrics['price']
         final_alpha = metrics['final_alpha']
+        alpha_log_iv = st.last_valid_iv
+
+        if opt_data['has_feed']:
+            if st.position == 1:
+                log_iv_candidate = opt_data.get('call_iv', 0.0)
+            elif st.position == -1:
+                log_iv_candidate = opt_data.get('put_iv', 0.0)
+            else:
+                log_call_iv = opt_data.get('call_iv', 0.0)
+                log_put_iv = opt_data.get('put_iv', 0.0)
+                if log_call_iv > 0.01 and log_put_iv > 0.01:
+                    log_iv_candidate = (log_call_iv + log_put_iv) / 2.0
+                elif log_call_iv > 0.01:
+                    log_iv_candidate = log_call_iv
+                else:
+                    log_iv_candidate = log_put_iv
+
+            if log_iv_candidate > 0.01:
+                alpha_log_iv = log_iv_candidate
         
         # 1. 更新 IV 状态
         if opt_data['has_feed']:
@@ -1283,7 +1326,8 @@ class SignalEngineV8:
                 logger.info(f"🧪 [IV_TRACE_3] {sym} | SE Raw OptData | Call_IV_Data: {c_data:.4f} | Put_IV_Data: {p_data:.4f} | Final_Curr_IV: {curr_iv:.4f}")
                 self._iv_se_count = getattr(self, '_iv_se_count', 0) + 1
 
-            if curr_iv > 0.01: st.last_valid_iv = curr_iv
+            if curr_iv > 0.01:
+                st.last_valid_iv = curr_iv
 
         
 
@@ -1320,7 +1364,7 @@ class SignalEngineV8:
             'action': 'ALPHA', 
             'ts': getattr(self, 'current_log_ts', curr_ts), # Use logical log_ts for DB storage
             'symbol': sym,
-            'alpha': final_alpha, 'iv': st.last_valid_iv, 'price': price, 'vol_z': metrics['vol_z'],
+            'alpha': final_alpha, 'iv': alpha_log_iv, 'price': price, 'vol_z': metrics['vol_z'],
             'index_trend': index_trend # [NEW] 记录入场时的趋势背景
         })
 
@@ -1499,6 +1543,17 @@ class SignalEngineV8:
 
     async def _run_model_inference(self, batch, symbols, prices, ny_now):
         """[Helper] 执行模型推斷与缓存"""
+        # 🛡️ [核心修复] 预热期硬核熔断：严禁在数据不满 30 条时记录任何 Alpha 指标
+        # real_len = batch.get('real_history_len', 30)
+        # if real_len < 30:
+        #     # 只有在整分时刻提示，防止刷屏日志
+        #     if ny_now.second == 0:
+        #         logger.warning(f"⚠️ [SE-Guard] Warmup Phase: real_len={real_len}/30. Forcing Alpha=0.0")
+        #     for s in symbols: 
+        #         self.cached_alphas[s] = 0.0
+        #         self.cached_event_probs[s] = 0.0
+        #     return None
+
         use_precalc = 'alpha_score' in batch or 'precalc_alpha' in batch
         if use_precalc:
             alphas = batch.get('precalc_alpha', batch.get('alpha_score'))
@@ -1509,6 +1564,8 @@ class SignalEngineV8:
                 for j, s in enumerate(symbols):
                     self.cached_event_probs[s] = float(eprobs[j])
             return alphas
+        
+       
             
         features_dict = batch.get('features_dict')
         if features_dict:
@@ -1545,6 +1602,14 @@ class SignalEngineV8:
         }
         
         with torch.no_grad():
+            # 🚀 [Fingerprint Audit] Trace NVDA at 10:00:00
+            if "NVDA" in symbols and ny_now.hour == 10 and ny_now.minute == 0 and ny_now.second == 0:
+                idx_nvda = symbols.index("NVDA")
+                stk_sample = x_stk[idx_nvda:idx_nvda+1]
+                logger.info(f"📊 [TRACE-NVDA] Tensor Fingerprint | Mean: {stk_sample.mean():.6f} | Std: {stk_sample.std():.6f} | Max: {stk_sample.max():.6f}")
+                # 🧪 [NEW] 保存全量指纹矩阵，用于像素级对碰
+                np.save("nvda_replay_1000.npy", stk_sample.cpu().numpy())
+                logger.info("💾 [TRACE-NVDA] Full Matrix saved to nvda_replay_1000.npy")
             out = self.slow_model(x_stk, x_opt, s_mock)
             
             # 1. 提取 Rank Score (Alpha)
@@ -1714,6 +1779,10 @@ class SignalEngineV8:
         # 6. 模型推理 (Alpha Score)
         raw_alphas = await self._run_model_inference(batch, symbols, stock_prices, ny_now)
         
+        # # 🚀 [Bug Fix] 如果推理引擎返回 None (热身期熔断)，则立刻中断当前批次的处理，防止后续迭代崩溃
+        # if raw_alphas is None:
+        #     return
+
         # 7. 自适应归一化 (仅在分钟边界更新均值/标差)
         # 🚀 [Parity Fix] 排除指数标的 (SPY, QQQ, VIXY) 对截面均值的污染，确保与 1m 离线基准对齐
         exclude_indices = {i for i, s in enumerate(symbols) if s in {'SPY', 'QQQ', 'VIXY'}}
