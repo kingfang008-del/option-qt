@@ -89,15 +89,38 @@ HASH_OPTION_SNAPSHOT = 'live_option_snapshot'      # IBKR Connector → Dashboar
 PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.116 port=5432"
 
 # ================= 核心交易标的 =================
+# GS 先注释掉，生产的时候再恢复，因为秒级回测数据里没有 GS 的期权数据，可能会导致回测失败
 TARGET_SYMBOLS =  [
-    'VIXY', 'SPY', 'QQQ', 
+    'VIXY', 'SPY',  
     # --- Tier 1: 巨无霸 ---
     'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'UNH', 'AMZN', 'AMD', 'MSTR', 'COIN',
     # --- Tier 2: 核心蓝筹 ---
-    'NFLX', 'CRWV', 'AVGO', 'MSFT', 'HOOD', 'MU', 'APP', 'GOOGL', 'WMT',  'GS',
+    'NFLX', 'CRWV', 'AVGO', 'MSFT', 'HOOD', 'MU', 'APP', 'GOOGL', 'WMT', 'QQQ', 
     # --- Tier 3: 高流动性 --- 
     'SMCI', 'ADBE', 'CRM', 'ORCL', 'NKE', 'XOM', 'INTC', 'DELL', 'IWM', 'GLD'
 ]
+
+# ================= 交易与归一化白/黑名单 =================
+# 仅用于禁止交易，不影响行情订阅与特征计算
+NON_TRADABLE_SYMBOLS = ['SPY', 'VIXY']
+
+# 截面 Alpha 归一化时剔除的符号（避免指数成分污染）
+ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS = ['SPY', 'VIXY']
+
+# 指数趋势计算参考符号
+INDEX_TREND_SYMBOLS = ['SPY', 'QQQ']
+
+# ================= 期权快照完整性门控（防发球机抖动） =================
+# 连续通过 N 个分钟边界才放行到模型输入（非阻塞）
+OPTION_GATE_MIN_CONSECUTIVE_PASS = 2
+# 放行后连续失败 M 个分钟边界才撤销放行（防抖）
+OPTION_GATE_MAX_CONSECUTIVE_FAIL = 2
+# 已放行后允许短抖的宽限期（分钟）
+OPTION_GATE_GRACE_MINUTES = 1
+# ATM IV 最低有效阈值
+OPTION_GATE_MIN_IV = 0.01
+# 是否启用 seq/frame_complete 强一致门控（无该字段时自动降级放行）
+OPTION_GATE_REQUIRE_FRAME_CONSISTENCY = True
 
 # ================= 价格模式 =================
 USE_BID_ASK_PRICING = True  # True=使用 Bid/Ask 中间价及 BSM 校准, False=仅使用最新成交价

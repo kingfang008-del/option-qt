@@ -8,6 +8,7 @@
 """
 import os
 os.environ['RUN_MODE'] = 'LIVEREPLAY'
+os.environ['RECALC_GREEKS'] = '1'
 import asyncio
 import threading
 import time
@@ -182,9 +183,12 @@ class BatchSQLiteDriver1s:
             last_known_payloads = {sym: {'ts': 0, 'symbol': sym, 'stock': {'open': 0, 'high': 0, 'low': 0, 'close': 0, 'volume': 0}, 'option_buckets': [], 'option_contracts': []} for sym in TARGET_SYMBOLS}
             last_5m_state = {}
             count = 0
+            global_seq = 0
             
             for ts_val in all_ts:
                 self.r.set("replay:current_ts", str(ts_val)) 
+                frame_complete = (int(ts_val) % 60 == 59)
+                frame_id = str(int(ts_val))
                 
                 # 预获取当前时间戳的引用
                 b1_ts = map_b1.get(ts_val, {})
@@ -200,6 +204,10 @@ class BatchSQLiteDriver1s:
                     # 1. 获取或创建基础 Payload (继承上一状态)
                     payload = last_known_payloads[sym]
                     payload['ts'] = ts_val
+                    global_seq += 1
+                    payload['frame_id'] = frame_id
+                    payload['seq'] = global_seq
+                    payload['frame_complete'] = frame_complete
                     
                     # 2. 如果本秒有股票成交，更新 Open/High/Low/Close/Volume
                     if sym in b1_ts:
@@ -258,11 +266,14 @@ class BatchSQLiteDriver1s:
                 while True:
                     # 使用 mget 并发拉取两把锁，消除额外的一倍网络往返时间
                     ack_feat, ack_orch = self.r.mget("sync:feature_calc_done", "sync:orch_done")
+                    ack_feat_fid, ack_orch_fid = self.r.mget("sync:feature_calc_done_frame_id", "sync:orch_done_frame_id")
                     
                     feat_ts = float(ack_feat) if ack_feat else 0.0
                     orch_ts = float(ack_orch) if ack_orch else 0.0
+                    feat_fid = ack_feat_fid.decode('utf-8') if isinstance(ack_feat_fid, bytes) else (str(ack_feat_fid) if ack_feat_fid else "")
+                    orch_fid = ack_orch_fid.decode('utf-8') if isinstance(ack_orch_fid, bytes) else (str(ack_orch_fid) if ack_orch_fid else "")
                     
-                    if feat_ts >= ts_val and orch_ts >= ts_val:
+                    if (feat_fid == frame_id and orch_fid == frame_id) or (feat_ts >= ts_val and orch_ts >= ts_val):
                         break
 
                     time.sleep(0.0005) 
@@ -329,7 +340,7 @@ class BatchSQLiteDriver1s:
         logger.info(f"✅ Loaded {len(map_o1)} snapshots in memory.")
         return map_b1, map_o1, map_b5, map_o5
 
-    async def _wait_for_sync(self, ts_val, enable_oms=False):
+    async def _wait_for_sync(self, ts_val, frame_id=None, enable_oms=False):
         """[Redis Mode Only] 等待后续两个引擎完成本秒处理"""
         if getattr(self, 'turbo', False): return
         
@@ -337,11 +348,14 @@ class BatchSQLiteDriver1s:
         while True:
             # 使用 mget 并发拉取两把锁，消除额外的一倍网络往返时间
             ack_feat, ack_orch = self.r.mget("sync:feature_calc_done", "sync:orch_done")
+            ack_feat_fid, ack_orch_fid = self.r.mget("sync:feature_calc_done_frame_id", "sync:orch_done_frame_id")
             
             feat_ts = float(ack_feat) if ack_feat else 0.0
             orch_ts = float(ack_orch) if ack_orch else 0.0
+            feat_fid = ack_feat_fid.decode('utf-8') if isinstance(ack_feat_fid, bytes) else (str(ack_feat_fid) if ack_feat_fid else "")
+            orch_fid = ack_orch_fid.decode('utf-8') if isinstance(ack_orch_fid, bytes) else (str(ack_orch_fid) if ack_orch_fid else "")
             
-            if feat_ts >= ts_val and orch_ts >= ts_val:
+            if (frame_id and feat_fid == frame_id and orch_fid == frame_id) or (feat_ts >= ts_val and orch_ts >= ts_val):
                 break
 
             time.sleep(0.0005) 
@@ -461,9 +475,12 @@ class BatchSQLiteDriver1s:
             last_known_payloads = {sym: {'ts': 0, 'symbol': sym, 'stock': {'open': 0, 'high': 0, 'low': 0, 'close': 0, 'volume': 0}, 'option_buckets': [], 'option_contracts': []} for sym in TARGET_SYMBOLS}
             last_5m_state = {}
             count = 0
+            global_seq = 0
             
             for ts_val in all_ts:
                 count += 1
+                frame_complete = (int(ts_val) % 60 == 59)
+                frame_id = str(int(ts_val))
                 # 1. 组装 1s Tick Batch
                 b1_ts = map_b1.get(ts_val, {})
                 o1_ts = map_o1.get(ts_val, {})
@@ -474,6 +491,10 @@ class BatchSQLiteDriver1s:
                 for sym in TARGET_SYMBOLS:
                     payload = last_known_payloads[sym]
                     payload['ts'] = ts_val
+                    global_seq += 1
+                    payload['frame_id'] = frame_id
+                    payload['seq'] = global_seq
+                    payload['frame_complete'] = frame_complete
                     
                     if sym in b1_ts:
                         payload['stock'] = b1_ts[sym]

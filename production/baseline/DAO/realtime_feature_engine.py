@@ -61,9 +61,15 @@ def _numba_poc_loop(close_windows, volume_windows, bins):
         
     return poc_values
 try:
-    from config import USE_5M_OPTION_DATA
+    from config import USE_5M_OPTION_DATA, ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS, INDEX_TREND_SYMBOLS
 except ImportError:
     USE_5M_OPTION_DATA = True # Default
+    ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS = ['SPY', 'QQQ', 'VIXY']
+    INDEX_TREND_SYMBOLS = ['SPY', 'QQQ']
+
+EXCLUDED_MODEL_SYMBOLS = set(ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS)
+VIX_SYMBOL = 'VIXY'
+INDEX_ROC_SYMBOLS = [(sym, f"{sym.lower()}_roc_5min") for sym in INDEX_TREND_SYMBOLS]
 
 logger = logging.getLogger("RealTimeFeatureEngine")
 
@@ -395,7 +401,8 @@ class RealTimeFeatureEngine:
                            option_snapshot_5m: Optional[Dict[str, np.ndarray]] = None,
                            feat_resolutions: Optional[Dict[str, str]] = None,
                            skip_scaling: bool = False,
-                           current_ts: Optional[float] = None) -> Dict[str, Dict]:
+                           current_ts: Optional[float] = None,
+                           recalc_greeks: bool = True) -> Dict[str, Dict]:
         results = {}
         all_feats = list(set(fast_feats + slow_feats))
         if not history_1min: return results
@@ -419,12 +426,12 @@ class RealTimeFeatureEngine:
         for tk, tv in time_feats.items():
             global_ctx[tk] = torch.tensor(tv, dtype=torch.float32, device=self.device)
             
-        df_vix = history_1min.get('VIXY')
+        df_vix = history_1min.get(VIX_SYMBOL)
         if df_vix is not None and not df_vix.empty:
             df_vix_aligned = df_vix.reindex(master_index).ffill().bfill()
             global_ctx.update(self._compute_vix_global(df_vix_aligned, all_feats))
 
-        for idx_sym, feat_name in [('SPY', 'spy_roc_5min'), ('QQQ', 'qqq_roc_5min')]:
+        for idx_sym, feat_name in INDEX_ROC_SYMBOLS:
             df_idx = history_1min.get(idx_sym)
             if df_idx is not None and not df_idx.empty:
                 roc_series = df_idx['close'].pct_change(5).fillna(0.0)
@@ -432,7 +439,7 @@ class RealTimeFeatureEngine:
                 global_ctx[feat_name] = torch.tensor(aligned_roc, dtype=torch.float32, device=self.device)
 
         # 3. 准备混合张量 (Hybrid Tensors)
-        ready_syns = [s for s, df in history_1min.items() if not df.empty and s not in ['SPY', 'QQQ', 'VIXY']]
+        ready_syns = [s for s, df in history_1min.items() if not df.empty and s not in EXCLUDED_MODEL_SYMBOLS]
         if not ready_syns: return results
         
         # 区分 1min 和 5min 特征
@@ -460,7 +467,7 @@ class RealTimeFeatureEngine:
                   if df_s is not None and not df_s.empty:
                       last_row = df_s.iloc[-1]
                       # 🚀 [Parity Fix] 使用传入的 option_contracts 透传给 Greeks 补算
-                      if option_contracts and s in option_contracts:
+                      if recalc_greeks and option_contracts and s in option_contracts:
                           # 🚀 [Parity Fix] 显式透传 current_ts (或 fallback 到 last_ts) 确保到期时间计算正确
                           target_ts = current_ts if current_ts else last_ts.timestamp()
                           raw_snap = self.supplement_greeks(

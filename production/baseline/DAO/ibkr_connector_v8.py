@@ -23,7 +23,6 @@ import os
 # [NEW] Add project root to sys.path to import utils
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import serialization_utils as ser
-from utils.greeks_math import calculate_bucket_greeks, get_current_rfr
 import os
 import time
 from typing import List, Dict, Set
@@ -47,8 +46,11 @@ logger = logging.getLogger("IBKR_Connector_Prod")
 from config import (
     REDIS_CFG as _REDIS_BASE, NY_TZ, IBKR_ACCOUNT_ID as ACCOUNT_ID, IBKR_PORT,
     STREAM_FUSED_MARKET as STREAM_KEY_FUSED, HASH_OPTION_SNAPSHOT as HASH_KEY_SNAPSHOT,
-    TRADING_ENABLED, DB_DIR, BUCKET_SPECS, TAG_TO_INDEX # [Fix] Restore imports
+    TRADING_ENABLED, DB_DIR, BUCKET_SPECS, TAG_TO_INDEX,
+    ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS
 )
+
+NO_OPTION_LOCK_SYMBOLS = set(ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS)
 
 # 🚀 [核心对齐] Buckets 数据索引定义
 IDX_PRICE = 0
@@ -82,6 +84,7 @@ class IBKRConnectorFinal:
         
         # [NEW] 绑定错误处理
         self.ib.errorEvent += self._on_error
+        logger.info("🧮 IB side Greeks disabled: streaming price/orderbook only; Greeks computed in realtime_feature_engine.")
 
     async def connect(self):
         """保持连接活跃"""
@@ -477,7 +480,7 @@ class IBKRConnectorFinal:
                     # logger.info(f"   ♻️ Restored Option: {opt_c.localSymbol}")
             
             # c2. 如果不是指数，且需要搜索 (锁缺失/无效)
-            is_index = original_key in ['VIXY', 'SPY', 'QQQ']
+            is_index = original_key in NO_OPTION_LOCK_SYMBOLS
             if not is_index:
                 # 检查是否缺锁
                 missing_tags = [tag for tag in TAG_TO_INDEX if tag not in self.locked_contracts.get(original_key, {})]
@@ -585,8 +588,9 @@ class IBKRConnectorFinal:
                 logger.error(f"❌ Failed to publish soft batch: {e}")
 
     def _collect_option_buckets(self, sym):
-        """收集 6 个期权桶的实时快照 & 合约ID (带有严格的 NaN 过滤与预热静默)"""
-        # [回滚] 恢复使用 np.zeros().tolist()
+        """收集 6 个期权桶的实时快照 & 合约ID。
+        约定：IB 侧只推送价格/盘口，不推送 Greeks/IV；Greeks 统一由下游引擎按分钟计算。
+        """
         buckets_data = np.zeros((6, 12), dtype=float).tolist()
         contracts_data = [""] * 6 
         locks = self.locked_contracts.get(sym)
@@ -618,86 +622,9 @@ class IBKRConnectorFinal:
             elif bid_p > 0 and ask_p > 0: price = (bid_p + ask_p) / 2.0
             else: price = 0.0 # 保持 0.0，Orchestrator 识别到 0 会用 BSM 自动兜底！
             
-            # ================== 替换开始 ==================
-            # =============================================================
-            # 🚀 [终极对齐逻辑]：拒绝使用 IBKR 推送！全部进入重算流程。
-            # =============================================================
+            # Greeks/IV 在 IB 侧固定置零；统一由 realtime_feature_engine 在分钟级计算。
             iv, delta, gamma, vega, theta = 0.0, 0.0, 0.0, 0.0, 0.0
-            cache_key = f"{sym}_{tag}"
 
-            S_price = self.last_spot_prices.get(sym, 0.0)
-            if S_price < 0.01:
-                # 兜底：如果没拿到正股价格，尝试从 ticker 拿
-                t_stock = self.ib.ticker(self.active_stocks.get(sym))
-                if t_stock:
-                    S_price = _safe_float(t_stock.last or t_stock.close or (t_stock.bid + t_stock.ask)/2)
-
-            # A. 确定期权价格 P
-            if bid_p > 0 and ask_p > 0: opt_price = (bid_p + ask_p) / 2.0
-            elif last_p > 0: opt_price = last_p
-            elif close_p > 0: opt_price = close_p
-            else: opt_price = 0.0
-
-            # B. 执行重算 (BSM)
-            if opt_price > 0 and S_price > 0.01:
-                try:
-                    from py_vollib_vectorized import vectorized_implied_volatility, get_all_greeks
-                    
-                    # 🚀 [核心对齐 1]：利率动态同步 (DGS3MO)
-                    r_dynamic = get_current_rfr(pd.Timestamp.now('America/New_York').timestamp())
-                    
-                    # 🚀 [核心对齐 2]：T 强制锚定到分钟整点 (floor '1min')
-                    expiry_str = contract.lastTradeDateOrContractMonth
-                    if expiry_str:
-                        # 统一 16:00 到期定义
-                        expiry_dt = pd.to_datetime(expiry_str, format='%Y%m%d').tz_localize('America/New_York') + pd.Timedelta(hours=16)
-                        ny_now = pd.Timestamp.now('America/New_York')
-                        # 【致命对齐步】强制向下取整到分钟，使 1s 生成的特征信号在这一分钟内保持与 1m 引擎一致
-                        ny_now_floored = ny_now.floor('1min')
-                        t_years = max(1e-6, (expiry_dt - ny_now_floored).total_seconds() / 31557600.0)
-                        
-                        # 构建单行 bucket 进行计算 (对齐 greeks_math 接口)
-                        # 我们只需要更新这一个合约的希腊值，所以暂存为一个 row
-                        temp_bucket = np.zeros((1, 12), dtype=np.float32)
-                        temp_bucket[0, IDX_PRICE] = opt_price
-                        temp_bucket[0, IDX_STRIKE] = float(contract.strike)
-
-                        r_dynamic=get_current_rfr(ny_now_floored.timestamp())
-                        calculate_bucket_greeks(temp_bucket, S_price, t_years, r_dynamic, [contract.localSymbol])
-                        
-                        iv, delta, gamma, vega, theta = (
-                            float(temp_bucket[0, IDX_IV]), float(temp_bucket[0, IDX_DELTA]),
-                            float(temp_bucket[0, IDX_GAMMA]), float(temp_bucket[0, IDX_VEGA]),
-                            float(temp_bucket[0, IDX_THETA])
-                        )
-                        
-                        if iv > 0.001:
-                            # 记录到健康缓存
-                            self.last_greeks_cache[cache_key] = (iv, delta, gamma, vega, theta)
-                        else:
-                            # IV 计算失败，回滚到缓存
-                            if cache_key in self.last_greeks_cache:
-                                iv, delta, gamma, vega, theta = self.last_greeks_cache[cache_key]
-                    else:
-                        if cache_key in self.last_greeks_cache:
-                            iv, delta, gamma, vega, theta = self.last_greeks_cache[cache_key]
-                except Exception as e:
-                    logger.error(f"⚠️ {sym} {tag} Parity Recalc Failed: {e}")
-                    if cache_key in self.last_greeks_cache:
-                        iv, delta, gamma, vega, theta = self.last_greeks_cache[cache_key]
-            
-            # 最后的极端兜底 (若没算出来也没缓存)
-            if iv < 1e-6 and cache_key in self.last_greeks_cache:
-                iv, delta, gamma, vega, theta = self.last_greeks_cache[cache_key]
-
-            # 最后再套一层独立的 IV 缓存，兼容旧逻辑 (有些时候 greeks 断了但 IV 没断)
-            if iv > 0.01: 
-                self.last_iv_cache[cache_key] = iv
-            elif cache_key in self.last_iv_cache: 
-                iv = self.last_iv_cache[cache_key]
-            # ================== 替换结束 ==================
-
-            # ================== 替换开始 ==================
             # 🚀 [核心对齐] 用盘口深度代替真实成交量 (与 step2_thetadata_sniper_v6 训练脚本一致)
             bid_size = _safe_float(t.bidSize)
             ask_size = _safe_float(t.askSize)
@@ -997,7 +924,7 @@ class IBKRConnectorFinal:
             # [Fix] 遍历所有已订阅的正股，不再依赖 _on_stock_bar 的推送
             # 这样即使没有 RealTimeBar，只要有 Snapshot 价格也能触发选合约
             for sym, contract in list(self.active_stocks.items()):
-                if sym in ['VIXY', 'SPY', 'QQQ']: continue
+                if sym in NO_OPTION_LOCK_SYMBOLS: continue
                 
                 # 获取当前价格 (优先用 MarketPrice，含盘前)
                 ticker = self.ib.ticker(contract)

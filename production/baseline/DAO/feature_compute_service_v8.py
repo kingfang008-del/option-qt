@@ -45,7 +45,9 @@ from config import (
     REDIS_CFG as _REDIS_BASE, NY_TZ,
     STREAM_FUSED_MARKET, STREAM_INFERENCE,
     FEATURE_SERVICE_STATE_FILE as STATE_FILE, DB_DIR,
-    LOG_DIR, USE_5M_OPTION_DATA
+    LOG_DIR, USE_5M_OPTION_DATA, NON_TRADABLE_SYMBOLS,
+    OPTION_GATE_MIN_CONSECUTIVE_PASS, OPTION_GATE_MAX_CONSECUTIVE_FAIL, OPTION_GATE_MIN_IV,
+    OPTION_GATE_GRACE_MINUTES, OPTION_GATE_REQUIRE_FRAME_CONSISTENCY
 )
 
 logging.basicConfig(
@@ -257,6 +259,29 @@ class FeatureComputeService:
             self.device = torch.device('mps')
             
         self.engine = RealTimeFeatureEngine(stats_path=None, device=str(self.device))
+        recalc_env = os.environ.get("RECALC_GREEKS", "1").strip().lower()
+        self.recalc_greeks = recalc_env not in {"0", "false", "no", "off"}
+        logger.info(f"🧮 Greeks Recalc Enabled: {self.recalc_greeks}")
+        self.option_gate_min_pass = max(
+            1, int(os.environ.get("OPTION_GATE_MIN_PASS", OPTION_GATE_MIN_CONSECUTIVE_PASS))
+        )
+        self.option_gate_max_fail = max(
+            1, int(os.environ.get("OPTION_GATE_MAX_FAIL", OPTION_GATE_MAX_CONSECUTIVE_FAIL))
+        )
+        self.option_gate_grace_minutes = max(
+            0, int(os.environ.get("OPTION_GATE_GRACE_MINUTES", OPTION_GATE_GRACE_MINUTES))
+        )
+        self.option_gate_min_iv = float(os.environ.get("OPTION_GATE_MIN_IV", OPTION_GATE_MIN_IV))
+        require_frame_env = os.environ.get("OPTION_GATE_REQUIRE_FRAME_CONSISTENCY")
+        if require_frame_env is None:
+            self.option_gate_require_frame_consistency = bool(OPTION_GATE_REQUIRE_FRAME_CONSISTENCY)
+        else:
+            self.option_gate_require_frame_consistency = require_frame_env.strip().lower() not in {"0", "false", "no", "off"}
+        logger.info(
+            f"🛡️ Option Gate Config | min_pass={self.option_gate_min_pass} "
+            f"| max_fail={self.option_gate_max_fail} | grace={self.option_gate_grace_minutes}m "
+            f"| min_iv={self.option_gate_min_iv:.4f} | frame_consistency={self.option_gate_require_frame_consistency}"
+        )
         
         self.normalizers = {
             s: RollingWindowNormalizer(
@@ -309,6 +334,20 @@ class FeatureComputeService:
 
         self.latest_opt_buckets = {}
         self.latest_opt_contracts = {}
+        self.preaggregated_1m_mode = False
+        self._preagg_mode_logged = False
+        self.sym_vol_mean = {}
+        self.sym_vol_var = {}
+        self.sym_last_vol_price = {}
+        self.cached_vol_z = {}
+        self.option_gate_state = {
+            s: {'pass_streak': 0, 'fail_streak': 0, 'ready': False, 'grace_until_ts': None} for s in self.symbols
+        }
+        self.option_frame_state = {
+            s: {'minute_flags': {}, 'last_seq': None} for s in self.symbols
+        }
+        self._last_gate_metrics_minute_ts = None
+        self.publish_frame_seq = 0
 
 
         # 尝试加载状态
@@ -683,7 +722,8 @@ class FeatureComputeService:
                 if replay_features and not self.history_1min[sym].empty and len(self.history_1min[sym]) > 50:
                     sliced_snaps = {s: snap[:, :12] for s, snap in self.option_snapshot.items()}
                     res = self.engine.compute_all_inputs(
-                        {sym: self.history_1min[sym]}, self.fast_feat_names, self.slow_feat_names, sliced_snaps, skip_scaling=True
+                        {sym: self.history_1min[sym]}, self.fast_feat_names, self.slow_feat_names, sliced_snaps,
+                        skip_scaling=True, recalc_greeks=self.recalc_greeks
                     )
                     if sym in res:
                         t_fast = res[sym]['fast_1m'][0].cpu().numpy()
@@ -772,7 +812,8 @@ class FeatureComputeService:
 
                 # 把整整 2000 根线一把丢给引擎算！
                 res = self.engine.compute_all_inputs(
-                    {sym: df_hist}, self.fast_feat_names, self.slow_feat_names, sliced_snaps, skip_scaling=True
+                    {sym: df_hist}, self.fast_feat_names, self.slow_feat_names, sliced_snaps,
+                    skip_scaling=True, recalc_greeks=self.recalc_greeks
                 )
                 
                 if sym in res:
@@ -861,47 +902,54 @@ class FeatureComputeService:
                 dt_utc = datetime.fromtimestamp(ts, timezone.utc)
                 dt_ny = dt_utc.astimezone(NY_TZ)
                 curr_minute = dt_ny.replace(second=0, microsecond=0)
+                is_preaggregated_1m = bool(payload.get('bar_preaggregated_1m', False))
+                if is_preaggregated_1m:
+                    self.preaggregated_1m_mode = True
+                    if not self._preagg_mode_logged:
+                        logger.info("🧭 [Mode] Pre-aggregated 1m feed detected: bypass tick->bar finalize path.")
+                        self._preagg_mode_logged = True
+
+                if sym in self.symbols:
+                    self._update_option_frame_state(sym, payload, ts)
                 
                 # =========================================================
                 # 🚀 绝对时序隔离：在吃入新的一秒前，坚决结算上一分钟！
                 # 即使中间有彻底无数据的断流分钟，也要用 while 循环把缺失的分钟完美补齐！
                 # =========================================================
-                if not hasattr(self, 'global_last_minute'):
-                    self.global_last_minute = curr_minute
-                    
-                if curr_minute > self.global_last_minute:
-                    while self.global_last_minute < curr_minute:
-                        # 跨越分钟！此时所有状态完美停留在上一秒 (冻结时光机)
-                        for s in self.symbols:
-                            if not hasattr(self, 'frozen_option_snapshot'):
-                                self.frozen_option_snapshot = {}
-                                self.frozen_option_snapshot_5m = {}
-                                self.frozen_latest_opt_buckets = {}
-                                self.frozen_latest_opt_contracts = {} # 🚀 必须包含合约字典冻结
-                                
-                            # 安全拷贝快照，防止被新一秒污染
-                            current_snap = self.option_snapshot.get(s)
-                            if current_snap is not None:
-                                self.frozen_option_snapshot[s] = current_snap.copy()
-                            else:
-                                self.frozen_option_snapshot[s] = np.zeros((6, 12), dtype=np.float32)
-                                
-                            from config import USE_5M_OPTION_DATA
-                            if USE_5M_OPTION_DATA:
-                                current_snap_5m = getattr(self, 'option_snapshot_5m', {}).get(s, current_snap)
-                                if current_snap_5m is not None:
-                                    self.frozen_option_snapshot_5m[s] = current_snap_5m.copy()
-                                else:
-                                    self.frozen_option_snapshot_5m[s] = np.zeros((6, 12), dtype=np.float32)
-                                    
-                            self.frozen_latest_opt_buckets[s] = self.latest_opt_buckets.get(s, [])
-                            self.frozen_latest_opt_contracts[s] = self.latest_opt_contracts.get(s, []) # 🚀 物理级对齐
-                            
-                            # 结算并生成 K 线 (包含0成交延续逻辑和正确的Volume累加)
-                            self._finalize_1min_bar(s, self.global_last_minute, cleanup=True)
+                if not is_preaggregated_1m:
+                    if not hasattr(self, 'global_last_minute'):
+                        self.global_last_minute = curr_minute
                         
-                        # 逐分钟递增，严密填补断流鸿沟
-                        self.global_last_minute += timedelta(minutes=1)
+                    if curr_minute > self.global_last_minute:
+                        while self.global_last_minute < curr_minute:
+                            # 跨越分钟！此时所有状态完美停留在上一秒 (冻结时光机)
+                            for s in self.symbols:
+                                if not hasattr(self, 'frozen_option_snapshot'):
+                                    self.frozen_option_snapshot = {}
+                                    self.frozen_option_snapshot_5m = {}
+                                    self.frozen_latest_opt_buckets = {}
+                                    self.frozen_latest_opt_contracts = {} # 🚀 必须包含合约字典冻结
+                                    
+                                # 安全拷贝快照，防止被新一秒污染
+                                current_snap = self.option_snapshot.get(s)
+                                if current_snap is not None:
+                                    self.frozen_option_snapshot[s] = current_snap.copy()
+                                else:
+                                    self.frozen_option_snapshot[s] = np.zeros((6, 12), dtype=np.float32)
+                                    
+                                from config import USE_5M_OPTION_DATA
+                                if USE_5M_OPTION_DATA:
+                                    current_snap_5m = getattr(self, 'option_snapshot_5m', {}).get(s, current_snap)
+                                    self.frozen_option_snapshot_5m[s] = current_snap_5m.copy() if current_snap_5m is not None else np.zeros((6, 12), dtype=np.float32)
+                                        
+                                self.frozen_latest_opt_buckets[s] = self.latest_opt_buckets.get(s, [])
+                                self.frozen_latest_opt_contracts[s] = self.latest_opt_contracts.get(s, []) # 🚀 物理级对齐
+                                
+                                # 结算并生成 K 线 (包含0成交延续逻辑和正确的Volume累加)
+                                self._finalize_1min_bar(s, self.global_last_minute, cleanup=True)
+                            
+                            # 逐分钟递增，严密填补断流鸿沟
+                            self.global_last_minute += timedelta(minutes=1)
 
                 # =========================================================
                 # 🚀 现在安全了，正式吸收属于新一秒的数据
@@ -941,6 +989,16 @@ class FeatureComputeService:
                     if c_val > 0:
                         self.latest_prices[sym] = c_val
                         self.last_tick_price[sym] = c_val
+                    if is_preaggregated_1m:
+                        o_val = float(stock.get('open', stock.get('o', c_val)))
+                        h_val = float(stock.get('high', stock.get('h', c_val)))
+                        l_val = float(stock.get('low', stock.get('l', c_val)))
+                        v_val = float(stock.get('volume', stock.get('v', 0.0)))
+                        self.history_1min[sym].loc[curr_minute, ['open', 'high', 'low', 'close', 'volume']] = [
+                            o_val, h_val, l_val, c_val, v_val
+                        ]
+                        if len(self.history_1min[sym]) > self.HISTORY_LEN:
+                            self.history_1min[sym] = self.history_1min[sym].iloc[-self.HISTORY_LEN:]
                 
                 stock_5m = payload.get('stock_5m')
                 if stock_5m and dt_ny.minute % 5 == 0:
@@ -997,11 +1055,11 @@ class FeatureComputeService:
     
                 # 🚀 7. 安全收录：只有在上一分钟被完美结转后，新 Tick 的成交才会进入收集器
                 stock_close = float(stock.get('close', stock.get('c', 0.0))) if stock else 0.0
-                if stock_close > 0:
+                if (not is_preaggregated_1m) and stock_close > 0:
                     self.current_bars_5s[sym].append(stock)
                 
                 # 8. 尾部透出更新，不清理（为 55 秒后的推断准备最新快照）
-                if dt_ny.second >= 55:
+                if (not is_preaggregated_1m) and dt_ny.second >= 55:
                      self._finalize_1min_bar(sym, curr_minute, cleanup=False)
 
         except Exception as e:
@@ -1093,6 +1151,249 @@ class FeatureComputeService:
         except Exception as e:
             logger.warning(f"⚠️ [Tagged ATM IV Error]: {e}")
             return 0.0, 0.0
+
+    def _is_option_snapshot_complete(self, buckets, contracts=None, min_iv=None):
+        """
+        IV 完整性门控：
+        仅当 ATM Call/Put 的 IV + Bid/Ask 都有效时，才允许该标的进入分钟级特征计算与推理。
+        """
+        if buckets is None:
+            return False
+
+        try:
+            min_iv = self.option_gate_min_iv if min_iv is None else float(min_iv)
+            arr = buckets if isinstance(buckets, np.ndarray) else np.array(buckets, dtype=np.float32)
+            if arr.ndim != 2:
+                return False
+            if arr.shape[0] <= 2 or arr.shape[1] <= 9:
+                return False
+
+            c_last = float(arr[2, 0])
+            p_last = float(arr[0, 0])
+            c_iv = float(arr[2, 7])
+            p_iv = float(arr[0, 7])
+            c_bid = float(arr[2, 8])
+            c_ask = float(arr[2, 9])
+            p_bid = float(arr[0, 8])
+            p_ask = float(arr[0, 9])
+
+            vals = [c_last, p_last, c_iv, p_iv, c_bid, c_ask, p_bid, p_ask]
+            if not np.isfinite(vals).all():
+                return False
+
+            iv_ok = (c_iv > float(min_iv)) and (p_iv > float(min_iv))
+            px_ok = (c_last > 0.0) and (p_last > 0.0)
+            ba_ok = (c_bid > 0.0) and (p_bid > 0.0) and (c_ask >= c_bid) and (p_ask >= p_bid)
+            contracts_ok = True if contracts is None else (len(contracts) > 2)
+
+            return bool(iv_ok and px_ok and ba_ok and contracts_ok)
+        except Exception:
+            return False
+
+    def _update_option_frame_state(self, sym: str, payload: dict, ts: float):
+        """按分钟维护 seq/frame_complete 一致性状态，用于发球机强一致校验。"""
+        if sym not in self.option_frame_state:
+            self.option_frame_state[sym] = {'minute_flags': {}, 'last_seq': None}
+
+        state = self.option_frame_state[sym]
+        minute_ts = int(float(ts) // 60) * 60
+
+        flags = state['minute_flags'].setdefault(
+            minute_ts,
+            {'has_integrity': False, 'has_complete': False, 'seq_ok': True}
+        )
+
+        has_seq_key = 'seq' in payload
+        has_complete_key = 'frame_complete' in payload
+        if has_seq_key or has_complete_key:
+            flags['has_integrity'] = True
+
+        if has_seq_key:
+            try:
+                seq_val = int(payload.get('seq'))
+                last_seq = state.get('last_seq')
+                if last_seq is not None and seq_val <= int(last_seq):
+                    flags['seq_ok'] = False
+                state['last_seq'] = seq_val
+            except Exception:
+                flags['seq_ok'] = False
+
+        if bool(payload.get('frame_complete', False)):
+            flags['has_complete'] = True
+
+        # 控制内存：仅保留最近 5 个分钟窗口
+        keep_keys = sorted(state['minute_flags'].keys())[-5:]
+        state['minute_flags'] = {k: state['minute_flags'][k] for k in keep_keys}
+
+    def _is_option_frame_consistent(self, sym: str, gate_minute_ts: Optional[float]) -> bool:
+        """门控层读取 seq/frame_complete 完整性。无元数据时自动降级放行。"""
+        if not self.option_gate_require_frame_consistency:
+            return True
+        if gate_minute_ts is None:
+            return True
+
+        state = self.option_frame_state.get(sym, {})
+        minute_flags = state.get('minute_flags', {})
+        target_minute = int(float(gate_minute_ts) // 60) * 60
+        flags = minute_flags.get(target_minute)
+
+        if not flags:
+            # 无元信息：兼容实时直连/老发球机，降级放行
+            return True
+        if not flags.get('has_integrity', False):
+            return True
+        if not flags.get('has_complete', False):
+            return False
+        if not flags.get('seq_ok', True):
+            return False
+        return True
+
+    def _update_option_gate_state(
+        self,
+        sym: str,
+        snapshot_ok: bool,
+        frame_ok: bool,
+        is_new_minute: bool,
+        gate_minute_ts: Optional[float] = None
+    ) -> bool:
+        """
+        非阻塞门控状态机：
+        1) 连续通过 N 分钟才放行；
+        2) 放行后连续失败 M 分钟才撤销；
+        3) 已放行后支持 grace_minutes 抗抖。
+        """
+        state = self.option_gate_state.setdefault(
+            sym, {'pass_streak': 0, 'fail_streak': 0, 'ready': False, 'grace_until_ts': None}
+        )
+        prev_ready = bool(state.get('ready', False))
+        current_gate_ts = float(gate_minute_ts) if gate_minute_ts is not None else None
+        gate_ok = bool(snapshot_ok and frame_ok)
+        in_grace = False
+
+        if is_new_minute:
+            if gate_ok:
+                state['pass_streak'] = int(state.get('pass_streak', 0)) + 1
+                state['fail_streak'] = 0
+                state['grace_until_ts'] = None
+                if not prev_ready and state['pass_streak'] >= self.option_gate_min_pass:
+                    state['ready'] = True
+            else:
+                state['fail_streak'] = int(state.get('fail_streak', 0)) + 1
+                state['pass_streak'] = 0
+                if prev_ready and self.option_gate_grace_minutes > 0 and current_gate_ts is not None:
+                    grace_until = state.get('grace_until_ts')
+                    if grace_until is None:
+                        grace_until = current_gate_ts + self.option_gate_grace_minutes * 60.0
+                        state['grace_until_ts'] = grace_until
+                    in_grace = current_gate_ts <= float(grace_until)
+                if prev_ready and (not in_grace) and state['fail_streak'] >= self.option_gate_max_fail:
+                    state['ready'] = False
+
+            if bool(state.get('ready', False)) != prev_ready:
+                logger.info(
+                    f"🔁 [IV-Gate] {sym} state changed: ready={state['ready']} "
+                    f"(pass={state['pass_streak']}, fail={state['fail_streak']}, grace_until={state.get('grace_until_ts')}, "
+                    f"min_pass={self.option_gate_min_pass}, max_fail={self.option_gate_max_fail}, grace_m={self.option_gate_grace_minutes})"
+                )
+
+        allow = bool(gate_ok and state.get('ready', False))
+        if is_new_minute and (not allow) and bool(state.get('ready', False)) and (not gate_ok):
+            # ready 状态下短抖，grace 期间继续允许放行
+            if self.option_gate_grace_minutes > 0 and current_gate_ts is not None:
+                grace_until = state.get('grace_until_ts')
+                if grace_until is not None and current_gate_ts <= float(grace_until):
+                    allow = True
+
+        if is_new_minute and not allow:
+            logger.warning(
+                f"⏭️ [IV-Gate] Skip {sym}: snapshot_ok={snapshot_ok}, frame_ok={frame_ok}, ready={state.get('ready', False)}, "
+                f"pass={state.get('pass_streak', 0)}, fail={state.get('fail_streak', 0)}, grace_until={state.get('grace_until_ts')}"
+            )
+        return allow
+
+    def _publish_option_gate_metrics(self, gate_minute_ts: float, gate_audit: Dict[str, dict]):
+        """每分钟发布 gate 质量指标到 Redis/PG，便于观测发球机抖动。"""
+        try:
+            minute_ts = int(float(gate_minute_ts) // 60) * 60
+            if self._last_gate_metrics_minute_ts == minute_ts:
+                return
+            self._last_gate_metrics_minute_ts = minute_ts
+
+            if not gate_audit:
+                return
+
+            total = len(gate_audit)
+            snapshot_ok_cnt = sum(1 for v in gate_audit.values() if v.get('snapshot_ok', False))
+            frame_ok_cnt = sum(1 for v in gate_audit.values() if v.get('frame_ok', False))
+            ready_symbols = sorted([s for s, v in gate_audit.items() if v.get('ready', False)])
+            allowed_symbols = sorted([s for s, v in gate_audit.items() if v.get('allow', False)])
+            failed_symbols = sorted([s for s, v in gate_audit.items() if not v.get('allow', False)])
+
+            metric = {
+                'ts': float(minute_ts),
+                'dt': datetime.fromtimestamp(minute_ts, NY_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+                'total_symbols': total,
+                'snapshot_ok_count': snapshot_ok_cnt,
+                'frame_ok_count': frame_ok_cnt,
+                'ready_count': len(ready_symbols),
+                'allow_count': len(allowed_symbols),
+                'pass_rate': float(len(allowed_symbols) / total) if total > 0 else 0.0,
+                'ready_symbols': ready_symbols,
+                'allow_symbols': allowed_symbols,
+                'failed_symbols': failed_symbols
+            }
+
+            # Redis 监控
+            self.r.hset("monitor:option_gate:1m", str(minute_ts), json.dumps(metric))
+            self.r.expire("monitor:option_gate:1m", 3600 * 6)
+            self.r.set("monitor:option_gate:last", json.dumps(metric), ex=3600 * 6)
+
+            # PostgreSQL 监控
+            try:
+                conn = self._get_pg_conn()
+                c = conn.cursor()
+                c.execute("""
+                    CREATE TABLE IF NOT EXISTS option_gate_metrics (
+                        ts DOUBLE PRECISION PRIMARY KEY,
+                        dt TEXT,
+                        total_symbols INT,
+                        snapshot_ok_count INT,
+                        frame_ok_count INT,
+                        ready_count INT,
+                        allow_count INT,
+                        pass_rate DOUBLE PRECISION,
+                        ready_symbols TEXT,
+                        allow_symbols TEXT,
+                        failed_symbols TEXT
+                    )
+                """)
+                c.execute("""
+                    INSERT INTO option_gate_metrics
+                    (ts, dt, total_symbols, snapshot_ok_count, frame_ok_count, ready_count, allow_count, pass_rate, ready_symbols, allow_symbols, failed_symbols)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (ts) DO UPDATE SET
+                        dt = EXCLUDED.dt,
+                        total_symbols = EXCLUDED.total_symbols,
+                        snapshot_ok_count = EXCLUDED.snapshot_ok_count,
+                        frame_ok_count = EXCLUDED.frame_ok_count,
+                        ready_count = EXCLUDED.ready_count,
+                        allow_count = EXCLUDED.allow_count,
+                        pass_rate = EXCLUDED.pass_rate,
+                        ready_symbols = EXCLUDED.ready_symbols,
+                        allow_symbols = EXCLUDED.allow_symbols,
+                        failed_symbols = EXCLUDED.failed_symbols
+                """, (
+                    metric['ts'], metric['dt'], metric['total_symbols'],
+                    metric['snapshot_ok_count'], metric['frame_ok_count'],
+                    metric['ready_count'], metric['allow_count'], metric['pass_rate'],
+                    json.dumps(metric['ready_symbols']), json.dumps(metric['allow_symbols']),
+                    json.dumps(metric['failed_symbols'])
+                ))
+                c.close()
+            except Exception as pg_e:
+                logger.warning(f"⚠️ [IV-Gate] PG metrics write failed: {pg_e}")
+        except Exception as e:
+            logger.warning(f"⚠️ [IV-Gate] metrics publish failed: {e}")
     
     def _finalize_1min_bar(self, sym, dt, cleanup=True):
         bars = self.current_bars_5s.get(sym, [])
@@ -1324,11 +1625,11 @@ class FeatureComputeService:
         alpha_label_ts = current_minute_ts - 60
         
         # 1. 拒止检查与符号隔离 (🚨 物理隔离：排除指数不参与交易)
-        NON_TRADE_SYMBOLS = {'SPY', 'QQQ', 'VIXY'}
-        ready_trading_symbols = [s for s in self.symbols if s not in NON_TRADE_SYMBOLS and not self.history_1min[s].empty]
+        non_trade_symbols = set(NON_TRADABLE_SYMBOLS)
+        ready_trading_symbols = [s for s in self.symbols if s not in non_trade_symbols and not self.history_1min[s].empty]
         
         if not ready_trading_symbols or len(self.history_1min[ready_trading_symbols[0]]) < 30:
-            missing = [s for s in self.symbols if s not in NON_TRADE_SYMBOLS and s not in ready_trading_symbols]
+            missing = [s for s in self.symbols if s not in non_trade_symbols and s not in ready_trading_symbols]
             if len(ready_trading_symbols) < 30:
                 logger.info(f"⏳ [Warmup Audit] {len(ready_trading_symbols)} symbols ready, {len(missing)} missing: {missing[:5]}")
             return None
@@ -1362,24 +1663,49 @@ class FeatureComputeService:
             sliced_snaps_5m = {s: (snap[:, :12].copy() if isinstance(snap, np.ndarray) else np.zeros((6,12))) for s, snap in source_snap_5m.items()}
 
             try:
+                compute_ts = alpha_label_ts if is_new_minute else data_ts
                 results_map = self.engine.compute_all_inputs(
                     history_1min=self.history_1min, history_5min=getattr(self, 'history_5min', {}),
                     fast_feats=self.fast_feat_names, slow_feats=self.slow_feat_names,
                     option_snapshots=sliced_snaps,  
                     option_contracts=source_contracts,  # 🚀 传入严格冻结版的合约，确保 100% 对齐
                     option_snapshot_5m=sliced_snaps_5m, feat_resolutions=getattr(self, 'feat_resolutions', {}),
-                    current_ts=data_ts 
+                    current_ts=compute_ts, recalc_greeks=self.recalc_greeks
                 )
             except Exception as e:
                 logger.error(f"Engine Compute Error: {e}", exc_info=True); return None
 
             batch_raw, valid_mask = [], []
+            gate_audit = {}
             for sym in self.symbols:
                 raw_vec = np.zeros(len(self.all_feat_names), dtype=np.float32)
                 is_valid = False
                 if sym in results_map:
-                    res_sym = results_map[sym]; is_valid = True
-                    if res_sym.get('updated_buckets') is not None:
+                    res_sym = results_map[sym]
+                    candidate_buckets = res_sym.get('updated_buckets')
+                    if candidate_buckets is None:
+                        candidate_buckets = source_snap.get(sym)
+                    candidate_contracts = source_contracts.get(sym, [])
+
+                    snapshot_ok = self._is_option_snapshot_complete(candidate_buckets, candidate_contracts)
+                    gate_minute_ts = alpha_label_ts if is_new_minute else data_ts
+                    frame_ok = self._is_option_frame_consistent(sym, gate_minute_ts)
+                    is_valid = self._update_option_gate_state(
+                        sym,
+                        snapshot_ok=snapshot_ok,
+                        frame_ok=frame_ok,
+                        is_new_minute=is_new_minute,
+                        gate_minute_ts=gate_minute_ts
+                    )
+                    gate_state = self.option_gate_state.get(sym, {})
+                    gate_audit[sym] = {
+                        'snapshot_ok': bool(snapshot_ok),
+                        'frame_ok': bool(frame_ok),
+                        'ready': bool(gate_state.get('ready', False)),
+                        'allow': bool(is_valid)
+                    }
+
+                    if is_valid and res_sym.get('updated_buckets') is not None:
                         enriched = res_sym['updated_buckets']
                         self.latest_opt_buckets[sym] = enriched
                         
@@ -1401,19 +1727,20 @@ class FeatureComputeService:
                         except Exception as e:
                             logger.error(f"❌ [Redis Write Error] Failed to write optic bar for {sym}: {e}")
                     
-                    for ftype in ['fast_1m', 'slow_1m']:
-                        if res_sym.get(ftype) is not None:
-                            latest = res_sym[ftype][0, :, -1].cpu().numpy()
-                            names = self.fast_feat_names if ftype == 'fast_1m' else self.slow_feat_names
-                            for i, fname in enumerate(names):
-                                if i < len(latest): 
-                                    val = float(latest[i])
-                                    raw_vec[self.feat_name_to_idx[fname]] = val
-                                    if is_new_minute:
-                                        ts_logi = pd.Timestamp(alpha_label_ts, unit='s', tz=NY_TZ)
-                                        self.history_1min[sym].loc[ts_logi, fname] = val
+                    if is_valid:
+                        for ftype in ['fast_1m', 'slow_1m']:
+                            if res_sym.get(ftype) is not None:
+                                latest = res_sym[ftype][0, :, -1].cpu().numpy()
+                                names = self.fast_feat_names if ftype == 'fast_1m' else self.slow_feat_names
+                                for i, fname in enumerate(names):
+                                    if i < len(latest): 
+                                        val = float(latest[i])
+                                        raw_vec[self.feat_name_to_idx[fname]] = val
+                                        if is_new_minute:
+                                            ts_logi = pd.Timestamp(alpha_label_ts, unit='s', tz=NY_TZ)
+                                            self.history_1min[sym].loc[ts_logi, fname] = val
 
-                if is_new_minute:
+                if is_new_minute and is_valid:
                     row_ts = pd.Timestamp(alpha_label_ts, unit='s', tz=NY_TZ)
                     if row_ts in self.history_1min[sym].index:
                         for fname in self.slow_feat_names:
@@ -1423,13 +1750,15 @@ class FeatureComputeService:
                 batch_raw.append(raw_vec); valid_mask.append(is_valid)
 
             self.cached_results_map, self.cached_batch_raw, self.cached_valid_mask = results_map, batch_raw, valid_mask
+            if is_new_minute:
+                self._publish_option_gate_metrics(alpha_label_ts, gate_audit)
         else:
             results_map, batch_raw, valid_mask = self.cached_results_map, self.cached_batch_raw, self.cached_valid_mask
 
         return batch_raw, valid_mask, results_map
 
     def _apply_normalization_sequence(self, batch_raw, valid_mask, data_ts, is_new_minute):
-        """[V8 Helper] 归一化层：执行 Z-Score 并维护 30 步长宏观历史"""
+        """[V8 Helper] 归一化层：执行 Z-Score，并通过 normalizer.get_sequence(30) 生成输入序列"""
         dt_ny = datetime.fromtimestamp(data_ts, NY_TZ)
         date_str = dt_ny.strftime('%Y%m%d')
         if not hasattr(self, 'created_debug_dates'): self.created_debug_dates = set()
@@ -1440,21 +1769,17 @@ class FeatureComputeService:
         is_rth = (570 <= current_minutes < 960)
         
         for b_idx, sym in enumerate(self.symbols):
-            raw_vec = batch_raw[b_idx]; is_valid = valid_mask[b_idx]; norm = self.normalizers[sym]
-            if is_valid and is_rth and is_new_minute: norm_vec = norm.process_frame(raw_vec)
-            else: norm_vec = norm.normalize_only(raw_vec)
-            batch_norm.append(norm_vec)
-            
-        norm_mat = np.stack(batch_norm)
-        if not hasattr(self, 'norm_history_30'): self.norm_history_30 = []
-        if is_new_minute:
-            self.norm_history_30.append(norm_mat)
-            if len(self.norm_history_30) > 30: self.norm_history_30.pop(0)
-        elif self.norm_history_30: self.norm_history_30[-1] = norm_mat
-        else: self.norm_history_30.append(norm_mat)
-        
-        padded_hist = [self.norm_history_30[0]] * (30 - len(self.norm_history_30)) + self.norm_history_30
-        return np.stack(padded_hist, axis=1)
+            raw_vec = batch_raw[b_idx]
+            is_valid = valid_mask[b_idx]
+            norm = self.normalizers[sym]
+            if is_valid and is_rth and is_new_minute:
+                norm.process_frame(raw_vec)
+            else:
+                norm.normalize_only(raw_vec)
+            batch_norm.append(norm.get_sequence(30))
+
+        # [B, 30, F]
+        return np.stack(batch_norm, axis=0)
     def _assemble_compute_payload(
         self, 
         norm_seq_30: np.ndarray, 
@@ -1529,10 +1854,14 @@ class FeatureComputeService:
 
             if snap is not None and isinstance(snap, np.ndarray) and snap.shape[0] >= 6:
                 c_iv, p_iv = snap[2, 7], snap[0, 7]
-                cheat_call.append(snap[2, 0]); cheat_call_iv.append(c_iv)
-                cheat_call_bid.append(snap[2, 8]); cheat_call_ask.append(snap[2, 9])
-                cheat_put.append(snap[0, 0]); cheat_put_iv.append(p_iv)
-                cheat_put_bid.append(snap[0, 8]); cheat_put_ask.append(snap[0, 9])
+                cheat_call.append(snap[2, 0])
+                cheat_call_iv.append(c_iv)
+                cheat_call_bid.append(snap[2, 8])
+                cheat_call_ask.append(snap[2, 9])
+                cheat_put.append(snap[0, 0])
+                cheat_put_iv.append(p_iv)
+                cheat_put_bid.append(snap[0, 8])
+                cheat_put_ask.append(snap[0, 9])
             else:
                 for lst in [cheat_call, cheat_call_iv, cheat_call_bid, cheat_call_ask, cheat_put, cheat_put_iv, cheat_put_bid, cheat_put_ask]:
                     lst.append(0.0)
@@ -1571,19 +1900,59 @@ class FeatureComputeService:
                         'contracts': getattr(self, 'latest_opt_contracts', {}).get(sym, []) # 5m暂保持宽松要求
                     }
         
-        # 🚀 [动态预热识别] 基于底层 Normalizer 的实际投喂次数
-        sample_sym = batch_symbols[0]
-        is_warmed_up = bool(self.normalizers[sample_sym].count >= 30)
+        # 🚀 [Warmup 对齐修复 v2]
+        # 仅统计 RTH(09:30-16:00) 的分钟历史，并对 alpha_label_ts 的“回退 1 分钟标签”做补偿。
+        # 目标行为：
+        # - 无预热：9:30 + 30 根后，首条 alpha 标签应为 10:00；
+        # - 有预热：开盘即可放行（由历史条数天然满足门槛）。
+        dt_label_ny = datetime.fromtimestamp(alpha_label_ts, NY_TZ)
+        label_floor = dt_label_ny.replace(second=0, microsecond=0)
+        rth_start = label_floor.replace(hour=9, minute=30, second=0, microsecond=0)
+        rth_end = label_floor.replace(hour=16, minute=0, second=0, microsecond=0)
+
+        hist_lens = []
+        for s in batch_symbols:
+            df_hist = self.history_1min.get(s, pd.DataFrame())
+            if df_hist is None or df_hist.empty:
+                hist_lens.append(0)
+                continue
+            try:
+                idx = df_hist.index
+                if getattr(idx, "tz", None) is None:
+                    idx = idx.tz_localize(NY_TZ)
+                rth_mask = (idx >= rth_start) & (idx <= min(label_floor, rth_end))
+                hist_lens.append(int(np.count_nonzero(rth_mask)))
+            except Exception:
+                hist_lens.append(0)
+
+        real_history_len = int(min(hist_lens)) if hist_lens else 0
+        # 为保证秒级/分钟级发球机起跑时点一致（无预热时均从 10:00 开始），
+        # 两种模式统一采用 31 根门槛。
+        warmup_required_len = 31
+        is_warmed_up = bool(real_history_len >= warmup_required_len)
+        # 额外保留归一化样本长度，便于诊断但不用于全局放行门控。
+        valid_counts = [int(self.normalizers[s].count) for s in batch_symbols if s in self.normalizers]
+        real_norm_history_len = int(min(valid_counts)) if valid_counts else 0
+
+        vol_z_dict = self._compute_payload_vol_z(
+            batch_symbols,
+            batch_prices,
+            batch_fast_vols,
+            is_new_minute=is_new_minute
+        )
 
         payload = {
             'ts': alpha_label_ts, 
             'log_ts': data_ts, 
+            'source_ts': data_ts,
+            'frame_id': str(int(data_ts)),
             'symbols': batch_symbols,
             'stock_price': batch_prices,
             'stock_volume': np.array(batch_volumes), # 🚀 修复丢失的成交量
             'stock_id': np.array(batch_stock_ids),
             'sector_id': np.zeros(len(batch_symbols)),
             'fast_vol': np.array(batch_fast_vols),
+            'vol_z_dict': vol_z_dict,
             'spy_roc_5min': np.array(batch_spy_rocs),
             'qqq_roc_5min': np.array(batch_qqq_rocs),
             'features_dict': features_dict,
@@ -1591,6 +1960,9 @@ class FeatureComputeService:
             'live_options_5m': live_options_5m,
             'is_new_minute': is_new_minute,  
             'is_warmed_up': is_warmed_up,
+            'real_history_len': real_history_len,
+            'real_norm_history_len': real_norm_history_len,
+            'warmup_required_len': int(warmup_required_len),
             'cheat_call': cheat_call, 'cheat_put': cheat_put,
             'cheat_call_bid': cheat_call_bid, 'cheat_call_ask': cheat_call_ask,
             'cheat_put_bid': cheat_put_bid, 'cheat_put_ask': cheat_put_ask,
@@ -1598,659 +1970,258 @@ class FeatureComputeService:
         }
         
         return payload
+
+    def _compute_payload_vol_z(self, symbols: list, prices: list, raw_vols: list, is_new_minute: bool) -> Dict[str, float]:
+        """在特征服务内生成分钟级 vol_z 事实，供下游直接消费。"""
+        import math
+
+        vol_z_dict = {}
+        use_price_proxy_env = os.environ.get('VOL_Z_USE_PRICE_PROXY', '1').strip().lower()
+        use_price_proxy = use_price_proxy_env not in {'0', 'false', 'no', 'off'}
+
+        for idx, sym in enumerate(symbols):
+            if not is_new_minute:
+                vol_z_dict[sym] = float(self.cached_vol_z.get(sym, 0.0))
+                continue
+
+            px = float(prices[idx]) if idx < len(prices) else 0.0
+            r_v = float(raw_vols[idx]) if idx < len(raw_vols) else 0.0
+
+            if use_price_proxy and px > 0:
+                prev_px = float(self.sym_last_vol_price.get(sym, 0.0))
+                if prev_px > 0:
+                    r_v = abs((px - prev_px) / prev_px) * 30.0
+                else:
+                    r_v = float(self.sym_vol_mean.get(sym, 0.01))
+                self.sym_last_vol_price[sym] = px
+
+            if abs(r_v) < 1e-9:
+                r_v = float(self.sym_vol_mean.get(sym, 0.01))
+
+            if sym not in self.sym_vol_mean:
+                self.sym_vol_mean[sym] = r_v
+                self.sym_vol_var[sym] = 0.1106 ** 2
+
+            diff = r_v - float(self.sym_vol_mean[sym])
+            vol_ewma = 2.0 / (15 + 1) if diff > 0 else 2.0 / (60 + 1)
+            self.sym_vol_mean[sym] += vol_ewma * diff
+            self.sym_vol_var[sym] = (1 - vol_ewma) * float(self.sym_vol_var[sym]) + vol_ewma * (diff ** 2)
+
+            v_std = math.sqrt(self.sym_vol_var[sym]) if self.sym_vol_var[sym] > 1e-9 else 1e-4
+            vz = (r_v - float(self.sym_vol_mean[sym])) / (v_std + 1e-6)
+            if abs(vz) > 10.0:
+                vz = 0.0
+
+            clipped_vz = max(-5.0, min(5.0, float(vz)))
+            self.cached_vol_z[sym] = clipped_vz
+            vol_z_dict[sym] = clipped_vz
+
+        return vol_z_dict
+
+    def _atomic_commit_minute_payload(self, payload: dict) -> bool:
+        """
+        分钟级原子提交：
+        1) 回写 BAR_OPT:1M
+        2) 发布 STREAM_INFERENCE
+        3) 更新 sync:feature_calc_done
+        全部在同一事务中完成，避免“表写了但流漏了”的分叉。
+        """
+        try:
+            ts_val = float(payload.get('ts', 0.0))
+            frame_id = str(payload.get('frame_id') or str(int(ts_val)))
+            self.publish_frame_seq = int(self.publish_frame_seq) + 1
+            frame_seq = int(payload.get('frame_seq') or self.publish_frame_seq)
+            payload['frame_id'] = frame_id
+            payload['frame_seq'] = frame_seq
+            payload['frame_complete'] = True
+            ts_field = str(int(ts_val))
+            symbols = payload.get('symbols', []) or []
+            live_options = payload.get('live_options', {}) or {}
+
+            packed_payload = ser.pack(payload)
+            pipe = self.r.pipeline(transaction=True)
+
+            for sym in symbols:
+                opt = live_options.get(sym, {}) or {}
+                buckets = opt.get('buckets', [])
+                contracts = opt.get('contracts', [])
+
+                c_iv, p_iv = self._extract_tagged_atm_iv(buckets)
+                opt_payload = {
+                    'buckets': buckets.tolist() if isinstance(buckets, np.ndarray) else buckets,
+                    'contracts': contracts.tolist() if isinstance(contracts, np.ndarray) else contracts,
+                    'atm_c_iv': float(c_iv),
+                    'atm_p_iv': float(p_iv)
+                }
+                pipe.hset(f"BAR_OPT:1M:{sym}", ts_field, json.dumps(opt_payload))
+
+            pipe.xadd(self.redis_cfg['output_stream'], {'data': packed_payload}, maxlen=100)
+            pipe.set("sync:feature_calc_done", str(ts_val))
+            pipe.set("sync:feature_calc_done_frame_id", frame_id)
+            pipe.hset("monitor:feature_commit:last", mapping={
+                'ts': str(ts_val),
+                'symbols': str(len(symbols)),
+                'mode': 'atomic_minute_commit',
+                'frame_id': frame_id,
+                'frame_seq': str(frame_seq)
+            })
+            pipe.expire("monitor:feature_commit:last", 3600)
+            pipe.execute()
+            return True
+        except Exception as e:
+            logger.error(f"❌ [Atomic Commit] Failed at ts={payload.get('ts')}, frame_id={payload.get('frame_id')}: {e}")
+            logger.warning("⚠️ [Redis SPOF] Atomic commit failed (single-node Redis); downstream consistency may be affected.")
+            return False
+
+    def _set_feature_sync_ack(self, ts_val: Optional[float], frame_id: Optional[str] = None):
+        """非分钟帧/跳过帧的轻量 ACK，减少回放链路超时。"""
+        if ts_val is None:
+            return
+        try:
+            self.r.set("sync:feature_calc_done", str(float(ts_val)))
+            if frame_id:
+                self.r.set("sync:feature_calc_done_frame_id", str(frame_id))
+        except Exception:
+            pass
     
     async def run_compute_cycle(self, ts_from_payload=None, return_payload=False):
         current_replay_ts = ts_from_payload if ts_from_payload else self.r.get("replay:current_ts")
         sync_ts = float(current_replay_ts) if current_replay_ts else time.time()
-        
+
         from datetime import datetime, timedelta
         target_time = datetime.fromtimestamp(sync_ts, NY_TZ)
         current_minute_ts = int(sync_ts // 60) * 60
         curr_minute_dt = target_time.replace(second=0, microsecond=0)
-        
-        if not hasattr(self, 'global_last_minute'):
-            self.global_last_minute = curr_minute_dt
-            
-        if self.global_last_minute < curr_minute_dt:
-            while self.global_last_minute < curr_minute_dt:
-                for s in self.symbols:
-                    if not hasattr(self, 'frozen_option_snapshot'):
-                        self.frozen_option_snapshot = {}
-                        self.frozen_option_snapshot_5m = {}
-                        self.frozen_latest_opt_buckets = {}
-                        self.frozen_latest_opt_contracts = {}
-                        
-                    current_snap = self.option_snapshot.get(s)
-                    self.frozen_option_snapshot[s] = current_snap.copy() if current_snap is not None else np.zeros((6, 12), dtype=np.float32)
-                    
-                    from config import USE_5M_OPTION_DATA
-                    if USE_5M_OPTION_DATA:
-                        current_snap_5m = getattr(self, 'option_snapshot_5m', {}).get(s, current_snap)
-                        self.frozen_option_snapshot_5m[s] = current_snap_5m.copy() if current_snap_5m is not None else np.zeros((6, 12), dtype=np.float32)
-                        
-                    self.frozen_latest_opt_buckets[s] = self.latest_opt_buckets.get(s, [])
-                    self.frozen_latest_opt_contracts[s] = self.latest_opt_contracts.get(s, [])
-                    
-                    self._finalize_1min_bar(s, self.global_last_minute, cleanup=True)
-                
-                self.global_last_minute += timedelta(minutes=1)
 
+        # 1) 分钟边界推进：秒级发球机模式下需要在此冻结并结算；
+        #    分钟预聚合模式下直接使用 process_market_data 写入的分钟事实，避免重复结算造成 +1 分钟漂移。
+        if not bool(getattr(self, 'preaggregated_1m_mode', False)):
+            if not hasattr(self, 'global_last_minute'):
+                self.global_last_minute = curr_minute_dt
+
+            if self.global_last_minute < curr_minute_dt:
+                while self.global_last_minute < curr_minute_dt:
+                    for s in self.symbols:
+                        if not hasattr(self, 'frozen_option_snapshot'):
+                            self.frozen_option_snapshot = {}
+                            self.frozen_option_snapshot_5m = {}
+                            self.frozen_latest_opt_buckets = {}
+                            self.frozen_latest_opt_contracts = {}
+
+                        current_snap = self.option_snapshot.get(s)
+                        self.frozen_option_snapshot[s] = current_snap.copy() if current_snap is not None else np.zeros((6, 12), dtype=np.float32)
+
+                        from config import USE_5M_OPTION_DATA
+                        if USE_5M_OPTION_DATA:
+                            current_snap_5m = getattr(self, 'option_snapshot_5m', {}).get(s, current_snap)
+                            self.frozen_option_snapshot_5m[s] = current_snap_5m.copy() if current_snap_5m is not None else np.zeros((6, 12), dtype=np.float32)
+
+                        self.frozen_latest_opt_buckets[s] = self.latest_opt_buckets.get(s, [])
+                        self.frozen_latest_opt_contracts[s] = self.latest_opt_contracts.get(s, [])
+
+                        self._finalize_1min_bar(s, self.global_last_minute, cleanup=True)
+
+                    self.global_last_minute += timedelta(minutes=1)
+        else:
+            self.global_last_minute = curr_minute_dt
+
+        # 2) 就绪性与边界判定
         ready_symbols = [s for s in self.symbols if not self.history_1min.get(s, pd.DataFrame()).empty]
-        if not ready_symbols: return None
-            
+        if not ready_symbols:
+            self._set_feature_sync_ack(sync_ts, frame_id=str(int(sync_ts)))
+            return None
+
         sample_s = ready_symbols[0]
-        curr_len = len(self.history_1min[sample_s])
-        required_len = 1
-        
-        if curr_len < required_len: return None
+        if len(self.history_1min[sample_s]) < 1:
+            self._set_feature_sync_ack(sync_ts, frame_id=str(int(sync_ts)))
+            return None
 
         data_ts = float(current_replay_ts) if current_replay_ts else target_time.timestamp()
-        
+        # 🚀 [鲁棒修复] 不再依赖精确 :00 秒，改为“分钟跨越”触发
+        last_minute_ts = getattr(self, 'last_model_minute_ts', 0)
+        preagg_mode = bool(getattr(self, 'preaggregated_1m_mode', False))
         is_new_minute = False
-        is_boundary = (int(sync_ts) % 60 == 0)
-        
-        if getattr(self, 'last_model_minute_ts', 0) == 0 and not is_boundary: return None
 
-        if is_boundary and getattr(self, 'last_model_minute_ts', 0) < current_minute_ts:
-            is_new_minute = True
-            self.last_model_minute_ts = current_minute_ts
-            
-        alpha_label_ts = data_ts - 60.0 if is_new_minute else data_ts
-
-        if is_new_minute or getattr(self, 'cached_batch_raw', None) is None:
-            source_snap = getattr(self, 'frozen_option_snapshot', self.option_snapshot) if is_new_minute else self.option_snapshot
-            source_snap_5m = getattr(self, 'frozen_option_snapshot_5m', getattr(self, 'option_snapshot_5m', {})) if is_new_minute else getattr(self, 'option_snapshot_5m', {})
-            source_contracts = getattr(self, 'frozen_latest_opt_contracts', self.latest_opt_contracts) if is_new_minute else self.latest_opt_contracts
-            
-            sliced_snaps = {s: snap[:, :12].copy() for s, snap in source_snap.items()}
-            sliced_snaps_5m = {s: snap[:, :12].copy() for s, snap in source_snap_5m.items()}
-
-            try:
-                results_map = self.engine.compute_all_inputs(
-                    history_1min=self.history_1min,
-                    history_5min=getattr(self, 'history_5min', {}),
-                    fast_feats=self.fast_feat_names,
-                    slow_feats=self.slow_feat_names,
-                    option_snapshots=sliced_snaps,  
-                    option_contracts=source_contracts,
-                    option_snapshot_5m=sliced_snaps_5m,
-                    feat_resolutions=getattr(self, 'feat_resolutions', {}),
-                    current_ts=alpha_label_ts
-                )
-            except Exception as e:
+        if preagg_mode:
+            # 预聚合分钟输入：每条都是完整分钟事实。
+            # 首帧也允许结算，标签使用当前分钟，不做 -60 回退。
+            if last_minute_ts == 0:
+                is_new_minute = True
+                self.last_model_minute_ts = current_minute_ts
+            elif current_minute_ts > last_minute_ts:
+                is_new_minute = True
+                self.last_model_minute_ts = current_minute_ts
+        else:
+            if last_minute_ts == 0:
+                # 秒级输入：首帧仅建立锚点，避免缺失 xx:00 秒导致整分钟漏算
+                self.last_model_minute_ts = current_minute_ts
+                self._set_feature_sync_ack(data_ts, frame_id=str(int(data_ts)))
                 return None
+            if current_minute_ts > last_minute_ts:
+                is_new_minute = True
+                self.last_model_minute_ts = current_minute_ts
 
-            batch_raw, valid_mask = [], []
-            for sym in self.symbols:
-                raw_vec = np.zeros(len(self.all_feat_names), dtype=np.float32)
-                is_valid = False
-                
-                if sym in results_map:
-                    res_sym = results_map[sym]
-                    is_valid = True
-                    
-                    # 🚀 引擎返回了经过 supplement_greeks 重新计算的矩阵！
-                    if res_sym.get('updated_buckets') is not None:
-                        enriched = res_sym['updated_buckets']
-                        
-                        # 更新内存状态
-                        self.latest_opt_buckets[sym] = enriched
-                        if is_new_minute and hasattr(self, 'frozen_latest_opt_buckets'):
-                            self.frozen_latest_opt_buckets[sym] = enriched
-                            
-                        # ==========================================================
-                        # 🚀 [真理级对齐核心]：用 Engine 算好的 IV，回写并覆盖 Redis！
-                        # 彻底抛弃上游的流式 IV，保证 100% 的离线/实盘算法同构！
-                        # ==========================================================
-                        if is_new_minute:
-                            try:
-                                real_c_iv, real_p_iv = self._extract_tagged_atm_iv(enriched)
-                                
-                                redis_key = f"BAR_OPT:1M:{sym}"
-                                ts_field = str(int(alpha_label_ts))
-                                
-                                # 从 Redis 取出之前 _finalize_1min_bar 写入的“生肉”字典
-                                existing_json = self.r.hget(redis_key, ts_field)
-                                if existing_json:
-                                    opt_dict = json.loads(existing_json)
-                                    
-                                    # 覆写 IV 和 Buckets 矩阵
-                                    opt_dict['atm_c_iv'] = real_c_iv
-                                    opt_dict['atm_p_iv'] = real_p_iv
-                                    opt_dict['buckets'] = enriched.tolist() if hasattr(enriched, 'tolist') else enriched
-                                    opt_dict['contracts'] = source_contracts.get(sym, [])
-                                    
-                                    # 强行重新写入 Redis，完成闭环！
-                                    self.r.hset(redis_key, ts_field, json.dumps(opt_dict))
-                            except Exception as e:
-                                logger.error(f"❌ Failed to overwrite Engine IV to Redis: {e}")
-                    
-                    if res_sym.get('fast_1m') is not None:
-                        fast_latest = res_sym['fast_1m'][0, :, -1].cpu().numpy()
-                        for i, fname in enumerate(self.fast_feat_names):
-                            if i < len(fast_latest): raw_vec[self.feat_name_to_idx[fname]] = float(fast_latest[i])
-                                
-                    if res_sym.get('slow_1m') is not None:
-                        slow_latest = res_sym['slow_1m'][0, :, -1].cpu().numpy()
-                        for i, fname in enumerate(self.slow_feat_names):
-                            if i < len(slow_latest): raw_vec[self.feat_name_to_idx[fname]] = float(slow_latest[i])
-                
-                self._inject_temporal_derivatives(sym, raw_vec, is_new_minute=is_new_minute)
-                batch_raw.append(raw_vec)
-                valid_mask.append(is_valid)
-                
-                # 🚀 [终极绝杀]：直接从送给神经网络的 raw_vec 里面把算好的 IV 扣出来，强行覆写 Redis！
-                # 彻底摆脱对 updated_buckets 的依赖，保证 Redis 记录和模型输入 1000% 一模一样！
-                if is_new_minute and is_valid:
-                    try:
-                        idx_c = self.feat_name_to_idx.get('options_atm_c_iv')
-                        idx_p = self.feat_name_to_idx.get('options_atm_p_iv')
-                        if idx_c is not None and idx_p is not None:
-                            real_c_iv = float(raw_vec[idx_c])
-                            real_p_iv = float(raw_vec[idx_p])
-                            
-                            redis_key = f"BAR_OPT:1M:{sym}"
-                            ts_field = str(int(alpha_label_ts))
-                            
-                            existing_json = self.r.hget(redis_key, ts_field)
-                            if existing_json:
-                                opt_dict = json.loads(existing_json)
-                                opt_dict['atm_c_iv'] = real_c_iv
-                                opt_dict['atm_p_iv'] = real_p_iv
-                                self.r.hset(redis_key, ts_field, json.dumps(opt_dict))
-                    except Exception as e:
-                        pass
-
-            self.cached_results_map = results_map
-            self.cached_batch_raw = batch_raw
-            self.cached_valid_mask = valid_mask
+        if preagg_mode:
+            alpha_label_ts = float(current_minute_ts) if is_new_minute else data_ts
         else:
-            results_map = self.cached_results_map
-            batch_raw = self.cached_batch_raw
-            valid_mask = self.cached_valid_mask
+            alpha_label_ts = (float(current_minute_ts) - 60.0) if is_new_minute else data_ts
 
-        if batch_raw is None: return None
+        # 3) 分钟计算主链：引擎计算 -> 归一化 -> payload 组装
+        step_res = self._step_engine_compute(
+            data_ts=data_ts,
+            is_new_minute=is_new_minute,
+            alpha_label_ts=alpha_label_ts
+        )
+        if not step_res:
+            self._set_feature_sync_ack(data_ts, frame_id=str(int(data_ts)))
+            return None
 
-        dt_ny_payload = datetime.fromtimestamp(alpha_label_ts, NY_TZ)
-        current_minutes = dt_ny_payload.hour * 60 + dt_ny_payload.minute
-        is_rth = (570 <= current_minutes < 960) 
-        
-        batch_norm = []
-        if not hasattr(self, 'norm_history_30'): self.norm_history_30 = []
-        
-        for b_idx, sym in enumerate(self.symbols):
-            raw_vec = batch_raw[b_idx]
-            is_valid = valid_mask[b_idx]
-            norm = self.normalizers[sym]
-            
-            if is_valid and is_rth and is_new_minute: 
-                norm_vec = norm.process_frame(raw_vec)
-            else: 
-                norm_vec = norm.normalize_only(raw_vec)
-                
-            batch_norm.append(norm_vec)
-            
-        norm_mat = np.stack(batch_norm) 
-        
-        if is_new_minute:
-            self.norm_history_30.append(norm_mat)
-            if len(self.norm_history_30) > 30: self.norm_history_30.pop(0)
-        else:
-            if len(self.norm_history_30) > 0: self.norm_history_30[-1] = norm_mat
-            else: self.norm_history_30.append(norm_mat)
-            
-        if len(self.norm_history_30) == 0: return None
-            
-        pad_len = 30 - len(self.norm_history_30)
-        if pad_len > 0: 
-            padded_history = [self.norm_history_30[0]] * pad_len + self.norm_history_30
-        else: 
-            padded_history = self.norm_history_30
-            
-        norm_seq_30 = np.stack(padded_history, axis=1) 
+        batch_raw, valid_mask, results_map = step_res
+        if batch_raw is None:
+            self._set_feature_sync_ack(data_ts, frame_id=str(int(data_ts)))
+            return None
+
+        norm_seq_30 = self._apply_normalization_sequence(
+            batch_raw=batch_raw,
+            valid_mask=valid_mask,
+            data_ts=data_ts,
+            is_new_minute=is_new_minute
+        )
 
         payload = self._assemble_compute_payload(
-            norm_seq_30=norm_seq_30, 
-            batch_raw=batch_raw, 
-            valid_mask=valid_mask, 
-            results_map=results_map, 
-            alpha_label_ts=alpha_label_ts, 
-            data_ts=data_ts, 
-            is_new_minute=is_new_minute, 
+            norm_seq_30=norm_seq_30,
+            batch_raw=batch_raw,
+            valid_mask=valid_mask,
+            results_map=results_map,
+            alpha_label_ts=alpha_label_ts,
+            data_ts=data_ts,
+            is_new_minute=is_new_minute,
             ready_symbols=ready_symbols
         )
-        
-        if not payload: return None
-
-        if payload.get('is_new_minute'):
-            try:
-                self.r.xadd(self.redis_cfg['output_stream'], {'data': ser.pack(payload)}, maxlen=100)
-            except Exception as e: pass
-
-        if return_payload: return payload
-        return None
-
-    async def run_compute_cycle_raw(self, ts_from_payload=None, return_payload=False):
-        """
-        [V8 终极版] 特征计算主循环 - (完美兼容秒级与分钟级对齐版)
-        """
-        # [🔥 修正] 优先使用来自消息 Payload 的显式时间戳
-        current_replay_ts = ts_from_payload if ts_from_payload else self.r.get("replay:current_ts")
-        
-        # 🚀 [暴力调试] 直接打印每一秒的时间戳到 stdout
-        
-        sync_ts = ts_from_payload if ts_from_payload else time.time()
-        target_time = datetime.fromtimestamp(sync_ts, NY_TZ)
-        current_minute_ts = int(sync_ts // 60) * 60
-        
-        # 🚀 [🔥 终极协议对齐：Label 修正]
-        # 基准协议规定：10:00:00-10:00:59 的 Bar 标签为 10:00:00。
-        # 我们在 10:01:00 附近完成该 Bar 的结算与特征计算。
-        # 因此，此处的 alpha_label_ts 必须回退 60s，以确保 Alpha 日志中的 10:00:00 行对应 10:00:00 的数据。
-        alpha_label_ts = current_minute_ts - 60
-
-        # 🚀 [Parity Fix] 重新定义 ready_symbols，确保作用域内所有索引对位
-        ready_symbols = [s for s in self.symbols if not self.history_1min[s].empty]
-        if not ready_symbols:
-            self.r.set("sync:feature_calc_done", sync_ts)
-            self.r.set("sync:orch_done", sync_ts)
+        if not payload:
+            self._set_feature_sync_ack(data_ts, frame_id=str(int(data_ts)))
             return None
-            
-        # ---------------- 拒止推理安全检查 ----------------
-        sample_s = ready_symbols[0]
-        curr_len = len(self.history_1min[sample_s])
-        required_len = 30
-        
-        if curr_len < required_len:
-            logger.debug(f"[数据不足-拒止推理] 历史K线 {curr_len} 根，要求 {required_len} 根，等待预热。")
-            self.r.set("sync:feature_calc_done", sync_ts)
-            self.r.set("sync:orch_done", sync_ts)
-            return
 
-        # =======================================================
-        # 🚀 [修复] 分钟跨越标志 & 时间戳分离
-        # - data_ts: 用于归一化/序列组装，始终用 target_time（分钟级精度）
-        # =======================================================
-        # 必须使用外部传入的精确到 1s 的 current_replay_ts！
-        # 绝不能用 target_time.timestamp()，否则时间戳会被强行拉回整分钟 (00秒)，导致 OMS 同步死锁！
-        data_ts = float(current_replay_ts) if current_replay_ts else target_time.timestamp()
-        
-        # [Time-Guard] 严格校时与强制异常终止
-        # 计算 数据采集时间 (Payload) 与 模型推断时间 (Nominal) 的偏差
-        time_skew = abs(data_ts - sync_ts)
-        if time_skew > 60.0:
-            logger.critical(f"🛑 [TIME_FATAL] 检测到严重时序偏移! Tick:{sync_ts} Data:{data_ts} Skew:{time_skew:.1f}s")
-            logger.critical(f"可能原因: 1. Driver 推送过快累积延迟 2. 内部 Buffer 堆积 3. 数据源本身时间错乱")
-            # 这里的 terminte 逻辑可以根据需要调整，暂时打印并报错
-            # sys.exit(1) 
-        
-        if int(sync_ts) % 10 == 0: # 提高频率到 10s 一次
-            logger.info(f"🕒 [Time-Sync] Tick:{datetime.fromtimestamp(sync_ts, NY_TZ).strftime('%H:%M:%S')} | Alpha_Log_TS:{datetime.fromtimestamp(data_ts, NY_TZ).strftime('%H:%M:%S')} | Symbols:{len(self.symbols)}")
-
-        is_new_minute = False
-        is_boundary = (int(sync_ts) % 60 == 0)
-        
-        # 🚀 [Parity Fix] 严格过滤：在遇到当天的第一个“整分钟边界”之前，抛弃所有 tick。
-        # 这样确保 alpha_logs 的第一条记录必然是整分钟（比如 10:00:00），避免在 09:59:55 时抢跑输出。
-        if getattr(self, 'last_model_minute_ts', 0) == 0 and not is_boundary:
-            if int(sync_ts) % 10 == 0: logger.debug("Waiting for the first minute boundary to align with 1m reference...")
-            if current_replay_ts:
-                self.r.set("sync:feature_calc_done", current_replay_ts)
-                self.r.set("sync:orch_done", current_replay_ts)
-            return
-
-        if is_boundary and getattr(self, 'last_model_minute_ts', 0) < current_minute_ts:
-            is_new_minute = True
-            self.last_model_minute_ts = current_minute_ts
-        
-        # [Parity & Speed] Only recompute raw features from engine at minute boundaries
-        if is_new_minute or getattr(self, 'cached_batch_raw', None) is None:
-            # ---------------- 1. 触发 Engine 计算 ----------------
-            # 🚀 [SECURITY_FIX] 使用 .copy() 彻底隔断原本 snap 的内存引用。
-            
-            # 👇 [手术 3 简化版：抛弃本地平移，拥抱 Redis 对位]
-            # 既然已有 Redis 标准化账本，我们直接引用实时同步后的 option_snapshot
-            source_snap = self.option_snapshot 
-            source_snap_5m = getattr(self, 'option_snapshot_5m', {})
-            
-            sliced_snaps = {s: snap[:, :12].copy() for s, snap in source_snap.items()}
-            sliced_snaps_5m = {s: (snap[:, :12].copy() if isinstance(snap, np.ndarray) else np.zeros((6,12))) for s, snap in source_snap_5m.items()}
-            # 👆 [手术 3 简化结束]
-
-            try:
-                results_map = self.engine.compute_all_inputs(
-                    history_1min=self.history_1min,
-                    history_5min=getattr(self, 'history_5min', {}),
-                    fast_feats=self.fast_feat_names,
-                    slow_feats=self.slow_feat_names,
-                    option_snapshots=sliced_snaps,  
-                    option_contracts=self.latest_opt_contracts,
-                    option_snapshot_5m=sliced_snaps_5m,
-                    feat_resolutions=getattr(self, 'feat_resolutions', {}),
-                    current_ts=data_ts 
+        if payload.get('is_new_minute') and (not bool(payload.get('is_warmed_up', False))):
+            if getattr(self, '_warmup_diag_log_count', 0) < 20:
+                logger.info(
+                    f"⏳ [Warmup-Diag] ts={int(payload.get('ts', 0))} "
+                    f"| real_history_len={payload.get('real_history_len', 0)}/{payload.get('warmup_required_len', 31)} "
+                    f"| real_norm_history_len={payload.get('real_norm_history_len', 0)} "
+                    f"| symbols={len(payload.get('symbols', []))}"
                 )
-            except Exception as e:
-                logger.error(f"Engine Compute Error: {e}", exc_info=True)
-                if current_replay_ts: 
-                    self.r.set("sync:feature_calc_done", current_replay_ts)
-                    self.r.set("sync:orch_done", current_replay_ts)
-                return
+                self._warmup_diag_log_count = getattr(self, '_warmup_diag_log_count', 0) + 1
 
-            # ---------------- 2. 解析与解包 ----------------
-            batch_raw = []
-            valid_mask = []
-            lx_fast_debug = []
-            lx_slow_debug = []
-            
-            for sym in self.symbols:
-                raw_vec = np.zeros(len(self.all_feat_names), dtype=np.float32)
-                is_valid = False
-                
-                if sym in results_map:
-                    res_sym = results_map[sym]
-                    is_valid = True
-                    
-                    # 🚀 [🔥 终极闭环修复] 将引擎中算出的正确希腊值阵列，回写覆盖系统级快照并同步 Redis！
-                    if res_sym.get('updated_buckets') is not None:
-                        enriched_buckets = res_sym['updated_buckets']
-                        self.latest_opt_buckets[sym] = enriched_buckets
-                        
-                        # 🚀 [核心对位] IV 算完后，必须立刻把带希腊值的快照同步回 Redis
-                        # 否则 Redis 里的 Bar 永远只有原始价格。
-                        try:
-                            real_c_iv, real_p_iv = self._extract_tagged_atm_iv(enriched_buckets)
-                            opt_p = {
-                                'buckets': enriched_buckets.tolist() if hasattr(enriched_buckets, 'tolist') else enriched_buckets,
-                                'contracts': self.latest_opt_contracts.get(sym, []),
-                                'atm_c_iv': real_c_iv,
-                                'atm_p_iv': real_p_iv
-                            }
-                            # alpha_label_ts 通常是分钟边界起始点 (如 10:00:00)
-                            self.r.hset(f"BAR_OPT:1M:{sym}", str(int(alpha_label_ts)), json.dumps(opt_p))
-                        except Exception: pass
-                    
-                    if res_sym.get('fast_1m') is not None:
-                        fast_latest = res_sym['fast_1m'][0, :, -1].cpu().numpy()
-                        for i, fname in enumerate(self.fast_feat_names):
-                            if i < len(fast_latest):
-                                raw_vec[self.feat_name_to_idx[fname]] = fast_latest[i]
-                                
-                    if res_sym.get('slow_1m') is not None:
-                        slow_latest = res_sym['slow_1m'][0, :, -1].cpu().numpy()
-                        for i, fname in enumerate(self.slow_feat_names):
-                            if i < len(slow_latest):
-                                raw_vec[self.feat_name_to_idx[fname]] = slow_latest[i]
-
-                # 🚀 [🔥 终极闭环：特征回填 (Feature Back-Fill)]
-                # 将本分钟算出的 IV/Gamma 等高阶指标物理回写到 history_1min 账本中。
-                # 只有这样，下一分钟算“动量 (Momentum)”时才能读到本分钟的基础数据。
-                if is_new_minute:
-                    target_row_ts = pd.Timestamp(alpha_label_ts, unit='s', tz=NY_TZ)
-                    if target_row_ts in self.history_1min[sym].index:
-                        # 挑选需要回填的期权特征列
-                        for fname in self.slow_feat_names:
-                            if 'options_' in fname:
-                                val = raw_vec[self.feat_name_to_idx[fname]]
-                                self.history_1min[sym].at[target_row_ts, fname] = val
-
-                self._inject_temporal_derivatives(sym, raw_vec, is_new_minute=is_new_minute)
-                batch_raw.append(raw_vec)
-                valid_mask.append(is_valid)
-                lx_fast_debug.append((sym, raw_vec[self.fast_indices]))
-                lx_slow_debug.append((sym, raw_vec[self.slow_indices]))
-
-            self.cached_results_map = results_map
-            self.cached_batch_raw = batch_raw
-            self.cached_valid_mask = valid_mask
-            self.cached_lx_fast_debug = lx_fast_debug
-            self.cached_lx_slow_debug = lx_slow_debug
-            if getattr(self, '_batch_trace_count', 0) < 3:
-                logger.info(f"🧪 [BATCH_TRACE] Branch: FULL_COMPUTE | Symbols: {len(self.symbols)} | BatchRaw_Len: {len(batch_raw)}")
-                self._batch_trace_count = getattr(self, '_batch_trace_count', 0) + 1
+        # 4) 单点提交：仅分钟边界发布到下游
+        if payload.get('is_new_minute'):
+            ok = self._atomic_commit_minute_payload(payload)
+            if not ok:
+                self._set_feature_sync_ack(data_ts, frame_id=str(int(data_ts)))
         else:
-            results_map = self.cached_results_map
-            batch_raw = self.cached_batch_raw
-            valid_mask = self.cached_valid_mask
-            lx_fast_debug = self.cached_lx_fast_debug
-            lx_slow_debug = self.cached_lx_slow_debug
-            if getattr(self, '_batch_trace_count', 0) < 3:
-                logger.info(f"🧪 [BATCH_TRACE] Branch: CACHE_LOAD | BatchRaw_Len: {len(batch_raw) if batch_raw else 'NONE'}")
-                self._batch_trace_count = getattr(self, '_batch_trace_count', 0) + 1
+            self._set_feature_sync_ack(data_ts, frame_id=str(int(data_ts)))
 
-        # 🚀 [终极防御] 强制兜底，防止 NoneType 导致回测崩溃
-        if batch_raw is None:
-            logger.warning("⚠️ [ROBUSTNESS_GUARD] batch_raw was None! Initializing to empty list.")
-            batch_raw = []
-            valid_mask = [False] * len(self.symbols)
-            lx_fast_debug = []; lx_slow_debug = []
-
-        # ---------------- 3. 主线程同步建表 & 异步写入 Debug 数据库 ----------------
-        # 🚀 [主线程同步建表] 根据数据的实际时间戳建表。保证在主线程完成，彻底杜绝并发锁死！
-        dt_ny = datetime.fromtimestamp(data_ts, NY_TZ)
-        date_str = dt_ny.strftime('%Y%m%d')
-        
-        if not hasattr(self, 'created_debug_dates'):
-            self.created_debug_dates = set()
-            
-        if date_str not in self.created_debug_dates:
-            self._ensure_debug_tables(date_str)
-            self.created_debug_dates.add(date_str)
-
-        if lx_fast_debug or lx_slow_debug:
-            if hasattr(self, 'debug_db_executor'):
-                self.debug_db_executor.submit(
-                    self._write_debug_batch,
-                    int(data_ts), 
-                    date_str,  # 🚀 直接传入算好的日期字符串
-                    lx_fast_debug, 
-                    lx_slow_debug   # 🚀 传完整的 List
-                )
-
-       # ---------------- 4. 归一化与序列组装 (修复时间轴坍缩漏洞) ----------------
-        if not hasattr(self, 'norm_history_30'): 
-            self.norm_history_30 = []
-            
-        batch_norm = []
-        current_minutes = dt_ny.hour * 60 + dt_ny.minute
-        is_rth = (570 <= current_minutes < 960)
-        
-        for b_idx, sym in enumerate(self.symbols):
-            raw_vec = batch_raw[b_idx]
-            is_valid = valid_mask[b_idx]
-            norm = self.normalizers[sym]
-            
-            # 🛡️ 只有在有效数据、盘中时间，且【真正跨越了 1 分钟】时，才推进 Buffer 污染均值
-            if is_valid and is_rth and is_new_minute:
-                norm_vec = norm.process_frame(raw_vec)
-            else:
-                # 否则只是实时投影（比如 10秒级的高频 Tick），绝不污染底层统计池
-                norm_vec = norm.normalize_only(raw_vec)
-                
-            batch_norm.append(norm_vec)
-            
-        norm_mat = np.stack(batch_norm) # [B, N_all_feats]
-        
-        # [🔥 核心修复] 正确维护 30 步的宏观时间序列
-        if is_new_minute:
-            # 物理分钟跨越，产生新的历史帧
-            self.norm_history_30.append(norm_mat)
-            if len(self.norm_history_30) > 30:
-                self.norm_history_30.pop(0)
-        else:
-            # 仍在同一分钟内的 1s 级高频刷新！
-            if len(self.norm_history_30) > 0:
-                # 覆盖最后一帧，使模型看到最新盘口，但绝不拉长序列导致时间轴坍缩！
-                self.norm_history_30[-1] = norm_mat
-            else:
-                self.norm_history_30.append(norm_mat)
-            
-        # ---------------- 5. 组装推流 Payload (The Dict-Payload) ----------------
-        payload_sent = False  # 👈 追踪本帧是否发出了数据
-        if len(self.norm_history_30) > 0:  
-            # [🔥 新增] 动态补齐 30 长度，彻底解决重启后瞎眼 30 分钟的问题
-            pad_len = 30 - len(self.norm_history_30)
-            if pad_len > 0:
-                # 用最老的一帧向左复制填充
-                padded_history = [self.norm_history_30[0]] * pad_len + self.norm_history_30
-            else:
-                padded_history = self.norm_history_30
-                
-            norm_seq_30 = np.stack(padded_history, axis=1) # [B, 30, N_all_feats]
-            
-            # 🚀 [核心修复] 把 batch_raw 堆叠成矩阵，供下面提取宏观/杂项特征使用
-            raw_mat = np.stack(batch_raw)
-            
-            batch_symbols = []
-            batch_prices = []
-            batch_stock_ids = []
-            batch_spy_rocs = []
-            batch_qqq_rocs = []
-            batch_fast_vols = []
-            
-            # 期权行情的 Mock 注入 (供回测使用)
-            cheat_call, cheat_put = [], []
-            cheat_call_bid, cheat_call_ask = [], []
-            cheat_put_bid, cheat_put_ask = [], []
-            cheat_call_iv, cheat_put_iv = [], []
-            
-            valid_b_indices = []
-            
-            for b_idx, sym in enumerate(self.symbols):
-                if sym not in ready_symbols or sym not in results_map:
-                    continue
-                    
-                valid_b_indices.append(b_idx)
-                batch_symbols.append(sym)
-                
-                # 🚀 [Surgery 23] 逻辑价格对齐：区分整分结算与秒级Tick
-                if is_new_minute:
-                    # 既然 payload_ts 是 data_ts - 60s (如 10:00:00)，我们就取该时刻结算收盘价
-                    from datetime import timedelta
-                    target_time_logi = target_time.replace(second=0, microsecond=0) - timedelta(minutes=1)
-                    try:
-                        p_close = self.history_1min[sym].at[target_time_logi, 'close']
-                    except:
-                        p_close = self.latest_prices.get(sym, 0.0)
-                    batch_prices.append(float(p_close))
-                else:
-                    # 秒级采样时，使用实时最准价格
-                    batch_prices.append(self.latest_prices.get(sym, 0.0))
-                
-                batch_stock_ids.append(b_idx)
-                
-                # 杂项特征提取
-                idx_spy = self.feat_name_to_idx.get('spy_roc_5min')
-                batch_spy_rocs.append(raw_mat[b_idx, idx_spy] if idx_spy is not None else 0.0)
-                idx_qqq = self.feat_name_to_idx.get('qqq_roc_5min')
-                batch_qqq_rocs.append(raw_mat[b_idx, idx_qqq] if idx_qqq is not None else 0.0)
-                idx_vol = self.feat_name_to_idx.get('fast_vol')
-                batch_fast_vols.append(raw_mat[b_idx, idx_vol] if idx_vol is not None else 0.0)
-                
-                # 👇 [手术 4a 简化版] 直接使用实时同步后的最新 Buckets
-                source_opt_buckets = self.latest_opt_buckets
-                source_snap_for_payload = self.option_snapshot 
-
-                snap = source_opt_buckets.get(sym)
-                if snap is None: snap = source_snap_for_payload.get(sym)
-
-                if snap is not None and isinstance(snap, np.ndarray) and snap.shape[0] >= 6:
-                    c_iv = snap[2, 7]
-                    p_iv = snap[0, 7]
-                    cheat_call.append(snap[2, 0]); cheat_call_iv.append(c_iv)
-                    cheat_call_bid.append(snap[2, 8]); cheat_call_ask.append(snap[2, 9])
-                    cheat_put.append(snap[0, 0]); cheat_put_iv.append(p_iv)
-                    cheat_put_bid.append(snap[0, 8]); cheat_put_ask.append(snap[0, 9])
-                    
-                    if sym == 'NVDA' and getattr(self, '_iv_cycle_count', 0) < 5:
-                        logger.info(f"🧪 [IV_TRACE_2] {sym} | Cycle IV Extract | Call_IV: {c_iv:.4f} | Put_IV: {p_iv:.4f}")
-                        self._iv_cycle_count = getattr(self, '_iv_cycle_count', 0) + 1
-                else:
-                    for lst in [cheat_call, cheat_call_iv, cheat_call_bid, cheat_call_ask, 
-                                cheat_put, cheat_put_iv, cheat_put_bid, cheat_put_ask]:
-                        lst.append(0.0)
-
-            if batch_symbols:
-                valid_b_indices = np.array(valid_b_indices)
-                valid_norm_seq = norm_seq_30[valid_b_indices] # [B_valid, 30, N_all_feats]
-                
-                features_dict = {}
-                for fname in self.slow_feat_names:
-                    f_idx = self.feat_name_to_idx[fname]
-                    # 🚀 [Parity Fix] 提取最后 30 帧，并转置为 [B, 30] 以对位 SignalEngineV8 的推理逻辑
-                    # 只有这样，模型才能精准提取到“当前时刻” (Index -1) 的信号，而非 30 分钟前的残影。
-                    # 🚀 提取的切片本身就是 [Batch, 30]，绝对不要做任何转置！
-                    features_dict[fname] = valid_norm_seq[:, :, f_idx]
-    
-                # =================================================================
-                # 🚀 [架构升维：事前合并期权字典 (Pre-Join)]
-                # =================================================================
-                live_options = {}
-                live_options_5m = {} 
-                
-                source_snap_5m_for_payload = getattr(self, 'option_snapshot_5m', {})
-
-                for sym in batch_symbols:
-                    live_options[sym] = {
-                        'buckets': source_opt_buckets.get(sym, []),
-                        'contracts': getattr(self, 'latest_opt_contracts', {}).get(sym, [])
-                    }
-                    if USE_5M_OPTION_DATA:
-                        snap_5m = source_snap_5m_for_payload.get(sym)
-
-                        if snap_5m is not None:
-                            live_options_5m[sym] = {
-                                'buckets': snap_5m.tolist() if isinstance(snap_5m, np.ndarray) else snap_5m,
-                                'contracts': getattr(self, 'latest_opt_contracts', {}).get(sym, [])
-                            }
-                
-                # =================================================================
-                # 🚀 [核心修复：实现 Alpha 标签的物理级准时达]
-                # 强制所有在该分钟产生的推断结果（包含 1s 刷新）全部打上上一分钟的标签
-                # 这样 10:01:00 到 10:01:59 产生的所有特征，在 DB 中都会对位到 10:00:00
-                # =================================================================
-                payload_ts = alpha_label_ts
-              
-                
-                payload = {  
-                    'ts': payload_ts, 
-                    'log_ts': data_ts, 
-                    'symbols': batch_symbols,
-                    'stock_price': batch_prices,
-                    'stock_id': np.array(batch_stock_ids),
-                    'sector_id': np.zeros(len(batch_symbols)),
-                    'fast_vol': np.array(batch_fast_vols),
-                    'spy_roc_5min': np.array(batch_spy_rocs),
-                    'qqq_roc_5min': np.array(batch_qqq_rocs),
-                    'features_dict': features_dict,
-                    'live_options': live_options,
-                    'live_options_5m': live_options_5m, # 🚀 [修复] 补齐 Payload 字段
-                    'is_new_minute': is_new_minute,  
-                    
-                    'cheat_call': cheat_call, 'cheat_put': cheat_put,
-                    'cheat_call_bid': cheat_call_bid, 'cheat_call_ask': cheat_call_ask,
-                    'cheat_put_bid': cheat_put_bid, 'cheat_put_ask': cheat_put_ask,
-                    'cheat_call_iv': cheat_call_iv, 'cheat_put_iv': cheat_put_iv,
-                }
-
-                if return_payload:
-                    return payload
- 
-
-                try:
-                     self.r.xadd(self.redis_cfg['output_stream'], {'data': ser.pack(payload)}, maxlen=100)
-                     payload_sent = True 
-                except Exception as e:
-                    logger.error(f"❌ Redis XADD Error: {e}")
-                    
-        # ✅ 严格在处理完本帧（包含 engine.compute 和 推流）后，再释放帧锁
-        from config import IS_SIMULATED
-        if IS_SIMULATED:
-            self.r.set("sync:feature_calc_done", sync_ts)
-            
-            # 👇 [🔥 致命黑洞修复] 如果因为没有有效股票导致没发消息，代为解开下游 Orch 的锁！
-            if not payload_sent:
-                self.r.set("sync:orch_done", sync_ts)
-
+        if return_payload:
+            return payload
         return None
 
     async def run(self):

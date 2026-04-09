@@ -160,8 +160,10 @@ class BatchSQLiteDriver:
 
             last_5m_state = {}
             count = 0
+            global_seq = 0
             for ts_val in tqdm(all_ts, desc=f"Inferring {db_path.name}"):
                 self.r.set("replay:current_ts", str(ts_val)) 
+                frame_id = str(int(ts_val))
                 
                 symbols_at_ts = set(map_b1.get(ts_val, {}).keys()) | set(map_o1.get(ts_val, {}).keys()) | \
                                 set(map_b5.get(ts_val, {}).keys()) | set(map_o5.get(ts_val, {}).keys())
@@ -171,7 +173,14 @@ class BatchSQLiteDriver:
                 start_id = last_msg[0][0] if last_msg else None
                 
                 for sym in symbols_at_ts:
-                    payload = {'ts': ts_val, 'symbol': sym}
+                    global_seq += 1
+                    payload = {
+                        'ts': ts_val,
+                        'symbol': sym,
+                        'frame_id': frame_id,
+                        'seq': global_seq,
+                        'frame_complete': True
+                    }
                     
                     # --- 1min 数据 ---
                     if sym in map_b1.get(ts_val, {}):
@@ -219,11 +228,15 @@ class BatchSQLiteDriver:
                 while True:
                     ack_feat = self.r.get("sync:feature_calc_done")
                     ack_orch = self.r.get("sync:orch_done")
+                    ack_feat_fid = self.r.get("sync:feature_calc_done_frame_id")
+                    ack_orch_fid = self.r.get("sync:orch_done_frame_id")
                     
                     feat_ts = float(ack_feat) if ack_feat else 0.0
                     orch_ts = float(ack_orch) if ack_orch else 0.0
+                    feat_fid = ack_feat_fid.decode('utf-8') if isinstance(ack_feat_fid, bytes) else (str(ack_feat_fid) if ack_feat_fid else "")
+                    orch_fid = ack_orch_fid.decode('utf-8') if isinstance(ack_orch_fid, bytes) else (str(ack_orch_fid) if ack_orch_fid else "")
                     
-                    if feat_ts >= ts_val and orch_ts >= ts_val:
+                    if (feat_fid == frame_id and orch_fid == frame_id) or (feat_ts >= ts_val and orch_ts >= ts_val):
                          break
                             
                     time.sleep(0.001) 

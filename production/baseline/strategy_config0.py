@@ -34,7 +34,7 @@ class StrategyConfig:
     # V0 逻辑: VOL_MIN 为 -1 (更宽松)，ALPHA_ENTRY 为 0.85
     VOL_MIN_Z: float = -1          
     VOL_MAX_Z: float = 4.0           
-    ALPHA_ENTRY_THRESHOLD: float = 0.85   
+    ALPHA_ENTRY_THRESHOLD: float = 0.2
     ALPHA_ENTRY_STRICT: float = 1.45      
     MIN_CS_ALPHA_Z: float = 0.5           
     

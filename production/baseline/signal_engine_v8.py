@@ -75,6 +75,9 @@ from config import (
     GLOBAL_EXPOSURE_LIMIT,      # 全局风险敞口上限
     COMMISSION_PER_CONTRACT,    # 期权手续费 ($/手)
     USE_BID_ASK_PRICING,        # [New] 价格模式开关
+    NON_TRADABLE_SYMBOLS,
+    ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS,
+    INDEX_TREND_SYMBOLS,
     IS_LIVEREPLAY,
     IS_BACKTEST,
     IS_SIMULATED
@@ -425,6 +428,9 @@ class SignalEngineV8:
         self.cached_vol_z = {}
         self.sym_vol_mean = {}
         self.sym_vol_var = {}
+        self.sym_last_vol_price = {}
+        self.processed_frame_ids = deque(maxlen=50000)
+        self.processed_frame_set = set()
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"DEBUG: Device: {self.device}")
@@ -837,6 +843,9 @@ class SignalEngineV8:
             contracts = snap_data.get('contracts', [])
             logger.debug(f"🎯 [Pre-Join] Using aligned option data for {sym}")
         else:
+            # frame 驱动的推理主链：禁止回退读 HASH，避免事实源分叉
+            if batch and ('frame_id' in batch):
+                return res
             # [兜底降级] 如果 batch 里没有，才去 Redis 查（实盘单股快照可能走这里）
             raw_snap = self.r.hget(HASH_OPTION_SNAPSHOT, sym)
             if not raw_snap: return res
@@ -896,6 +905,29 @@ class SignalEngineV8:
             logger.warning(f"Failed to parse live option snapshot for {sym}: {e}")
         
         return res
+
+    def _mark_orch_done(self, curr_ts: float, frame_id: str = None):
+        if not hasattr(self, 'r'):
+            return
+        self.r.set("sync:orch_done", str(curr_ts))
+        if frame_id:
+            self.r.set("sync:orch_done_frame_id", str(frame_id))
+
+    def _is_duplicate_frame(self, frame_id: str) -> bool:
+        if not frame_id:
+            return False
+        return frame_id in self.processed_frame_set
+
+    def _remember_frame(self, frame_id: str):
+        if not frame_id:
+            return
+        if frame_id in self.processed_frame_set:
+            return
+        self.processed_frame_ids.append(frame_id)
+        self.processed_frame_set.add(frame_id)
+        while len(self.processed_frame_set) > self.processed_frame_ids.maxlen:
+            old = self.processed_frame_ids.popleft()
+            self.processed_frame_set.discard(old)
 
     def _get_opt_data_backtest(self, batch, i, sym, st):
         """[Refactor] 解析离线期权数据 (Batch Payload) + NaN 过滤"""
@@ -959,7 +991,8 @@ class SignalEngineV8:
 
     def _prep_symbol_metrics(self, i, sym, stock_prices, raw_alphas, opt_data, metrics_batch, use_precalc_feed=False, metrics_batch_manual=None):
         """[核心] 为单个标的准备分钟级指标，支持分钟边界的价格与期权采样纠偏"""
-        if sym in ['SPY', 'QQQ']: return None # VIXY 不再排除，用于 Regime Guard
+        converge_to_single = os.environ.get('DUAL_CONVERGE_TO_SINGLE') == '1'
+        if sym in NON_TRADABLE_SYMBOLS: return None
         if sym not in self.states:
             if self.mode == 'backtest': self.states[sym] = SymbolState(sym)
             else: return None
@@ -969,10 +1002,13 @@ class SignalEngineV8:
         # --- [NEW] 强行修正分钟边界的价格与期权采样 ---
         # 实时回放进入 :00 秒时，必须强制读取并使用上一分末秒 (:59) 的盘口状态，以对齐 1m 基准表
         price = float(stock_prices[i])
-        calc_price = st.last_tick_price if st.last_tick_price is not None else price
-        
-        # 期权对位：使用上一秒缓存的期权快照
-        calc_opt_data = st.last_tick_opt_data if st.last_tick_opt_data is not None else opt_data
+        if converge_to_single and self.mode == 'backtest':
+            calc_price = price
+            calc_opt_data = opt_data
+        else:
+            calc_price = st.last_tick_price if st.last_tick_price is not None else price
+            # 期权对位：使用上一秒缓存的期权快照
+            calc_opt_data = st.last_tick_opt_data if st.last_tick_opt_data is not None else opt_data
         
         raw_alpha_val = float(raw_alphas[i])
         raw_vols = metrics_batch.get('fast_vol', [0.0] * (i + 1))
@@ -1514,7 +1550,7 @@ class SignalEngineV8:
         qqq_day_roc = 0.0
         
         for i, sym in enumerate(symbols):
-            if sym in ['SPY', 'QQQ']:
+            if sym in INDEX_TREND_SYMBOLS:
                 p = stock_prices[i]
                 if sym not in self.index_opening_prices and p > 1.0:
                     self.index_opening_prices[sym] = p
@@ -1630,8 +1666,23 @@ class SignalEngineV8:
         vol_z_dict = {}
         import math
         raw_vols = batch.get('fast_vol', np.zeros(len(symbols)))
+        stock_prices = batch.get('stock_price', np.zeros(len(symbols)))
+        use_price_proxy_env = os.environ.get('VOL_Z_USE_PRICE_PROXY', '1').strip().lower()
+        use_price_proxy = use_price_proxy_env not in {'0', 'false', 'no', 'off'}
         for idx_v, s_v in enumerate(symbols):
-            r_v = float(raw_vols[idx_v])
+            r_v = float(raw_vols[idx_v]) if idx_v < len(raw_vols) else 0.0
+
+            # 统一口径：优先使用价格变化代理，避免秒级/分钟级 fast_vol 口径差导致的漂移
+            if use_price_proxy:
+                px = float(stock_prices[idx_v]) if idx_v < len(stock_prices) else 0.0
+                prev_px = float(self.sym_last_vol_price.get(s_v, 0.0))
+                if px > 0:
+                    if prev_px > 0:
+                        # 将分钟收益映射到与历史风控相近量级，便于平滑迁移
+                        r_v = abs((px - prev_px) / prev_px) * 30.0
+                    else:
+                        r_v = self.sym_vol_mean.get(s_v, 0.01)
+                    self.sym_last_vol_price[s_v] = px
             
             # [Fix B] 波动率防爆保护：防断流
             if abs(r_v) < 1e-9:
@@ -1678,6 +1729,7 @@ class SignalEngineV8:
         is_new_minute = batch.get('is_new_minute', True)
         symbols = batch.get('symbols', [])
         stock_prices = batch.get('stock_price', [])
+        frame_id = str(batch.get('frame_id')) if batch.get('frame_id') is not None else None
         
         # 🚀 [Refine] use_precalc_feed should depend on whether alpha is actually provided in the batch
         use_precalc_feed = 'alpha_score' in batch or 'precalc_alpha' in batch
@@ -1696,6 +1748,11 @@ class SignalEngineV8:
         if ny_now is None:
              return
 
+        if frame_id and self._is_duplicate_frame(frame_id):
+            logger.warning(f"♻️ [Frame-Dedupe] Skip duplicated frame_id={frame_id}")
+            self._mark_orch_done(curr_ts, frame_id=frame_id)
+            return
+
         # 🚀 [频率无关重构] 即使驱动没传 is_new_minute，SE 应该自己通过 ts 跨越来判定
         last_t = getattr(self, 'last_process_ts_for_gating', 0.0)
         is_new_min_crossing = (int(curr_ts / 60) > int(last_t / 60)) or (last_t == 0)
@@ -1703,6 +1760,7 @@ class SignalEngineV8:
 
         # 分钟级回测模式：每一帧都是 should_update_full，确保计算不被缓存拦截
         # 秒级模式 (LIVEREPLAY)：只有在 is_new_minute 为 True 时才是 should_update_full (由特征服务结算驱动)
+        converge_to_single = os.environ.get('DUAL_CONVERGE_TO_SINGLE') == '1'
         if is_high_freq:
             # 🚨 [关键修复]：高频回放模式下，强制信任来自特征服务的结算信号！
             # 防止因为 ts 抖动 (10:00:00 -> 10:01:01) 导致的二次误触发。
@@ -1724,17 +1782,27 @@ class SignalEngineV8:
                 self.states[s_t].update_tick_state(stock_prices[idx_t], bid, ask)
 
         # 2. 秒级风控扫荡（持仓止损、止盈判定）
-        await self._process_exits(batch)
+        if not (converge_to_single and self.mode == 'backtest'):
+            await self._process_exits(batch)
 
         # ✅ [核心重构] 第二阶段：分钟级策略（仅在分钟跨越或非高频模式下执行）
         if not should_update_full:
             # 高频增量帧：仅同步 PnL 后退出
             if IS_LIVEREPLAY:
                  await self._report_pnl_status_logic(curr_ts, "LIVEREPLAY_SYNC")
-            await self._oms_sync(curr_ts)
+            await self._oms_sync(curr_ts, frame_id=frame_id)
             return
 
         # 🚀 以下逻辑仅在分钟整点运行 🚀
+        if not use_precalc_feed and not bool(batch.get('is_warmed_up', False)):
+            if getattr(self, '_warmup_gate_log_count', 0) < 10:
+                logger.info(
+                    f"⏳ [SE-Warmup-Gate] Skip inference at {ny_now.strftime('%H:%M:%S')} "
+                    f"| real_history_len={batch.get('real_history_len', 0)}/30"
+                )
+                self._warmup_gate_log_count = getattr(self, '_warmup_gate_log_count', 0) + 1
+            await self._oms_sync(curr_ts, frame_id=frame_id)
+            return
         
         # 3. 记录行情数据 (为 Alpha 日志准备时间戳)
         # 🚀 [Surgery 24] 逻辑时间戳对齐：如果是整分结算，强制用 ts (逻辑上代表的那一分钟)，否则用 log_ts (物理时间)
@@ -1785,7 +1853,7 @@ class SignalEngineV8:
 
         # 7. 自适应归一化 (仅在分钟边界更新均值/标差)
         # 🚀 [Parity Fix] 排除指数标的 (SPY, QQQ, VIXY) 对截面均值的污染，确保与 1m 离线基准对齐
-        exclude_indices = {i for i, s in enumerate(symbols) if s in {'SPY', 'QQQ', 'VIXY'}}
+        exclude_indices = {i for i, s in enumerate(symbols) if s in ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS}
         valid_alphas = [a for i, a in enumerate(raw_alphas) if i not in exclude_indices]
         
         if valid_alphas:
@@ -1803,7 +1871,18 @@ class SignalEngineV8:
         self.alpha_count += 1
 
         # 8. 波动率 Z-Score 与 市场状态判定
-        vol_z_dict = self._update_volatility_metrics(batch, symbols)
+        # 优先消费上游 FCS 已计算好的分钟事实，避免下游二次递推产生路径漂移。
+        vol_z_dict = batch.get('vol_z_dict')
+        if isinstance(vol_z_dict, dict) and vol_z_dict:
+            for s_v, v_v in vol_z_dict.items():
+                try:
+                    self.cached_vol_z[s_v] = float(v_v)
+                    if s_v in self.states:
+                        self.states[s_v].last_vol_z = float(v_v)
+                except Exception:
+                    pass
+        else:
+            vol_z_dict = self._update_volatility_metrics(batch, symbols)
 
         # 🚀 [NEW] 计算全局市场状态 (Market Regime Guard)
         vixy_st = self.states.get('VIXY')
@@ -1819,7 +1898,13 @@ class SignalEngineV8:
         
         # 9. 符号处理循环 (更新分钟指标 & 评估入场信号)
         entry_candidates = []
-        metrics_batch = {'alpha_mean': mean_a, 'alpha_std': std_a, 'vol_z_dict': vol_z_dict, 'curr_ts': curr_ts}
+        metrics_batch = {
+            'alpha_mean': mean_a,
+            'alpha_std': std_a,
+            'vol_z_dict': vol_z_dict,
+            'curr_ts': curr_ts,
+            'fast_vol': raw_vols
+        }
         final_alphas_for_ic = np.zeros(len(symbols))
         
         for i, sym in enumerate(symbols):
@@ -1896,7 +1981,8 @@ class SignalEngineV8:
             heartbeat_payload = {'ts': curr_ts, 'action': 'HEARTBEAT'}
             self.r.xadd('orch_trade_signals', {'data': ser.pack(heartbeat_payload)}, maxlen=5000)
 
-        await self._oms_sync(curr_ts)
+        self._remember_frame(frame_id)
+        await self._oms_sync(curr_ts, frame_id=frame_id)
 
     async def _process_exits(self, batch: dict):
         """[高频风控] 每一秒执行一次，检查持仓标的是否达到策略止损/止盈阈值"""
@@ -1947,7 +2033,7 @@ class SignalEngineV8:
                 getattr(self, 'last_is_zombie', False), self.last_index_trend, should_update_full=False
             )
 
-    async def _oms_sync(self, curr_ts: float):
+    async def _oms_sync(self, curr_ts: float, frame_id: str = None):
         """[Consolidated] 统一处理 OMS 状态同步与卡位控制"""
         if not curr_ts: return
 
@@ -1960,7 +2046,8 @@ class SignalEngineV8:
             sync_payload = {'action': 'SYNC', 'ts': curr_ts, 'prices': latest_prices}
             await self.signal_queue.put(sync_payload)
             # await self.signal_queue.join() # ❌ [BUG FIX] S4 driver consumes queue sequentially *after* process_tick returns. Calling join() here causes an infinite deadlock.
-            if hasattr(self, 'r'): self.r.set("sync:orch_done", str(curr_ts))
+            if hasattr(self, 'r'):
+                self._mark_orch_done(curr_ts, frame_id=frame_id)
             return
 
         # 2. Redis 模式 (s2 / Realtime)
@@ -1971,7 +2058,7 @@ class SignalEngineV8:
             
             # 🚀 [核心修复] 如果是纯推理模式 (only_log_alpha=True)，SE 就是终点站，直接更新打卡
             if getattr(self, 'only_log_alpha', False):
-                self.r.set("sync:orch_done", str(curr_ts))
+                self._mark_orch_done(curr_ts, frame_id=frame_id)
             else:
                 # 否则需要等待执行引擎 (OMS) 真正撮合完毕
                 wait_start = time.time()
@@ -1982,7 +2069,7 @@ class SignalEngineV8:
                     if time.time() - wait_start > 30: 
                         logger.error(f"🚨 [SE Deadlock] OMS Sync Timeout at TS: {curr_ts}")
                         # 自救措施：强制更新同步位，防止 Driver 彻底卡死
-                        self.r.set("sync:orch_done", str(curr_ts))
+                        self._mark_orch_done(curr_ts, frame_id=frame_id)
                         break
 
     def _prepare_ny_time(self, batch: dict):
