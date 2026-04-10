@@ -95,6 +95,7 @@ class DataPersistenceServiceSQLite:
                 low REAL,
                 close REAL,
                 volume REAL,
+                vwap REAL,
                 PRIMARY KEY (symbol, ts)
             )
         """)
@@ -149,6 +150,11 @@ class DataPersistenceServiceSQLite:
                 self.cursor.execute(f"SELECT datetime_ny FROM {table} LIMIT 1")
             except:
                 self.cursor.execute(f"ALTER TABLE {table} ADD COLUMN datetime_ny TEXT")
+
+        try:
+            self.cursor.execute("SELECT vwap FROM market_bars_1m LIMIT 1")
+        except:
+            self.cursor.execute("ALTER TABLE market_bars_1m ADD COLUMN vwap REAL")
 
         try:
             self.cursor.execute("SELECT event_prob FROM alpha_logs LIMIT 1")
@@ -286,6 +292,7 @@ class DataPersistenceServiceSQLite:
             stock = payload.get('stock', {})
             price = float(stock.get('close', 0.0))
             vol = float(stock.get('volume', 0.0))
+            vwap = float(stock.get('vwap', price)) # 🚀 [Fix] 优先提取 vwap，缺失则用 close
             
             if price > 0:
                 if key not in self.bar_buffer:
@@ -293,16 +300,23 @@ class DataPersistenceServiceSQLite:
                     self.bar_buffer[key] = {
                         'symbol': symbol, 
                         'ts': minute_ts,
-                        'open': price, 'high': price, 'low': price, 'close': price,
-                        'volume': vol
+                        'open': stock.get('open', price), 
+                        'high': stock.get('high', price), 
+                        'low': stock.get('low', price), 
+                        'close': price,
+                        'volume': vol,
+                        'vwap': vwap
                     }
                 else:
-                    # 更新现有 bar
+                    # 更新现有 bar (仅用于实时 Tick 模式)
                     b = self.bar_buffer[key]
-                    b['high'] = max(b['high'], price)
-                    b['low'] = min(b['low'], price)
+                    b['high'] = max(b['high'], stock.get('high', price))
+                    b['low'] = min(b['low'], stock.get('low', price))
                     b['close'] = price
-                    b['volume'] += vol # 假设是 Tick 增量或需要累加
+                    b['volume'] += vol 
+                    # vwap 的更新比较复杂，如果是重放预聚合的可直接赋值
+                    if payload.get('bar_preaggregated_1m'):
+                        b['vwap'] = vwap
             
             # --- [新增] 2. 处理 Option Data ---
             if 'option_buckets' in payload:
@@ -326,45 +340,57 @@ class DataPersistenceServiceSQLite:
             # 为了防止内存溢出，我们只保留最近 300 秒的 bar 在内存，旧的从 buffer 移除
             current_cutoff = time.time() - 300 # 5分钟前的数据才清理 Buffer (防止乱序)
             
-            # 1. 写入 K线 (使用 REPLACE INTO 实现更新)
-            if self.bar_buffer:
-                bars_to_write = []
-                keys_to_delete = []
-                
-                for key, bar in self.bar_buffer.items():
-                    bars_to_write.append((
-                        bar['symbol'], bar['ts'], 
-                        bar['open'], bar['high'], bar['low'], bar['close'], bar['volume']
-                    ))
-                    if key[1] < current_cutoff:
-                        keys_to_delete.append(key)
+            # 🚀 [核心保护] 在重放模式 (BACKTEST/LIVEREPLAY) 下，禁止写入 market_bars 和 option_snapshots
+            # 因为数据源本就来自 SQLite，回写会导致 OHLCV 精度丢失（由发球机组装导致）
+            run_mode = os.environ.get('RUN_MODE', 'REALTIME')
+            is_replay = run_mode in ['BACKTEST', 'LIVEREPLAY']
 
-                self.cursor.executemany(
-                    "REPLACE INTO market_bars_1m (symbol, ts, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    bars_to_write
-                )
-                
-                for k in keys_to_delete:
-                    del self.bar_buffer[k]
+            # 1. 写入 K线
+            if self.bar_buffer:
+                if is_replay:
+                    # 重放模式仅清空 Buffer，不写入 DB
+                    self.bar_buffer.clear()
+                else:
+                    bars_to_write = []
+                    keys_to_delete = []
+                    
+                    for key, bar in self.bar_buffer.items():
+                        bars_to_write.append((
+                            bar['symbol'], bar['ts'], 
+                            bar['open'], bar['high'], bar['low'], bar['close'], bar['volume'], bar['vwap']
+                        ))
+                        if key[1] < current_cutoff:
+                            keys_to_delete.append(key)
+
+                    self.cursor.executemany(
+                        "REPLACE INTO market_bars_1m (symbol, ts, open, high, low, close, volume, vwap) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        bars_to_write
+                    )
+                    
+                    for k in keys_to_delete:
+                        del self.bar_buffer[k]
 
             # [新增] 2. 写入期权快照
             if self.option_buffer:
-                opts_to_write = []
-                opt_keys_to_delete = []
-                
-                for key, buckets_json in self.option_buffer.items():
-                    opts_to_write.append((key[0], key[1], buckets_json))
+                if is_replay:
+                    self.option_buffer.clear()
+                else:
+                    opts_to_write = []
+                    opt_keys_to_delete = []
                     
-                    if key[1] < current_cutoff:
-                        opt_keys_to_delete.append(key)
-                
-                self.cursor.executemany(
-                    "REPLACE INTO option_snapshots_1m (symbol, ts, buckets_json) VALUES (?, ?, ?)",
-                    opts_to_write
-                )
-                
-                for k in opt_keys_to_delete:
-                    del self.option_buffer[k]
+                    for key, buckets_json in self.option_buffer.items():
+                        opts_to_write.append((key[0], key[1], buckets_json))
+                        
+                        if key[1] < current_cutoff:
+                            opt_keys_to_delete.append(key)
+                    
+                    self.cursor.executemany(
+                        "REPLACE INTO option_snapshots_1m (symbol, ts, buckets_json) VALUES (?, ?, ?)",
+                        opts_to_write
+                    )
+                    
+                    for k in opt_keys_to_delete:
+                        del self.option_buffer[k]
 
             # 🚀 [新增] 2b. 写入 5m 期权快照
             if getattr(self, 'option_buffer_5m', None):

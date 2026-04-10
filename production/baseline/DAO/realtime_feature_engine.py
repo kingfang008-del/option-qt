@@ -22,6 +22,10 @@ import math
 from typing import Dict, List, Optional, Tuple
 import pytz
 import ta  # 引入与离线完全对齐的 ta 库
+
+# 🚀 [Parity Fix] 屏蔽 Pandas 未来版本关于 silent downcasting 的警告
+pd.set_option('future.no_silent_downcasting', True)
+
 import numba
 import os
 import sys
@@ -130,7 +134,8 @@ class RealTimeFeatureEngine:
     def supplement_greeks(self, symbol: str, buckets: np.ndarray, contracts: list, stock_price: float, timestamp: float):
         if buckets is None or len(buckets) == 0:
             return buckets
-        
+
+        out = np.asarray(buckets, dtype=np.float32).copy()
         try:
             ts_ny = pd.Timestamp(timestamp, unit='s', tz='UTC').tz_convert('America/New_York')
             # 🚀 [Surgery 8] IV 锚点精准对齐
@@ -141,7 +146,8 @@ class RealTimeFeatureEngine:
             # 🚀 [核心修复 3：动态读取真实的无风险利率 RFR，消除 0.347 vs 0.350 的偏差]
             r_val = None
             date_str = ts_ny.strftime('%Y%m%d')
-            if not hasattr(self, 'rfr_cache'): self.rfr_cache = {}
+            if not hasattr(self, 'rfr_cache'):
+                self.rfr_cache = {}
             
             if date_str in self.rfr_cache:
                 r_val = self.rfr_cache[date_str]
@@ -154,34 +160,41 @@ class RealTimeFeatureEngine:
                     idx = df_rfr.index.searchsorted(search_date)
                     idx = np.clip(idx, 0, len(df_rfr) - 1)
                     latest_r = float(df_rfr['DGS3MO'].iloc[idx])
-                    if latest_r > 1.0: latest_r /= 100.0
+                    if latest_r > 1.0:
+                        latest_r /= 100.0
                     self.rfr_cache[date_str] = latest_r
                     r_val = latest_r
 
-            for tkr in contracts:
-                if tkr and len(tkr) > 15:
-                    ext = tkr.replace('O:', '')
-                    import re
-                    m = re.search(r'\d{6}', ext)
-                    if m:
-                        exp_str = m.group(0)
-                        expiry_dt = pd.to_datetime(exp_str, format='%y%m%d').tz_localize('America/New_York') + pd.Timedelta(hours=16)
-                        time_diff = (expiry_dt - ts_anchor).total_seconds()
-                        t_years = max(1e-6, time_diff / 31557600.0)
-                        
-                        calculate_bucket_greeks(
-                            buckets, 
-                            stock_price, 
-                            t_years, 
-                            r=r_val, # 👈 传入真实的无风险利率！
-                            contracts=contracts, 
-                            current_ts=timestamp
-                        )
-                        break
+            import re
+            n_rows = min(len(out), len(contracts) if contracts is not None else 0)
+            for i in range(n_rows):
+                tkr = contracts[i]
+                if not tkr or len(tkr) <= 15:
+                    continue
+
+                ext = tkr.replace('O:', '')
+                m = re.search(r'\d{6}', ext)
+                if not m:
+                    continue
+
+                expiry_dt = pd.to_datetime(m.group(0), format='%y%m%d').tz_localize('America/New_York') + pd.Timedelta(hours=16)
+                time_diff = (expiry_dt - ts_anchor).total_seconds()
+                t_years = max(1e-6, time_diff / 31557600.0)
+
+                row_bucket = out[i:i+1, :].copy()
+                calculate_bucket_greeks(
+                    row_bucket,
+                    stock_price,
+                    t_years,
+                    r=r_val,
+                    contracts=[tkr],
+                    current_ts=timestamp
+                )
+                out[i, :row_bucket.shape[1]] = row_bucket[0]
         except Exception as e:
             logger.error(f"Error in supplement_greeks for {symbol}: {e}")
-            
-        return buckets
+
+        return out
 
     # ==========================================================================
     # 辅助计算 (宏观指标与 Pandas 预计算)
@@ -261,8 +274,16 @@ class RealTimeFeatureEngine:
 
         needs_vwap = any(f in active_feats for f in ['vwap_diff', 'vwap_log_return', 'return_divergence', 'poc_deviation'])
         if needs_vwap:
-            # 🚀 [终极对齐] 如果输入中已经有聚合好的精确 vwap (由 FCS 实时产生或从 DB 读取)，则直接使用，否则降级重算
-            vwap = df['vwap'] if 'vwap' in df.columns else (df['close'] * df['volume']).cumsum() / (df['volume'].cumsum() + self.epsilon)
+            # VWAP 必须对应“完整分钟 bar”的分钟内成交加权均价。
+            # 如果上游已提供精确的 bar VWAP，就直接使用；否则不能退化成
+            # 日内累计 VWAP（那会改变特征语义并放大 parity 偏差），只做保守近似。
+            if 'vwap' in df.columns:
+                vwap = pd.to_numeric(df['vwap'], errors='coerce').astype(np.float64)
+            else:
+                vwap = close_ff.copy()
+
+            vwap = vwap.replace(0, np.nan).ffill()
+            vwap = vwap.fillna(close_ff)
             
             if 'vwap_diff' in active_feats: 
                 df['vwap_diff'] = (df['close'] - vwap) / (vwap + self.epsilon)
@@ -298,9 +319,16 @@ class RealTimeFeatureEngine:
             ).stoch().fillna(50.0)
 
         if 'cci' in active_feats:
-            df['cci'] = ta.trend.CCIIndicator(
-                high=df['high'], low=df['low'], close=df['close'], window=20
-            ).cci().fillna(0.0)
+            if len(df) >= 20:
+                cci_raw = ta.trend.CCIIndicator(
+                    high=df['high'], low=df['low'], close=df['close'], window=20
+                ).cci()
+                # CCI 必须建立在 20 根完整分钟 K 线之上；对窗口未成熟阶段保持 NaN，
+                # 避免把“不完整分钟/未成熟窗口”硬填成 0 混入序列。
+                cci_raw.iloc[:19] = np.nan
+                df['cci'] = cci_raw.ffill().fillna(0.0)
+            else:
+                df['cci'] = 0.0
 
         if 'adx_smooth_10' in active_feats:
             try:
@@ -353,6 +381,8 @@ class RealTimeFeatureEngine:
         active_pandas_feats = [f for f in self.PANDAS_FEATS if f in all_feats]
         num_cols = 5 + len(active_pandas_feats)
         prices_bh = torch.zeros(B, max_len, num_cols, device=self.device)
+        if len(active_pandas_feats) > 0:
+            prices_bh[:, :, 5:] = float('nan')
         
         feat_idx_map = {feat: 5 + i for i, feat in enumerate(active_pandas_feats)}
 
@@ -366,12 +396,13 @@ class RealTimeFeatureEngine:
             if df_computed is None or df_computed.empty:
                 continue # prices_bh 保持全 0，安全跳过
 
-            # 🚀 [防弹修复 2] 强制补齐目标列！
-            # 哪怕 _pandas_compute_features 某些指标计算失败，也强行补 0，绝不让 KeyError 发生！
             target_cols = ['close', 'high', 'low', 'open', 'volume'] + active_pandas_feats
-            for col in target_cols:
+            for col in ['close', 'high', 'low', 'open', 'volume']:
                 if col not in df_computed.columns:
                     df_computed[col] = 0.0
+            for col in active_pandas_feats:
+                if col not in df_computed.columns:
+                    df_computed[col] = np.nan
 
             # 对齐时间轴 (ffill 产生粘性，保证高频采样下不丢失分钟级信号)
             aligned_df = df_computed.reindex(master_index).ffill().bfill()
@@ -384,6 +415,50 @@ class RealTimeFeatureEngine:
             prices_bh[i, :, :] = vals
             
         return prices_bh, feat_idx_map
+
+    def _derive_5m_from_1m_history(
+        self,
+        history_1min: Dict[str, pd.DataFrame],
+        ready_syns: List[str]
+    ) -> Tuple[Dict[str, pd.DataFrame], Optional[pd.Index]]:
+        """
+        从 1min 主历史直接派生 5min K 线，避免维护独立 5min 历史引入异步相位。
+        所有 5min 特征都建立在同一套 1min master timeline 之上。
+        """
+        derived_history_5m: Dict[str, pd.DataFrame] = {}
+        master_index_5m = None
+
+        for sym in ready_syns:
+            df_1m = history_1min.get(sym)
+            if df_1m is None or df_1m.empty:
+                continue
+
+            base_cols = [c for c in ['open', 'high', 'low', 'close', 'volume'] if c in df_1m.columns]
+            if len(base_cols) < 5:
+                continue
+
+            df_ohlcv = df_1m[base_cols].sort_index()
+            df_5m = df_ohlcv.resample('5min', closed='left', label='left').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).dropna(subset=['open', 'high', 'low', 'close'], how='any')
+
+            if df_5m.empty:
+                continue
+
+            derived_history_5m[sym] = df_5m
+            if master_index_5m is None:
+                master_index_5m = df_5m.index
+            else:
+                master_index_5m = master_index_5m.union(df_5m.index)
+
+        if master_index_5m is not None:
+            master_index_5m = master_index_5m.sort_values()
+
+        return derived_history_5m, master_index_5m
 
     # ==========================================================================
     # 核心入口：引入严格的 Pandas 时间轴对齐 (Data Alignment)
@@ -428,14 +503,14 @@ class RealTimeFeatureEngine:
             
         df_vix = history_1min.get(VIX_SYMBOL)
         if df_vix is not None and not df_vix.empty:
-            df_vix_aligned = df_vix.reindex(master_index).ffill().bfill()
+            df_vix_aligned = df_vix.reindex(master_index).ffill().bfill().infer_objects(copy=False)
             global_ctx.update(self._compute_vix_global(df_vix_aligned, all_feats))
 
         for idx_sym, feat_name in INDEX_ROC_SYMBOLS:
             df_idx = history_1min.get(idx_sym)
             if df_idx is not None and not df_idx.empty:
-                roc_series = df_idx['close'].pct_change(5).fillna(0.0)
-                aligned_roc = roc_series.reindex(master_index).ffill().fillna(0.0).values
+                roc_series = df_idx['close'].pct_change(5).fillna(0.0).infer_objects(copy=False)
+                aligned_roc = roc_series.reindex(master_index).ffill().fillna(0.0).infer_objects(copy=False).values
                 global_ctx[feat_name] = torch.tensor(aligned_roc, dtype=torch.float32, device=self.device)
 
         # 3. 准备混合张量 (Hybrid Tensors)
@@ -459,7 +534,7 @@ class RealTimeFeatureEngine:
         opts_bh = torch.zeros(B, 6, 12, device=self.device)
         for i, s in enumerate(ready_syns):
             if option_snapshots and s in option_snapshots:
-                  raw_snap = option_snapshots[s]
+                  raw_snap = np.asarray(option_snapshots[s], dtype=np.float32).copy()
                   
                   # 🚀 [Parity Fix] 核心集成：在生成 Tensor 前，强制执行希腊值补算/重算逻辑
                   # 底层 calculate_bucket_greeks 会先抹除旧 IV (0.5) 再根据当前价重算
@@ -489,60 +564,37 @@ class RealTimeFeatureEngine:
             option_snapshot=opts_bh, skip_scaling=skip_scaling, global_ctx=global_ctx
         )
 
-        # --- B. 计算 5min 特征 (如果存在) ---
+        # --- B. 计算 5min 特征 (从 1min master timeline 派生) ---
         batch_res_5m = {}
         opts_bh_5m = None
-        if slow_feats_5m and history_5min:
-            # 5min 的 master_index 相对简单，因为输入就是 5min K线
-            indices_5m = [df.index for df in history_5min.values() if not df.empty]
-            if indices_5m:
-                master_index_5m = indices_5m[0]
-                for idx in indices_5m[1:]: master_index_5m = master_index_5m.union(idx)
-                master_index_5m = master_index_5m.sort_values()
-                
-                prices_bh_5m, feat_idx_map_5m = self._prepare_hybrid_tensors(history_5min, ready_syns, master_index_5m, slow_feats_5m)
-                
-                opts_bh_5m = torch.zeros(B, 6, 12, device=self.device)
-                for i, s in enumerate(ready_syns):
-                    if option_snapshot_5m and s in option_snapshot_5m:
-                        raw_snap = option_snapshot_5m[s]
-                        if raw_snap.shape[0] < 6:
-                            raw_snap = np.vstack([raw_snap, np.zeros((6-raw_snap.shape[0], raw_snap.shape[1]), dtype=raw_snap.dtype)])
-                        if raw_snap.shape[1] < 12:
-                            raw_snap = np.hstack([raw_snap, np.zeros((raw_snap.shape[0], 12-raw_snap.shape[1]), dtype=raw_snap.dtype)])
-                        opts_bh_5m[i] = torch.tensor(raw_snap[:, :12], dtype=torch.float32, device=self.device)
+        if slow_feats_5m:
+            derived_history_5m, master_index_5m = self._derive_5m_from_1m_history(history_1min, ready_syns)
+            if derived_history_5m and master_index_5m is not None and len(master_index_5m) > 0:
+                prices_bh_5m, feat_idx_map_5m = self._prepare_hybrid_tensors(
+                    derived_history_5m, ready_syns, master_index_5m, slow_feats_5m
+                )
+
+                # 5min 期权特征也使用当前 1min 冻结快照，不再维护独立 option_snapshot_5m 相位。
+                opts_bh_5m = opts_bh
 
                 res_5m_raw = self.compute_batch_features(
-                    prices_bh_5m, feat_idx_map_5m, ready_syns, [], slow_feats_5m, 
+                    prices_bh_5m, feat_idx_map_5m, ready_syns, [], slow_feats_5m,
                     option_snapshot=opts_bh_5m, skip_scaling=skip_scaling, global_ctx=global_ctx
                 )
-                
-                # ==============================================================
-                # 🚀 [时序映射终极防弹升级] 彻底废弃 repeat_interleave
-                # 利用时间戳强行映射，完美解决实盘 09:37 这种非整数时间的相位错乱问题！
-                # ==============================================================
+
                 if res_5m_raw.get('slow_1m') is not None:
-                    t_5m_raw = res_5m_raw['slow_1m'] # [B, N_5m, L_5m]
+                    t_5m_raw = res_5m_raw['slow_1m']  # [B, N_5m, L_5m]
                     L_5m = t_5m_raw.shape[-1]
-                    
-                    # 1. 查找 1min 的每个时间点，在 5min 时间轴上的索引位置
-                   # 1. 查找 1min 的每个时间点，在 5min 时间轴上的索引位置
-                    # 🚀 [🔥 致命维度修复] master_index 长度为 500，但模型特征仅需最后 30 步！
-                    # 必须切片最后 30 个 1min 时间点去映射，否则张量会被拉伸到 500 导致维度爆炸。
+                    active_index_5m = master_index_5m[-L_5m:]
+
+                    # 5min 特征统一广播回 1min 主时间轴：
+                    # 将每个 1min 时间点映射到它所属的 5min bucket，再做前向填充。
                     target_master_index = master_index[-30:]
-                    pos_indices = master_index_5m.searchsorted(target_master_index)
-                    
-                    # 2. 将全局绝对索引转换为 t_5m_raw 的局部相对索引
-                    start_idx_5m = len(master_index_5m) - L_5m
-                    rel_indices = pos_indices - start_idx_5m
-                    
-                    # 3. 边界保护，防止因为断流产生的越界
-                    rel_indices = np.clip(rel_indices, 0, L_5m - 1)
+                    target_bucket_index = target_master_index.floor('5min')
+                    rel_indices = active_index_5m.get_indexer(target_bucket_index, method='ffill')
+                    rel_indices = np.where(rel_indices < 0, 0, rel_indices)
                     rel_idx_tensor = torch.tensor(rel_indices, dtype=torch.long, device=self.device)
-                    
-                    # 4. 提取出与 1min 绝对时序等长 (30) 且严格对齐的 5min 特征序列
-                    t_5m_upsampled = t_5m_raw[:, :, rel_idx_tensor]
-                    batch_res_5m['slow_1m'] = t_5m_upsampled 
+                    batch_res_5m['slow_1m'] = t_5m_raw[:, :, rel_idx_tensor]
         
         # 4. 组装并分发
         for i, s in enumerate(ready_syns):
@@ -550,25 +602,23 @@ class RealTimeFeatureEngine:
             # 合并 1m 和 5m 的 slow 特征
             s_slow_1m = batch_res_1m['slow_1m'][i] if batch_res_1m.get('slow_1m') is not None else None
             s_slow_5m = batch_res_5m['slow_1m'][i] if batch_res_5m.get('slow_1m') is not None else None
-            
-            if s_slow_1m is not None:
-                if s_slow_5m is not None:
-                    # 我们需要按照 slow_feats 的原始顺序合并列
-                    merged_slow = torch.zeros(len(slow_feats), 30, device=self.device)
-                    k1, k5 = 0, 0
-                    for f in slow_feats:
-                        idx = slow_feats.index(f)
-                        if f in slow_feats_5m:
+
+            output_slow = None
+            if slow_feats:
+                # 始终按完整 slow_feats 顺序构造输出，避免当 1m/5m 某一侧为空时
+                # 直接返回“裸子集张量”造成列错位（例如 5min CCI 落到错误列）。
+                merged_slow = torch.zeros(len(slow_feats), 30, device=self.device)
+                k1, k5 = 0, 0
+                for idx, f in enumerate(slow_feats):
+                    if f in slow_feats_5m:
+                        if s_slow_5m is not None and k5 < s_slow_5m.shape[0]:
                             merged_slow[idx] = s_slow_5m[k5]
-                            k5 += 1
-                        else:
+                        k5 += 1
+                    else:
+                        if s_slow_1m is not None and k1 < s_slow_1m.shape[0]:
                             merged_slow[idx] = s_slow_1m[k1]
-                            k1 += 1
-                    output_slow = merged_slow.unsqueeze(0)
-                else:
-                    output_slow = s_slow_1m.unsqueeze(0)
-            else:
-                output_slow = s_slow_5m.unsqueeze(0) if s_slow_5m is not None else None
+                        k1 += 1
+                output_slow = merged_slow.unsqueeze(0)
 
             results[s] = {
                 'fast_1m': s_fast if s_fast is not None else None,
@@ -612,6 +662,16 @@ class RealTimeFeatureEngine:
         for feat_name, idx in feat_idx_map.items():
             if feat_name in all_feats:
                 res[feat_name] = prices_bh[:, :, idx]
+
+        def _merge_with_fallback(name: str, fallback: torch.Tensor):
+            if name not in all_feats:
+                return
+            if name not in res:
+                res[name] = fallback
+                return
+            existing = res[name]
+            if torch.isnan(existing).any():
+                res[name] = torch.where(torch.isnan(existing), fallback, existing)
 
         # [🆕 新增] 截面动量 (Cross-Sectional Momentum Z-Score)
         # 必须在 Batch 层面计算，直接利用 res 中的 close_log_return
@@ -682,17 +742,19 @@ class RealTimeFeatureEngine:
             if 'macd_diff_ratio' in all_feats: res['macd_diff_ratio'] = (macd - sig) / (close + self.epsilon)
 
         # 兜底：如果某些特征因为配置问题没有被 Pandas 处理到，这里保留旧版计算逻辑 (如 k/d, rsi等)
-        if 'rsi' in all_feats and 'rsi' not in res: 
-            res['rsi'] = self._rsi(close, 14)
-        if ('k' in all_feats or 'd' in all_feats) and 'k' not in res:
+        if 'rsi' in all_feats:
+            _merge_with_fallback('rsi', self._rsi(close, 14))
+        if 'k' in all_feats or 'd' in all_feats:
             k, d, _ = self._kdj(high, low, close)
-            if 'k' in all_feats: res['k'] = k
-            if 'd' in all_feats: res['d'] = d
-        if 'vwap_diff' in all_feats and 'vwap_diff' not in res:
+            if 'k' in all_feats:
+                _merge_with_fallback('k', k)
+            if 'd' in all_feats:
+                _merge_with_fallback('d', d)
+        if 'vwap_diff' in all_feats:
             cum_pv = torch.cumsum(close * volume, dim=1)
             cum_v = torch.cumsum(volume, dim=1)
             vwap = cum_pv / (cum_v + self.epsilon)
-            res['vwap_diff'] =  close - vwap  / (vwap + self.epsilon)
+            _merge_with_fallback('vwap_diff', (close - vwap) / (vwap + self.epsilon))
 
         # --- 3. 挂载 Global & Option Features ---
         for k, v in global_ctx.items():

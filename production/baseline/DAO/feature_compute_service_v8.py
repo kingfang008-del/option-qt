@@ -61,6 +61,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("FeatService")
 
+
+def _safe_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
 # Feature service-specific Redis config (extends base)
 REDIS_CFG = {
     **_REDIS_BASE,
@@ -204,6 +214,56 @@ class RollingWindowNormalizer:
             
         return x_norm
 
+
+class OptionMinuteAggregator:
+    """
+    将秒级期权 quote 流归约为“分钟唯一快照”。
+    当前采用与分钟基准库最接近的语义：
+    - 价格/盘口/size：取该分钟最后一个有效 quote
+    - volume：统一强制定义为 bid_size + ask_size（与训练口径一致）
+    """
+    def __init__(self, rows: int = 6, cols: int = 12):
+        self.rows = rows
+        self.cols = cols
+        self.state = {}
+
+    def reset(self):
+        self.state = {}
+
+    def update(self, symbol: str, minute_dt, snapshot_arr: np.ndarray, contracts, update_ts: float = None):
+        if snapshot_arr is None:
+            return
+        arr = np.asarray(snapshot_arr, dtype=np.float32)
+        if arr.ndim != 2:
+            return
+        if arr.shape[0] < self.rows:
+            arr = np.vstack([arr, np.zeros((self.rows - arr.shape[0], arr.shape[1]), dtype=np.float32)])
+        if arr.shape[1] < self.cols:
+            arr = np.hstack([arr, np.zeros((arr.shape[0], self.cols - arr.shape[1]), dtype=np.float32)])
+        arr = arr[:self.rows, :self.cols].copy()
+
+        # 统一分钟语义：volume 永远强制使用最后有效盘口 size 之和。
+        size_sum = np.maximum(arr[:, 10], 0.0) + np.maximum(arr[:, 11], 0.0)
+        arr[:, 6] = size_sum
+
+        self.state[symbol] = {
+            'minute_dt': minute_dt,
+            'snapshot': arr,
+            'contracts': list(contracts) if contracts else [],
+            'update_ts': float(update_ts) if update_ts is not None else None,
+        }
+
+    def finalize(self, symbol: str, minute_dt):
+        st = self.state.get(symbol)
+        if not st:
+            return None, [], None
+        if st.get('minute_dt') != minute_dt:
+            return None, [], None
+        snap = np.asarray(st.get('snapshot'), dtype=np.float32).copy()
+        size_sum = np.maximum(snap[:, 10], 0.0) + np.maximum(snap[:, 11], 0.0)
+        snap[:, 6] = size_sum
+        return snap, list(st.get('contracts', [])), st.get('update_ts')
+
 class FeatureComputeService:
     def __init__(self, redis_cfg, symbols, config_paths):
         print(f"init Service... Symbols: {len(symbols)}")
@@ -308,6 +368,8 @@ class FeatureComputeService:
         self.option_snapshot_5m = {s: np.zeros((6, 12), dtype=np.float32) for s in self.symbols}
         self.latest_prices = {s: 0.0 for s in self.symbols}
         self.last_tick_price = {s: 0.0 for s in self.symbols}
+        self.last_stock_update_ts = {s: None for s in self.symbols}
+        self.last_option_update_ts = {s: None for s in self.symbols}
         self.truth_map_1min = {}
         
         # 🚀 [架构由于瘦身] 抛弃本地 Frozen 冗余，全面拥抱 Redis 真相账本
@@ -334,6 +396,7 @@ class FeatureComputeService:
 
         self.latest_opt_buckets = {}
         self.latest_opt_contracts = {}
+        self.option_minute_agg = OptionMinuteAggregator()
         self.preaggregated_1m_mode = False
         self._preagg_mode_logged = False
         self.sym_vol_mean = {}
@@ -348,6 +411,17 @@ class FeatureComputeService:
         }
         self._last_gate_metrics_minute_ts = None
         self.publish_frame_seq = 0
+        self.runtime_payload_audit_enabled = os.environ.get("FCS_RUNTIME_AUDIT", "0").strip().lower() in {"1", "true", "yes", "on"}
+        self.runtime_payload_audit_symbol = os.environ.get("FCS_RUNTIME_AUDIT_SYMBOL", "NVDA").strip() or "NVDA"
+        self.runtime_payload_audit_ts = int(_safe_float_env("FCS_RUNTIME_AUDIT_TS", 1767373980.0))
+        audit_dir_default = Path("/tmp/fcs_runtime_audit")
+        self.runtime_payload_audit_dir = Path(os.environ.get("FCS_RUNTIME_AUDIT_DIR", str(audit_dir_default))).expanduser()
+        self.runtime_payload_audit_written = set()
+        if self.runtime_payload_audit_enabled:
+            logger.info(
+                f"🧪 Runtime payload audit enabled | symbol={self.runtime_payload_audit_symbol} "
+                f"| ts={self.runtime_payload_audit_ts} | dir={self.runtime_payload_audit_dir}"
+            )
 
 
         # 尝试加载状态
@@ -366,6 +440,179 @@ class FeatureComputeService:
             return self.pg_conn
         except:
             return psycopg2.connect(PG_DB_URL)
+
+    def _to_audit_matrix(self, snap):
+        if snap is None:
+            return []
+        arr = np.asarray(snap, dtype=np.float64)
+        if arr.ndim != 2:
+            return []
+        return arr[:, :12].tolist()
+
+    def _to_audit_row(self, snap, row_idx: int):
+        arr = np.asarray(snap, dtype=np.float64)
+        if arr.ndim != 2 or row_idx >= arr.shape[0]:
+            return {}
+        row = arr[row_idx]
+        return {
+            'price': float(row[0]) if row.shape[0] > 0 else 0.0,
+            'delta': float(row[1]) if row.shape[0] > 1 else 0.0,
+            'gamma': float(row[2]) if row.shape[0] > 2 else 0.0,
+            'vega': float(row[3]) if row.shape[0] > 3 else 0.0,
+            'theta': float(row[4]) if row.shape[0] > 4 else 0.0,
+            'strike': float(row[5]) if row.shape[0] > 5 else 0.0,
+            'volume': float(row[6]) if row.shape[0] > 6 else 0.0,
+            'iv': float(row[7]) if row.shape[0] > 7 else 0.0,
+            'bid': float(row[8]) if row.shape[0] > 8 else 0.0,
+            'ask': float(row[9]) if row.shape[0] > 9 else 0.0,
+            'bid_size': float(row[10]) if row.shape[0] > 10 else 0.0,
+            'ask_size': float(row[11]) if row.shape[0] > 11 else 0.0,
+        }
+
+    def _build_greeks_input_audit(
+        self,
+        *,
+        symbol: str,
+        buckets,
+        contracts,
+        stock_price: float,
+        timestamp: float,
+        bucket_id: int = 5,
+    ):
+        arr = np.asarray(buckets, dtype=np.float64)
+        if arr.ndim != 2 or bucket_id >= arr.shape[0]:
+            return {}
+
+        row = self._to_audit_row(arr, bucket_id)
+        contract = contracts[bucket_id] if contracts and bucket_id < len(contracts) else ""
+        payload = {
+            'symbol': symbol,
+            'bucket_id': int(bucket_id),
+            'contract': contract,
+            'timestamp': float(timestamp) if timestamp is not None else None,
+            'stock_price_input': float(stock_price) if stock_price is not None else None,
+            'row_before_or_after': row,
+        }
+
+        try:
+            ts_ny = pd.Timestamp(timestamp, unit='s', tz='UTC').tz_convert('America/New_York')
+            ts_anchor = ts_ny.floor('1min')
+            payload['timestamp_ny'] = ts_ny.isoformat()
+            payload['ts_anchor_ny'] = ts_anchor.isoformat()
+
+            r_val = None
+            date_str = ts_ny.strftime('%Y%m%d')
+            if not hasattr(self.engine, 'rfr_cache'):
+                self.engine.rfr_cache = {}
+            if date_str in self.engine.rfr_cache:
+                r_val = self.engine.rfr_cache[date_str]
+            else:
+                rfr_candidates = [
+                    Path("/home/kingfang007/risk_free_rates.parquet"),
+                    Path(__file__).resolve().parents[3] / "risk_free_rates.parquet",
+                    Path("risk_free_rates.parquet"),
+                ]
+                rfr_file = next((p for p in rfr_candidates if p.exists()), None)
+                if rfr_file is not None:
+                    df_rfr = pd.read_parquet(rfr_file)
+                    search_date = ts_ny.replace(hour=0, minute=0, second=0, microsecond=0).tz_localize(None)
+                    idx = df_rfr.index.searchsorted(search_date)
+                    idx = int(np.clip(idx, 0, len(df_rfr) - 1))
+                    r_val = float(df_rfr['DGS3MO'].iloc[idx])
+                    if r_val > 1.0:
+                        r_val /= 100.0
+                    self.engine.rfr_cache[date_str] = r_val
+                    payload['rfr_source'] = str(rfr_file)
+            payload['r'] = float(r_val) if r_val is not None else None
+
+            ext = str(contract).replace('O:', '')
+            import re
+            m = re.search(r'\d{6}', ext)
+            if m:
+                exp_str = m.group(0)
+                expiry_dt = pd.to_datetime(exp_str, format='%y%m%d').tz_localize('America/New_York') + pd.Timedelta(hours=16)
+                t_years = max(1e-6, (expiry_dt - ts_anchor).total_seconds() / 31557600.0)
+                payload['expiry_ny'] = expiry_dt.isoformat()
+                payload['T_years'] = float(t_years)
+        except Exception as audit_e:
+            payload['input_audit_error'] = str(audit_e)
+
+        return payload
+
+    def _maybe_write_runtime_payload_audit(
+        self,
+        *,
+        alpha_label_ts: float,
+        data_ts: float,
+        symbol: str,
+        payload_stock_price: float,
+        latest_stock_price: float,
+        last_stock_update_ts: float,
+        last_option_update_ts: float,
+        source_option_snapshot,
+        frozen_option_snapshot,
+        payload_option_snapshot,
+        latest_opt_buckets,
+        frozen_latest_opt_buckets,
+        contracts,
+        pre_supplement_greeks_input=None,
+        post_supplement_greeks_input=None,
+        bucket_id: int = 5,
+    ):
+        if not self.runtime_payload_audit_enabled:
+            return
+        if symbol != self.runtime_payload_audit_symbol:
+            return
+        target_ts = int(float(alpha_label_ts))
+        if target_ts != self.runtime_payload_audit_ts:
+            return
+        audit_key = (symbol, target_ts)
+        if audit_key in self.runtime_payload_audit_written:
+            return
+
+        contract = contracts[bucket_id] if contracts and bucket_id < len(contracts) else ""
+        payload_ts = None
+        try:
+            payload_ts = float(data_ts)
+        except Exception:
+            payload_ts = None
+
+        payload = {
+            'ts': target_ts,
+            'source_ts': payload_ts,
+            'symbol': symbol,
+            'bucket_id': int(bucket_id),
+            'bucket_name': 'NEXT_CALL_ATM' if bucket_id == 5 else str(bucket_id),
+            'contract': contract,
+            'stock_price': float(payload_stock_price),
+            'latest_stock_price': float(latest_stock_price),
+            'last_stock_update_ts': float(last_stock_update_ts) if last_stock_update_ts is not None else None,
+            'last_option_update_ts': float(last_option_update_ts) if last_option_update_ts is not None else None,
+            'contracts': list(contracts) if contracts else [],
+            'option_snapshot': self._to_audit_matrix(source_option_snapshot),
+            'frozen_option_snapshot': self._to_audit_matrix(frozen_option_snapshot),
+            'payload_option_snapshot': self._to_audit_matrix(payload_option_snapshot),
+            'latest_opt_buckets': self._to_audit_matrix(latest_opt_buckets),
+            'frozen_latest_opt_buckets': self._to_audit_matrix(frozen_latest_opt_buckets),
+            'pre_supplement_greeks_input': pre_supplement_greeks_input or {},
+            'post_supplement_greeks_input': post_supplement_greeks_input or {},
+            'focus_rows': {
+                'option_snapshot': self._to_audit_row(source_option_snapshot, bucket_id),
+                'frozen_option_snapshot': self._to_audit_row(frozen_option_snapshot, bucket_id),
+                'payload_option_snapshot': self._to_audit_row(payload_option_snapshot, bucket_id),
+                'latest_opt_buckets': self._to_audit_row(latest_opt_buckets, bucket_id),
+                'frozen_latest_opt_buckets': self._to_audit_row(frozen_latest_opt_buckets, bucket_id),
+            }
+        }
+
+        try:
+            self.runtime_payload_audit_dir.mkdir(parents=True, exist_ok=True)
+            out_path = self.runtime_payload_audit_dir / f"{symbol}_{target_ts}_runtime_audit.json"
+            out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+            self.runtime_payload_audit_written.add(audit_key)
+            logger.info(f"💾 [FCS_RUNTIME_AUDIT] Wrote runtime audit to {out_path}")
+        except Exception as audit_e:
+            logger.warning(f"⚠️ [FCS_RUNTIME_AUDIT] Failed to write audit JSON: {audit_e}")
  
     def _ensure_debug_tables(self, date_str):
         """[主线程同步建表 & 分区化] 升级为 PARTITION BY RANGE 模式"""
@@ -929,9 +1176,10 @@ class FeatureComputeService:
                                     self.frozen_option_snapshot_5m = {}
                                     self.frozen_latest_opt_buckets = {}
                                     self.frozen_latest_opt_contracts = {} # 🚀 必须包含合约字典冻结
-                                    
-                                # 安全拷贝快照，防止被新一秒污染
-                                current_snap = self.option_snapshot.get(s)
+
+                                # 优先使用分钟归约器输出，确保秒级链路冻结语义稳定且与分钟基准一致。
+                                agg_snap, agg_contracts, agg_update_ts = self.option_minute_agg.finalize(s, self.global_last_minute)
+                                current_snap = agg_snap if agg_snap is not None else self.option_snapshot.get(s)
                                 if current_snap is not None:
                                     self.frozen_option_snapshot[s] = current_snap.copy()
                                 else:
@@ -942,8 +1190,10 @@ class FeatureComputeService:
                                     current_snap_5m = getattr(self, 'option_snapshot_5m', {}).get(s, current_snap)
                                     self.frozen_option_snapshot_5m[s] = current_snap_5m.copy() if current_snap_5m is not None else np.zeros((6, 12), dtype=np.float32)
                                         
-                                self.frozen_latest_opt_buckets[s] = self.latest_opt_buckets.get(s, [])
-                                self.frozen_latest_opt_contracts[s] = self.latest_opt_contracts.get(s, []) # 🚀 物理级对齐
+                                self.frozen_latest_opt_buckets[s] = current_snap.copy() if current_snap is not None else self.latest_opt_buckets.get(s, [])
+                                self.frozen_latest_opt_contracts[s] = agg_contracts if agg_contracts else self.latest_opt_contracts.get(s, []) # 🚀 物理级对齐
+                                if agg_update_ts is not None:
+                                    self.last_option_update_ts[s] = float(agg_update_ts)
                                 
                                 # 结算并生成 K 线 (包含0成交延续逻辑和正确的Volume累加)
                                 self._finalize_1min_bar(s, self.global_last_minute, cleanup=True)
@@ -974,11 +1224,19 @@ class FeatureComputeService:
                     if getattr(self, '_premarket_flushed_date', None) != dt_ny.date():
                         today_start = dt_ny.replace(hour=0, minute=0, second=0, microsecond=0)
                         rth_start = dt_ny.replace(hour=9, minute=30, second=0, microsecond=0)
+                        rth_end = dt_ny.replace(hour=16, minute=0, second=0, microsecond=0)
                         for s in self.symbols:
                             df = self.history_1min.get(s, pd.DataFrame())
                             if not df.empty:
-                                mask = (df.index < today_start) | (df.index >= rth_start)
-                                self.history_1min[s] = df[mask]
+                                idx = df.index
+                                if getattr(idx, "tz", None) is None:
+                                    idx = idx.tz_localize(NY_TZ)
+                                # Keep all prior-day rows, but for the current replay day
+                                # only retain regular-session 09:30-16:00 bars. This
+                                # removes stray same-day ghost rows such as 22:30 that
+                                # would otherwise shift the 30-step model window.
+                                mask = (idx < today_start) | ((idx >= rth_start) & (idx <= rth_end))
+                                self.history_1min[s] = df[mask].sort_index()
                         self._premarket_flushed_date = dt_ny.date()
                         logger.info("🧹 09:30 准点清洗完成！引擎进入纯净实盘模式。")
                 
@@ -989,13 +1247,15 @@ class FeatureComputeService:
                     if c_val > 0:
                         self.latest_prices[sym] = c_val
                         self.last_tick_price[sym] = c_val
+                        self.last_stock_update_ts[sym] = float(ts)
                     if is_preaggregated_1m:
                         o_val = float(stock.get('open', stock.get('o', c_val)))
                         h_val = float(stock.get('high', stock.get('h', c_val)))
                         l_val = float(stock.get('low', stock.get('l', c_val)))
                         v_val = float(stock.get('volume', stock.get('v', 0.0)))
-                        self.history_1min[sym].loc[curr_minute, ['open', 'high', 'low', 'close', 'volume']] = [
-                            o_val, h_val, l_val, c_val, v_val
+                        vw_val = float(stock.get('vwap', c_val))
+                        self.history_1min[sym].loc[curr_minute, ['open', 'high', 'low', 'close', 'volume', 'vwap']] = [
+                            o_val, h_val, l_val, c_val, v_val, vw_val
                         ]
                         if len(self.history_1min[sym]) > self.HISTORY_LEN:
                             self.history_1min[sym] = self.history_1min[sym].iloc[-self.HISTORY_LEN:]
@@ -1003,7 +1263,8 @@ class FeatureComputeService:
                 stock_5m = payload.get('stock_5m')
                 if stock_5m and dt_ny.minute % 5 == 0:
                     o, h, l, c, v = stock_5m['open'], stock_5m['high'], stock_5m['low'], stock_5m['close'], stock_5m['volume']
-                    self.history_5min[sym].loc[curr_minute, ['open', 'high', 'low', 'close', 'volume']] = [o, h, l, c, v]
+                    vw = stock_5m.get('vwap', c)
+                    self.history_5min[sym].loc[curr_minute, ['open', 'high', 'low', 'close', 'volume', 'vwap']] = [o, h, l, c, v, vw]
                     if len(self.history_5min[sym]) > 100: self.history_5min[sym] = self.history_5min[sym].iloc[-100:]
                 
                 # 1m 期权快照处理
@@ -1023,10 +1284,25 @@ class FeatureComputeService:
                     if np.sum(arr[:, 0]) > 0.001 or np.sum(arr[:, 6]) > 0.001: 
                         arr[:, 6] = np.maximum(arr[:, 6], 0.0)
                         self.option_snapshot[sym] = arr
+                        self.last_option_update_ts[sym] = float(ts)
+                        if not is_preaggregated_1m:
+                            self.option_minute_agg.update(sym, curr_minute, arr, c_data, update_ts=ts)
                         from config import USE_5M_OPTION_DATA
                         if USE_5M_OPTION_DATA:
                             if not hasattr(self, 'option_snapshot_5m'): self.option_snapshot_5m = {}
                             self.option_snapshot_5m[sym] = arr.copy()
+
+                        # 预聚合 1m 输入本身就是该分钟的最终事实，直接冻结为这一分钟唯一来源，
+                        # 避免后续 run_compute_cycle 继续读取上一分钟残留的 frozen_* 状态。
+                        if is_preaggregated_1m:
+                            if not hasattr(self, 'frozen_option_snapshot'):
+                                self.frozen_option_snapshot = {}
+                                self.frozen_option_snapshot_5m = {}
+                                self.frozen_latest_opt_buckets = {}
+                                self.frozen_latest_opt_contracts = {}
+                            self.frozen_option_snapshot[sym] = arr.copy()
+                            self.frozen_latest_opt_buckets[sym] = arr.copy()
+                            self.frozen_latest_opt_contracts[sym] = list(c_data) if c_data else []
                         self.warmup_needed[sym] = False
     
                 # 5m 期权快照处理
@@ -1052,6 +1328,8 @@ class FeatureComputeService:
                             arr[:, 6] = minute_vol
                             if not hasattr(self, 'option_snapshot_5m'): self.option_snapshot_5m = {}
                             self.option_snapshot_5m[sym] = arr
+                            if is_preaggregated_1m and hasattr(self, 'frozen_option_snapshot_5m'):
+                                self.frozen_option_snapshot_5m[sym] = arr.copy()
     
                 # 🚀 7. 安全收录：只有在上一分钟被完美结转后，新 Tick 的成交才会进入收集器
                 stock_close = float(stock.get('close', stock.get('c', 0.0))) if stock else 0.0
@@ -1661,9 +1939,30 @@ class FeatureComputeService:
             
             sliced_snaps = {s: snap[:, :12].copy() for s, snap in source_snap.items()}
             sliced_snaps_5m = {s: (snap[:, :12].copy() if isinstance(snap, np.ndarray) else np.zeros((6,12))) for s, snap in source_snap_5m.items()}
+            compute_ts = alpha_label_ts if is_new_minute else data_ts
+            self.runtime_pre_greeks_input_audit = {}
+            self.runtime_post_greeks_input_audit = {}
+            if self.runtime_payload_audit_enabled:
+                for s in self.symbols:
+                    if s not in sliced_snaps:
+                        continue
+                    df_s = self.history_1min.get(s)
+                    if df_s is None or df_s.empty:
+                        continue
+                    try:
+                        stock_price_input = float(df_s.iloc[-1]['close'])
+                    except Exception:
+                        continue
+                    self.runtime_pre_greeks_input_audit[s] = self._build_greeks_input_audit(
+                        symbol=s,
+                        buckets=sliced_snaps.get(s),
+                        contracts=source_contracts.get(s, []),
+                        stock_price=stock_price_input,
+                        timestamp=compute_ts,
+                        bucket_id=5,
+                    )
 
             try:
-                compute_ts = alpha_label_ts if is_new_minute else data_ts
                 results_map = self.engine.compute_all_inputs(
                     history_1min=self.history_1min, history_5min=getattr(self, 'history_5min', {}),
                     fast_feats=self.fast_feat_names, slow_feats=self.slow_feat_names,
@@ -1708,10 +2007,27 @@ class FeatureComputeService:
                     if is_valid and res_sym.get('updated_buckets') is not None:
                         enriched = res_sym['updated_buckets']
                         self.latest_opt_buckets[sym] = enriched
+                        if self.runtime_payload_audit_enabled:
+                            df_s = self.history_1min.get(sym)
+                            if df_s is not None and not df_s.empty:
+                                try:
+                                    stock_price_input = float(df_s.iloc[-1]['close'])
+                                    self.runtime_post_greeks_input_audit[sym] = self._build_greeks_input_audit(
+                                        symbol=sym,
+                                        buckets=enriched,
+                                        contracts=source_contracts.get(sym, []),
+                                        stock_price=stock_price_input,
+                                        timestamp=compute_ts,
+                                        bucket_id=5,
+                                    )
+                                except Exception:
+                                    pass
                         
                         # 🚀 [核心补漏] 必须同步更新 Frozen 字典，这样 downstream 的 payload 才能吃到被补算了 Greeks 的版本！
                         if is_new_minute and hasattr(self, 'frozen_latest_opt_buckets'):
                             self.frozen_latest_opt_buckets[sym] = enriched
+                        if is_new_minute and hasattr(self, 'frozen_option_snapshot'):
+                            self.frozen_option_snapshot[sym] = np.asarray(enriched, dtype=np.float32).copy()
 
                         try:
                             atm_c_iv = float(enriched[2, 7]) if enriched.shape[0] > 2 else 0.0
@@ -1733,8 +2049,22 @@ class FeatureComputeService:
                                 latest = res_sym[ftype][0, :, -1].cpu().numpy()
                                 names = self.fast_feat_names if ftype == 'fast_1m' else self.slow_feat_names
                                 for i, fname in enumerate(names):
-                                    if i < len(latest): 
+                                    has_latest = i < len(latest)
+                                    if has_latest:
                                         val = float(latest[i])
+                                    else:
+                                        val = np.nan
+
+                                    # 5min 慢特征在个别帧如果暂时未产出，不应瞬时塌成 0；
+                                    # 直接沿用最近一次有效值，保持 1min 主时间轴上的 piecewise-constant 语义。
+                                    if (not has_latest or not np.isfinite(val)) and ftype == 'slow_1m':
+                                        hist_df = self.history_1min.get(sym)
+                                        if hist_df is not None and fname in hist_df.columns:
+                                            prev_series = pd.to_numeric(hist_df[fname], errors='coerce').dropna()
+                                            if not prev_series.empty:
+                                                val = float(prev_series.iloc[-1])
+
+                                    if np.isfinite(val):
                                         raw_vec[self.feat_name_to_idx[fname]] = val
                                         if is_new_minute:
                                             ts_logi = pd.Timestamp(alpha_label_ts, unit='s', tz=NY_TZ)
@@ -1848,9 +2178,9 @@ class FeatureComputeService:
             batch_fast_vols.append(raw_mat[b_idx, idx_vol] if idx_vol is not None else 0.0)
             
             # 提取期权快照
-            snap = source_opt_buckets.get(sym)
-            if snap is None: 
-                snap = source_snap_for_payload.get(sym)
+            snap = source_snap_for_payload.get(sym)
+            if snap is None:
+                snap = source_opt_buckets.get(sym)
 
             if snap is not None and isinstance(snap, np.ndarray) and snap.shape[0] >= 6:
                 c_iv, p_iv = snap[2, 7], snap[0, 7]
@@ -1888,8 +2218,11 @@ class FeatureComputeService:
         source_contracts = getattr(self, 'frozen_latest_opt_contracts', self.latest_opt_contracts) if is_new_minute else self.latest_opt_contracts # 🚀
 
         for sym in batch_symbols:
+            snap_live = source_snap_for_payload.get(sym)
+            if snap_live is None:
+                snap_live = source_opt_buckets.get(sym, [])
             live_options[sym] = {
-                'buckets': source_opt_buckets.get(sym, []),
+                'buckets': snap_live.tolist() if isinstance(snap_live, np.ndarray) else snap_live,
                 'contracts': source_contracts.get(sym, []) # 🚀 强绑定
             }
             if USE_5M_OPTION_DATA:
@@ -1968,6 +2301,143 @@ class FeatureComputeService:
             'cheat_put_bid': cheat_put_bid, 'cheat_put_ask': cheat_put_ask,
             'cheat_call_iv': cheat_call_iv, 'cheat_put_iv': cheat_put_iv,
         }
+
+        for idx_sym, sym in enumerate(batch_symbols):
+            payload_snap = live_options.get(sym, {}).get('buckets', [])
+            self._maybe_write_runtime_payload_audit(
+                alpha_label_ts=alpha_label_ts,
+                data_ts=data_ts,
+                symbol=sym,
+                payload_stock_price=batch_prices[idx_sym],
+                latest_stock_price=self.latest_prices.get(sym, 0.0),
+                last_stock_update_ts=self.last_stock_update_ts.get(sym),
+                last_option_update_ts=self.last_option_update_ts.get(sym),
+                source_option_snapshot=self.option_snapshot.get(sym),
+                frozen_option_snapshot=getattr(self, 'frozen_option_snapshot', {}).get(sym),
+                payload_option_snapshot=payload_snap,
+                latest_opt_buckets=self.latest_opt_buckets.get(sym),
+                frozen_latest_opt_buckets=getattr(self, 'frozen_latest_opt_buckets', {}).get(sym),
+                contracts=source_contracts.get(sym, []),
+                pre_supplement_greeks_input=getattr(self, 'runtime_pre_greeks_input_audit', {}).get(sym),
+                post_supplement_greeks_input=getattr(self, 'runtime_post_greeks_input_audit', {}).get(sym),
+                bucket_id=5,
+            )
+
+        if "NVDA" in batch_symbols and int(float(alpha_label_ts)) == 1767366000:
+            try:
+                nvda_idx = batch_symbols.index("NVDA")
+                nvda_sym = "NVDA"
+                nvda_hist = self.history_1min.get(nvda_sym, pd.DataFrame())
+                if nvda_hist is not None and not nvda_hist.empty:
+                    hist_idx = nvda_hist.index
+                    if getattr(hist_idx, "tz", None) is None:
+                        hist_idx = hist_idx.tz_localize(NY_TZ)
+                    tail_ts = np.asarray([int(ts.timestamp()) for ts in hist_idx[-40:]], dtype=np.int64)
+                else:
+                    tail_ts = np.asarray([], dtype=np.int64)
+                nvda_feat = {
+                    name: np.asarray(features_dict[name][nvda_idx], dtype=np.float32).copy()
+                    for name in sorted(features_dict.keys())
+                }
+                cci_idx = self.feat_name_to_idx.get('cci')
+                norm_obj = self.normalizers.get(nvda_sym)
+                norm_seq_tail = valid_norm_seq[nvda_idx] if valid_norm_seq is not None and len(valid_norm_seq) > nvda_idx else None
+                nvda_raw_idx = self.symbols.index(nvda_sym)
+                raw_ohlcv_cols = ['open', 'high', 'low', 'close', 'volume']
+                raw_ohlcv = {}
+                derived_5m = pd.DataFrame()
+                if nvda_hist is not None and not nvda_hist.empty:
+                    hist_tail_30 = nvda_hist.sort_index().tail(30)
+                    for col in raw_ohlcv_cols:
+                        if col in hist_tail_30.columns:
+                            raw_ohlcv[f"hist_{col}_30"] = np.asarray(hist_tail_30[col].fillna(0.0).values, dtype=np.float32)
+                    if 'vwap' in hist_tail_30.columns:
+                        raw_ohlcv["hist_vwap_30"] = np.asarray(hist_tail_30['vwap'].fillna(0.0).values, dtype=np.float32)
+                    if all(col in hist_tail_30.columns for col in ['high', 'low', 'close']):
+                        tp = (
+                            hist_tail_30['high'].astype(np.float64) +
+                            hist_tail_30['low'].astype(np.float64) +
+                            hist_tail_30['close'].astype(np.float64)
+                        ) / 3.0
+                        tp_sma20 = tp.rolling(20, min_periods=20).mean()
+                        tp_mad20 = tp.rolling(20, min_periods=20).apply(
+                            lambda x: float(np.mean(np.abs(x - np.mean(x)))), raw=True
+                        )
+                        cci_raw = (tp - tp_sma20) / (0.015 * tp_mad20.replace(0.0, np.nan))
+                        raw_ohlcv["cci_raw_30"] = np.asarray(cci_raw.fillna(0.0).values, dtype=np.float32)
+
+                    if all(col in nvda_hist.columns for col in ['open', 'high', 'low', 'close', 'volume']):
+                        derived_5m = nvda_hist[['open', 'high', 'low', 'close', 'volume']].sort_index().resample(
+                            '5min', closed='left', label='left'
+                        ).agg({
+                            'open': 'first',
+                            'high': 'max',
+                            'low': 'min',
+                            'close': 'last',
+                            'volume': 'sum'
+                        }).dropna(subset=['open', 'high', 'low', 'close'], how='any')
+                        if not derived_5m.empty:
+                            tail_5m = derived_5m.tail(30)
+                            raw_ohlcv["hist_5m_close_30"] = np.asarray(tail_5m['close'].fillna(0.0).values, dtype=np.float32)
+                            raw_ohlcv["hist_5m_high_30"] = np.asarray(tail_5m['high'].fillna(0.0).values, dtype=np.float32)
+                            raw_ohlcv["hist_5m_low_30"] = np.asarray(tail_5m['low'].fillna(0.0).values, dtype=np.float32)
+                            tp_5m = (
+                                tail_5m['high'].astype(np.float64) +
+                                tail_5m['low'].astype(np.float64) +
+                                tail_5m['close'].astype(np.float64)
+                            ) / 3.0
+                            tp_5m_sma20 = tp_5m.rolling(20, min_periods=20).mean()
+                            tp_5m_mad20 = tp_5m.rolling(20, min_periods=20).apply(
+                                lambda x: float(np.mean(np.abs(x - np.mean(x)))), raw=True
+                            )
+                            cci_raw_5m = (tp_5m - tp_5m_sma20) / (0.015 * tp_5m_mad20.replace(0.0, np.nan))
+                            raw_ohlcv["cci_raw_5m_30"] = np.asarray(cci_raw_5m.fillna(0.0).values, dtype=np.float32)
+                            raw_ohlcv["history_tail_ts_5m"] = np.asarray(
+                                [int(ts.timestamp()) for ts in tail_5m.index],
+                                dtype=np.int64
+                            )
+
+                curr_snap = source_opt_buckets.get(nvda_sym)
+                if curr_snap is None:
+                    curr_snap = source_snap_for_payload.get(nvda_sym)
+                curr_snap_arr = np.asarray(curr_snap, dtype=np.float32) if curr_snap is not None and len(curr_snap) > 0 else np.zeros((6, 12), dtype=np.float32)
+                if curr_snap_arr.ndim != 2:
+                    curr_snap_arr = np.zeros((6, 12), dtype=np.float32)
+                frozen_snap = getattr(self, 'frozen_option_snapshot', {}).get(nvda_sym)
+                frozen_snap_arr = np.asarray(frozen_snap, dtype=np.float32) if frozen_snap is not None and len(frozen_snap) > 0 else np.zeros((6, 12), dtype=np.float32)
+                if frozen_snap_arr.ndim != 2:
+                    frozen_snap_arr = np.zeros((6, 12), dtype=np.float32)
+                frozen_bucket = getattr(self, 'frozen_latest_opt_buckets', {}).get(nvda_sym, [])
+                frozen_bucket_arr = np.asarray(frozen_bucket, dtype=np.float32) if frozen_bucket is not None and len(frozen_bucket) > 0 else np.zeros((6, 12), dtype=np.float32)
+                if frozen_bucket_arr.ndim != 2:
+                    frozen_bucket_arr = np.zeros((6, 12), dtype=np.float32)
+                np.savez_compressed(
+                    "nvda_fcs_parity_1767366000.npz",
+                    **nvda_feat,
+                    **raw_ohlcv,
+                    stock_price=np.asarray([batch_prices[nvda_idx]], dtype=np.float32),
+                    fast_vol=np.asarray([batch_fast_vols[nvda_idx]], dtype=np.float32),
+                    cheat_call_iv=np.asarray([cheat_call_iv[nvda_idx]], dtype=np.float32),
+                    cheat_put_iv=np.asarray([cheat_put_iv[nvda_idx]], dtype=np.float32),
+                    option_snapshot_6x12=curr_snap_arr[:, :12].copy(),
+                    frozen_option_snapshot_6x12=frozen_snap_arr[:, :12].copy(),
+                    frozen_latest_opt_buckets_6x12=frozen_bucket_arr[:, :12].copy(),
+                    cci_feature_seq_30=np.asarray(nvda_feat.get('cci', np.zeros(30, dtype=np.float32)), dtype=np.float32),
+                    cci_norm_seq_30=np.asarray(norm_seq_tail[:, cci_idx], dtype=np.float32).copy() if norm_seq_tail is not None and cci_idx is not None else np.zeros(30, dtype=np.float32),
+                    cci_raw_latest=np.asarray([raw_mat[nvda_raw_idx, cci_idx] if cci_idx is not None else 0.0], dtype=np.float32),
+                    cci_norm_mean=np.asarray([norm_obj.last_mean[cci_idx] if norm_obj is not None and cci_idx is not None else 0.0], dtype=np.float32),
+                    cci_norm_std=np.asarray([norm_obj.last_std[cci_idx] if norm_obj is not None and cci_idx is not None else 1.0], dtype=np.float32),
+                    history_len_5m=np.asarray([int(len(derived_5m))], dtype=np.int32),
+                    valid_mask=np.asarray([int(valid_mask[self.symbols.index(nvda_sym)])], dtype=np.int32),
+                    normalizer_count=np.asarray([int(self.normalizers[nvda_sym].count)], dtype=np.int32),
+                    real_history_len=np.asarray([int(real_history_len)], dtype=np.int32),
+                    real_norm_history_len=np.asarray([int(real_norm_history_len)], dtype=np.int32),
+                    alpha_label_ts=np.asarray([int(alpha_label_ts)], dtype=np.int64),
+                    history_tail_ts=tail_ts,
+                )
+                logger.info("💾 [FCS_TRACE] Saved NVDA feature parity snapshot to nvda_fcs_parity_1767366000.npz")
+            except Exception as trace_e:
+                logger.warning(f"⚠️ [FCS_TRACE] Failed to save NVDA parity snapshot: {trace_e}")
         
         return payload
 
@@ -2321,7 +2791,10 @@ class FeatureComputeService:
                 ts = int(ts_bytes.decode('utf-8'))
                 p = json.loads(payload_bytes.decode('utf-8'))
                 data_list.append({
-                    'timestamp': NY_TZ.localize(datetime.fromtimestamp(ts)),
+                    # Rebuild directly in New York timezone. Localizing a naive
+                    # datetime.fromtimestamp(ts) will reinterpret local wall time
+                    # as New York time and create ghost bars such as 22:30.
+                    'timestamp': datetime.fromtimestamp(ts, NY_TZ),
                     'open': p['open'], 'high': p['high'], 'low': p['low'], 
                     'close': p['close'], 'volume': p['volume'], 'vwap': p.get('vwap', p['close'])
                 })

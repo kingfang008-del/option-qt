@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import pytz
 import sys
 import os
+from pathlib import Path
 
  
 # 🚀 [核心修复] 强制同步仿真测试的运行模式
@@ -39,9 +40,22 @@ def compare_buckets(r_raw, s_raw, spot_price):
                 if idx >= len(buckets):
                     return None
                 row = buckets[idx]
-                if not isinstance(row, list) or len(row) < 10:
+                if not isinstance(row, list) or len(row) < 12:
                     return None
-                return {"iv": row[7], "bid": row[8], "ask": row[9]}
+                return {
+                    "last": row[0],
+                    "delta": row[1],
+                    "gamma": row[2],
+                    "vega": row[3],
+                    "theta": row[4],
+                    "strike": row[5],
+                    "volume": row[6],
+                    "iv": row[7],
+                    "bid": row[8],
+                    "ask": row[9],
+                    "bid_size": row[10],
+                    "ask_size": row[11],
+                }
 
             # config.py 定义:
             # 0=PUT_ATM, 2=CALL_ATM
@@ -49,19 +63,26 @@ def compare_buckets(r_raw, s_raw, spot_price):
 
         r_c, r_p = extract_tagged_info(r_raw)
         s_c, s_p = extract_tagged_info(s_raw)
-        
-        # 结果对位输出:
-        # (r_c_iv, s_c_iv, r_p_iv, s_p_iv,
-        #  r_c_bid, s_c_bid, r_c_ask, s_c_ask,
-        #  r_p_bid, s_p_bid, r_p_ask, s_p_ask)
-        def v(obj, k): return obj[k] if obj else 0.0
-        return (
-            v(r_c, 'iv'), v(s_c, 'iv'), v(r_p, 'iv'), v(s_p, 'iv'),
-            v(r_c, 'bid'), v(s_c, 'bid'), v(r_c, 'ask'), v(s_c, 'ask'),
-            v(r_p, 'bid'), v(s_p, 'bid'), v(r_p, 'ask'), v(s_p, 'ask')
-        )
-    except Exception as e:
-        return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+
+        def v(obj, k):
+            return float(obj[k]) if obj and k in obj else 0.0
+
+        return {
+            'call': {k: (v(r_c, k), v(s_c, k)) for k in ['last', 'delta', 'gamma', 'vega', 'theta', 'strike', 'volume', 'iv', 'bid', 'ask', 'bid_size', 'ask_size']},
+            'put': {k: (v(r_p, k), v(s_p, k)) for k in ['last', 'delta', 'gamma', 'vega', 'theta', 'strike', 'volume', 'iv', 'bid', 'ask', 'bid_size', 'ask_size']},
+        }
+    except Exception:
+        zero_pair = (0.0, 0.0)
+        return {
+            'call': {k: zero_pair for k in ['last', 'delta', 'gamma', 'vega', 'theta', 'strike', 'volume', 'iv', 'bid', 'ask', 'bid_size', 'ask_size']},
+            'put': {k: zero_pair for k in ['last', 'delta', 'gamma', 'vega', 'theta', 'strike', 'volume', 'iv', 'bid', 'ask', 'bid_size', 'ask_size']},
+        }
+
+
+def _print_row(time_str, typ, field, redis_val, sql_val, tol):
+    diff = abs(float(redis_val) - float(sql_val))
+    status = "✅" if diff <= tol else "❌"
+    print(f"{time_str:<10} | {typ:<6} | {field:<12} | {redis_val:<12.6f} | {sql_val:<12.6f} | {diff:<12.8f} | {status}")
 
 def run_parity_audit(symbol='NVDA', start_h=9, start_m=55, end_h=10, end_m=20):
     # 路径自动适配 (优先使用服务器路径)
@@ -111,16 +132,13 @@ def run_parity_audit(symbol='NVDA', start_h=9, start_m=55, end_h=10, end_m=20):
         if r_bar_raw and not sql_bar.empty:
             rb = json.loads(r_bar_raw.decode('utf-8'))
             sb = sql_bar.iloc[0]
-            r_c, s_c = rb['close'], sb['close']
-            r_v, s_v = rb['volume'], sb['volume']
-            c_diff = abs(r_c - s_c)
-            v_diff = abs(r_v - s_v)
-            c_st = "✅" if c_diff < 0.001 else "❌"
-            v_tag = "FLAT" if r_v == 0 else "LIVE"
-            v_st = "✅" if v_diff < 0.1 else "❌"
-            print(f"{time_str:<10} | STOCK  | Close ({v_tag}) | {r_c:<12.4f} | {s_c:<12.4f} | {c_diff:<12.6f} | {c_st}")
-            if v_diff > 0.1:
-                print(f"{'':<10} | STOCK  | Volume     | {r_v:<12.1f} | {s_v:<12.1f} | {v_diff:<12.1f} | {v_st}")
+            _print_row(time_str, "STOCK", "Open", rb.get('open', 0.0), sb['open'], 0.001)
+            _print_row("", "STOCK", "High", rb.get('high', 0.0), sb['high'], 0.001)
+            _print_row("", "STOCK", "Low", rb.get('low', 0.0), sb['low'], 0.001)
+            _print_row("", "STOCK", "Close", rb.get('close', 0.0), sb['close'], 0.001)
+            _print_row("", "STOCK", "Volume", rb.get('volume', 0.0), sb['volume'], 0.1)
+            if 'vwap' in rb:
+                _print_row("", "STOCK", "VWAP", rb.get('vwap', 0.0), rb.get('vwap', 0.0), 0.001)
              
         # 2. Check Option Snapshot
         r_opt_raw = r.hget(f"BAR_OPT:1M:{symbol}", key_str)
@@ -129,35 +147,25 @@ def run_parity_audit(symbol='NVDA', start_h=9, start_m=55, end_h=10, end_m=20):
         if r_opt_raw and not sql_opt.empty:
             ro = json.loads(r_opt_raw.decode('utf-8'))
             so_json = json.loads(sql_opt.iloc[0]['buckets_json'])
-            
-            # 🚀 [终极对位] 注入当前时刻的股价作为 ATM 探测锚点
-            # 🚀 [终极对位] 注入完整字典，激活语义识别逻辑
-            (
-                r_c_iv, s_c_iv, r_p_iv, s_p_iv,
-                r_c_bid, s_c_bid, r_c_ask, s_c_ask,
-                r_p_bid, s_p_bid, r_p_ask, s_p_ask
-            ) = compare_buckets(ro, so_json, current_spot)
-            
-            c_iv_diff = abs(r_c_iv - s_c_iv)
-            p_iv_diff = abs(r_p_iv - s_p_iv)
-            c_bid_diff = abs(r_c_bid - s_c_bid)
-            c_ask_diff = abs(r_c_ask - s_c_ask)
-            p_bid_diff = abs(r_p_bid - s_p_bid)
-            p_ask_diff = abs(r_p_ask - s_p_ask)
-            
-            c_iv_st = "✅" if c_iv_diff < 0.0001 else "❌"
-            p_iv_st = "✅" if p_iv_diff < 0.0001 else "❌"
-            c_bid_st = "✅" if c_bid_diff < 0.001 else "❌"
-            c_ask_st = "✅" if c_ask_diff < 0.001 else "❌"
-            p_bid_st = "✅" if p_bid_diff < 0.001 else "❌"
-            p_ask_st = "✅" if p_ask_diff < 0.001 else "❌"
-            
-            print(f"{'':<10} | OPTION | ATM_C_IV   | {r_c_iv:<12.6f} | {s_c_iv:<12.6f} | {c_iv_diff:<12.8f} | {c_iv_st}")
-            print(f"{'':<10} | OPTION | ATM_P_IV   | {r_p_iv:<12.6f} | {s_p_iv:<12.6f} | {p_iv_diff:<12.8f} | {p_iv_st}")
-            print(f"{'':<10} | OPTION | CALL_BID   | {r_c_bid:<12.4f} | {s_c_bid:<12.4f} | {c_bid_diff:<12.6f} | {c_bid_st}")
-            print(f"{'':<10} | OPTION | CALL_ASK   | {r_c_ask:<12.4f} | {s_c_ask:<12.4f} | {c_ask_diff:<12.6f} | {c_ask_st}")
-            print(f"{'':<10} | OPTION | PUT_BID    | {r_p_bid:<12.4f} | {s_p_bid:<12.4f} | {p_bid_diff:<12.6f} | {p_bid_st}")
-            print(f"{'':<10} | OPTION | PUT_ASK    | {r_p_ask:<12.4f} | {s_p_ask:<12.4f} | {p_ask_diff:<12.6f} | {p_ask_st}")
+
+            bucket_cmp = compare_buckets(ro, so_json, current_spot)
+            field_tols = {
+                'last': 0.001, 'delta': 0.0001, 'gamma': 0.0001, 'vega': 0.0001, 'theta': 0.0001,
+                'strike': 0.001, 'volume': 0.1, 'iv': 0.0001, 'bid': 0.001, 'ask': 0.001,
+                'bid_size': 0.1, 'ask_size': 0.1
+            }
+            field_labels = {
+                'last': 'LAST', 'delta': 'DELTA', 'gamma': 'GAMMA', 'vega': 'VEGA', 'theta': 'THETA',
+                'strike': 'STRIKE', 'volume': 'VOLUME', 'iv': 'IV', 'bid': 'BID', 'ask': 'ASK',
+                'bid_size': 'BID_SIZE', 'ask_size': 'ASK_SIZE'
+            }
+
+            first = True
+            for side_key, side_prefix in [('call', 'CALL_ATM'), ('put', 'PUT_ATM')]:
+                for field_name, (r_val, s_val) in bucket_cmp[side_key].items():
+                    row_time = "" if not first else ""
+                    _print_row(row_time, "OPTION", f"{side_prefix}_{field_labels[field_name]}", r_val, s_val, field_tols[field_name])
+                    first = False
         elif not r_opt_raw and not sql_opt.empty:
              print(f"{time_str:<10} | OPTION | MISSING    | {'EMPTY':<12} | {'DATA_EXIST':<12} | {'N/A':<12} | ⚠️ Redis Missing")
 
@@ -168,10 +176,195 @@ def run_parity_audit(symbol='NVDA', start_h=9, start_m=55, end_h=10, end_m=20):
     print("\n💡 Tip: If Close checks PASS but IV checks FAIL, investigate Greeks re-calculation logic in RealTimeFeatureEngine.")
     print("💡 Tip: If Redis is MISSING data, ensure s2_run_realtime_replay_sqlite_1s.py --turbo has finished processing that time period.")
 
+
+def _fmt_float(val):
+    try:
+        return f"{float(val):.8f}"
+    except Exception:
+        return str(val)
+
+
+def _fmt_ts_array(arr):
+    vals = np.asarray(arr).astype(np.int64).tolist()
+    out = []
+    for ts in vals:
+        try:
+            dt_str = datetime.fromtimestamp(int(ts), NY_TZ).strftime('%Y-%m-%d %H:%M:%S')
+            out.append(f"{ts}({dt_str})")
+        except Exception:
+            out.append(str(ts))
+    return out
+
+
+def run_feature_parity_audit(left_npz: str, right_npz: str, top_n: int = 20):
+    left_path = Path(left_npz).expanduser().resolve()
+    right_path = Path(right_npz).expanduser().resolve()
+
+    if not left_path.exists():
+        raise FileNotFoundError(f"Left feature snapshot not found: {left_path}")
+    if not right_path.exists():
+        raise FileNotFoundError(f"Right feature snapshot not found: {right_path}")
+
+    left = np.load(left_path, allow_pickle=False)
+    right = np.load(right_path, allow_pickle=False)
+
+    left_keys = set(left.files)
+    right_keys = set(right.files)
+    common = sorted(left_keys & right_keys)
+    left_only = sorted(left_keys - right_keys)
+    right_only = sorted(right_keys - left_keys)
+
+    print(f"🧪 [Feature Parity Audit] Left:  {left_path}")
+    print(f"🧪 [Feature Parity Audit] Right: {right_path}")
+    print("-" * 140)
+
+    if left_only:
+        print(f"⚠️ Left-only keys: {', '.join(left_only)}")
+    if right_only:
+        print(f"⚠️ Right-only keys: {', '.join(right_only)}")
+    if left_only or right_only:
+        print("-" * 140)
+
+    diffs = []
+    exact_match_count = 0
+    left_hist_ts = np.asarray(left['history_tail_ts']) if 'history_tail_ts' in left.files else None
+    right_hist_ts = np.asarray(right['history_tail_ts']) if 'history_tail_ts' in right.files else None
+
+    def infer_ts_for_idx(key, idx_tuple):
+        if not idx_tuple or left_hist_ts is None or right_hist_ts is None:
+            return ""
+        if not key.startswith("hist_"):
+            return ""
+        if len(idx_tuple) != 1:
+            return ""
+        pos = int(idx_tuple[0])
+        if pos < 0:
+            return ""
+        # hist_*_30 corresponds to the most recent 30 rows of history_tail_ts
+        left_tail30 = left_hist_ts[-30:] if left_hist_ts.shape[0] >= 30 else left_hist_ts
+        right_tail30 = right_hist_ts[-30:] if right_hist_ts.shape[0] >= 30 else right_hist_ts
+        if pos >= len(left_tail30) or pos >= len(right_tail30):
+            return ""
+        l_ts = int(left_tail30[pos])
+        r_ts = int(right_tail30[pos])
+        l_dt = datetime.fromtimestamp(l_ts, NY_TZ).strftime('%H:%M:%S')
+        r_dt = datetime.fromtimestamp(r_ts, NY_TZ).strftime('%H:%M:%S')
+        return f"{l_dt}/{r_dt}"
+
+    for key in common:
+        a = np.asarray(left[key])
+        b = np.asarray(right[key])
+
+        if a.shape != b.shape:
+            diffs.append({
+                'key': key,
+                'shape_mismatch': True,
+                'left_shape': a.shape,
+                'right_shape': b.shape
+            })
+            continue
+
+        delta = np.abs(a - b)
+        max_diff = float(np.max(delta)) if delta.size else 0.0
+        mean_diff = float(np.mean(delta)) if delta.size else 0.0
+        sum_diff = float(np.sum(delta)) if delta.size else 0.0
+
+        if max_diff <= 1e-12:
+            exact_match_count += 1
+            continue
+
+        flat_idx = int(np.argmax(delta)) if delta.size else 0
+        unravel_idx = np.unravel_index(flat_idx, delta.shape) if delta.size else ()
+        diffs.append({
+            'key': key,
+            'shape_mismatch': False,
+            'shape': a.shape,
+            'max_diff': max_diff,
+            'mean_diff': mean_diff,
+            'sum_diff': sum_diff,
+            'argmax': unravel_idx,
+            'left_val': float(a[unravel_idx]) if delta.size else 0.0,
+            'right_val': float(b[unravel_idx]) if delta.size else 0.0,
+            'ts_hint': infer_ts_for_idx(key, unravel_idx),
+        })
+
+    print(f"✅ Exact matches: {exact_match_count}")
+    print(f"❌ Different keys : {len(diffs)}")
+    print("-" * 140)
+
+    diffs.sort(
+        key=lambda x: (
+            1 if x.get('shape_mismatch') else 0,
+            x.get('max_diff', 0.0),
+            x.get('mean_diff', 0.0),
+            x['key']
+        ),
+        reverse=True
+    )
+
+    if not diffs:
+        print("All common keys match exactly.")
+        return
+
+    header = f"{'Key':<40} | {'Shape':<18} | {'MaxDiff':<14} | {'MeanDiff':<14} | {'WorstIdx':<16} | {'TimeHint':<17} | {'Left':<14} | {'Right':<14}"
+    print(header)
+    print("-" * 140)
+
+    for item in diffs[:top_n]:
+        if item.get('shape_mismatch'):
+            print(
+                f"{item['key']:<40} | "
+                f"{str(item['left_shape']):<18} | "
+                f"{'SHAPE':<14} | "
+                f"{'MISMATCH':<14} | "
+                f"{'-':<16} | "
+                f"{'-':<17} | "
+                f"{str(item['left_shape']):<14} | "
+                f"{str(item['right_shape']):<14}"
+            )
+            continue
+
+        print(
+            f"{item['key']:<40} | "
+            f"{str(item['shape']):<18} | "
+            f"{item['max_diff']:<14.8f} | "
+            f"{item['mean_diff']:<14.8f} | "
+            f"{str(item['argmax']):<16} | "
+            f"{item.get('ts_hint', ''):<17} | "
+            f"{_fmt_float(item['left_val']):<14} | "
+            f"{_fmt_float(item['right_val']):<14}"
+        )
+
+    print("-" * 140)
+    if 'history_tail_ts' in common:
+        left_hist = np.asarray(left['history_tail_ts'])
+        right_hist = np.asarray(right['history_tail_ts'])
+        same_shape = left_hist.shape == right_hist.shape
+        same_values = same_shape and np.array_equal(left_hist, right_hist)
+        if (not same_shape) or (not same_values):
+            print("🕒 history_tail_ts mismatch detail:")
+            print(f"LEFT  ({left_hist.shape}):")
+            for item in _fmt_ts_array(left_hist):
+                print(f"  {item}")
+            print(f"RIGHT ({right_hist.shape}):")
+            for item in _fmt_ts_array(right_hist):
+                print(f"  {item}")
+            print("-" * 140)
+    print("💡 Tip: If only a few option features diverge, inspect FCS frozen option snapshot / gate timing.")
+    print("💡 Tip: If many stock features diverge together, inspect normalizer state and minute history length.")
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--symbol', type=str, default='NVDA')
+    parser.add_argument('--feature-left', type=str, default=None)
+    parser.add_argument('--feature-right', type=str, default=None)
+    parser.add_argument('--top-n', type=int, default=20)
     args = parser.parse_args()
-    
-    run_parity_audit(symbol=args.symbol)
+
+    if args.feature_left or args.feature_right:
+        if not (args.feature_left and args.feature_right):
+            raise SystemExit("Both --feature-left and --feature-right are required for feature parity audit.")
+        run_feature_parity_audit(args.feature_left, args.feature_right, top_n=args.top_n)
+    else:
+        run_parity_audit(symbol=args.symbol)

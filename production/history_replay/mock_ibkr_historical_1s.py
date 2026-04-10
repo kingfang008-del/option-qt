@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import time
+from config import EXECUTION_DELAY_BARS, EXECUTION_DELAY_SECONDS
 
 logger = logging.getLogger("MockIBKR_Hist")
 
@@ -21,11 +22,15 @@ class MockIBKRHistorical:
         self.market_history = [] # [New] 存储完整市场行情，用于后验时延分析
         self.initial_capital =  50_000.0 # [对齐 V15] 初始资金
         # =========================================================
-        # 🚀 [核心引擎升级] 强制实盘延迟模拟开关
+        # 🚀 [核心引擎升级] 与 OMS 共用统一执行延迟配置，避免双处手改
         # =========================================================
-        self.execution_delay_bars = 0   # 1min 级别延迟 (已废弃，建议用 seconds)
-        self.execution_delay_seconds = 1 # [NEW] 1秒级别精准延迟 (高仿真模式)
-        self.fill_delay = self.execution_delay_bars 
+        self.execution_delay_bars = EXECUTION_DELAY_BARS
+        self.execution_delay_seconds = EXECUTION_DELAY_SECONDS
+        self.fill_delay = (
+            f"{self.execution_delay_seconds}s"
+            if self.execution_delay_seconds > 0
+            else f"{self.execution_delay_bars} bar(s)"
+        )
         self.ib = self._create_mock_ib()
 
 

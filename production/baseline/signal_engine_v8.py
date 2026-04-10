@@ -608,11 +608,6 @@ class SignalEngineV8:
         """计算两个时间点之间的有效交易分钟数 (排除闭市时间)"""
         if end_ts < start_ts: return 0.0
         
-        # 简单实现: 如果跨天，只计算每交易日 6.5 小时 (390分钟)
-        # 如果是同一天，直接减
-        # 为了精确，需要考虑 weekends
-        # 这里简化：按日历时间差剔除周末和非交易时间
-        
         start_dt = datetime.fromtimestamp(start_ts, tz=timezone('America/New_York'))
         end_dt = datetime.fromtimestamp(end_ts, tz=timezone('America/New_York'))
         
@@ -999,16 +994,11 @@ class SignalEngineV8:
 
         st = self.states[sym]
         
-        # --- [NEW] 强行修正分钟边界的价格与期权采样 ---
-        # 实时回放进入 :00 秒时，必须强制读取并使用上一分末秒 (:59) 的盘口状态，以对齐 1m 基准表
-        price = float(stock_prices[i])
-        if converge_to_single and self.mode == 'backtest':
-            calc_price = price
-            calc_opt_data = opt_data
-        else:
-            calc_price = st.last_tick_price if st.last_tick_price is not None else price
-            # 期权对位：使用上一秒缓存的期权快照
-            calc_opt_data = st.last_tick_opt_data if st.last_tick_opt_data is not None else opt_data
+        # 🚀 [Parity Fix] 统一对位点：始终相信 Payload 提供的分钟级事实
+        # 不再根据模式进行采样对位修正，彻底解决秒级回放与分钟级基准的 Alpha 漂移
+        price = float(stock_prices[i]) if i < len(stock_prices) else 0.0
+        calc_price = price
+        calc_opt_data = opt_data
         
         raw_alpha_val = float(raw_alphas[i])
         raw_vols = metrics_batch.get('fast_vol', [0.0] * (i + 1))
@@ -1630,7 +1620,7 @@ class SignalEngineV8:
                 x_opt = x_slow[..., self.slow_option_indices]
 
         s_mock = {
-            'stock_id': torch.from_numpy(batch['stock_id']).long().to(self.device) if 'stock_id' in batch else torch.zeros(len(symbols), dtype=torch.long).to(self.device),
+            'stock_id': torch.from_numpy(batch['stock_id'].copy()).long().to(self.device) if 'stock_id' in batch else torch.zeros(len(symbols), dtype=torch.long).to(self.device),
             'sector_id': torch.zeros(len(symbols), dtype=torch.long).to(self.device),
             'day_of_week': torch.full((len(symbols),), ny_now.weekday(), dtype=torch.long).to(self.device),
             'hour': torch.full((len(symbols),), ny_now.hour, dtype=torch.long).to(self.device),
@@ -1725,7 +1715,11 @@ class SignalEngineV8:
     async def process_batch(self, batch: dict):
         # 🚀 [零干扰引擎] 自动识别数据模式
         # 如果是实盘/回放模式，或者环境变量强制开启了高频模式，则进入“升频执行，降频推理”
-        is_high_freq = (self.mode == 'realtime' or os.environ.get('RUN_MODE') == 'LIVEREPLAY' or os.environ.get('FORCE_HIGH_FREQ') == '1')
+        parity_mode_1s = os.environ.get('REPLAY_1S_PARITY_MODE') == '1'
+        is_high_freq = (
+            not parity_mode_1s and
+            (self.mode == 'realtime' or os.environ.get('RUN_MODE') == 'LIVEREPLAY' or os.environ.get('FORCE_HIGH_FREQ') == '1')
+        )
         is_new_minute = batch.get('is_new_minute', True)
         symbols = batch.get('symbols', [])
         stock_prices = batch.get('stock_price', [])
@@ -1862,6 +1856,11 @@ class SignalEngineV8:
         else:
             mean_a = np.mean(raw_alphas); std_a = np.std(raw_alphas)
 
+        # 🚀 [Parity Fix] 将瞬时截面指标注入 Batch，确保 _prep_symbol_metrics 
+        # 使用当前时刻的“事实均值”进行归一化，彻底消除 EWMA 带来的状态漂移。
+        batch['alpha_mean'] = float(mean_a)
+        batch['alpha_std']  = float(std_a)
+
         if self.alpha_count == 0:
             self.dynamic_alpha_mean = float(mean_a); self.dynamic_alpha_std = float(std_a if std_a > 1e-5 else 1.0)
         else:
@@ -1908,6 +1907,11 @@ class SignalEngineV8:
         final_alphas_for_ic = np.zeros(len(symbols))
         
         for i, sym in enumerate(symbols):
+            # 🚀 [Parity Audit] 仅针对 NVDA 打印深度对碰字段
+            if sym == 'NVDA':
+                raw_alpha_val = float(raw_alphas[i])
+                logger.info(f"🔍 [Alpha-Audit] {sym} | Raw:{raw_alpha_val:.6f} | CS_Count:{len(valid_alphas)} | CS_Mean:{mean_a:.6f} | CS_Std:{std_a:.6f} | Mode:{self.states.get(sym).correction_mode if self.states.get(sym) else 'N/A'}")
+
             # 1. 优先获取期权合约数据 (用于指标计算时的对位缓存)
             st = self.states.get(sym)
             if not st and self.mode == 'backtest':

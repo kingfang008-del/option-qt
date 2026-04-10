@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import re
 try:
     from py_vollib_vectorized import vectorized_implied_volatility, get_all_greeks
     HAS_VOLLIB = True
@@ -11,7 +12,7 @@ IDX_PRICE, IDX_DELTA, IDX_GAMMA, IDX_VEGA, IDX_THETA, IDX_STRIKE, IDX_VOLUME, ID
 
 def find_iv(price, S, K, T, r, flag):
     """Fallback simple IV finder if py_vollib is missing"""
-    return 0.2  # Simple placeholder
+    raise RuntimeError("py_vollib_vectorized is required for reliable IV calculation")
 
 # =========================================================
 # 🏦 [动态利率自标定]：模块级缓存与查找逻辑
@@ -66,10 +67,21 @@ def get_current_rfr(current_ts: float):
         val = _G_RFR_SERIES.asof(dt)
         if pd.isna(val):
              raise RuntimeError(f"❌ [RFR_MISSING] No interest rate data found for date {dt.date()} in cache.")
+        val = float(val)
+        if abs(val) > 1.0:
+            val /= 100.0
         return val
     except Exception as e:
         if isinstance(e, RuntimeError): raise e
         raise RuntimeError(f"❌ [RFR_LOOKUP_FAILED] Date: {current_ts}, Error: {e}")
+
+
+def _parse_option_type(ticker: str) -> str:
+    text = str(ticker or "").replace("O:", "")
+    m = re.search(r"\d{6}([CP])", text)
+    if not m:
+        raise ValueError(f"Cannot parse option type from contract: {ticker}")
+    return m.group(1).lower()
 
 def calculate_bucket_greeks(buckets: np.ndarray, S: float, T: float, r: float = None, contracts: list = None, current_ts: float = None):
     """
@@ -88,6 +100,12 @@ def calculate_bucket_greeks(buckets: np.ndarray, S: float, T: float, r: float = 
         # 如果依然拿不到利率，记录警告并返回原始 buckets (杜绝运行时异常中断整个特征链路)
         if log_id < 20: print(f">>>> [RFR_WARNING] r is None. Greeks recalculation aborted.")
         return buckets
+    r = float(r)
+    if abs(r) > 1.0:
+        r /= 100.0
+
+    if not HAS_VOLLIB:
+        raise RuntimeError("py_vollib_vectorized is not installed; cannot recalculate Greeks safely")
     # 🚀 [优化] 持续采样追踪：不再只打印前 20 条，改为每 1000 个 Bucket 采样打印一次
     if not hasattr(calculate_bucket_greeks, "_sample_cnt"):
         calculate_bucket_greeks._sample_cnt = 0
@@ -116,7 +134,10 @@ def calculate_bucket_greeks(buckets: np.ndarray, S: float, T: float, r: float = 
         # 🚨 [FIX] 删除了导致 0.5 泄露的临时占位符
         # buckets[i, IDX_IV] = 0.5 <-- DELETED
         
-        opt_type = 'p' if 'P' in str(ticker) else 'c'
+        try:
+            opt_type = _parse_option_type(ticker)
+        except ValueError:
+            continue
         price = float(buckets[i, IDX_PRICE])
         strike = float(buckets[i, IDX_STRIKE])
         
@@ -129,16 +150,13 @@ def calculate_bucket_greeks(buckets: np.ndarray, S: float, T: float, r: float = 
         iv = 0.0
         if price > 0.0001:
             try:
-                if HAS_VOLLIB:
-                    res = vectorized_implied_volatility(
-                        np.array([price]), np.array([S]), np.array([strike]),
-                        np.array([T]), np.array([r]), opt_type, return_as='numpy', on_error='ignore'
-                    )
-                    iv = float(res[0]) if not np.isnan(res[0]) else 0.0
-                    # if log_id < 20:
-                    #     print(f">>>> [MATH_TRACE] Row {i} | Ticker: {ticker} | P: {price:.4f} | S: {S:.2f} | K: {strike:.2f} | T: {T:.8f} | IV: {iv:.4f}")
-                else:
-                    iv = find_iv(price, S, strike, T, r, opt_type)
+                res = vectorized_implied_volatility(
+                    np.array([price]), np.array([S]), np.array([strike]),
+                    np.array([T]), np.array([r]), opt_type, return_as='numpy', on_error='ignore'
+                )
+                iv = float(res[0]) if not np.isnan(res[0]) else 0.0
+                # if log_id < 20:
+                #     print(f">>>> [MATH_TRACE] Row {i} | Ticker: {ticker} | P: {price:.4f} | S: {S:.2f} | K: {strike:.2f} | T: {T:.8f} | IV: {iv:.4f}")
             except Exception as e:
                 #if log_id < 20: print(f">>>> [MATH_TRACE] Row {i} Calc Error: {e}")
                 iv = 0.0
@@ -150,15 +168,14 @@ def calculate_bucket_greeks(buckets: np.ndarray, S: float, T: float, r: float = 
         # 希腊值计算
         if iv > 0.001:
             try:
-                if HAS_VOLLIB:
-                    g_df = get_all_greeks(
-                        opt_type, np.array([S]), np.array([strike]),
-                        np.array([T]), np.array([r]), np.array([iv]), return_as='dict'
-                    )
-                    buckets[i, IDX_DELTA] = float(g_df['delta'][0])
-                    buckets[i, IDX_GAMMA] = float(g_df['gamma'][0])
-                    buckets[i, IDX_VEGA] = float(g_df['vega'][0])
-                    buckets[i, IDX_THETA] = float(g_df['theta'][0])
+                g_df = get_all_greeks(
+                    opt_type, np.array([S]), np.array([strike]),
+                    np.array([T]), np.array([r]), np.array([iv]), return_as='dict'
+                )
+                buckets[i, IDX_DELTA] = float(g_df['delta'][0])
+                buckets[i, IDX_GAMMA] = float(g_df['gamma'][0])
+                buckets[i, IDX_VEGA] = float(g_df['vega'][0])
+                buckets[i, IDX_THETA] = float(g_df['theta'][0])
             except Exception as e:
                 pass
 

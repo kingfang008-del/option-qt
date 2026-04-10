@@ -7,8 +7,17 @@
 核心改动: 适配 history_sqlite_1s，移除跨越分钟的聚合缓冲池，直接按秒帧 (23400帧/天) 极速发车！
 """
 import os
-os.environ['RUN_MODE'] = 'LIVEREPLAY'
-os.environ['RECALC_GREEKS'] = '1'
+import sys
+PARITY_MODE_BOOT = '--parity-mode' in sys.argv
+if PARITY_MODE_BOOT:
+    os.environ['RUN_MODE'] = 'BACKTEST'
+    os.environ['RECALC_GREEKS'] = '1'
+    os.environ['FORCE_HIGH_FREQ'] = '0'
+    os.environ['REPLAY_1S_PARITY_MODE'] = '1'
+else:
+    os.environ['RUN_MODE'] = 'LIVEREPLAY'
+    os.environ['RECALC_GREEKS'] = '1'
+    os.environ.setdefault('REPLAY_1S_PARITY_MODE', '0')
 import asyncio
 import threading
 import time
@@ -16,7 +25,6 @@ import logging
 import sqlite3
 import json
 import uuid
-import sys
 import copy
 from pathlib import Path
 import pandas as pd
@@ -55,9 +63,10 @@ logger = logging.getLogger("1s_BatchInference")
 
 class BatchSQLiteDriver1s:
     """1秒级全量连续流发球机"""
-    def __init__(self, target_dbs: list, run_id: str):
+    def __init__(self, target_dbs: list, run_id: str, parity_mode: bool = False):
         self.target_dbs = sorted(target_dbs)
         self.run_id = run_id
+        self.parity_mode = parity_mode
         self.r = redis.Redis(**{k:v for k,v in REDIS_CFG.items() if k in ['host','port','db']})
     
     def run(self):
@@ -125,6 +134,13 @@ class BatchSQLiteDriver1s:
             if df_bars_1s.empty:
                 logger.warning(f"⚠️ No 1s data in {db_path.name}, skipping.")
                 continue
+
+            if self.parity_mode:
+                rth_start_dt = pytz.timezone('America/New_York').localize(datetime.strptime(date_str + " 09:30:00", "%Y%m%d %H:%M:%S"))
+                rth_start_ts = int(rth_start_dt.timestamp())
+                df_bars_1s = df_bars_1s[df_bars_1s['ts'] >= rth_start_ts].copy()
+                df_opts_1s = df_opts_1s[df_opts_1s['ts'] >= rth_start_ts].copy()
+                logger.info(f"🎯 [Parity Mode] Trimmed pre-RTH 1s rows before {rth_start_dt}.")
 
             # =====================================================================
             # 🚀 [真 1s 高频发车]
@@ -214,10 +230,15 @@ class BatchSQLiteDriver1s:
                         payload['stock'] = b1_ts[sym]
                     else:
                         # [重要] 若无成交，则价格继承上一秒 Close，成交量强制归 0
-                        # 这样特征引擎收到的 price 不会突降到 0
                         if payload['stock']['close'] > 0:
-                            payload['stock'] = payload['stock'].copy()
-                            payload['stock']['volume'] = 0.0
+                            prev_close = float(payload['stock']['close'])
+                            payload['stock'] = {
+                                'open': prev_close,
+                                'high': prev_close,
+                                'low': prev_close,
+                                'close': prev_close,
+                                'volume': 0.0
+                            }
                     
                     # 3. 如果本秒有期权快照，更新
                     if sym in o1_ts:
@@ -380,7 +401,8 @@ class BatchSQLiteDriver1s:
             if hasattr(feat_svc, 'reset_internal_memory'):
                 feat_svc.reset_internal_memory()
             
-            start_dt = NY_TZ.localize(datetime.strptime(date_str + " 09:29:00", "%Y%m%d %H:%M:%S"))
+            start_hhmmss = "09:30:00" if self.parity_mode else "09:29:00"
+            start_dt = NY_TZ.localize(datetime.strptime(date_str + f" {start_hhmmss}", "%Y%m%d %H:%M:%S"))
             end_dt = NY_TZ.localize(datetime.strptime(date_str + " 16:00:00", "%Y%m%d %H:%M:%S"))
             start_ts, end_ts = int(start_dt.timestamp()), int(end_dt.timestamp())
 
@@ -500,8 +522,14 @@ class BatchSQLiteDriver1s:
                         payload['stock'] = b1_ts[sym]
                     else:
                         if payload['stock']['close'] > 0:
-                            payload['stock'] = payload['stock'].copy()
-                            payload['stock']['volume'] = 0.0
+                            prev_close = float(payload['stock']['close'])
+                            payload['stock'] = {
+                                'open': prev_close,
+                                'high': prev_close,
+                                'low': prev_close,
+                                'close': prev_close,
+                                'volume': 0.0
+                            }
                             
                     if sym in o1_ts: payload.update(o1_ts[sym])
                     
@@ -528,6 +556,12 @@ class BatchSQLiteDriver1s:
                 feat_payload = await feat_svc.run_compute_cycle(ts_from_payload=ts_val, return_payload=True)
                 
                 if feat_payload:
+                    if self.parity_mode and not bool(feat_payload.get('is_new_minute', False)):
+                        # Parity mode compares minute facts only. Dropping second-level
+                        # transient payloads prevents :01 timestamps and fallback IV=0.5
+                        # from leaking into alpha_logs.
+                        continue
+
                     # =====================================================================
                     # 🚀 [终极闭环修复 3] 将含 IV 的特征包推给持久化服务，写入 option_snapshots
                     # =====================================================================
@@ -570,7 +604,15 @@ async def main():
     parser.add_argument('--skip-warmup', action='store_true', help="Skip Feature Engine deep warmup for instant start")
     parser.add_argument('--enable-oms', action='store_true', help="Enable full OMS and Mock Broker (Backtest mode)")
     parser.add_argument('--turbo', action='store_true', help="🚀 [Turbo Mode] In-process execution (Redis bypass) for Alpha-only mode")
+    parser.add_argument('--parity-mode', action='store_true', help="Align 1s replay with minute launcher semantics (BACKTEST mode, no pre-09:30 frames).")
     args = parser.parse_args()
+
+    if args.parity_mode:
+        os.environ['RUN_MODE'] = 'BACKTEST'
+        os.environ['RECALC_GREEKS'] = '1'
+        os.environ['FORCE_HIGH_FREQ'] = '0'
+        os.environ['REPLAY_1S_PARITY_MODE'] = '1'
+        logger.info("🎯 [Parity Mode] 1s replay aligned to minute launcher semantics while keeping 1s Greek recompute enabled.")
 
     if not DB_DIR_1S.exists():
         logger.error(f"❌ DB Directory not found: {DB_DIR_1S}")
@@ -657,6 +699,11 @@ async def main():
 
     env = os.environ.copy()
     env['REPLAY_START_TS'] = str(replay_start_ts)
+    if args.parity_mode:
+        env['RUN_MODE'] = 'BACKTEST'
+        env['RECALC_GREEKS'] = '1'
+        env['FORCE_HIGH_FREQ'] = '0'
+        env['REPLAY_1S_PARITY_MODE'] = '1'
     if args.skip_warmup:
         env['SKIP_DEEP_WARMUP'] = '1'
 
@@ -731,14 +778,10 @@ async def main():
         
         base_dir = Path(__file__).resolve().parent.parent.parent
         config_paths = {
-            'fast': str(base_dir / "daily_backtest/fast_feature.json"), 
-            'slow': str(base_dir / "daily_backtest/slow_feature.json")
+            'fast': str("/home/kingfang007/notebook/train/fast_feature.json"),
+            'slow': str("/home/kingfang007/notebook/train/slow_feature.json")
         }
         
-        if not Path(config_paths['fast']).exists():
-            config_paths['fast'] = str(PROJECT_ROOT / "config/fast_feature.json")
-            config_paths['slow'] = str(PROJECT_ROOT / "config/slow_feature.json")
-
         model_paths = {
             'slow': str(PROJECT_ROOT / "checkpoints_advanced_alpha/advanced_alpha_best.pth"),
             'fast': str(PROJECT_ROOT / "checkpoints_advanced_alpha/fast_final_best.pth")
@@ -764,7 +807,7 @@ async def main():
             persistence_svc = data_persistence_service_v8_sqlite.DataPersistenceServiceSQLite()
             threading.Thread(target=persistence_svc.run, daemon=True).start()
             
-            driver = BatchSQLiteDriver1s(target_dbs=target_dbs, run_id=RUN_ID)
+            driver = BatchSQLiteDriver1s(target_dbs=target_dbs, run_id=RUN_ID, parity_mode=args.parity_mode)
             await driver.run_turbo(feat_svc, signal_svc)
             
             logger.info("🏁 [Turbo Mode] Replay Completed.")
@@ -815,7 +858,7 @@ async def main():
 
         def _run_driver():
             try:
-                driver = BatchSQLiteDriver1s(target_dbs=target_dbs, run_id=RUN_ID)
+                driver = BatchSQLiteDriver1s(target_dbs=target_dbs, run_id=RUN_ID, parity_mode=args.parity_mode)
                 driver.run()
             except Exception as e:
                 logger.error(f"❌ 1s Driver Crashed: {e}")

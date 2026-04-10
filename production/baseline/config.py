@@ -152,6 +152,20 @@ SLIPPAGE_EXIT_PCT     = 0.001      # 平仓滑点 (0.1%)
 EXIT_ORDER_TYPE       = 'MKT'      # 平仓订单类型 (MKT/LMT)
 DISABLE_ICEBERG       = False      # [新增] 是否禁用冰山拆单逻辑 (用于对比秒级与分钟级一致性)
 SYNC_EXECUTION        = False      # [新增] 同步执行模式 (用于 bit-perfect 确定性回放验证)
+# 通用执行延迟: 作为 OMS 与 Mock IBKR 的统一来源。
+# 1min 级回测优先使用 bars，1s 级高仿真回测可使用 seconds。
+EXECUTION_DELAY_BARS = int(
+    os.environ.get("EXECUTION_DELAY_BARS", os.environ.get("OMS_SIGNAL_DELAY_BARS", "0"))
+)
+EXECUTION_DELAY_SECONDS = int(os.environ.get("EXECUTION_DELAY_SECONDS", "0"))
+# OMS 延迟执行: 保持特征/标签时间不变，仅把真正下单延后 N 根 1min bar。
+# 默认只延迟 BUY，避免把风控平仓也一起拖后；如有需要可通过环境变量扩展到 SELL。
+OMS_SIGNAL_DELAY_BARS = EXECUTION_DELAY_BARS
+OMS_SIGNAL_DELAY_ACTIONS = tuple(
+    a.strip().upper()
+    for a in os.environ.get("OMS_SIGNAL_DELAY_ACTIONS", "BUY").split(",")
+    if a.strip()
+)
 
 # ================= Dashboard 配置 =================
 DASHBOARD_REFRESH_RATE = 1.0

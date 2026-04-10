@@ -15,6 +15,7 @@
 
 import asyncio
 import math
+import copy
 
 import redis
 
@@ -72,6 +73,8 @@ from config import (
     USE_BID_ASK_PRICING,        # [New] 价格模式开关
     SLIPPAGE_ENTRY_PCT,         # [Fix] Added to imports
     SLIPPAGE_EXIT_PCT,          # [Fix] Added to imports
+    OMS_SIGNAL_DELAY_BARS,
+    OMS_SIGNAL_DELAY_ACTIONS,
     IS_LIVEREPLAY,
     IS_BACKTEST,
     IS_SIMULATED
@@ -322,6 +325,7 @@ class ExecutionEngineV8:
         self.last_index_trend = 0 
         self.spy_ema_roc = 0.0     # [NEW] 5min EMA ROC (势能平滑)
         self.qqq_ema_roc = 0.0
+        self.delayed_signal_queue = []
         
         # 赋予一个先验初始值 (防止冷启动期间的极端缩放)
         self.dynamic_vol_mean = 0.0739 
@@ -331,8 +335,8 @@ class ExecutionEngineV8:
        
         
         # ML Models run on Signal Engine
-        
 
+        
 
     def _get_fair_market_price(self, base_price: float, bid: float, ask: float, prev_price: float = 0.0) -> float:
         """
@@ -357,6 +361,62 @@ class ExecutionEngineV8:
                     market_price = prev_price
 
         return market_price
+
+    def _should_delay_signal(self, action: str) -> bool:
+        return OMS_SIGNAL_DELAY_BARS > 0 and str(action).upper() in OMS_SIGNAL_DELAY_ACTIONS
+
+    def _eligible_trade_ts(self, signal_ts: float) -> float:
+        return float(signal_ts) + float(OMS_SIGNAL_DELAY_BARS * 60)
+
+    async def _queue_delayed_signal(self, payload: dict):
+        sym = payload.get('symbol')
+        action = str(payload.get('action', '')).upper()
+        curr_ts = float(payload.get('ts', 0.0) or 0.0)
+        eligible_ts = self._eligible_trade_ts(curr_ts)
+        queued_payload = copy.deepcopy(payload)
+        queued_payload['_delay_eligible_ts'] = eligible_ts
+        self.delayed_signal_queue.append(queued_payload)
+        self.delayed_signal_queue.sort(key=lambda x: float(x.get('_delay_eligible_ts', 0.0)))
+
+        if sym in self.states:
+            st = self.states[sym]
+            st.is_pending = True
+            st.pending_side = action
+
+        logger.info(
+            f"⏳ [OMS Delay] Queued {action} for {sym} | "
+            f"signal_ts={curr_ts:.0f} | eligible_ts={eligible_ts:.0f} | delay_bars={OMS_SIGNAL_DELAY_BARS}"
+        )
+        await self._broadcast_state_to_redis()
+
+    async def _flush_delayed_signals(self, curr_ts: float):
+        if not self.delayed_signal_queue:
+            return
+
+        ready = []
+        pending = []
+        for item in self.delayed_signal_queue:
+            if float(item.get('_delay_eligible_ts', 0.0)) <= float(curr_ts):
+                ready.append(item)
+            else:
+                pending.append(item)
+        self.delayed_signal_queue = pending
+
+        for item in ready:
+            sym = item.get('symbol')
+            action = str(item.get('action', '')).upper()
+            if sym in self.states:
+                st = self.states[sym]
+                st.is_pending = False
+                st.pending_side = None
+
+            released = copy.deepcopy(item)
+            released['_delay_released'] = True
+            logger.info(
+                f"▶️ [OMS Delay] Releasing {action} for {sym} at ts={curr_ts:.0f} "
+                f"(eligible_ts={float(item.get('_delay_eligible_ts', 0.0)):.0f})"
+            )
+            await self._handle_trade_signal(released, allow_delay_queue=False)
 
     def _prepare_ny_time(self, batch: dict):
         """[Refactor] 统一解析美东时间及处理保存逻辑"""
@@ -526,9 +586,18 @@ class ExecutionEngineV8:
             pipe.hset("oms:live_positions", mapping=active_states)
         pipe.execute()
 
-    async def process_trade_signal(self, payload: dict):
+    async def _handle_trade_signal(self, payload: dict, allow_delay_queue: bool = True):
         action = payload.get('action')
         curr_ts = payload.get('ts')
+        curr_ts_float = float(curr_ts) if curr_ts is not None else None
+
+        if curr_ts_float is not None:
+            self.last_curr_ts = curr_ts_float
+            await self._flush_delayed_signals(curr_ts_float)
+
+        if allow_delay_queue and action in ('BUY', 'SELL') and self._should_delay_signal(action):
+            await self._queue_delayed_signal(payload)
+            return
         
         # 👇 拦截 SE 发来的同步锁信号
         if action == 'SYNC':
@@ -551,9 +620,6 @@ class ExecutionEngineV8:
 
         sig = payload.get('sig')
         stock_price = payload.get('stock_price', 0.0)
-         
-        if curr_ts:
-            self.last_curr_ts = curr_ts  # [补充] 维持 OMS 的逻辑时钟
 
         batch_idx = payload.get('batch_idx', -1)
 
@@ -564,6 +630,9 @@ class ExecutionEngineV8:
         
         # [🔥 避免竞争] 如果当前状态被锁，直接拒绝新的发单 (仅针对开仓)
         if action == 'BUY':
+            if payload.get('_delay_released'):
+                st.is_pending = False
+                st.pending_side = None
             if st.is_pending and not getattr(self, 'use_shared_mem', False):
                 logger.warning(f"🚫 [OMS] {sym} is pending! Ignoring BUY signal.")
                 return
@@ -574,6 +643,9 @@ class ExecutionEngineV8:
             await self._execute_entry(sym, sig, stock_price, curr_ts, batch_idx)
             
         elif action == 'SELL':
+            if payload.get('_delay_released'):
+                st.is_pending = False
+                st.pending_side = None
             # 🚀 [修复 1] 共享内存下，SE 为了光速复用资金已提前将 position 清 0，OMS 必须无条件放行平仓单！
             if st.position == 0 and not getattr(self, 'use_shared_mem', False):
                 logger.warning(f"🚫 [OMS] {sym} has no position! Ignoring SELL signal.")
@@ -583,6 +655,9 @@ class ExecutionEngineV8:
         
         # 👑 处理完毕后，全网广播最新的真实持仓状态！
         await self._broadcast_state_to_redis()
+
+    async def process_trade_signal(self, payload: dict):
+        await self._handle_trade_signal(payload, allow_delay_queue=True)
 
     async def run(self):
         from config import get_redis_db, RUN_MODE

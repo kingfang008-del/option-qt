@@ -9,7 +9,7 @@
 import os
 # 🚀 必须在最顶层注入，确保后续 import 的 config.py 以及启动的子进程都能继承！
 os.environ['RUN_MODE'] = 'BACKTEST'
-os.environ['RECALC_GREEKS'] = '0'
+os.environ['RECALC_GREEKS'] = '1'
 import asyncio
 import threading
 import time
@@ -102,7 +102,7 @@ class BatchSQLiteDriver:
                 
                 # 2. 提取双分辨率数据
                 logger.info(f"📥 Fetching dual-resolution data from SQLite for {date_str}...")
-                df_bars_1m = pd.read_sql("SELECT symbol, ts, open, high, low, close, volume FROM market_bars_1m ORDER BY ts ASC", conn)
+                df_bars_1m = pd.read_sql("SELECT symbol, ts, open, high, low, close, volume, vwap FROM market_bars_1m ORDER BY ts ASC", conn)
                 df_opts_1m = pd.read_sql("SELECT symbol, ts, buckets_json FROM option_snapshots_1m ORDER BY ts ASC", conn)
                 
                 # 检查是否存在 5m 表，不存在则跳过 5m 逻辑
@@ -110,7 +110,7 @@ class BatchSQLiteDriver:
                 has_5m = c.fetchone() is not None
                 
                 if has_5m:
-                    df_bars_5m = pd.read_sql("SELECT symbol, ts, open, high, low, close, volume FROM market_bars_5m ORDER BY ts ASC", conn)
+                    df_bars_5m = pd.read_sql("SELECT symbol, ts, open, high, low, close, volume, vwap FROM market_bars_5m ORDER BY ts ASC", conn)
                     df_opts_5m = pd.read_sql("SELECT symbol, ts, buckets_json FROM option_snapshots_5m ORDER BY ts ASC", conn)
                 else:
                     df_bars_5m = pd.DataFrame()
@@ -146,7 +146,8 @@ class BatchSQLiteDriver:
                     if type_key == 'bars':
                         m[ts][sym] = {
                             'open': row['open'], 'high': row['high'],
-                            'low': row['low'], 'close': row['close'], 'volume': row['volume']
+                            'low': row['low'], 'close': row['close'], 'volume': row['volume'],
+                            'vwap': row.get('vwap', row['close'])
                         }
                     else: # options
                         opt_data = row['buckets_json']
