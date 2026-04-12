@@ -342,9 +342,9 @@ class MockIBKRHistorical:
         from pathlib import Path
         log_dir = Path.home() / "quant_project/logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        filename = log_dir / "replay_trades_v8.csv"
-        df_trades.to_csv(filename, index=False)
-        print(f"\n💾 Trades saved to {filename}")
+        target_path = log_dir / filename
+        df_trades.to_csv(target_path, index=False)
+        print(f"\n💾 Trades saved to {target_path}")
         
         self._print_daily_report(df_trades)
         self._print_summary_report(df_trades, open_pos)

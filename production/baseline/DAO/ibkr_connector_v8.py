@@ -81,10 +81,24 @@ class IBKRConnectorFinal:
         self.initial_scan_done = False # [New] 用于防止 maintenance_loop 抢跑
 
         self.last_greeks_cache = {}  # [🔥 核心补丁 1] 新增：缓存全套希腊值
+        self._use_tick_driven_publish = os.environ.get('IBKR_TICK_DRIVEN_PUBLISH', '1').strip().lower() not in {'0', 'false', 'no', 'off'}
+        self._publish_debounce_sec = max(
+            0.0,
+            float(os.environ.get('IBKR_TICK_PUBLISH_DEBOUNCE_MS', '80')) / 1000.0
+        )
+        self._last_bar_cache = {}
+        self._last_total_volume = {}
+        self._collecting_ts = None
         
         # [NEW] 绑定错误处理
         self.ib.errorEvent += self._on_error
+        if self._use_tick_driven_publish:
+            self.ib.pendingTickersEvent += self._on_pending_tickers
         logger.info("🧮 IB side Greeks disabled: streaming price/orderbook only; Greeks computed in realtime_feature_engine.")
+        if self._use_tick_driven_publish:
+            logger.info(f"⚡ Tick-driven publish enabled | debounce={self._publish_debounce_sec * 1000:.0f}ms")
+        else:
+            logger.info("🕔 Tick-driven publish disabled; using 5s bar trigger.")
 
     async def connect(self):
         """保持连接活跃"""
@@ -466,9 +480,9 @@ class IBKRConnectorFinal:
             # B. 存入内存 & 订阅正股
             self.active_stocks[original_key] = contract
             
-            # [Fix] 订阅 5秒 Bar (关键: 触发 _on_stock_bar)
+            # 保留 5 秒 Bar 作为 OHLCV / fallback 数据源，但不再作为低延迟发布的唯一触发器。
             self.ib.reqRealTimeBars(contract, 5, 'TRADES', False)
-            # 订阅实时行情 (用于 Greeks/Tick)
+            # 订阅实时行情，用于 tick 驱动的低延迟发布与价格更新。
             self.ib.reqMktData(contract, '', False, False)
             # logger.info(f"✅ Subscribed Stock: {original_key}")
 
@@ -528,21 +542,107 @@ class IBKRConnectorFinal:
             'ts': b.time.timestamp()
         }
 
-        # 2. [🔥 核心逻辑] 软批处理 (Debounced Bar Collection)
-        # 目的: 给予 300ms 聚合窗口，确保全市场(30+标的)的新 Bar 都能到齐再发布快照。
-        # 彻底解决“首个标的抢跑推送旧数据”导致的实盘特征延迟/畸变问题。
+        # 2. [Fallback] 若未开启 tick 驱动，则仍使用 5 秒 Bar 触发整帧发布。
         ts_val = b.time.timestamp()
         if not hasattr(self, '_last_published_batch_ts'): self._last_published_batch_ts = 0
-        
-        # 如果是新的一秒，且当前没有正在启动的采集器，则启动 300ms 采集任务
-        if ts_val > self._last_published_batch_ts:
-            if not hasattr(self, '_collecting_ts') or self._collecting_ts != ts_val:
+        if not self._use_tick_driven_publish and ts_val > self._last_published_batch_ts:
+            if self._collecting_ts != ts_val:
                 self._collecting_ts = ts_val
                 asyncio.create_task(self._debounced_publish(ts_val))
 
+    @staticmethod
+    def _safe_float(val):
+        return float(val) if (val is not None and not np.isnan(val)) else 0.0
+
+    @staticmethod
+    def _to_symbol(contract_sym: str) -> str:
+        return contract_sym.replace(' ', '.') if 'BRK' in contract_sym else contract_sym
+
+    def _resolve_stock_price_from_ticker(self, ticker) -> float:
+        last_p = self._safe_float(getattr(ticker, 'last', None))
+        if last_p > 0:
+            return last_p
+
+        market_p = self._safe_float(ticker.marketPrice()) if hasattr(ticker, 'marketPrice') else 0.0
+        if market_p > 0:
+            return market_p
+
+        close_p = self._safe_float(getattr(ticker, 'close', None))
+        if close_p > 0:
+            return close_p
+
+        bid_p = self._safe_float(getattr(ticker, 'bid', None))
+        ask_p = self._safe_float(getattr(ticker, 'ask', None))
+        if bid_p > 0 and ask_p > 0:
+            return (bid_p + ask_p) / 2.0
+        return 0.0
+
+    def _on_pending_tickers(self, tickers):
+        """使用 reqMktData 驱动 1 秒级本地聚合，避免整条链被 5 秒 Bar 卡住。"""
+        if not self._use_tick_driven_publish:
+            return
+
+        now_ts = time.time()
+        second_ts = float(int(now_ts))
+        touched = False
+
+        for ticker in tickers:
+            try:
+                contract = getattr(ticker, 'contract', None)
+                if contract is None or getattr(contract, 'secType', '') != 'STK':
+                    continue
+
+                sym = self._to_symbol(contract.symbol)
+                if sym not in self.active_stocks:
+                    continue
+
+                price = self._resolve_stock_price_from_ticker(ticker)
+                if price <= 0:
+                    continue
+
+                total_vol = self._safe_float(getattr(ticker, 'volume', None))
+                prev_total = self._last_total_volume.get(sym)
+                delta_vol = 0.0
+                if total_vol > 0:
+                    if prev_total is not None and total_vol >= prev_total:
+                        delta_vol = total_vol - prev_total
+                    self._last_total_volume[sym] = total_vol
+
+                bar = self._last_bar_cache.get(sym)
+                if bar is None or int(bar.get('ts', 0)) != int(second_ts):
+                    self._last_bar_cache[sym] = {
+                        'open': price,
+                        'high': price,
+                        'low': price,
+                        'close': price,
+                        'volume': max(0.0, delta_vol),
+                        'ts': second_ts,
+                    }
+                else:
+                    bar['high'] = max(float(bar['high']), price)
+                    bar['low'] = min(float(bar['low']), price)
+                    bar['close'] = price
+                    bar['volume'] = float(bar.get('volume', 0.0)) + max(0.0, delta_vol)
+
+                self.last_spot_prices[sym] = price
+                self.last_tick_time[sym] = now_ts
+                touched = True
+            except Exception:
+                continue
+
+        if not touched:
+            return
+
+        if not hasattr(self, '_last_published_batch_ts'):
+            self._last_published_batch_ts = 0
+
+        if second_ts > self._last_published_batch_ts and self._collecting_ts != second_ts:
+            self._collecting_ts = second_ts
+            asyncio.create_task(self._debounced_publish(second_ts))
+
     async def _debounced_publish(self, ts_val):
         """[🔥 NEW] 聚合窗口延迟触发器"""
-        await asyncio.sleep(0.3) # 给予 300ms 的 IBKR 传输抖动冗余
+        await asyncio.sleep(self._publish_debounce_sec)
         if ts_val > self._last_published_batch_ts:
             self._last_published_batch_ts = ts_val
             self._publish_batch_snapshot(ts_val)
@@ -553,7 +653,7 @@ class IBKRConnectorFinal:
         
         # 扫描所有活跃标的 (含 SPY/QQQ 等无期权标的)
         for sym in self.active_stocks:
-            # 获取该标的最近一次的 5s Bar 缓存
+            # 获取该标的最近一次的本地聚合 Bar 缓存
             bar_data = self._last_bar_cache.get(sym)
             if not bar_data: continue
             

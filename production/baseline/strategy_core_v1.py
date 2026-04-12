@@ -17,7 +17,10 @@ from datetime import datetime
 from typing import List, Tuple
 
 from config import TARGET_SYMBOLS
-from strategy_config import StrategyConfig
+try:
+    from strategy_config import StrategyConfig
+except ImportError:
+    from production.baseline.strategy_config import StrategyConfig
 
 class StrategyCoreV1:
     def __init__(self, config: StrategyConfig = None):

@@ -18,6 +18,12 @@ class OrchestratorAccounting:
     def __init__(self, orchestrator):
         self.orch = orchestrator
 
+    @staticmethod
+    def _resolve_mode_label(mode_override=None):
+        if mode_override:
+            return mode_override
+        return "BACKTEST" if getattr(os.environ, 'get', None) and os.environ.get('RUN_MODE') == 'LIVEREPLAY' else None
+
     def _emit_trade_log(self, payload):
         """发送交易日志到 Redis Stream供 Dashboard 展示"""
         try:
@@ -34,6 +40,62 @@ class OrchestratorAccounting:
             self.orch.r.xadd(STREAM_TRADE_LOG, {'data': ser.pack(payload)}, maxlen=10000)
         except Exception as e:
             logger.error(f"Failed to emit trade log: {e}")
+
+    def _process_open_accounting(
+        self,
+        sym,
+        st,
+        filled_qty,
+        fill_price,
+        stock_price,
+        entry_ts,
+        sig,
+        duration,
+        ratio,
+        timing_fields=None,
+        mode_override=None,
+        note_suffix="",
+    ):
+        """统一处理 OPEN 成交后的状态回写与日志落库。"""
+        if filled_qty <= 0:
+            return
+
+        st.position = sig['dir']
+        st.qty = filled_qty
+        st.entry_stock = stock_price
+        st.entry_price = fill_price
+        st.entry_ts = entry_ts
+        st.opt_type = 'call' if st.position == 1 else 'put'
+        st.entry_spy_roc = sig.get('meta', {}).get('spy_roc', 0.0)
+        st.entry_index_trend = sig.get('meta', {}).get('index_trend', 0)
+        st.entry_alpha_z = sig.get('meta', {}).get('alpha_z', 0.0)
+        st.entry_iv = sig.get('meta', {}).get('iv', st.last_valid_iv)
+        st.max_roi = 0.0
+
+        timing_fields = timing_fields or {}
+        reason = sig.get('reason', '')
+        if note_suffix:
+            reason = f"{reason}{note_suffix}"
+
+        self._emit_trade_log({
+            'ts': entry_ts,
+            'symbol': sym,
+            'action': 'OPEN',
+            'side': 'BUY',
+            'qty': filled_qty,
+            'price': fill_price,
+            'stock_price': stock_price,
+            **timing_fields,
+            'strategy_note': json.dumps({
+                'tag': sig.get('tag'),
+                'reason': reason,
+                'iv': getattr(st, 'last_valid_iv', 0.0),
+                **timing_fields,
+            }),
+            'fill_duration': round(duration, 1),
+            'fill_ratio': round(ratio, 2),
+            'mode': mode_override or self.orch.mode.upper(),
+        })
 
     def _process_exit_accounting(self, sym, st, filled_qty, fill_price, stock_price, curr_ts, reason, duration, ratio, original_position=None):
         """[核心新增] 统一财务清算中心：只有发生物理成交才碰钱、算盈亏、写日志"""

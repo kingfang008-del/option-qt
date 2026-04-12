@@ -26,6 +26,7 @@ import sqlite3
 import json
 import uuid
 import copy
+import psycopg2
 from pathlib import Path
 import pandas as pd
 import pytz
@@ -48,10 +49,11 @@ import signal_engine_v8
 import execution_engine_v8
 from mock_ibkr_historical import MockIBKRHistorical
 import data_persistence_service_v8_sqlite
+import data_persistence_service_v8_pg
 
 from config import (
     REDIS_CFG, PROJECT_ROOT, FEATURE_SERVICE_STATE_FILE,STREAM_ORCH_SIGNAL,GROUP_FEATURE,GROUP_ORCH,GROUP_OMS,GROUP_PERSISTENCE,
-    STREAM_FUSED_MARKET, HASH_OPTION_SNAPSHOT, STREAM_INFERENCE, STREAM_TRADE_LOG
+    STREAM_FUSED_MARKET, HASH_OPTION_SNAPSHOT, STREAM_INFERENCE, STREAM_TRADE_LOG, PG_DB_URL
 )
 import redis
 
@@ -60,6 +62,53 @@ DB_DIR_1S = PROJECT_ROOT / "data" / "history_sqlite_1s"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [1s_INFERENCE] - %(message)s')
 logger = logging.getLogger("1s_BatchInference")
+
+
+def _pg_partition_exists(cursor, table_name: str) -> bool:
+    cursor.execute(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name=%s)",
+        (table_name,),
+    )
+    return bool(cursor.fetchone()[0])
+
+
+def _truncate_pg_mirror_day(date_str: str, *, include_alpha: bool = True, include_features: bool = False, include_market: bool = False):
+    """Clear mirrored PG partitions for a replay day so sqlite remains the single source of truth."""
+    tables = []
+    if include_alpha:
+        tables.append(f"alpha_logs_{date_str}")
+    if include_features:
+        tables.append(f"feature_logs_{date_str}")
+    if include_market:
+        tables.extend([
+            f"market_bars_1s_{date_str}",
+            f"option_snapshots_1s_{date_str}",
+            f"market_bars_5m_{date_str}",
+            f"option_snapshots_5m_{date_str}",
+        ])
+
+    if not tables:
+        return
+
+    conn = None
+    try:
+        conn = psycopg2.connect(PG_DB_URL)
+        cur = conn.cursor()
+        truncated = []
+        for table_name in tables:
+            if _pg_partition_exists(cur, table_name):
+                cur.execute(f"TRUNCATE TABLE {table_name}")
+                truncated.append(table_name)
+        conn.commit()
+        if truncated:
+            logger.info(f"🧹 [PG Mirror Clean] {date_str} truncated: {', '.join(truncated)}")
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.warning(f"⚠️ [PG Mirror Clean Failed] {date_str}: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 class BatchSQLiteDriver1s:
     """1秒级全量连续流发球机"""
@@ -312,52 +361,91 @@ class BatchSQLiteDriver1s:
     async def _load_all_data_to_memory(self, start_ts, end_ts):
         """🚀 [Turbo Mode] 一次性载入全天 1s/5m 数据，消除 SQLite 瓶颈"""
         logger.info(f"💾 [Turbo] Loading all data from {start_ts} to {end_ts}...")
-        
-        # 1. 加载 1s 股票数据
-        df_b1 = pd.read_sql(f"SELECT * FROM market_bars_1s WHERE ts >= {start_ts} AND ts <= {end_ts}", self.conn)
-        map_b1 = {}
-        for ts, group in df_b1.groupby('ts'):
-            map_b1[float(ts)] = {row['symbol']: {
-                'open': row['open'], 'high': row['high'], 'low': row['low'], 'close': row['close'], 'volume': row['volume']
-            } for _, row in group.iterrows()}
-            
-        # 2. 加载 1s 期权快照 ( buckets 为 JSON, 包含 buckets 和 contracts )
-        df_o1 = pd.read_sql(f"SELECT * FROM option_snapshots_1s WHERE ts >= {start_ts} AND ts <= {end_ts}", self.conn)
-        map_o1 = {}
-        for ts, group in df_o1.groupby('ts'):
-            day_snaps = {}
-            for _, row in group.iterrows():
-                b_json = row['buckets_json']
-                blob = json.loads(b_json) if isinstance(b_json, str) else {}
-                
-                # 🚨 [Turbo Audit] 捕捉加载瞬间
-                if row['symbol'] == 'NVDA' and len(map_o1) < 1:
-                    logger.info(f"🚨 [TURBO_MEM_LOAD] NVDA Raw JSON Sample: {b_json[:100]}...")
+
+        def _build_bar_map(df: pd.DataFrame):
+            if df.empty:
+                return {}
+            from collections import defaultdict
+            out = defaultdict(dict)
+            ts_vals = df['ts'].to_numpy(copy=False)
+            sym_vals = df['symbol'].to_numpy(copy=False)
+            o_vals = df['open'].to_numpy(copy=False)
+            h_vals = df['high'].to_numpy(copy=False)
+            l_vals = df['low'].to_numpy(copy=False)
+            c_vals = df['close'].to_numpy(copy=False)
+            v_vals = df['volume'].to_numpy(copy=False)
+            for ts, sym, o, h, l, c, v in zip(ts_vals, sym_vals, o_vals, h_vals, l_vals, c_vals, v_vals):
+                out[float(ts)][sym] = {
+                    'open': float(o),
+                    'high': float(h),
+                    'low': float(l),
+                    'close': float(c),
+                    'volume': float(v),
+                }
+            return dict(out)
+
+        def _build_option_map(df: pd.DataFrame, *, audit_first: bool = False):
+            if df.empty:
+                return {}
+            from collections import defaultdict
+            out = defaultdict(dict)
+            ts_vals = df['ts'].to_numpy(copy=False)
+            sym_vals = df['symbol'].to_numpy(copy=False)
+            json_vals = df['buckets_json'].to_numpy(copy=False)
+            audit_logged = False
+            for ts, sym, b_json in zip(ts_vals, sym_vals, json_vals):
+                if isinstance(b_json, str):
+                    try:
+                        blob = json.loads(b_json)
+                    except Exception:
+                        blob = {}
+                else:
+                    blob = b_json if isinstance(b_json, dict) else {}
+
+                if audit_first and (not audit_logged) and sym == 'NVDA':
+                    audit_logged = True
+                    sample = b_json[:100] if isinstance(b_json, str) else str(blob)[:100]
+                    logger.info(f"🚨 [TURBO_MEM_LOAD] NVDA Raw JSON Sample: {sample}...")
                     if 'buckets' in blob and len(blob['buckets']) > 0:
                         logger.info(f"🚨 [TURBO_MEM_LOAD] NVDA Extracted Price: {blob['buckets'][0][0]}")
-                
-                day_snaps[row['symbol']] = {
+
+                out[float(ts)][sym] = {
                     'buckets': blob.get('buckets', []),
-                    'contracts': blob.get('contracts', [])
+                    'contracts': blob.get('contracts', []),
                 }
-            map_o1[float(ts)] = day_snaps
-            
+            return dict(out)
+
+        # 1. 加载 1s 股票数据
+        df_b1 = pd.read_sql(
+            f"SELECT symbol, ts, open, high, low, close, volume FROM market_bars_1s "
+            f"WHERE ts >= {start_ts} AND ts <= {end_ts}",
+            self.conn,
+        )
+        map_b1 = _build_bar_map(df_b1)
+
+        # 2. 加载 1s 期权快照 ( buckets 为 JSON, 包含 buckets 和 contracts )
+        df_o1 = pd.read_sql(
+            f"SELECT symbol, ts, buckets_json FROM option_snapshots_1s "
+            f"WHERE ts >= {start_ts} AND ts <= {end_ts}",
+            self.conn,
+        )
+        map_o1 = _build_option_map(df_o1, audit_first=True)
+
         # 3. 加载 5m 股票和期权数据
-        df_b5 = pd.read_sql(f"SELECT * FROM market_bars_5m WHERE ts >= {start_ts} AND ts <= {end_ts}", self.conn)
-        map_b5 = {float(ts): {row['symbol']: row.to_dict() for _, row in group.iterrows()} for ts, group in df_b5.groupby('ts')}
-        
-        df_o5 = pd.read_sql(f"SELECT * FROM option_snapshots_5m WHERE ts >= {start_ts} AND ts <= {end_ts}", self.conn)
-        map_o5 = {}
-        for ts, group in df_o5.groupby('ts'):
-            day_snaps = {}
-            for _, row in group.iterrows():
-                blob = json.loads(row['buckets_json']) if isinstance(row['buckets_json'], str) else {}
-                day_snaps[row['symbol']] = {
-                    'buckets': blob.get('buckets', []),
-                    'contracts': blob.get('contracts', [])
-                }
-            map_o5[float(ts)] = day_snaps
-        
+        df_b5 = pd.read_sql(
+            f"SELECT symbol, ts, open, high, low, close, volume FROM market_bars_5m "
+            f"WHERE ts >= {start_ts} AND ts <= {end_ts}",
+            self.conn,
+        )
+        map_b5 = _build_bar_map(df_b5)
+
+        df_o5 = pd.read_sql(
+            f"SELECT symbol, ts, buckets_json FROM option_snapshots_5m "
+            f"WHERE ts >= {start_ts} AND ts <= {end_ts}",
+            self.conn,
+        )
+        map_o5 = _build_option_map(df_o5)
+
         logger.info(f"✅ Loaded {len(map_o1)} snapshots in memory.")
         return map_b1, map_o1, map_b5, map_o5
 
@@ -384,22 +472,51 @@ class BatchSQLiteDriver1s:
             if timeout > 60000: # 30s
                 logger.warning(f"⚠️ [STALL] Sync Timeout at ts={ts_val}. Feat:{feat_ts} Orch:{orch_ts}")
                 break
-    async def run_turbo(self, feat_svc, signal_svc):
+    async def run_turbo(
+        self,
+        feat_svc,
+        signal_svc,
+        *,
+        mirror_pg: bool = False,
+        mirror_pg_clean: bool = True,
+        mirror_pg_features: bool = False,
+        mirror_pg_market: bool = False,
+    ):
         """🚀 [Turbo Mode] 极速进程内回放：Driver -> Feat -> Orch 瞬时直连"""
         logger.info("🔥 [Turbo Mode] Starting vectorized-speed in-process replay...")
+        logger.info(
+            "🪞 [Mirror] sqlite canonical | mirror_pg=%s | mirror_pg_features=%s | mirror_pg_market=%s",
+            mirror_pg,
+            mirror_pg_features,
+            mirror_pg_market,
+        )
         NY_TZ = pytz.timezone('America/New_York')
 
         if not self.target_dbs:
             logger.error(f"❌ No databases to process for Turbo Mode.")
             return
 
-        for db_path in self.target_dbs:
+        pg_persist_svc = None
+        if mirror_pg:
+            persist_pg_cfg = copy.deepcopy(REDIS_CFG)
+            persist_pg_cfg['pg_group'] = GROUP_PERSISTENCE
+            data_persistence_service_v8_pg.REDIS_CFG = persist_pg_cfg
+            first_date = self.target_dbs[0].stem.split('_')[1]
+            pg_persist_svc = data_persistence_service_v8_pg.DataPersistenceServicePG(start_date=first_date)
+
+        is_first_day = True
+        for day_idx, db_path in enumerate(self.target_dbs):
             date_str = db_path.stem.split('_')[1]
             logger.info(f"📂 [Turbo] Processing Database: {db_path.name}")
             
-            # 🚀 [确定性加固] 进入新交易日前，彻底抹除引擎所有残余状态
-            if hasattr(feat_svc, 'reset_internal_memory'):
-                feat_svc.reset_internal_memory()
+            # 仅首日冷启动；后续日期保留上一交易日尾盘的滚动状态，实现真正跨日热启动。
+            if is_first_day:
+                if hasattr(feat_svc, 'reset_internal_memory'):
+                    feat_svc.reset_internal_memory()
+                logger.info("❄️ [Turbo Cold Start] First replay day reinitializes FCS with REPLAY_START_TS-bounded historical warmup.")
+            else:
+                prev_date = self.target_dbs[day_idx - 1].stem.split('_')[1]
+                logger.info(f"🔥 [Turbo Hot Start] Reusing in-memory rolling state carried from previous day {prev_date}.")
             
             start_hhmmss = "09:30:00" if self.parity_mode else "09:29:00"
             start_dt = NY_TZ.localize(datetime.strptime(date_str + f" {start_hhmmss}", "%Y%m%d %H:%M:%S"))
@@ -414,9 +531,6 @@ class BatchSQLiteDriver1s:
             if not map_o1:
                 logger.warning(f"⚠️ No snapshots found in {db_path.name} for RTH. Skipping...")
                 continue
-            
-            # 🚀 [核准重构] 移除所有盘前预热与作弊注入，严格执行冷启动
-            logger.info("❄️ [Cold Start] Starting with empty internal memory buffers.")
             
             # 🚀 [确定性加固] 清理本次回放可能占据的 Redis 历史，确保 Redis 是唯一的、纯净的状态标准
             try:
@@ -443,6 +557,19 @@ class BatchSQLiteDriver1s:
             # =====================================================================
             from data_persistence_service_v8_sqlite import DataPersistenceServiceSQLite
             persist_svc = DataPersistenceServiceSQLite(db_dir=DB_DIR_1S, start_date=date_str)
+            if pg_persist_svc:
+                if mirror_pg_clean:
+                    _truncate_pg_mirror_day(
+                        date_str,
+                        include_alpha=True,
+                        include_features=mirror_pg_features,
+                        include_market=mirror_pg_market,
+                    )
+                else:
+                    logger.info(
+                        "🪞 [PG Mirror] skip-pg-clean enabled in turbo mode for %s; existing partitions will be reused.",
+                        date_str,
+                    )
 
             # =====================================================================
             # 🚀 [终极闭环修复 2] 完美拦截 Alpha 信号
@@ -464,12 +591,15 @@ class BatchSQLiteDriver1s:
                             payload = ser.unpack(data_str)
                             
                             if payload.get('action') == 'ALPHA':
-                                persist_svc.alpha_buffer.append((
+                                alpha_row_sqlite = (
                                     payload['ts'], payload['symbol'], 
                                     float(payload.get('alpha', 0)), float(payload.get('iv', 0)),
                                     float(payload.get('price', 0)), float(payload.get('vol_z', 0)),
                                     float(payload.get('event_prob', 0))
-                                ))
+                                )
+                                persist_svc.alpha_buffer.append(alpha_row_sqlite)
+                                if pg_persist_svc:
+                                    pg_persist_svc.alpha_buffer.append(alpha_row_sqlite[:6])
                         except Exception as e:
                             pass # 静默丢弃非标准格式，不影响主流程
                             
@@ -502,6 +632,7 @@ class BatchSQLiteDriver1s:
             for ts_val in all_ts:
                 count += 1
                 frame_complete = (int(ts_val) % 60 == 59)
+                minute_boundary = (int(ts_val) % 60 == 0)
                 frame_id = str(int(ts_val))
                 # 1. 组装 1s Tick Batch
                 b1_ts = map_b1.get(ts_val, {})
@@ -547,9 +678,15 @@ class BatchSQLiteDriver1s:
                 
                 # 喂入引擎缓存
                 await feat_svc.process_market_data(batch_payloads)
+                if pg_persist_svc:
+                    pg_persist_svc._check_date_rotation(ts_val)
+                    if mirror_pg_market:
+                        for payload in batch_payloads:
+                            pg_persist_svc.process_market_data(payload)
                 
-                # 盘前数据只建立快照，不触发 PyTorch
-                if ts_val < first_full_min:
+                # 秒级仍然持续喂市场，但真正昂贵的 compute/signal 仅在分钟边界触发。
+                # 对分钟 alpha 而言，这里等价于“在新分钟第一秒结算上一分钟”。
+                if (not minute_boundary) or ts_val < first_full_min:
                     continue
                 
                 # 2. 直连 Feature Engine 计算
@@ -566,6 +703,8 @@ class BatchSQLiteDriver1s:
                     # 🚀 [终极闭环修复 3] 将含 IV 的特征包推给持久化服务，写入 option_snapshots
                     # =====================================================================
                     persist_svc.process_feature_data(feat_payload)
+                    if pg_persist_svc and mirror_pg_features:
+                        pg_persist_svc.process_feature_data(feat_payload)
                     
                     # 3. 直连 Signal Engine，触发上方拦截器，存入 Alpha
                     await signal_svc.process_batch(feat_payload)
@@ -575,6 +714,8 @@ class BatchSQLiteDriver1s:
                 # =====================================================================
                 if ts_val % 60 == 0:
                     persist_svc.flush() 
+                    if pg_persist_svc:
+                        pg_persist_svc.flush()
                     
                     # 🚀 [新功能] 实时审计：确保上一分钟的数据已成功入账
                     check_ts = int(ts_val - 60)
@@ -590,11 +731,15 @@ class BatchSQLiteDriver1s:
             # 跑完全天后，强制刷入最后残留的数据
             logger.info("💾 Triggering final flush to SQLite...")
             persist_svc.flush() 
+            if pg_persist_svc:
+                logger.info("💾 Triggering final flush to PostgreSQL mirror...")
+                pg_persist_svc.flush()
             
             try: self.r.delete(STREAM_TRADE_LOG)
             except: pass
             
             logger.info("✅ Direct persistence completed (Zero-Loss).")
+            is_first_day = False
 
 
 async def main():
@@ -605,6 +750,10 @@ async def main():
     parser.add_argument('--enable-oms', action='store_true', help="Enable full OMS and Mock Broker (Backtest mode)")
     parser.add_argument('--turbo', action='store_true', help="🚀 [Turbo Mode] In-process execution (Redis bypass) for Alpha-only mode")
     parser.add_argument('--parity-mode', action='store_true', help="Align 1s replay with minute launcher semantics (BACKTEST mode, no pre-09:30 frames).")
+    parser.add_argument('--mirror-pg', action='store_true', help="Use sqlite 1s replay as canonical engine and mirror alpha results into PostgreSQL.")
+    parser.add_argument('--mirror-pg-features', action='store_true', help="When --mirror-pg is enabled, mirror feature_logs into PostgreSQL too.")
+    parser.add_argument('--mirror-pg-market', action='store_true', help="Deprecated/no-op for s2 replay. Market/options snapshots belong to s1 seeding and will not be rewritten here.")
+    parser.add_argument('--skip-pg-clean', action='store_true', help="Default behavior truncates mirrored PostgreSQL partitions before replay; use this to keep existing PG data.")
     args = parser.parse_args()
 
     if args.parity_mode:
@@ -613,6 +762,12 @@ async def main():
         os.environ['FORCE_HIGH_FREQ'] = '0'
         os.environ['REPLAY_1S_PARITY_MODE'] = '1'
         logger.info("🎯 [Parity Mode] 1s replay aligned to minute launcher semantics while keeping 1s Greek recompute enabled.")
+
+    if args.mirror_pg_market:
+        logger.warning("⚠️ [PG Mirror] --mirror-pg-market is disabled in s2 replay. market_bars/option_snapshots must come from s1 seeding, not alpha replay.")
+        args.mirror_pg_market = False
+
+    pg_clean_enabled = bool(args.mirror_pg and not args.skip_pg_clean)
 
     if not DB_DIR_1S.exists():
         logger.error(f"❌ DB Directory not found: {DB_DIR_1S}")
@@ -699,42 +854,51 @@ async def main():
 
     env = os.environ.copy()
     env['REPLAY_START_TS'] = str(replay_start_ts)
+    os.environ['REPLAY_START_TS'] = str(replay_start_ts)
     if args.parity_mode:
-        env['RUN_MODE'] = 'BACKTEST'
-        env['RECALC_GREEKS'] = '1'
-        env['FORCE_HIGH_FREQ'] = '0'
-        env['REPLAY_1S_PARITY_MODE'] = '1'
+        for k, v in {
+            'RUN_MODE': 'BACKTEST',
+            'RECALC_GREEKS': '1',
+            'FORCE_HIGH_FREQ': '0',
+            'REPLAY_1S_PARITY_MODE': '1',
+        }.items():
+            env[k] = v
+            os.environ[k] = v
     if args.skip_warmup:
         env['SKIP_DEEP_WARMUP'] = '1'
+        os.environ['SKIP_DEEP_WARMUP'] = '1'
 
     feature_process = None
     try:
-        logger.info("🚀 Starting Feature Compute Service (Subprocess)...")
-        feature_process = subprocess.Popen(
-            [sys.executable, "feature_compute_service_v8.py"],
-            cwd=str(PROJECT_ROOT/"baseline"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env 
-        )
+        if args.turbo:
+            logger.info("⚡ [Turbo Mode] Skipping Feature Compute Service subprocess; in-process FCS will warm up with replay clock.")
+        else:
+            logger.info("🚀 Starting Feature Compute Service (Subprocess)...")
+            feature_process = subprocess.Popen(
+                [sys.executable, "feature_compute_service_v8.py"],
+                cwd=str(PROJECT_ROOT/"baseline"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env 
+            )
 
-        ready_event = threading.Event()
-        def monitor_stdout():
-            for line in iter(feature_process.stdout.readline, ''):
-                sys.stdout.write(f"[FEAT] {line}")
-                sys.stdout.flush()
-                if ("Complete" in line and "Warmup" in line) or "Deep Warmup Complete" in line or "Cold start" in line or "Skipped" in line:
-                    ready_event.set()
+            ready_event = threading.Event()
+            def monitor_stdout():
+                for line in iter(feature_process.stdout.readline, ''):
+                    sys.stdout.write(f"[FEAT] {line}")
+                    sys.stdout.flush()
+                    if ("Complete" in line and "Warmup" in line) or "Deep Warmup Complete" in line or "Cold start" in line or "Skipped" in line:
+                        ready_event.set()
 
-        threading.Thread(target=monitor_stdout, daemon=True).start()
+            threading.Thread(target=monitor_stdout, daemon=True).start()
 
-        logger.info("⏳ Waiting for Engine Deep Warmup to complete...")
-        if not ready_event.wait(timeout=60):
-            logger.error("❌ Warmup Timeout! Feature service failed to initialize.")
-            return
-            
-        logger.info("✅ Feature Engine Warmup Finished.")
+            logger.info("⏳ Waiting for Engine Deep Warmup to complete...")
+            if not ready_event.wait(timeout=60):
+                logger.error("❌ Warmup Timeout! Feature service failed to initialize.")
+                return
+                
+            logger.info("✅ Feature Engine Warmup Finished.")
 
         class ReplayDatetime(dt.datetime):
             @classmethod
@@ -754,6 +918,8 @@ async def main():
         execution_engine_v8.time.time = replay_time
         data_persistence_service_v8_sqlite.datetime = ReplayDatetime
         data_persistence_service_v8_sqlite.time.time = replay_time
+        data_persistence_service_v8_pg.datetime = ReplayDatetime
+        data_persistence_service_v8_pg.time.time = replay_time
 
         orig_init_db = data_persistence_service_v8_sqlite.DataPersistenceServiceSQLite._init_db
         def robust_init_db(self):
@@ -808,7 +974,14 @@ async def main():
             threading.Thread(target=persistence_svc.run, daemon=True).start()
             
             driver = BatchSQLiteDriver1s(target_dbs=target_dbs, run_id=RUN_ID, parity_mode=args.parity_mode)
-            await driver.run_turbo(feat_svc, signal_svc)
+            await driver.run_turbo(
+                feat_svc,
+                signal_svc,
+                mirror_pg=args.mirror_pg,
+                mirror_pg_clean=pg_clean_enabled,
+                mirror_pg_features=args.mirror_pg_features,
+                mirror_pg_market=args.mirror_pg_market,
+            )
             
             logger.info("🏁 [Turbo Mode] Replay Completed.")
             return
@@ -844,6 +1017,30 @@ async def main():
         data_persistence_service_v8_sqlite.DB_DIR = DB_DIR_1S 
         persistence_svc = data_persistence_service_v8_sqlite.DataPersistenceServiceSQLite(start_date=args.start_date)
         threading.Thread(target=persistence_svc.run, daemon=True).start()
+        if args.mirror_pg:
+            logger.info("🪞 Starting PostgreSQL mirror persistence service...")
+            persist_pg_cfg = copy.deepcopy(REDIS_CFG)
+            persist_pg_cfg['pg_group'] = GROUP_PERSISTENCE
+            data_persistence_service_v8_pg.REDIS_CFG = persist_pg_cfg
+            target_dates_for_pg = sorted({p.stem.split('_')[1] for p in target_dbs})
+            if pg_clean_enabled:
+                logger.info(
+                    "🧹 [PG Mirror Clean] overwrite partitions before replay | alpha=%s feature=%s market=%s",
+                    True,
+                    args.mirror_pg_features,
+                    args.mirror_pg_market,
+                )
+                for date_str in target_dates_for_pg:
+                    _truncate_pg_mirror_day(
+                        date_str,
+                        include_alpha=True,
+                        include_features=args.mirror_pg_features,
+                        include_market=args.mirror_pg_market,
+                    )
+            else:
+                logger.info("🪞 [PG Mirror] skip-pg-clean enabled; replay will append/update existing PostgreSQL partitions.")
+            persistence_pg_svc = data_persistence_service_v8_pg.DataPersistenceServicePG(start_date=target_dates_for_pg[0])
+            threading.Thread(target=persistence_pg_svc.run, daemon=True).start()
 
         logger.info("🛠️ Building V8 Signal Engine (1s Inference Factory Mode)...")
         signal_engine = SignalEngineV8(

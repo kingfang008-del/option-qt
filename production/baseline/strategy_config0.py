@@ -34,8 +34,8 @@ class StrategyConfig:
     # V0 逻辑: VOL_MIN 为 -1 (更宽松)，ALPHA_ENTRY 为 0.85
     VOL_MIN_Z: float = -1          
     VOL_MAX_Z: float = 4.0           
-    ALPHA_ENTRY_THRESHOLD: float = 0.2
-    ALPHA_ENTRY_STRICT: float = 1.45      
+    ALPHA_ENTRY_THRESHOLD: float = 0.8
+    ALPHA_ENTRY_STRICT: float = 1.2
     MIN_CS_ALPHA_Z: float = 0.5           
     
     # ================= 4. Momentum & Trend =================
@@ -52,8 +52,12 @@ class StrategyConfig:
     
     # ================= 6. Risk & Event =================
     # V0 核心版本中对 Stock Hard Stop 的定义
-    STOCK_HARD_STOP_TIGHT: float = 0.0015     # V0 为 0.0015
-    STOCK_HARD_STOP_LOOSE: float = 0.003      # V0 为 0.003
+    # [默认值] VIX 平静时使用的宽松止损
+    STOCK_HARD_STOP_TIGHT: float = 0.003
+    STOCK_HARD_STOP_LOOSE: float = 0.005
+    # [波动值] VIX 波动 (Regime Choppy) 时自动收紧的止损
+    STOCK_HARD_STOP_TIGHT_VOLATILE: float = 0.003
+    STOCK_HARD_STOP_LOOSE_VOLATILE: float = 0.005
     STOCK_HARD_STOP_EVENT: float = 0.008  
     EVENT_PROB_THRESHOLD: float = 0.7     
     EVENT_HODL_MINS: int = 30              
@@ -75,7 +79,7 @@ class StrategyConfig:
     TIME_STOP_MINS: int = 30          # V0 只有 30 分钟窗口
     TIME_STOP_ROI: float = 0.05       # 30 分钟内若未达到 5%，则可能离场
     ALPHA_FLIP_THRESHOLD: float = 0.8
-    HIGH_CONFIDENCE_THRESHOLD: float = 1.3
+    HIGH_CONFIDENCE_THRESHOLD: float = 1.2
     
     # ================= 9. Plan A: Smart Stop-Loss (Old Style) =================
     # V0 并不原生支持 Plan A 的 Grid 搜索，此处为兼容性占位
@@ -91,23 +95,32 @@ class StrategyConfig:
     ORDER_TIMEOUT_SECONDS: int = 30
     ORDER_MAX_RETRIES: int = 3
 
-    # ================= 11. Profit Guards (V0 Legacy Ladder) =================
-    # V0 使用的是打散的阶梯分量，此处统一组合
+    # ================= 11. Profit Guards (Universal Ladder) =================
+    # 旧版 V0 的第一档是 15% 才开始保利润，很多单到不了这里就被回撤吃掉。
+    # 这里改成和 strategy_config.py 一致的 ladder 写法，并把第一档前移。
+    LADDER_TIGHT: List[Tuple[float, float]] = field(default_factory=lambda: [
+        (0.08, 0.05),
+        (0.12, 0.08),
+        (0.20, 0.15),
+        (0.35, 0.28),
+        (0.50, 0.40),
+        (0.75, 0.60),
+        (1.00, 0.85),
+        (1.50, 1.30),
+        (2.00, 1.75),
+        (4.50, 3.80),
+    ])
+    LADDER_WIDE: List[Tuple[float, float]] = field(default_factory=lambda: [
+        (0.15, 0.08),
+        (0.30, 0.20),
+        (0.50, 0.38),
+        (0.80, 0.65),
+        (1.50, 1.25),
+        (2.50, 2.10),
+        (5.00, 4.20),
+    ])
     FLASH_PROTECT_TRIGGER: float = 0.05
     FLASH_PROTECT_EXIT: float = 0.02
-    
-    # L1~L10 阶梯
-    STEP_PROT_L1_TRIGGER: float = 0.12; STEP_PROT_L1_EXIT: float = 0.10
-    STEP_PROT_L2_TRIGGER: float = 0.25; STEP_PROT_L2_EXIT: float = 0.20
-    STEP_PROT_L3_TRIGGER: float = 0.35; STEP_PROT_L3_EXIT: float = 0.30
-    STEP_PROT_L4_TRIGGER: float = 0.50; STEP_PROT_L4_EXIT: float = 0.40
-    STEP_PROT_L5_TRIGGER: float = 0.75; STEP_PROT_L5_EXIT: float = 0.60
-    STEP_PROT_L6_TRIGGER: float = 1.00; STEP_PROT_L6_EXIT: float = 0.85
-    STEP_PROT_L7_TRIGGER: float = 1.50; STEP_PROT_L7_EXIT: float = 1.30
-    STEP_PROT_L8_TRIGGER: float = 2.00; STEP_PROT_L8_EXIT: float = 1.75
-    STEP_PROT_L9_TRIGGER: float = 3.00; STEP_PROT_L9_EXIT: float = 2.60
-    STEP_PROT_L10_TRIGGER: float = 4.50; STEP_PROT_L10_EXIT: float = 3.80
-
     TRAILING_TRIGGER_ROI: float = 5.50
     TRAILING_KEEP_RATIO: float = 0.92
     COUNTER_TREND_PROTECT_TRIGGER: float = 0.25
@@ -136,14 +149,18 @@ class StrategyConfig:
     SLOW_BULL_MIN_INDEX_ROC: float = 0.0005
     
     INDEX_GUARD_ENABLED: bool = True
-    INDEX_GUARD_SHORT_BLOCK_ENABLED: bool = False
+    INDEX_GUARD_SHORT_BLOCK_ENABLED: bool = True
     INDEX_ROC_THRESHOLD: float = -0.01
 
     # ================= 16. Market Regime Guard (Choppiness Filter) =================
-    REGIME_GUARD_ENABLED: bool = True
-    REGIME_REVERSAL_THRESHOLD: int = 5         # 30分钟内 > 5次 0.15% 反转即拦截
+    REGIME_GUARD_ENABLED: bool = False
+    REGIME_ENTRY_GUARD_ENABLED: bool = True
+    REGIME_ADAPTIVE_STOCK_STOP_ENABLED: bool = False
+    REGIME_REVERSAL_THRESHOLD: int = 6         # 30分钟内 > 5次 0.15% 反转即拦截
     REGIME_WINDOW_MINS: int = 30
-    REGIME_REVERSAL_PERCENT: float = 0.001    # 0.15% 反转阈值
+    REGIME_REVERSAL_PERCENT: float = 0.0012     # 0.15% 反转阈值
+    REGIME_VIXY_ROC_THRESHOLD: float = 0.003   # VIXY 5分钟正向跳升超过 0.3% 时标记波动候选
+    REGIME_REQUIRE_NEUTRAL_INDEX_FOR_ENTRY_GUARD: bool = True  # 只有大盘方向不清楚时才启用 regime 入场拦截
 
     # ================= 17. Guard Switches (V0 Context) =================
     ENTRY_MOMENTUM_GUARD_ENABLED: bool = True
@@ -158,5 +175,23 @@ class StrategyConfig:
     EXIT_LIQUIDITY_GUARD_ENABLED: bool = True
     EXIT_COND_STOP_ENABLED: bool = True
     EXIT_SMALL_GAIN_ENABLED: bool = True
+
+    # ================= 18. 1s 高频平仓确认 =================
+    # 仅用于秒级回测/高频执行路径，避免被秒级盘口噪声过早打出场
+    EXIT_CONFIRM_SECONDS_1S: int = 8
+    EXIT_CONFIRM_REASON_PREFIXES: Tuple[str, ...] = (
+        "HARD_STOP",
+        "COND_STOP",
+        "TRAILING_",
+        "STEP_PROT_",
+        "FLASH_PROT_",
+        "PROTECT_COUNTER",
+        "TIME_STOP",
+        "SMALL_GAIN_",
+        "MACD_FADE",
+        "STOCK_STOP",
+        "ZOMBIE_STOP",
+        "SPREAD_STOP",
+    )
     
     PARITY_STRICT_MODE: bool = True           # V0 通常代表严格基准模式

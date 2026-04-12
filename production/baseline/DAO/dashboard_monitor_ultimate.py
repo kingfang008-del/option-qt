@@ -4,6 +4,7 @@ import json
 import pickle
 import sys
 import os
+import sqlite3
 from pathlib import Path
 
 # [NEW] Add project root to sys.path to import utils
@@ -489,6 +490,319 @@ def load_option_price_history(symbol):
         pass
     
     return bucket_history, contract_names
+
+
+@st.cache_data(ttl=30)
+def load_option_quote_quality(symbol, limit=240):
+    """读取近期 option_snapshots_1m，并统计盘口质量。"""
+    summary = {
+        'snapshots': 0,
+        'valid_quote_ratio': 0.0,
+        'median_spread_pct': np.nan,
+        'median_depth': np.nan,
+        'stale_gap_count': 0,
+        'median_mid_last_bps': np.nan,
+    }
+    bucket_df = pd.DataFrame()
+    try:
+        conn = psycopg2.connect(PG_DB_URL)
+        from datetime import timedelta
+        ts_3_days_ago = int((datetime.now(NY_TZ) - timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        query = f"""
+            SELECT ts, buckets_json FROM option_snapshots_1m
+            WHERE symbol = '{symbol}'
+            AND ts >= {ts_3_days_ago}
+            ORDER BY ts DESC
+            LIMIT {int(limit)}
+        """
+        df = pd.read_sql(query, conn)
+        conn.close()
+        if df.empty:
+            return summary, bucket_df
+
+        df = df.sort_values('ts').reset_index(drop=True)
+        summary['snapshots'] = int(len(df))
+        if len(df) >= 2:
+            gaps = df['ts'].diff().dropna()
+            summary['stale_gap_count'] = int((gaps > 120).sum())
+
+        rows = []
+        for snap in df['buckets_json']:
+            try:
+                blob = snap if isinstance(snap, dict) else json.loads(snap) if isinstance(snap, str) else {}
+            except Exception:
+                blob = {}
+            buckets = blob.get('buckets', []) if isinstance(blob, dict) else []
+            for idx, bucket in enumerate(buckets[:6]):
+                if not isinstance(bucket, (list, tuple)) or len(bucket) < 12:
+                    continue
+                price = float(bucket[0] or 0.0)
+                bid = float(bucket[8] or 0.0)
+                ask = float(bucket[9] or 0.0)
+                bid_size = float(bucket[10] or 0.0)
+                ask_size = float(bucket[11] or 0.0)
+                mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+                valid = int(bid > 0 and ask > 0 and ask >= bid)
+                spread_pct = ((ask - bid) / mid) if valid and mid > 0 else np.nan
+                mid_last_bps = (abs(mid - price) / mid * 10000.0) if valid and price > 0 and mid > 0 else np.nan
+                rows.append({
+                    'bucket': idx,
+                    'valid': valid,
+                    'spread_pct': spread_pct,
+                    'depth': bid_size + ask_size,
+                    'mid_last_bps': mid_last_bps,
+                })
+
+        if not rows:
+            return summary, bucket_df
+
+        bucket_df = pd.DataFrame(rows)
+        summary['valid_quote_ratio'] = float(bucket_df['valid'].mean()) if not bucket_df.empty else 0.0
+        valid_only = bucket_df[bucket_df['valid'] == 1]
+        if not valid_only.empty:
+            summary['median_spread_pct'] = float(valid_only['spread_pct'].median())
+            summary['median_depth'] = float(valid_only['depth'].median())
+            summary['median_mid_last_bps'] = float(valid_only['mid_last_bps'].median())
+
+        bucket_df = (
+            bucket_df.groupby('bucket', as_index=False)
+            .agg(
+                valid_quote_ratio=('valid', 'mean'),
+                median_spread_pct=('spread_pct', 'median'),
+                median_depth=('depth', 'median'),
+                median_mid_last_bps=('mid_last_bps', 'median'),
+            )
+            .sort_values('bucket')
+        )
+        return summary, bucket_df
+    except Exception as e:
+        print(f"Error loading option quote quality: {e}")
+        return summary, pd.DataFrame()
+
+
+@st.cache_data(ttl=30)
+def fetch_alpha_execution_funnel(query_date, target_table):
+    """统计 alpha -> open/fill/close 的漏斗。"""
+    try:
+        start_dt = datetime.combine(query_date, dt_time(0, 0, 0))
+        start_ts = int(NY_TZ.localize(start_dt).timestamp())
+        end_ts = start_ts + 86400
+
+        conn = psycopg2.connect(PG_DB_URL)
+        df_alpha = pd.read_sql(
+            f"""
+            SELECT ts, symbol, alpha, iv, price, vol_z
+            FROM alpha_logs
+            WHERE ts >= {start_ts} AND ts < {end_ts}
+            """,
+            conn,
+        )
+        df_trade = pd.read_sql(
+            f"""
+            SELECT ts, symbol, action, details_json
+            FROM {target_table}
+            WHERE ts >= {start_ts} AND ts < {end_ts}
+            """,
+            conn,
+        )
+        conn.close()
+
+        if df_trade.empty:
+            df_trade = pd.DataFrame(columns=['ts', 'symbol', 'action', 'details_json'])
+
+        if not df_trade.empty:
+            def _parse_detail(raw, key, default=np.nan):
+                try:
+                    obj = json.loads(raw)
+                    return obj.get(key, default)
+                except Exception:
+                    return default
+
+            df_trade['fill_ratio'] = df_trade['details_json'].apply(lambda r: _parse_detail(r, 'fill_ratio'))
+
+        eligible_alpha = df_alpha[(df_alpha['alpha'].abs() >= 0.8) & (df_alpha['vol_z'] >= -1.0)].copy() if not df_alpha.empty else pd.DataFrame()
+        open_df = df_trade[df_trade['action'] == 'OPEN'].copy() if not df_trade.empty else pd.DataFrame()
+        close_df = df_trade[df_trade['action'] == 'CLOSE'].copy() if not df_trade.empty else pd.DataFrame()
+
+        if not open_df.empty and not eligible_alpha.empty:
+            matched = eligible_alpha.merge(open_df[['symbol', 'ts']], on='symbol', how='left', suffixes=('', '_open'))
+            matched['matched'] = (matched['ts_open'] - matched['ts']).abs() <= 120
+            executed_from_eligible = int(matched['matched'].fillna(False).sum())
+        else:
+            executed_from_eligible = 0
+
+        partial_fills = 0
+        full_fills = 0
+        if not open_df.empty:
+            fill_ratio = pd.to_numeric(open_df['fill_ratio'], errors='coerce')
+            partial_fills = int(((fill_ratio > 0) & (fill_ratio < 0.999)).sum())
+            full_fills = int((fill_ratio >= 0.999).sum())
+
+        return {
+            'alpha_total': int(len(df_alpha)),
+            'alpha_eligible': int(len(eligible_alpha)),
+            'open_total': int(len(open_df)),
+            'eligible_to_open': int(executed_from_eligible),
+            'partial_fills': int(partial_fills),
+            'full_fills': int(full_fills),
+            'close_total': int(len(close_df)),
+            'symbol_signaled': int(df_alpha['symbol'].nunique()) if not df_alpha.empty else 0,
+            'symbol_opened': int(open_df['symbol'].nunique()) if not open_df.empty else 0,
+        }
+    except Exception as e:
+        print(f"Error fetching alpha execution funnel: {e}")
+        return {
+            'alpha_total': 0,
+            'alpha_eligible': 0,
+            'open_total': 0,
+            'eligible_to_open': 0,
+            'partial_fills': 0,
+            'full_fills': 0,
+            'close_total': 0,
+            'symbol_signaled': 0,
+            'symbol_opened': 0,
+        }
+
+
+@st.cache_data(ttl=20)
+def load_intraday_pg_alpha(query_date, symbol_filter="ALL"):
+    start_dt = datetime.combine(query_date, dt_time(0, 0, 0))
+    start_ts = int(NY_TZ.localize(start_dt).timestamp())
+    end_ts = start_ts + 86400
+    conn = psycopg2.connect(PG_DB_URL)
+    sql = f"""
+        SELECT ts, symbol, alpha, iv, price, vol_z
+        FROM alpha_logs
+        WHERE ts >= {start_ts} AND ts < {end_ts}
+    """
+    if symbol_filter and symbol_filter != "ALL":
+        sql += f" AND symbol = '{symbol_filter}'"
+    sql += " ORDER BY ts ASC, symbol ASC"
+    df = pd.read_sql(sql, conn)
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=20)
+def load_intraday_sqlite_replay_alpha(query_date, symbol_filter="ALL"):
+    date_str = pd.Timestamp(query_date).strftime("%Y%m%d")
+    db_path = SQLITE_DATA_DIR / f"market_{date_str}.db"
+    if not db_path.exists():
+        return pd.DataFrame(), str(db_path)
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    sql = """
+        SELECT ts, symbol, alpha, iv, price, vol_z
+        FROM alpha_logs
+    """
+    if symbol_filter and symbol_filter != "ALL":
+        sql += f" WHERE symbol = '{symbol_filter}'"
+    sql += " ORDER BY ts ASC, symbol ASC"
+    df = pd.read_sql(sql, conn)
+    conn.close()
+    return df, str(db_path)
+
+
+@st.cache_data(ttl=20)
+def load_intraday_alpha_audit_csv(query_date, symbol_filter="ALL"):
+    p = Path.home() / "quant_project" / "logs" / "alpha_audit.csv"
+    if not p.exists():
+        return pd.DataFrame(), str(p)
+    df = pd.read_csv(p)
+    if df.empty:
+        return df, str(p)
+    df = df.rename(columns={'timestamp': 'ts'})
+    df['ts'] = pd.to_numeric(df['ts'], errors='coerce')
+    df = df.dropna(subset=['ts'])
+    start_dt = datetime.combine(query_date, dt_time(0, 0, 0))
+    start_ts = int(NY_TZ.localize(start_dt).timestamp())
+    end_ts = start_ts + 86400
+    df = df[(df['ts'] >= start_ts) & (df['ts'] < end_ts)].copy()
+    if symbol_filter and symbol_filter != "ALL":
+        df = df[df['symbol'] == symbol_filter].copy()
+    keep = [c for c in ['ts', 'symbol', 'alpha', 'price', 'vol_z'] if c in df.columns]
+    if 'iv' not in df.columns:
+        df['iv'] = np.nan
+        keep.append('iv')
+    df = df[keep].sort_values(['ts', 'symbol']).reset_index(drop=True)
+    return df, str(p)
+
+
+def build_intraday_alpha_diff(pg_df, replay_df, tolerance=1e-6):
+    metrics = {
+        'live_rows': 0,
+        'replay_rows': 0,
+        'matched_rows': 0,
+        'coverage_live': 0.0,
+        'coverage_replay': 0.0,
+        'exact_alpha_ratio': 0.0,
+        'within_tol_alpha_ratio': 0.0,
+        'alpha_max_diff': np.nan,
+        'iv_max_diff': np.nan,
+        'price_max_diff': np.nan,
+        'vol_z_max_diff': np.nan,
+    }
+    if pg_df is None or replay_df is None or pg_df.empty or replay_df.empty:
+        return metrics, pd.DataFrame(), pd.DataFrame()
+
+    left = pg_df.copy()
+    right = replay_df.copy()
+    left['ts'] = pd.to_numeric(left['ts'], errors='coerce')
+    right['ts'] = pd.to_numeric(right['ts'], errors='coerce')
+    left = left.dropna(subset=['ts', 'symbol'])
+    right = right.dropna(subset=['ts', 'symbol'])
+
+    merged = left.merge(right, on=['ts', 'symbol'], how='outer', suffixes=('_live', '_replay'), indicator=True)
+    matched = merged[merged['_merge'] == 'both'].copy()
+
+    metrics['live_rows'] = int(len(left))
+    metrics['replay_rows'] = int(len(right))
+    metrics['matched_rows'] = int(len(matched))
+    metrics['coverage_live'] = float(len(matched) / len(left)) if len(left) > 0 else 0.0
+    metrics['coverage_replay'] = float(len(matched) / len(right)) if len(right) > 0 else 0.0
+
+    for field in ['alpha', 'iv', 'price', 'vol_z']:
+        lcol = f'{field}_live'
+        rcol = f'{field}_replay'
+        if lcol in matched.columns and rcol in matched.columns:
+            matched[f'{field}_diff'] = pd.to_numeric(matched[lcol], errors='coerce') - pd.to_numeric(matched[rcol], errors='coerce')
+            abs_col = matched[f'{field}_diff'].abs()
+            metrics[f'{field}_max_diff'] = float(abs_col.max()) if not abs_col.dropna().empty else np.nan
+
+    if 'alpha_diff' in matched.columns and not matched['alpha_diff'].dropna().empty:
+        abs_alpha = matched['alpha_diff'].abs()
+        metrics['exact_alpha_ratio'] = float((abs_alpha <= 1e-12).mean())
+        metrics['within_tol_alpha_ratio'] = float((abs_alpha <= tolerance).mean())
+
+    if not matched.empty:
+        matched['dt_ny'] = pd.to_datetime(matched['ts'], unit='s', utc=True).dt.tz_convert('America/New_York')
+        matched['minute_ny'] = matched['dt_ny'].dt.floor('1min')
+        rolling = (
+            matched.groupby('minute_ny', as_index=False)
+            .agg(
+                alpha_mae=('alpha_diff', lambda s: np.nanmean(np.abs(s))),
+                iv_mae=('iv_diff', lambda s: np.nanmean(np.abs(s))),
+                price_mae=('price_diff', lambda s: np.nanmean(np.abs(s))),
+                vol_z_mae=('vol_z_diff', lambda s: np.nanmean(np.abs(s))),
+                matched_rows=('symbol', 'count'),
+            )
+            .sort_values('minute_ny')
+        )
+    else:
+        rolling = pd.DataFrame()
+
+    detail_cols = ['ts', 'symbol', '_merge']
+    for field in ['alpha', 'iv', 'price', 'vol_z']:
+        for suffix in ['live', 'replay']:
+            col = f'{field}_{suffix}'
+            if col in merged.columns:
+                detail_cols.append(col)
+        diff_col = f'{field}_diff'
+        if diff_col in matched.columns and diff_col not in detail_cols:
+            pass
+    detail = matched.copy()
+    if 'alpha_diff' in detail.columns:
+        detail = detail.sort_values(by='alpha_diff', key=lambda s: s.abs(), ascending=False)
+    return metrics, rolling, detail
 
 # ================= 3. 业务逻辑与计算 (Logic) =================
 def calculate_model_health(df):
@@ -1065,6 +1379,35 @@ with tab1:
     else:
         st.info("Waiting for Snapshot...")
 
+    st.divider()
+    st.subheader("Quote Quality")
+    qq_summary, qq_bucket_df = load_option_quote_quality(symbol)
+    q1, q2, q3, q4, q5 = st.columns(5)
+    q1.metric("Snapshots", f"{qq_summary['snapshots']}")
+    q2.metric("Valid Quote Ratio", f"{qq_summary['valid_quote_ratio']:.1%}")
+    q3.metric(
+        "Median Spread",
+        f"{qq_summary['median_spread_pct']:.2%}" if pd.notna(qq_summary['median_spread_pct']) else "N/A"
+    )
+    q4.metric(
+        "Median Depth",
+        f"{qq_summary['median_depth']:.0f}" if pd.notna(qq_summary['median_depth']) else "N/A"
+    )
+    q5.metric(
+        "Mid-Last Drift",
+        f"{qq_summary['median_mid_last_bps']:.1f} bps" if pd.notna(qq_summary['median_mid_last_bps']) else "N/A",
+        delta=f"{qq_summary['stale_gap_count']} stale gaps"
+    )
+    if not qq_bucket_df.empty:
+        qq_disp = qq_bucket_df.copy()
+        qq_disp['valid_quote_ratio'] = qq_disp['valid_quote_ratio'].map(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A")
+        qq_disp['median_spread_pct'] = qq_disp['median_spread_pct'].map(lambda x: f"{x:.2%}" if pd.notna(x) else "N/A")
+        qq_disp['median_depth'] = qq_disp['median_depth'].map(lambda x: f"{x:.0f}" if pd.notna(x) else "N/A")
+        qq_disp['median_mid_last_bps'] = qq_disp['median_mid_last_bps'].map(lambda x: f"{x:.1f}" if pd.notna(x) else "N/A")
+        st.dataframe(qq_disp, use_container_width=True, hide_index=True)
+    else:
+        st.info("No recent option snapshot quality data yet.")
+
     # --- [Fix 4] 期权价格走势 + 交易标记 ---
     st.divider()
     
@@ -1421,6 +1764,16 @@ with tab5:
             # [🔥 模式切换] 根据全局开关切换查询目标表，确保空跑和实盘流水不混淆
             from config import TRADING_ENABLED
             target_table = 'trade_logs' if TRADING_ENABLED else 'trade_logs_backtest'
+
+            funnel = fetch_alpha_execution_funnel(query_date, target_table)
+            st.write("##### Alpha -> Execution Funnel")
+            f1, f2, f3, f4, f5, f6 = st.columns(6)
+            f1.metric("Alpha Total", f"{funnel['alpha_total']}")
+            f2.metric("Eligible Alpha", f"{funnel['alpha_eligible']}")
+            f3.metric("Matched OPEN", f"{funnel['eligible_to_open']}")
+            f4.metric("OPEN Total", f"{funnel['open_total']}", delta=f"{funnel['symbol_opened']} syms")
+            f5.metric("Full Fills", f"{funnel['full_fills']}", delta=f"Partial {funnel['partial_fills']}")
+            f6.metric("CLOSE Total", f"{funnel['close_total']}", delta=f"Signaled {funnel['symbol_signaled']} syms")
             
             sql = f"SELECT * FROM {target_table} WHERE ts >= {target_start_ts} AND ts < {target_end_ts} ORDER BY ts ASC"
             df_all = pd.read_sql(sql, conn)
@@ -1436,7 +1789,12 @@ with tab5:
                         return d.get(key, default)
                     except: return default
 
-                for k in ['pnl', 'roi', 'stock_price', 'entry_stock', 'mode', 'account_cash']:
+                for k in [
+                    'pnl', 'roi', 'stock_price', 'entry_stock', 'mode', 'account_cash',
+                    'alpha_label_ts', 'alpha_available_ts', 'order_submit_ts', 'fill_ts',
+                    'alpha_to_submit_ms', 'submit_to_fill_ms', 'alpha_to_fill_ms',
+                    'fill_duration', 'fill_ratio'
+                ]:
                     df_all[k] = df_all['details_json'].apply(lambda r: parse_val(r, k))
 
                 # 提取 strategy_note 里的子字段 (alpha, reason, tag)
@@ -1451,6 +1809,12 @@ with tab5:
                 df_all['alpha'] = df_all['details_json'].apply(lambda r: extract_note(r, 'alpha'))
                 df_all['reason'] = df_all['details_json'].apply(lambda r: extract_note(r, 'reason'))
                 df_all['tag'] = df_all['details_json'].apply(lambda r: extract_note(r, 'tag'))
+
+                for ts_col in ['alpha_label_ts', 'alpha_available_ts', 'order_submit_ts', 'fill_ts']:
+                    if ts_col in df_all.columns:
+                        df_all[f'{ts_col}_ny'] = pd.to_datetime(
+                            df_all[ts_col], unit='s', errors='coerce', utc=True
+                        ).dt.tz_convert('America/New_York')
 
                 # ✅ 2. 遍历计算已平仓盈亏 & 找出当前未平仓头寸
                 open_positions = {}
@@ -1484,6 +1848,67 @@ with tab5:
                         closed_pnl += pnl_val
                         if pnl_val > 0: wins += 1
                         elif pnl_val < 0: losses += 1
+
+                open_df = df_all[df_all['action'] == 'OPEN'].copy()
+                if not open_df.empty:
+                    lat_cols = st.columns(3)
+                    avg_a2s = pd.to_numeric(open_df['alpha_to_submit_ms'], errors='coerce').dropna()
+                    avg_s2f = pd.to_numeric(open_df['submit_to_fill_ms'], errors='coerce').dropna()
+                    avg_a2f = pd.to_numeric(open_df['alpha_to_fill_ms'], errors='coerce').dropna()
+                    lat_cols[0].metric("Alpha->Submit", f"{avg_a2s.mean():.0f} ms" if not avg_a2s.empty else "N/A")
+                    lat_cols[1].metric("Submit->Fill", f"{avg_s2f.mean():.0f} ms" if not avg_s2f.empty else "N/A")
+                    lat_cols[2].metric("Alpha->Fill", f"{avg_a2f.mean():.0f} ms" if not avg_a2f.empty else "N/A")
+
+                    chain_cols = st.columns(4)
+                    alpha_label_delay = (
+                        (pd.to_numeric(open_df['alpha_available_ts'], errors='coerce') - pd.to_numeric(open_df['alpha_label_ts'], errors='coerce')) * 1000.0
+                    ).dropna()
+                    if not alpha_label_delay.empty:
+                        chain_cols[0].metric("Label->Available", f"{alpha_label_delay.mean():.0f} ms")
+                    else:
+                        chain_cols[0].metric("Label->Available", "N/A")
+                    if not avg_a2s.empty:
+                        chain_cols[1].metric("Available->Submit", f"{avg_a2s.mean():.0f} ms")
+                    else:
+                        chain_cols[1].metric("Available->Submit", "N/A")
+                    if not avg_s2f.empty:
+                        chain_cols[2].metric("Submit->Fill", f"{avg_s2f.mean():.0f} ms")
+                    else:
+                        chain_cols[2].metric("Submit->Fill", "N/A")
+                    if not avg_a2f.empty:
+                        chain_cols[3].metric("Available->Fill", f"{avg_a2f.mean():.0f} ms")
+                    else:
+                        chain_cols[3].metric("Available->Fill", "N/A")
+
+                    st.caption("`Label->Available` 目前用 `alpha_label_ts -> alpha_available_ts` 近似，代表分钟标签落点到信号真正可下单之间的链路耗时。")
+
+                    latency_plot_df = pd.DataFrame({
+                        'Available->Submit': avg_a2s,
+                        'Submit->Fill': avg_s2f,
+                        'Available->Fill': avg_a2f,
+                    })
+                    latency_long = latency_plot_df.melt(var_name='stage', value_name='latency_ms').dropna()
+                    if not latency_long.empty:
+                        fig_lat = px.box(
+                            latency_long,
+                            x='stage',
+                            y='latency_ms',
+                            color='stage',
+                            points='outliers',
+                            title="Decision Chain Latency Distribution"
+                        )
+                        fig_lat.update_layout(height=320, margin=dict(t=40, b=10, l=10, r=10), template=PLOTLY_THEME, showlegend=False)
+                        st.plotly_chart(fig_lat, use_container_width=True)
+
+                    st.markdown("#### Alpha Timing Audit")
+                    timing_cols = [
+                        'datetime_ny', 'symbol', 'action', 'qty', 'price', 'tag', 'reason',
+                        'alpha_label_ts_ny', 'alpha_available_ts_ny', 'order_submit_ts_ny', 'fill_ts_ny',
+                        'alpha_to_submit_ms', 'submit_to_fill_ms', 'alpha_to_fill_ms',
+                        'fill_ratio', 'fill_duration'
+                    ]
+                    exist_cols = [c for c in timing_cols if c in open_df.columns]
+                    st.dataframe(open_df[exist_cols], use_container_width=True)
 
                 # ✅ 3+4. Live Price 流式刷新卡片 (独立每 3s 自动更新，不需全页刷新)
                 @st.fragment(run_every=3)
@@ -1816,6 +2241,118 @@ with tab9:
     3. **Build (S5)**: 调用 `s5` 生成回测数据集。
     4. **Replay**: 运行 V8 Historical Replay 并对比实盘记录。
     """)
+
+    st.subheader("🧪 Intraday Alpha Diff Console")
+    st.caption("实时将 PostgreSQL `alpha_logs` 视为 live 真相账本，并与 replay 侧 alpha 进行滚动 diff。适合一边实盘推理，一边跑离线回放做日内核对。")
+
+    cmp_c1, cmp_c2, cmp_c3, cmp_c4 = st.columns([1.1, 1.2, 1.0, 1.0])
+    with cmp_c1:
+        compare_date = st.date_input("Compare Date", value=datetime.now(NY_TZ).date(), key="alpha_diff_date")
+    with cmp_c2:
+        compare_source = st.selectbox(
+            "Replay Source",
+            ["SQLite Replay DB", "Signal Alpha Audit CSV"],
+            index=0,
+            key="alpha_diff_source"
+        )
+    with cmp_c3:
+        compare_symbol = st.selectbox("Symbol Filter", ["ALL"] + symbols, index=0, key="alpha_diff_symbol")
+    with cmp_c4:
+        diff_tol = st.number_input("Alpha Tol", min_value=0.0, value=1e-6, step=1e-6, format="%.6f", key="alpha_diff_tol")
+
+    live_alpha_df = load_intraday_pg_alpha(compare_date, compare_symbol)
+    replay_hint = ""
+    if compare_source == "SQLite Replay DB":
+        replay_alpha_df, replay_hint = load_intraday_sqlite_replay_alpha(compare_date, compare_symbol)
+    else:
+        replay_alpha_df, replay_hint = load_intraday_alpha_audit_csv(compare_date, compare_symbol)
+
+    diff_metrics, diff_rolling, diff_detail = build_intraday_alpha_diff(live_alpha_df, replay_alpha_df, tolerance=float(diff_tol))
+
+    d1, d2, d3, d4, d5, d6 = st.columns(6)
+    d1.metric("Live Rows", f"{diff_metrics['live_rows']}")
+    d2.metric("Replay Rows", f"{diff_metrics['replay_rows']}")
+    d3.metric("Matched", f"{diff_metrics['matched_rows']}", delta=f"Live {diff_metrics['coverage_live']:.1%}")
+    d4.metric("Replay Coverage", f"{diff_metrics['coverage_replay']:.1%}")
+    d5.metric("Exact Alpha", f"{diff_metrics['exact_alpha_ratio']:.1%}")
+    d6.metric("Within Tol", f"{diff_metrics['within_tol_alpha_ratio']:.1%}")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Alpha Max Diff", f"{diff_metrics['alpha_max_diff']:.6f}" if pd.notna(diff_metrics['alpha_max_diff']) else "N/A")
+    m2.metric("IV Max Diff", f"{diff_metrics['iv_max_diff']:.6f}" if pd.notna(diff_metrics['iv_max_diff']) else "N/A")
+    m3.metric("Price Max Diff", f"{diff_metrics['price_max_diff']:.6f}" if pd.notna(diff_metrics['price_max_diff']) else "N/A")
+    m4.metric("Vol_Z Max Diff", f"{diff_metrics['vol_z_max_diff']:.6f}" if pd.notna(diff_metrics['vol_z_max_diff']) else "N/A")
+
+    if replay_hint:
+        st.caption(f"Replay source path: `{replay_hint}`")
+
+    if not diff_rolling.empty:
+        fig_diff = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_diff.add_trace(
+            go.Scatter(
+                x=diff_rolling['minute_ny'],
+                y=diff_rolling['alpha_mae'],
+                mode='lines+markers',
+                name='Alpha MAE',
+                line=dict(color='#ff7f0e', width=2)
+            ),
+            secondary_y=False
+        )
+        fig_diff.add_trace(
+            go.Scatter(
+                x=diff_rolling['minute_ny'],
+                y=diff_rolling['matched_rows'],
+                mode='lines',
+                name='Matched Rows',
+                line=dict(color='#1f77b4', width=1, dash='dot')
+            ),
+            secondary_y=True
+        )
+        fig_diff.update_layout(
+            height=320,
+            margin=dict(l=10, r=10, t=30, b=10),
+            template=PLOTLY_THEME,
+            title="Intraday Rolling Alpha Diff"
+        )
+        fig_diff.update_yaxes(title_text="Alpha MAE", secondary_y=False)
+        fig_diff.update_yaxes(title_text="Matched Rows", secondary_y=True)
+        st.plotly_chart(fig_diff, use_container_width=True)
+
+        diff_long = diff_rolling.melt(
+            id_vars=['minute_ny'],
+            value_vars=['alpha_mae', 'iv_mae', 'price_mae', 'vol_z_mae'],
+            var_name='field',
+            value_name='mae'
+        )
+        fig_fields = px.line(
+            diff_long,
+            x='minute_ny',
+            y='mae',
+            color='field',
+            title="Field-Level Rolling MAE"
+        )
+        fig_fields.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), template=PLOTLY_THEME)
+        st.plotly_chart(fig_fields, use_container_width=True)
+    else:
+        st.info("No overlapping live/replay alpha rows yet for the selected source/date.")
+
+    if not diff_detail.empty:
+        st.markdown("#### Top Mismatches")
+        preview = diff_detail.copy().head(100)
+        preview['time_ny'] = pd.to_datetime(preview['ts'], unit='s', utc=True).dt.tz_convert('America/New_York').dt.strftime('%H:%M:%S')
+        show_cols = [
+            'time_ny', 'symbol',
+            'alpha_live', 'alpha_replay', 'alpha_diff',
+            'iv_live', 'iv_replay', 'iv_diff',
+            'price_live', 'price_replay', 'price_diff',
+            'vol_z_live', 'vol_z_replay', 'vol_z_diff'
+        ]
+        final_cols = [c for c in show_cols if c in preview.columns]
+        st.dataframe(preview[final_cols], use_container_width=True)
+    else:
+        st.info("No mismatch detail to show yet.")
+
+    st.divider()
     
     c_cfg, c_act = st.columns([1, 2])
     with c_cfg:

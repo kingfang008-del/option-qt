@@ -42,7 +42,7 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), '../model')
 if MODEL_DIR not in sys.path: sys.path.insert(0, MODEL_DIR)
 
 # 引入纯策略核心
-from strategy_core_v0 import StrategyCoreV0, StrategyConfig
+from strategy_selector import ACTIVE_STRATEGY_CORE_VERSION, StrategyCore, StrategyConfig
 
 # [Refactor] 引入模块化执行组件
 from orchestrator_state_manager import OrchestratorStateManager
@@ -89,6 +89,7 @@ from trading_tft_stock_embed import AdvancedAlphaNet
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [V8_Orch] - %(levelname)s - %(message)s')
 logger = logging.getLogger("V8_SignalEngine")
+PURE_ALPHA_REPLAY = os.environ.get('PURE_ALPHA_REPLAY') == '1'
 
 # [Fix] 显式添加 FileHandler 确保写入文件
 from config import LOG_DIR
@@ -174,6 +175,10 @@ class SymbolState:
         self.cached_macd_hist_slope = 0.0
         self.last_vol_z = 0.0
         self.last_min_ts = 0  # [Fix A] 记录上一次分钟指标更新的分钟时间戳
+        self.last_seen_ts = 0.0
+        self.pending_exit_reason = ""
+        self.pending_exit_count = 0
+        self.pending_exit_first_ts = 0.0
 
     def get_reversal_count(self, window_mins=30, threshold=0.001):
         """[Market Regime Guard] 计算过去 N 分钟内价格反转(洗盘)的频率"""
@@ -308,6 +313,11 @@ class SymbolState:
             'ema_fast_val': self.ema_fast_val,
             'ema_slow_val': self.ema_slow_val,
             'dea_val': self.dea_val
+            ,
+            'last_seen_ts': self.last_seen_ts,
+            'pending_exit_reason': self.pending_exit_reason,
+            'pending_exit_count': self.pending_exit_count,
+            'pending_exit_first_ts': self.pending_exit_first_ts,
         }
 
     def from_dict(self, data):
@@ -347,14 +357,19 @@ class SymbolState:
         self.ema_fast_val = data.get('ema_fast_val')
         self.ema_slow_val = data.get('ema_slow_val')
         self.dea_val = data.get('dea_val')
+        self.last_seen_ts = data.get('last_seen_ts', 0.0)
+        self.pending_exit_reason = data.get('pending_exit_reason', "")
+        self.pending_exit_count = data.get('pending_exit_count', 0)
+        self.pending_exit_first_ts = data.get('pending_exit_first_ts', 0.0)
 
 class SignalEngineV8:
     def __init__(self, symbols, mode='realtime', config_paths=None, model_paths=None):
         print(f"DEBUG: V8Orchestrator Initializing... Mode={mode}")
         self.mode = mode
         self.symbols = symbols
-        self.strategy = StrategyCoreV0(StrategyConfig())
+        self.strategy = StrategyCore(StrategyConfig())
         self.cfg = self.strategy.cfg
+        logger.info(f"🧭 Active strategy core: {ACTIVE_STRATEGY_CORE_VERSION}")
         self.states = {s: SymbolState(s, config=self.cfg) for s in symbols}
         self.symbol_states = self.states # Alias
         
@@ -416,7 +431,6 @@ class SignalEngineV8:
         self.dynamic_alpha_mean = 0.0
         self.dynamic_alpha_std = 1.0
         self.alpha_count = 0
-
         # 赋予一个先验初始值 (防止冷启动期间的极端缩放)
         self.dynamic_vol_mean = 0.0739 
         self.dynamic_vol_std = 0.1106
@@ -478,6 +492,49 @@ class SignalEngineV8:
         # [NEW] 模式启动声明
         mode_str = "✅ [Bid/Ask + BSM 校准模式]" if USE_BID_ASK_PRICING else "⚠️ [成交价模式 (Transaction Price Mode)]"
         logger.info(f"📊 Orchestrator 启动! 当前价格计算模式: {mode_str}")
+
+    def _is_high_freq_tick(self, st, curr_ts):
+        prev_ts = float(getattr(st, 'last_seen_ts', 0.0) or 0.0)
+        st.last_seen_ts = float(curr_ts)
+        if prev_ts <= 0:
+            return False
+        dt_sec = float(curr_ts) - prev_ts
+        return 0.0 < dt_sec <= 2.0
+
+    def _should_confirm_exit(self, reason):
+        prefixes = getattr(self.cfg, 'EXIT_CONFIRM_REASON_PREFIXES', ())
+        return any(str(reason).startswith(prefix) for prefix in prefixes)
+
+    def _confirm_high_freq_exit(self, st, exit_sig, curr_ts):
+        reason = str(exit_sig.get('reason', ''))
+        if not self._should_confirm_exit(reason):
+            st.pending_exit_reason = ""
+            st.pending_exit_count = 0
+            st.pending_exit_first_ts = 0.0
+            return exit_sig
+
+        required = max(1, int(getattr(self.cfg, 'EXIT_CONFIRM_SECONDS_1S', 1)))
+        if st.pending_exit_reason == reason:
+            st.pending_exit_count += 1
+        else:
+            st.pending_exit_reason = reason
+            st.pending_exit_count = 1
+            st.pending_exit_first_ts = float(curr_ts)
+
+        if st.pending_exit_count < required:
+            logger.debug(f"⏳ [Exit Confirm] {st.symbol} waiting {st.pending_exit_count}/{required} for {reason}")
+            return None
+
+        exit_sig['reason'] = f"{reason}|CONFIRM_{st.pending_exit_count}s"
+        st.pending_exit_reason = ""
+        st.pending_exit_count = 0
+        st.pending_exit_first_ts = 0.0
+        return exit_sig
+
+    def _reset_exit_confirmation(self, st):
+        st.pending_exit_reason = ""
+        st.pending_exit_count = 0
+        st.pending_exit_first_ts = 0.0
 
     def _load_state(self):
         return self.state_manager._load_state()
@@ -791,7 +848,10 @@ class SignalEngineV8:
             'curr_price': market_opt_price, 'curr_stock': stock_price,
             'bid': bid,
             'ask': ask,
-            'snap_roc': getattr(st, 'last_snap_roc', 0.0)
+            'snap_roc': getattr(st, 'last_snap_roc', 0.0),
+            'global_regime_reversal_cnt': getattr(self, 'last_global_regime_reversal_cnt', 0),
+            'regime_reversal_count': getattr(self, 'last_global_regime_reversal_cnt', 0),
+            'is_volatile_regime': getattr(self, 'last_global_is_volatile_regime', False),
         }
         
         # 高频更新 max_roi (让 Protect 和 Trailing Stop 的追踪更加灵敏)
@@ -987,7 +1047,6 @@ class SignalEngineV8:
     def _prep_symbol_metrics(self, i, sym, stock_prices, raw_alphas, opt_data, metrics_batch, use_precalc_feed=False, metrics_batch_manual=None):
         """[核心] 为单个标的准备分钟级指标，支持分钟边界的价格与期权采样纠偏"""
         converge_to_single = os.environ.get('DUAL_CONVERGE_TO_SINGLE') == '1'
-        if sym in NON_TRADABLE_SYMBOLS: return None
         if sym not in self.states:
             if self.mode == 'backtest': self.states[sym] = SymbolState(sym)
             else: return None
@@ -1002,6 +1061,8 @@ class SignalEngineV8:
         
         raw_alpha_val = float(raw_alphas[i])
         raw_vols = metrics_batch.get('fast_vol', [0.0] * (i + 1))
+        alpha_label_ts_arr = metrics_batch.get('alpha_label_ts', [0.0] * (i + 1))
+        alpha_available_ts_arr = metrics_batch.get('alpha_available_ts', [0.0] * (i + 1))
         
         # 1. 更新指标状态 (MACD, ROC)
         st.update_indicators(calc_price, raw_alpha_val, ts=metrics_batch.get('curr_ts'), use_precalc_feed=use_precalc_feed)
@@ -1016,6 +1077,13 @@ class SignalEngineV8:
 
         # Alpha & Vol 缩放
         vol_z_dict = metrics_batch.get('vol_z_dict', {})
+        if sym in NON_TRADABLE_SYMBOLS:
+            if sym in vol_z_dict:
+                try:
+                    st.last_vol_z = float(vol_z_dict[sym])
+                except Exception:
+                    pass
+            return None
         
         if use_precalc_feed:
             # 🚀 [回测/预计算模式] 直接透传预处理好的 Z-Score
@@ -1067,15 +1135,19 @@ class SignalEngineV8:
             'macd_slope': macd_slope,
             'snap_roc': snap_roc,
             'event_prob': self.cached_event_probs.get(sym, 0.0), # [🆕 新增]
+            'alpha_label_ts': float(alpha_label_ts_arr[i]) if i < len(alpha_label_ts_arr) else 0.0,
+            'alpha_available_ts': float(alpha_available_ts_arr[i]) if i < len(alpha_available_ts_arr) else 0.0,
             'st': st
         }
         return metrics
         
     # 🚀 [零干扰修复] 签名增加 should_update_full，用于决定是否写 Alpha Log
-    async def _evaluate_symbol_signals(self, i, sym, metrics, opt_data, ny_now, curr_ts, spy_roc, qqq_roc, is_zombie_market, index_trend=0, global_regime_reversal_cnt=0, should_update_full=True):
+    async def _evaluate_symbol_signals(self, i, sym, metrics, opt_data, ny_now, curr_ts, spy_roc, qqq_roc, is_zombie_market, index_trend=0, global_regime_reversal_cnt=0, global_is_volatile_regime=None, should_update_full=True):
         """[Refactor] 核心策略评价 logic (平仓与开仓信号收集) - 修复空仓不交易BUG"""
         from config import USE_BID_ASK_PRICING
         st = metrics['st']
+        if global_is_volatile_regime is None:
+            global_is_volatile_regime = getattr(self, 'last_global_is_volatile_regime', False)
         
         # 🚀 [终极期权对位] 
         # 如果当前是分钟边界 (:00 秒触发的决策)，为了对齐 1m 基准表，必须使用上一秒缓存的期权快照 (:59)
@@ -1168,6 +1240,7 @@ class SignalEngineV8:
             'snap_roc': metrics['snap_roc'],
             'global_regime_reversal_cnt': global_regime_reversal_cnt, # 🚀 [NEW]
             'regime_reversal_count': global_regime_reversal_cnt,     # For V0 compatibility
+            'is_volatile_regime': bool(global_is_volatile_regime),
             'state': st
         }
         
@@ -1300,7 +1373,9 @@ class SignalEngineV8:
                     'strike': t_k, 'iv': t_iv, 'contract_id': t_id, 'volume': t_vol, 
                     'bid': t_bid, 'ask': t_ask, 'bid_size': t_bs, 'ask_size': t_as, 
                     'spy_roc': spy_roc, 'alpha_z': final_alpha, 
-                    'index_trend': index_trend
+                    'index_trend': index_trend,
+                    'alpha_label_ts': metrics.get('alpha_label_ts', 0.0),
+                    'alpha_available_ts': metrics.get('alpha_available_ts', curr_ts),
                 }
             })
             return entry_sig
@@ -1430,6 +1505,7 @@ class SignalEngineV8:
 
         # 4. 执行平仓 (必须在 is_zombie_market 之前，确保 EOD 和止损能随时触发)
         if st.position != 0:
+            high_freq_tick = self._is_high_freq_tick(st, curr_ts)
             # 🛡️ [终极修复] 建仓绝对保护期 (Entry Breathing Room)
             # 绝对禁止在建仓后的最初 60 秒内通过常规逻辑平仓
             if curr_ts - st.entry_ts < 59.0:
@@ -1440,9 +1516,13 @@ class SignalEngineV8:
             current_roi = (ctx['curr_price'] - st.entry_price) / st.entry_price if st.entry_price > 0 else 0
             logger.info(f"🔍 [主循环平仓送审] {sym} | 模式: {self.mode} | 当前价: {ctx['curr_price']:.2f} | 成本: {st.entry_price:.2f} | ROI: {current_roi*100:.2f}% | Max ROI: {st.max_roi*100:.2f}%")
           
-                
+            
             exit_sig = self.strategy.check_exit(ctx)
             if exit_sig:
+                if high_freq_tick:
+                    exit_sig = self._confirm_high_freq_exit(st, exit_sig, curr_ts)
+                    if not exit_sig:
+                        return None
                 exit_sig['price'] = ctx['curr_price']
                 exit_sig['market_price'] = market_opt_price
                 if opt_data['has_feed']:
@@ -1464,6 +1544,8 @@ class SignalEngineV8:
                     logger.info(f"📝 [Shadow] {sym} Exit signal detected, but skipping execution (Alpha-Only).")
                     return None
             else:
+                if high_freq_tick:
+                    self._reset_exit_confirmation(st)
                 # [🎯 靶向日志 B3] 明确是被策略内部拒绝
                 logger.debug(f"🛡️ [策略拒平] {sym} 的 check_exit 返回 None，当前无满足条件的平仓信号。")
                 return None
@@ -1528,7 +1610,9 @@ class SignalEngineV8:
                     'strike': t_k, 'iv': t_iv, 'contract_id': t_id, 'volume': t_vol, 
                     'bid': t_bid, 'ask': t_ask, 'bid_size': t_bs, 'ask_size': t_as, 
                     'spy_roc': spy_roc, 'alpha_z': final_alpha, 'ask_size': t_as, # [Fix] 显式传导 ask_size 供流动性评估
-                    'index_trend': index_trend
+                    'index_trend': index_trend,
+                    'alpha_label_ts': metrics.get('alpha_label_ts', 0.0),
+                    'alpha_available_ts': metrics.get('alpha_available_ts', curr_ts),
                 }
             })
             return entry_sig
@@ -1711,6 +1795,21 @@ class SignalEngineV8:
         self.last_is_zombie = (zero_vol_pct > 0.50)
         return vol_z_dict
 
+    def _update_vixy_regime_state(self, symbols, stock_prices, curr_ts):
+        """只更新 VIXY 的分钟状态，用于 regime / hard stop 切档，不触发交易。"""
+        for idx, sym in enumerate(symbols):
+            if sym != 'VIXY':
+                continue
+            st = self.states.get(sym)
+            if st is None:
+                st = self.states[sym] = SymbolState(sym, config=self.cfg)
+            try:
+                price = float(stock_prices[idx]) if idx < len(stock_prices) else 0.0
+            except Exception:
+                price = 0.0
+            if price > 0:
+                st.update_indicators(price, 0.0, ts=curr_ts, use_precalc_feed=True)
+
 
     async def process_batch(self, batch: dict):
         # 🚀 [零干扰引擎] 自动识别数据模式
@@ -1765,6 +1864,9 @@ class SignalEngineV8:
 
         if should_update_full and is_high_freq:
             logger.info(f"🆕 [Minute Boundary] {ny_now} | ts: {curr_ts} | Symbols: {len(symbols)}")
+
+        if should_update_full:
+            self._update_vixy_regime_state(symbols, stock_prices, curr_ts)
         
         # ✅ [核心重构] 第一阶段：秒级更新（始终执行）
         # 1. 更新所有标的的 Tick 视图（价格、买卖盘）
@@ -1792,7 +1894,10 @@ class SignalEngineV8:
             if getattr(self, '_warmup_gate_log_count', 0) < 10:
                 logger.info(
                     f"⏳ [SE-Warmup-Gate] Skip inference at {ny_now.strftime('%H:%M:%S')} "
-                    f"| real_history_len={batch.get('real_history_len', 0)}/30"
+                    f"| real_history_len={batch.get('real_history_len', 0)}/{batch.get('warmup_required_len', 31)} "
+                    f"| total_history_len={batch.get('total_history_len', 0)} "
+                    f"| real_norm_history_len={batch.get('real_norm_history_len', 0)} "
+                    f"| cross_day={batch.get('has_cross_day_warmup', False)}"
                 )
                 self._warmup_gate_log_count = getattr(self, '_warmup_gate_log_count', 0) + 1
             await self._oms_sync(curr_ts, frame_id=frame_id)
@@ -1886,6 +1991,9 @@ class SignalEngineV8:
         # 🚀 [NEW] 计算全局市场状态 (Market Regime Guard)
         vixy_st = self.states.get('VIXY')
         global_regime_reversal_cnt = 0
+        global_is_volatile_regime = False
+        vixy_roc_5m = 0.0
+        raw_vixy_volatile_regime = False
         if vixy_st:
             # [Fix] 增加 getattr 鲁棒性，应对 Config 尚未刷新但 Engine 已升级的情况
             regime_window = getattr(self.cfg, 'REGIME_WINDOW_MINS', 30)
@@ -1893,6 +2001,28 @@ class SignalEngineV8:
             global_regime_reversal_cnt = vixy_st.get_reversal_count(
                 window_mins=regime_window,
                 threshold=regime_thresh
+            )
+            regime_limit = getattr(self.cfg, 'REGIME_REVERSAL_THRESHOLD', 6)
+            vixy_roc_5m, _, _, _ = vixy_st.get_strategy_metrics()
+            vixy_roc_threshold = getattr(self.cfg, 'REGIME_VIXY_ROC_THRESHOLD', 0.003)
+            raw_vixy_volatile_regime = (
+                global_regime_reversal_cnt > regime_limit
+                or vixy_roc_5m >= vixy_roc_threshold
+            )
+            require_neutral_index = getattr(self.cfg, 'REGIME_REQUIRE_NEUTRAL_INDEX_FOR_TIGHT_STOP', True)
+            global_is_volatile_regime = (
+                raw_vixy_volatile_regime
+                and (not require_neutral_index or index_trend == 0)
+            )
+        self.last_global_regime_reversal_cnt = int(global_regime_reversal_cnt)
+        prev_regime_flag = getattr(self, 'last_global_is_volatile_regime', None)
+        self.last_global_is_volatile_regime = bool(global_is_volatile_regime)
+        if prev_regime_flag is None or prev_regime_flag != self.last_global_is_volatile_regime:
+            logger.info(
+                f"🧭 [Regime Audit] VIXY_ROC_5M={vixy_roc_5m:.4%} | "
+                f"VIXY_Reversals={int(global_regime_reversal_cnt)} | "
+                f"IndexTrend={index_trend} | RawVol={raw_vixy_volatile_regime} | "
+                f"Volatile={self.last_global_is_volatile_regime}"
             )
         
         # 9. 符号处理循环 (更新分钟指标 & 评估入场信号)
@@ -1941,12 +2071,16 @@ class SignalEngineV8:
                 i, sym, metrics, opt_data, ny_now, curr_ts, spy_rocs[i], qqq_rocs[i], 
                 getattr(self, 'last_is_zombie', False), index_trend, 
                 global_regime_reversal_cnt=global_regime_reversal_cnt, # 🚀 [NEW]
+                global_is_volatile_regime=global_is_volatile_regime,
                 should_update_full=True
             )
             if entry_sig:
                 logger.info(f"🎯 [Signal Found] {sym} | Reason: {entry_sig.get('reason')} | Alpha: {metrics['final_alpha']:.2f}")
-                # 🚀 [Parity Fix] 统一采用 Orchestrator 的排序算法 (Alpha / IV * Momentum)
-                raw_rank = abs(metrics['final_alpha']) / max(0.1, st.last_valid_iv)
+                # S4 回测纯执行模式下，排序只由 alpha 和价格动量驱动，不再让 IV 参与二次筛选。
+                if PURE_ALPHA_REPLAY:
+                    raw_rank = abs(metrics['final_alpha'])
+                else:
+                    raw_rank = abs(metrics['final_alpha']) / max(0.1, st.last_valid_iv)
                 mom_multiplier = 1.0 + abs(metrics['roc_5m']) * 100.0
                 entry_candidates.append({
                     'sym': sym, 'sig': entry_sig, 'price': metrics['price'],
@@ -2034,7 +2168,9 @@ class SignalEngineV8:
             await self._evaluate_symbol_signals(
                 i, sym, metrics, opt_data, ny_now, curr_ts, 
                 self.last_spy_roc_val, self.last_qqq_roc_val, 
-                getattr(self, 'last_is_zombie', False), self.last_index_trend, should_update_full=False
+                getattr(self, 'last_is_zombie', False), self.last_index_trend,
+                global_regime_reversal_cnt=getattr(self, 'last_global_regime_reversal_cnt', 0),
+                should_update_full=False
             )
 
     async def _oms_sync(self, curr_ts: float, frame_id: str = None):
@@ -2126,6 +2262,7 @@ class SignalEngineV8:
     # ================= 替换掉旧的 _emit_trade_signal =================
     async def _emit_trade_signal(self, action, sym, sig, stock_price, curr_ts, batch_idx):
         st = self.states[sym]
+        original_position = st.position
         
         # 🚨 [真正的无状态设计]
         # SE 只负责发出意图，绝对不允许越权修改本地的 st.position 等真实资金状态。
@@ -2138,6 +2275,7 @@ class SignalEngineV8:
         elif action == 'SELL':
             st.is_pending = True
             st.pending_action = 'SELL'
+            sig['original_position'] = original_position
             
             # 🚀 [对齐单引擎] 立即释放方向锁 (position)
             # 单引擎中 _execute_exit 同步执行，在符号循环中间就清零了 position。

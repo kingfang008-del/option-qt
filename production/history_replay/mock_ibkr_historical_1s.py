@@ -4,7 +4,13 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import time
-from config import EXECUTION_DELAY_BARS, EXECUTION_DELAY_SECONDS
+from config import (
+    COMMISSION_PER_CONTRACT,
+    EXECUTION_DELAY_BARS,
+    EXECUTION_DELAY_SECONDS,
+    BACKTEST_1S_DISABLE_DELAY,
+    BACKTEST_1S_DISABLE_POSTHOC_REPRICE,
+)
 
 logger = logging.getLogger("MockIBKR_Hist")
 
@@ -24,8 +30,9 @@ class MockIBKRHistorical:
         # =========================================================
         # 🚀 [核心引擎升级] 与 OMS 共用统一执行延迟配置，避免双处手改
         # =========================================================
-        self.execution_delay_bars = EXECUTION_DELAY_BARS
-        self.execution_delay_seconds = EXECUTION_DELAY_SECONDS
+        self.execution_delay_bars = 0 if BACKTEST_1S_DISABLE_DELAY else EXECUTION_DELAY_BARS
+        self.execution_delay_seconds = 0 if BACKTEST_1S_DISABLE_DELAY else EXECUTION_DELAY_SECONDS
+        self.disable_posthoc_reprice = BACKTEST_1S_DISABLE_POSTHOC_REPRICE
         self.fill_delay = (
             f"{self.execution_delay_seconds}s"
             if self.execution_delay_seconds > 0
@@ -221,83 +228,86 @@ class MockIBKRHistorical:
             else: return data['pa'] if data['pa'] > 0 else data['p']
 
     def _match_trades(self):
-        """[升级版] 带有 Delay Bar 和 Bid/Ask 惩罚的 FIFO 真实撮合逻辑"""
-        open_positions = {} 
+        """支持部分成交 FIFO、手续费、时延重定价的 1s 历史撮合。"""
+        open_positions = {}
         trades = []
-        
+
         sorted_orders = sorted(self.orders, key=lambda x: x['ts'])
-        
+
         for od in sorted_orders:
             sym = od['symbol']
-            
+
             if od['action'] == 'BUY':
-                if sym not in open_positions: open_positions[sym] = []
-                open_positions[sym].append(od)
-                
+                if sym not in open_positions:
+                    open_positions[sym] = []
+                open_positions[sym].append(dict(od))
+
             elif od['action'] == 'SELL':
                 if sym in open_positions and open_positions[sym]:
-                    buy_od = open_positions[sym].pop(0)
-                    
-                    # 默认使用 0 bar 理想价格
-                    entry_price = buy_od['price']
-                    exit_price = od['price']
-                    opt_dir = buy_od.get('opt_dir', 'CALL')
+                    remaining_sell_qty = od['qty']
+                    while remaining_sell_qty > 0 and open_positions[sym]:
+                        buy_od = open_positions[sym][0]
+                        match_qty = min(buy_od['qty'], remaining_sell_qty)
 
-                    # =========================================================
-                    # 🚀 [时间机器] 时延盘口重定价 (Delay Execution Reprepricing)
-                    # =========================================================
-                    delay_bars = getattr(self, 'execution_delay_bars', 0)
-                    delay_secs = getattr(self, 'execution_delay_seconds', 0)
-                    
-                    if delay_secs > 0:
-                        # [高仿真] 使用秒级偏移匹配价格
-                        delayed_entry = self._get_price_at_time(sym, buy_od['ts'] + delay_secs, opt_dir, 'BUY')
-                        delayed_exit = self._get_price_at_time(sym, od['ts'] + delay_secs, opt_dir, 'SELL')
-                    elif delay_bars > 0:
-                        # [传统模式] 使用 1min Bar 偏移匹配价格
-                        delayed_entry = self._get_price_at_bar_offset(sym, buy_od['ts'], opt_dir, 'BUY', delay_bars, price_type='mid')
-                        delayed_exit = self._get_price_at_bar_offset(sym, od['ts'], opt_dir, 'SELL', delay_bars, price_type='mid')
-                    else:
-                        delayed_entry, delayed_exit = None, None
-                        
-                    if delayed_entry is not None and delayed_entry > 0.01:
-                        entry_price = delayed_entry
-                    if delayed_exit is not None and delayed_exit > 0.01:
-                        exit_price = delayed_exit
-                    # =========================================================
-                    
-                    cost = entry_price * buy_od['qty'] * 100
-                    proceeds = exit_price * od['qty'] * 100
-                    pnl = proceeds - cost
-                    roi = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
-                    
-                    # 计算持仓时间 (分钟)
-                    duration = (od['ts'] - buy_od['ts']) / 60.0 
-                    
-                    trades.append({
-                        'date': buy_od['date'],
-                        'symbol': sym,
-                        'entry_time': buy_od['time'],
-                        'exit_time': od['time'],
-                        'pnl': pnl,
-                        'roi': roi,
-                        'qty': od['qty'],
-                        'entry_price': entry_price,  # 记录被惩罚后的真实买价
-                        'exit_price': exit_price,    # 记录被惩罚后的真实卖价
-                        'reason': od['reason'],
-                        'duration': duration,
-                        'entry_ts': buy_od['ts'],
-                        'exit_ts': od['ts'],
-                        'contract': buy_od.get('contract', ''),
-                        'opt_dir': opt_dir,
-                        'entry_stock': buy_od.get('stock_price', 0.0),
-                        'exit_stock': od.get('stock_price', 0.0),
-                        'liq_chunks': buy_od.get('liq_chunks', 1),
-                        'liq_reason': buy_od.get('liq_reason', 'N/A')
-                    })
+                        entry_price = buy_od['price']
+                        exit_price = od['price']
+                        opt_dir = buy_od.get('opt_dir', 'CALL')
+
+                        delay_bars = getattr(self, 'execution_delay_bars', 0)
+                        delay_secs = getattr(self, 'execution_delay_seconds', 0)
+
+                        if not self.disable_posthoc_reprice:
+                            if delay_secs > 0:
+                                delayed_entry = self._get_price_at_time(sym, buy_od['ts'] + delay_secs, opt_dir, 'BUY')
+                                delayed_exit = self._get_price_at_time(sym, od['ts'] + delay_secs, opt_dir, 'SELL')
+                            elif delay_bars > 0:
+                                delayed_entry = self._get_price_at_bar_offset(sym, buy_od['ts'], opt_dir, 'BUY', delay_bars, price_type='mid')
+                                delayed_exit = self._get_price_at_bar_offset(sym, od['ts'], opt_dir, 'SELL', delay_bars, price_type='mid')
+                            else:
+                                delayed_entry, delayed_exit = None, None
+
+                            if delayed_entry is not None and delayed_entry > 0.01:
+                                entry_price = delayed_entry
+                            if delayed_exit is not None and delayed_exit > 0.01:
+                                exit_price = delayed_exit
+
+                        entry_commission = match_qty * COMMISSION_PER_CONTRACT
+                        exit_commission = match_qty * COMMISSION_PER_CONTRACT
+                        cost = (entry_price * match_qty * 100) + entry_commission
+                        proceeds = (exit_price * match_qty * 100) - exit_commission
+                        pnl = proceeds - cost
+                        roi = (exit_price - entry_price) * match_qty * 100 / cost if cost > 0 else 0
+
+                        trades.append({
+                            'date': buy_od['date'],
+                            'symbol': sym,
+                            'entry_time': buy_od['time'],
+                            'exit_time': od['time'],
+                            'pnl': pnl,
+                            'roi': roi,
+                            'qty': match_qty,
+                            'entry_price': entry_price,
+                            'exit_price': exit_price,
+                            'reason': od.get('reason', 'N/A'),
+                            'duration': (od['ts'] - buy_od['ts']) / 60.0,
+                            'entry_ts': buy_od['ts'],
+                            'exit_ts': od['ts'],
+                            'contract': buy_od.get('contract', ''),
+                            'opt_dir': opt_dir,
+                            'entry_stock': buy_od.get('stock_price', 0.0),
+                            'exit_stock': od.get('stock_price', 0.0),
+                            'liq_chunks': buy_od.get('liq_chunks', 1),
+                            'liq_reason': buy_od.get('liq_reason', 'N/A')
+                        })
+
+                        remaining_sell_qty -= match_qty
+                        buy_od['qty'] -= match_qty
+                        if buy_od['qty'] <= 0:
+                            open_positions[sym].pop(0)
+
         return trades, open_positions
 
-    def save_trades(self):
+    def save_trades(self, filename="replay_trades_v8_1s.csv"):
         if not self.orders:
             print("\n⚠️ NO TRADES EXECUTED.")
             return
@@ -317,9 +327,9 @@ class MockIBKRHistorical:
         from pathlib import Path
         log_dir = Path.home() / "quant_project/logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        filename = log_dir / "replay_trades_v8.csv"
-        df_trades.to_csv(filename, index=False)
-        print(f"\n💾 Trades saved to {filename}")
+        target_path = log_dir / filename
+        df_trades.to_csv(target_path, index=False)
+        print(f"\n💾 Trades saved to {target_path}")
         
         self._print_daily_report(df_trades)
         self._print_summary_report(df_trades, open_pos)
@@ -429,14 +439,14 @@ class MockIBKRHistorical:
             
             if p_entry and p_exit:
                 new_pnl = (p_exit - p_entry) * tr['qty'] * 100
-                delayed_trades.append({'date': tr['date'], 'pnl': new_pnl})
+                delayed_trades.append({'date': tr['date'], 'exit_ts': tr['exit_ts'], 'pnl': new_pnl})
             else:
                 # 缺失数据 (比如延迟后碰到了收盘) 视同保本或剥离
                 pass
         
         df_delayed = pd.DataFrame(delayed_trades)
-        rets = self._get_daily_returns(df_delayed)
-        return self._compute_sharpe(rets)
+        rets = self._get_intraday_returns(df_delayed)
+        return self._compute_sharpe(rets, is_intraday=True)
 
     def _get_daily_returns(self, df):
         if df.empty: return pd.Series()
@@ -447,9 +457,21 @@ class MockIBKRHistorical:
         if not daily_returns.empty:
             daily_returns.iloc[0] = daily_pnl.iloc[0] / self.initial_capital
         return daily_returns
+
+    def _get_intraday_returns(self, df):
+        """Use trade-level returns so single-day 1s replays can still report decay."""
+        if df.empty:
+            return pd.Series()
+        df_sorted = df.sort_values('exit_ts').copy()
+        df_sorted['cum_pnl'] = df_sorted['pnl'].cumsum()
+        equity_curve = self.initial_capital + df_sorted['cum_pnl']
+        return equity_curve.pct_change().fillna(df_sorted['pnl'].iloc[0] / self.initial_capital)
         
-    def _compute_sharpe(self, rets):
+    def _compute_sharpe(self, rets, is_intraday=True):
         if len(rets) > 1 and rets.std() > 1e-9:
+            if is_intraday:
+                # Same conservative trade-level annualization used by the 1m mock.
+                return np.sqrt(252 * 50) * (rets.mean() / rets.std())
             return np.sqrt(252) * (rets.mean() / rets.std())
         return 0.0
 
@@ -534,11 +556,11 @@ class MockIBKRHistorical:
                 pnl_pct = (s_exit - s_entry) / s_entry * direction
                 # 将收益率映射为虚拟 PnL 供 _get_daily_returns 计算 (这里乘以 initial_capital 放大)
                 virtual_pnl = pnl_pct * self.initial_capital * 0.1 # 假设 10% 杠杆
-                stock_trades.append({'date': tr['date'], 'pnl': virtual_pnl})
+                stock_trades.append({'date': tr['date'], 'exit_ts': tr['exit_ts'], 'pnl': virtual_pnl})
         
         df_stock = pd.DataFrame(stock_trades)
-        rets = self._get_daily_returns(df_stock)
-        return self._compute_sharpe(rets)
+        rets = self._get_intraday_returns(df_stock)
+        return self._compute_sharpe(rets, is_intraday=True)
 
     def _print_pure_directional_ic_report(self):
         """[Premium] 纯净方向性 IC 诊断 (Pure Directional IC Benchmark)
@@ -563,10 +585,20 @@ class MockIBKRHistorical:
             return
             
         df = pd.DataFrame(data_list)
+        # 1s 回放会把分钟 alpha 广播到每一秒。如果直接 shift(-k)，
+        # "1 min fwd" 会被误算成 1 秒 forward。这里先降采样到分钟网格，
+        # 让 IC 口径和分钟版保持一致。
+        df['minute_ts'] = (df['ts'].astype(np.int64) // 60) * 60
+        df = (
+            df.sort_values('ts')
+              .drop_duplicates(subset=['minute_ts', 'sym'], keep='first')
+              .drop(columns=['ts'])
+              .rename(columns={'minute_ts': 'ts'})
+        )
         # 转换日期和符号索引，方便计算 Forward Return
         df = df.pivot(index='ts', columns='sym', values=['alpha', 'price'])
         
-        horizons = [1, 5, 15, 30, 60] # 分钟 (假设 1 bar = 1 min)
+        horizons = [1, 5, 15, 30, 60] # 分钟；上面已经降采样为 1 bar = 1 min
         
         results = []
         for k in horizons:

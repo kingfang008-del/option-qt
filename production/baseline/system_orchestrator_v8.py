@@ -41,7 +41,7 @@ from pytz import timezone
 from scipy.stats import norm 
 
 # 引入纯策略核心
-from strategy_core_v0 import StrategyCoreV0, StrategyConfig
+from strategy_selector import ACTIVE_STRATEGY_CORE_VERSION, StrategyCore, StrategyConfig
 
 # [Refactor] 引入模块化执行组件
 from orchestrator_state_manager import OrchestratorStateManager
@@ -346,8 +346,9 @@ class V8Orchestrator:
         self.symbols = symbols
         self.states = {s: SymbolState(s) for s in symbols}
         self.symbol_states = self.states # Alias
-        self.strategy = StrategyCoreV0(StrategyConfig())
+        self.strategy = StrategyCore(StrategyConfig())
         self.cfg = self.strategy.cfg  # [Fix] 显式暴露配置给组件
+        logger.info(f"🧭 Active strategy core: {ACTIVE_STRATEGY_CORE_VERSION}")
         
         # [Refactor] 模块化组件初始化
         self.state_manager = OrchestratorStateManager(self)

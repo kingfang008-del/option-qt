@@ -4,6 +4,8 @@
 import os
 # 🚨 绝对第一优先级！在所有 import 之前，强行把整个进程及其子模块按倒在 BACKTEST 模式！
 os.environ['RUN_MODE'] = 'BACKTEST'
+os.environ['DUAL_CONVERGE_TO_SINGLE'] = '1'
+os.environ['PURE_ALPHA_REPLAY'] = '1'
 
 import asyncio
 import threading
@@ -28,8 +30,9 @@ sys.path.insert(0, str(ROOT_DIR / "production" / "baseline"))
 sys.path.insert(0, str(ROOT_DIR / "production" / "history_replay"))
 sys.path.insert(0, str(ROOT_DIR / "production" / "model"))
 
-# 导入 V8 引擎
-from system_orchestrator_v8 import V8Orchestrator
+# 导入双引擎
+from signal_engine_v8 import SignalEngineV8
+from execution_engine_v8 import ExecutionEngineV8
 # 导入 Driver 和 Mock IBKR 
 import mock_ibkr_historical
 from mock_ibkr_historical import MockIBKRHistorical
@@ -37,7 +40,8 @@ print(f"🔍 [Import Trace] Using MockIBKR from: {mock_ibkr_historical.__file__}
 
 # 🚨 导入 config 并确认 Redis 流名称 (虽然不再作为主要 Bus，但维持一致性)
 import config
-import system_orchestrator_v8
+import signal_engine_v8
+import execution_engine_v8
 
 BACKTEST_STREAM = "backtest_stream"
 BACKTEST_GROUP  = "backtest_group"
@@ -45,18 +49,20 @@ BACKTEST_GROUP  = "backtest_group"
 # 统一所有可能用到的配置源
 config.REDIS_CFG['input_stream'] = BACKTEST_STREAM
 config.REDIS_CFG['orch_group'] = BACKTEST_GROUP
-system_orchestrator_v8.REDIS_CFG['input_stream'] = BACKTEST_STREAM
-system_orchestrator_v8.REDIS_CFG['orch_group'] = BACKTEST_GROUP
+signal_engine_v8.REDIS_CFG['input_stream'] = BACKTEST_STREAM
+signal_engine_v8.REDIS_CFG['orch_group'] = BACKTEST_GROUP
+execution_engine_v8.REDIS_CFG['input_stream'] = BACKTEST_STREAM
+execution_engine_v8.REDIS_CFG['orch_group'] = BACKTEST_GROUP
 
 # ================= 配置区域 =================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [REPLAY_STABLE] - %(message)s')
-logger = logging.getLogger("ReplayStable")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [REPLAY_S2_1M] - %(message)s')
+logger = logging.getLogger("ReplayS2_1M")
 
 def resolve_db_path(args):
     """[Critical Fix] 严格锁定并寻找 history_sqlite_1m 目录下的权威数据库"""
     CURRENT_DIR = Path(__file__).resolve().parent
     # 🚀 既然确定了是在 history_sqlite_1m 下，我们直接锁定这个路径，不做任何模糊搜索
-    HIST_DIR = CURRENT_DIR.parent / "preprocess" / "backtest" / "history_sqlite_1s"
+    HIST_DIR = CURRENT_DIR.parent / "preprocess" / "backtest" / "history_sqlite_1m"
     
     if args.date:
         db_name = f"market_{args.date}.db"
@@ -98,13 +104,26 @@ async def main():
     from config import TARGET_SYMBOLS
     symbols = [args.symbol] if args.symbol else TARGET_SYMBOLS
 
-    logger.info("🛠️ Building V8 Orchestrator Engine...") 
-    orch = V8Orchestrator(
-        symbols=symbols, 
-        mode='backtest', 
-        config_paths=config_paths, 
-        model_paths={} 
+    logger.info("🛠️ Building V8 Dual Engine...") 
+    signal_engine = SignalEngineV8(
+        symbols=symbols,
+        mode='backtest',
+        config_paths=config_paths,
+        model_paths={}
     )
+    shared_signal_queue = asyncio.Queue()
+    signal_engine.signal_queue = shared_signal_queue
+    signal_engine.use_shared_mem = True
+
+    exec_engine = ExecutionEngineV8(
+        symbols=symbols,
+        mode='backtest',
+        shared_states=signal_engine.states,
+        signal_queue=shared_signal_queue
+    )
+    exec_engine.strategy.cfg = signal_engine.strategy.cfg
+    exec_engine.cfg = signal_engine.strategy.cfg
+    exec_engine.use_shared_mem = True
     
     logger.info(f"🔌 Injecting Mock IBKR...")
     mock_ibkr = MockIBKRHistorical()
@@ -113,8 +132,10 @@ async def main():
     # 彻底清理 Redis 遗留状态
     mock_ibkr.r.flushdb()
     
-    orch.ibkr = mock_ibkr
-    orch.mock_cash = mock_ibkr.initial_capital
+    signal_engine.ibkr = mock_ibkr
+    exec_engine.ibkr = mock_ibkr
+    signal_engine.mock_cash = mock_ibkr.initial_capital
+    exec_engine.mock_cash = mock_ibkr.initial_capital
     
     # ==========================================
     # 数据加载与直接对齐 (Robust AsOf Join)
@@ -124,6 +145,24 @@ async def main():
     df_s = pd.read_sql("SELECT ts, symbol, close, open, high, low, volume FROM market_bars_1m", conn)
     df_o = pd.read_sql("SELECT ts, symbol, buckets_json FROM option_snapshots_1m", conn)
     conn.close()
+
+    # 🚀 [NEW] Calculate Index ROCs from the full dataset before filtering
+    # Ensure ts is float for all calculations
+    df_s['ts'] = df_s['ts'].astype(float)
+    df_idx = df_s[df_s['symbol'].isin(['SPY', 'QQQ'])].pivot(index='ts', columns='symbol', values='close')
+    
+    # Prepare a ROC map for all unique timestamps
+    unique_ts = sorted(df_s['ts'].unique())
+    df_roc_map = pd.DataFrame(index=unique_ts)
+    for col in ['SPY', 'QQQ']:
+        if col in df_idx.columns:
+            # 5-minute ROC (1m bars = 5 periods)
+            df_roc_map[f'{col.lower()}_roc_5min'] = df_idx[col].pct_change(periods=5).fillna(0.0)
+        else:
+            df_roc_map[f'{col.lower()}_roc_5min'] = 0.0
+    
+    # Merge ROCs into df_s so they carry over after symbol filtering
+    df_s = df_s.merge(df_roc_map.reset_index().rename(columns={'index': 'ts'}), on='ts', how='left')
 
     if symbols:
         df_a = df_a[df_a['symbol'].isin(symbols)]
@@ -239,26 +278,39 @@ async def main():
             'feed_call_id': [""] * len(group),
         }
 
-        # 核心逻辑：直接灌入 Orchestrator 引擎
-        await orch.process_batch(packet)
-        
-        # 记录行情数据，确保 MockIBKR 能在 EOD 匹配到离散价格
+        if is_new_minute:
+            sig_count = int((packet['precalc_alpha'] != 0).sum())
+            if sig_count > 0:
+                logger.info(f"📡 [REPLAY_S2_1M] Minute {current_minute} | Active Signals: {sig_count}")
+
+        await signal_engine.process_batch(packet)
         mock_ibkr.record_market_data(packet, alphas=packet['precalc_alpha'])
+
+        while not shared_signal_queue.empty():
+            try:
+                sig_payload = shared_signal_queue.get_nowait()
+                await exec_engine.process_trade_signal(sig_payload)
+                shared_signal_queue.task_done()
+            except Exception:
+                break
+
+        await exec_engine.process_trade_signal({'action': 'SYNC', 'ts': float(ts_val), 'payload': {}})
+        signal_engine.mock_cash = exec_engine.mock_cash
 
     # ==========================================
     # 汇总
     # ==========================================
     elapsed = time.time() - start_time
     print(f"\n✅ Stable Replay Finished in {elapsed:.1f}s.")
-    await orch.force_close_all()
+    await exec_engine.force_close_all()
     await asyncio.sleep(0.5)
-    mock_ibkr.save_trades(filename="replay_trades_v8.csv") 
+    mock_ibkr.save_trades(filename="replay_trades_s2_1m.csv") 
     
     print("\n" + "="*50)
-    print("📊 FINAL BACKTEST PERFORMANCE SUMMARY (V8 STABLE)")
+    print("📊 FINAL BACKTEST PERFORMANCE SUMMARY (S2 1M DUAL)")
     print("="*50)
-    orch.accounting.print_backtest_summary()
-    orch.print_counter_trend_summary()
+    exec_engine.accounting.print_backtest_summary()
+    exec_engine.accounting.print_counter_trend_summary()
     print("="*50 + "\n")
 
 if __name__ == "__main__":

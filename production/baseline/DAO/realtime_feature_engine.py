@@ -509,7 +509,7 @@ class RealTimeFeatureEngine:
         for idx_sym, feat_name in INDEX_ROC_SYMBOLS:
             df_idx = history_1min.get(idx_sym)
             if df_idx is not None and not df_idx.empty:
-                roc_series = df_idx['close'].pct_change(5).fillna(0.0).infer_objects(copy=False)
+                roc_series = df_idx['close'].pct_change(5, fill_method=None).fillna(0.0).infer_objects(copy=False)
                 aligned_roc = roc_series.reindex(master_index).ffill().fillna(0.0).infer_objects(copy=False).values
                 global_ctx[feat_name] = torch.tensor(aligned_roc, dtype=torch.float32, device=self.device)
 

@@ -384,6 +384,7 @@ async def main():
         import config
         persist_pg_cfg = copy.deepcopy(config.REDIS_CFG)
         persist_pg_cfg['group'] = 'persistence_group_pg'
+        persist_pg_cfg['pg_group'] = 'persistence_group_pg'
         persist_pg_cfg['consumer'] = 'pg_writer_1m'
         data_persistence_service_v8_pg.REDIS_CFG = persist_pg_cfg
         

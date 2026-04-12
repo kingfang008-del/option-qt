@@ -16,6 +16,7 @@ logger = logging.getLogger("StrategyCore")
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import List, Tuple
     
 from config import TARGET_SYMBOLS
 from strategy_config0 import StrategyConfig
@@ -61,7 +62,7 @@ class StrategyCoreV0:
             return False
             
         # 3. 市场状态卫士 (Regime Guard - Choppiness Filter)
-        if getattr(self.cfg, 'REGIME_GUARD_ENABLED', False):
+        if getattr(self.cfg, 'REGIME_GUARD_ENABLED', False) and getattr(self.cfg, 'REGIME_ENTRY_GUARD_ENABLED', False):
             if not self._check_regime_guard(ctx): return False
 
         return True
@@ -71,6 +72,12 @@ class StrategyCoreV0:
         [NEW] 核心对齐: 拦截高洗盘频率行情
         通过反转次数统计来识别 Alpha 失效的市场环境
         """
+        if 'is_volatile_regime' in ctx:
+            if ctx.get('is_volatile_regime', False):
+                logger.info(f"🚫 [REGIME_GUARD] {ctx['symbol']} Blocked. Volatile regime detected.")
+                return False
+            return True
+
         reversal_count = ctx.get('regime_reversal_count', 0)
         limit = getattr(self.cfg, 'REGIME_REVERSAL_THRESHOLD', 6)
         if reversal_count > limit:
@@ -239,11 +246,21 @@ class StrategyCoreV0:
         if action == -1 and macd_hist >= -th: return False
         return True
 
+    def _get_dynamic_ladder(self, pos: dict) -> List[Tuple[float, float]]:
+        """根据初始信号强度动态选择不同的利润阶梯 (V0 默认为 TIGHT)"""
+        if not getattr(self.cfg, 'DYNAMIC_LADDER_ENABLED', False):
+            return self.cfg.LADDER_TIGHT
+        
+        # 兼容性设计: 如果以后需要像 V1 一样动态切换
+        init_alpha = abs(pos.get('init_ctx', {}).get('alpha_z', 0.0))
+        if init_alpha >= getattr(self.cfg, 'HIGH_ALPHA_WIDE_THRESHOLD', 2.5):
+            return self.cfg.LADDER_WIDE
+        return self.cfg.LADDER_TIGHT
+
     def _evaluate_profit_guards(self, pos: dict, current_roi: float) -> dict:
         """
         [🔥 抽象重构] 统一利润锁定引擎 (Unified Profit Guard Engine)
         自顶向下拦截，融合了 微利保本、阶梯止盈 和 暴利追踪。
-        只在利润从高点回撤时触发，绝不截断正在上涨的暴利单。
         """
         max_roi = pos.get('max_roi', 0.0)
         
@@ -257,66 +274,28 @@ class StrategyCoreV0:
             if max_roi > self.cfg.COUNTER_TREND_PROTECT_TRIGGER and current_roi < self.cfg.COUNTER_TREND_PROTECT_EXIT:
                 return {'action': 'SELL', 'reason': f"PROTECT_COUNTER({max_roi:.1%}->{current_roi:.1%})"}
 
-        # 2. 顺势单：无上限的动态防线 (按 Max_ROI 从高到低降级判定)
+        # 2. 顺势单：动态防线判定
         
-        # Level 11: 史诗级暴利追踪 (摸到 550% 以上)
+        # Level Epic: 暴利追踪 (史诗级别)
         if max_roi >= self.cfg.TRAILING_TRIGGER_ROI:
             trailing_exit = max_roi * self.cfg.TRAILING_KEEP_RATIO
             if current_roi < trailing_exit:
                 return {'action': 'SELL', 'reason': f"TRAILING_EPIC({max_roi:.1%}->{current_roi:.1%})"}
 
-        # Level 10: 摸到 450%，保底 380%
-        elif max_roi >= self.cfg.STEP_PROT_L10_TRIGGER:
-            if current_roi < self.cfg.STEP_PROT_L10_EXIT:
-                return {'action': 'SELL', 'reason': f"STEP_PROT_L10({max_roi:.1%}->{current_roi:.1%})"}
+        # Step Ladder: 阶梯防线 (按 LADDER 配置循环评估)
+        ladder = self._get_dynamic_ladder(pos)
+        for trigger, floor in reversed(ladder):
+            if max_roi >= trigger:
+                if current_roi < floor:
+                    return {
+                        'action': 'SELL', 
+                        'reason': f"STEP_PROT({max_roi:.1%}->{current_roi:.1%})|T:{trigger:.2f}"
+                    }
+                # 一旦命中最高档位触发器，即使未达成回撤卖出条件，也直接 Break，跳过低档位判定
+                break
 
-        # Level 9: 摸到 300%，保底 260%
-        elif max_roi >= self.cfg.STEP_PROT_L9_TRIGGER:
-            if current_roi < self.cfg.STEP_PROT_L9_EXIT:
-                return {'action': 'SELL', 'reason': f"STEP_PROT_L9({max_roi:.1%}->{current_roi:.1%})"}
-
-        # Level 8: 摸到 200%，保底 175%
-        elif max_roi >= self.cfg.STEP_PROT_L8_TRIGGER:
-            if current_roi < self.cfg.STEP_PROT_L8_EXIT:
-                return {'action': 'SELL', 'reason': f"STEP_PROT_L8({max_roi:.1%}->{current_roi:.1%})"}
-
-        # Level 7: 摸到 150%，保底 130%
-        elif max_roi >= self.cfg.STEP_PROT_L7_TRIGGER:
-            if current_roi < self.cfg.STEP_PROT_L7_EXIT:
-                return {'action': 'SELL', 'reason': f"STEP_PROT_L7({max_roi:.1%}->{current_roi:.1%})"}
-
-        # Level 6: 摸到 100%，保底 85%
-        elif max_roi >= self.cfg.STEP_PROT_L6_TRIGGER:
-            if current_roi < self.cfg.STEP_PROT_L6_EXIT:
-                return {'action': 'SELL', 'reason': f"STEP_PROT_L6({max_roi:.1%}->{current_roi:.1%})"}
-
-        # Level 5: 摸到 75%，保底 60%
-        elif max_roi >= self.cfg.STEP_PROT_L5_TRIGGER:
-            if current_roi < self.cfg.STEP_PROT_L5_EXIT:
-                return {'action': 'SELL', 'reason': f"STEP_PROT_L5({max_roi:.1%}->{current_roi:.1%})"}
-
-        # Level 4: 摸到 50%，保底 40%
-        elif max_roi >= self.cfg.STEP_PROT_L4_TRIGGER:
-            if current_roi < self.cfg.STEP_PROT_L4_EXIT:
-                return {'action': 'SELL', 'reason': f"STEP_PROT_L4({max_roi:.1%}->{current_roi:.1%})"}
-                
-        # Level 3: 摸到 35%，保底 30%
-        elif max_roi >= self.cfg.STEP_PROT_L3_TRIGGER:
-            if current_roi < self.cfg.STEP_PROT_L3_EXIT:
-                return {'action': 'SELL', 'reason': f"STEP_PROT_L3({max_roi:.1%}->{current_roi:.1%})"}
-                
-        # Level 2: 摸到 25%，保底 20%
-        elif max_roi >= self.cfg.STEP_PROT_L2_TRIGGER:
-            if current_roi < self.cfg.STEP_PROT_L2_EXIT:
-                return {'action': 'SELL', 'reason': f"STEP_PROT_L2({max_roi:.1%}->{current_roi:.1%})"}
-                
-        # Level 1: 摸到 12%，保底 10%
-        elif max_roi >= self.cfg.STEP_PROT_L1_TRIGGER:
-            if current_roi < self.cfg.STEP_PROT_L1_EXIT:
-                return {'action': 'SELL', 'reason': f"STEP_PROT_L1({max_roi:.1%}->{current_roi:.1%})"}
-                
-        # Level 0: 摸到 5%，极速保本 2% (原 FLASH_PROTECT)
-        elif max_roi >= self.cfg.FLASH_PROTECT_TRIGGER:
+        # Level 0: 极速保本 (Flash Protect)
+        if max_roi >= self.cfg.FLASH_PROTECT_TRIGGER:
             if current_roi <= self.cfg.FLASH_PROTECT_EXIT:
                 return {'action': 'SELL', 'reason': f"FLASH_PROT_L0({max_roi:.1%}->{current_roi:.1%})"}
         
@@ -409,22 +388,41 @@ class StrategyCoreV0:
         return None
 
     def _check_stock_hard_stop(self, ctx: dict, pos: dict, held_mins: float, stock_roi: float) -> dict:
-        """检查正股硬止损，根据 Alpha 置信度和持仓时间动态调整"""
+        """检查正股硬止损，根据 Regime 状态、Alpha 置信度和持仓时间动态调整"""
         if pos['entry_stock'] <= 0 or ctx['curr_stock'] <= 0: return None
 
         alpha_val = ctx.get('alpha_z', 0.0)
         
-        # 确定基础门槛
-        tight_sl = self.cfg.STOCK_HARD_STOP_TIGHT
-        base_th = self.cfg.STOCK_HARD_STOP_LOOSE if abs(alpha_val) >= self.cfg.HIGH_CONFIDENCE_THRESHOLD else tight_sl
+        # [🔥 Regime-Adaptive] 根据 VIX 波动状态动态选择止损参数
+        # 波动市 (Choppy) → 收紧止损线 (0.0015 / 0.003)
+        # 平静市 (Calm)   → 放宽止损线 (0.003 / 0.005)
+        is_volatile_regime = False
+        if getattr(self.cfg, 'REGIME_ADAPTIVE_STOCK_STOP_ENABLED', False):
+            if 'is_volatile_regime' in ctx:
+                is_volatile_regime = bool(ctx.get('is_volatile_regime'))
+            else:
+                reversal_count = ctx.get('regime_reversal_count', 0)
+                regime_limit = getattr(self.cfg, 'REGIME_REVERSAL_THRESHOLD', 6)
+                is_volatile_regime = (reversal_count > regime_limit)
+        
+        if is_volatile_regime:
+            tight_sl = getattr(self.cfg, 'STOCK_HARD_STOP_TIGHT_VOLATILE', self.cfg.STOCK_HARD_STOP_TIGHT)
+            loose_sl = getattr(self.cfg, 'STOCK_HARD_STOP_LOOSE_VOLATILE', self.cfg.STOCK_HARD_STOP_LOOSE)
+        else:
+            tight_sl = self.cfg.STOCK_HARD_STOP_TIGHT
+            loose_sl = self.cfg.STOCK_HARD_STOP_LOOSE
+
+        # 确定基础门槛：高置信度 Alpha 使用宽松档，否则使用紧缩档
+        base_th = loose_sl if abs(alpha_val) >= self.cfg.HIGH_CONFIDENCE_THRESHOLD else tight_sl
         
         # 初始 3 分钟宽限期
         is_in_buffer = held_mins < 3.0
         current_th = max(base_th * 3.0, 0.005) if is_in_buffer else base_th
         tag = "(BUFFER)" if is_in_buffer else ""
+        regime_tag = "[VOL]" if is_volatile_regime else "[CALM]"
 
         if (pos['dir'] == 1 and stock_roi < -current_th) or (pos['dir'] == -1 and stock_roi > current_th):
-            return {'action': 'SELL', 'reason': f"STOCK_STOP{tag}:{stock_roi:.2%}(Th:{current_th:.2%})"}
+            return {'action': 'SELL', 'reason': f"STOCK_STOP{regime_tag}{tag}:{stock_roi:.2%}(Th:{current_th:.2%})"}
         return None
 
     def _check_time_and_inactivity_stops(self, ctx: dict, pos: dict, held_mins: float, roi: float) -> dict:

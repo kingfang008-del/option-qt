@@ -280,7 +280,7 @@ class ExecutionEngineV8:
         self.alpha_count = 0
 
         # Create lightweight config proxy for execution/accounting dependencies
-        from strategy_core_v0 import StrategyConfig
+        from strategy_selector import StrategyConfig
         class DummyStrategy:
             def __init__(self):
                 self.cfg = StrategyConfig()

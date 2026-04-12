@@ -1,18 +1,20 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import pandas as pd
-import numpy as np
-import sqlite3
+import gc
 import json
 import logging
+import os
+import sqlite3
 import warnings
-import gc
 from pathlib import Path
-from tqdm import tqdm
 from datetime import datetime
-import pytz
 import argparse
+import pytz
+import psycopg2
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -21,29 +23,184 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 PROJECT_ROOT = Path.home() / "quant_project"
 DB_DIR       = PROJECT_ROOT / "data" / "history_sqlite_1s"  # 建立专属的 1s 数据库目录防止冲突
 
-# 1s 数据源路径
-OPT_RAW_DIR  = Path("/mnt/s990/data/raw_1s/options")
-STOCK_RAW_DIR= Path("/mnt/s990/data/raw_1s/stocks")
-
 NY_TZ = pytz.timezone('America/New_York')
 
 try:
-    from config import TARGET_SYMBOLS 
+    from config import PG_DB_URL, TARGET_SYMBOLS
 except ImportError:
     # 如果找不到 config，提供一个默认列表供测试
     TARGET_SYMBOLS = ['NVDA', 'AAPL', 'TSLA', 'SPY', 'QQQ']
+    PG_DB_URL = None
 
 # ================= 参数解析 =================
 def parse_args():
     parser = argparse.ArgumentParser(description="Option Snapshot Seeder (1s High-Frequency Edition)")
     parser.add_argument("--start_date", type=str, default="2026-01-02", help="只处理该日期及之后的数据")
     parser.add_argument("--end_date", type=str, default="2099-12-31", help="只处理该日期及之前的数据")
+    parser.add_argument(
+        "--stock-root",
+        type=str,
+        default=os.environ.get("RAW_1S_STOCK_ROOT", "/mnt/s990/data/raw_1s/stocks"),
+        help="1s 股票原始 parquet 根目录",
+    )
+    parser.add_argument(
+        "--option-root",
+        type=str,
+        default=os.environ.get("RAW_1S_OPTION_ROOT", "/mnt/s990/data/raw_1s/options"),
+        help="1s 期权原始 parquet 根目录",
+    )
+    parser.add_argument(
+        "--mirror-pg",
+        action="store_true",
+        help="将 SQLite 作为 canonical seeder，同时镜像写入 PostgreSQL。",
+    )
+    parser.add_argument(
+        "--skip-pg-clean",
+        action="store_true",
+        help="默认镜像写 PG 前会按日清空对应分区；如需保留已有 PG 数据，则显式跳过。",
+    )
     return parser.parse_args()
 
 args = parse_args()
 
 START_DATE = pd.to_datetime(args.start_date).date()
 END_DATE   = pd.to_datetime(args.end_date).date()
+OPT_RAW_DIR  = Path(args.option_root)
+STOCK_RAW_DIR= Path(args.stock_root)
+PG_MIRROR_ENABLED = bool(args.mirror_pg and PG_DB_URL)
+PG_MIRROR_CLEAN = bool(PG_MIRROR_ENABLED and not args.skip_pg_clean)
+PG_PREPARED_DATES = set()
+
+if not STOCK_RAW_DIR.exists():
+    raise FileNotFoundError(f"Stock raw 1s root not found: {STOCK_RAW_DIR}")
+if not OPT_RAW_DIR.exists():
+    raise FileNotFoundError(f"Option raw 1s root not found: {OPT_RAW_DIR}")
+
+
+def _get_pg_conn():
+    if not PG_DB_URL:
+        raise RuntimeError("PG_DB_URL is not configured; cannot mirror PostgreSQL writes.")
+    return psycopg2.connect(PG_DB_URL)
+
+
+def _pg_partition_exists(cursor, table_name):
+    cursor.execute(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name=%s)",
+        (table_name,),
+    )
+    return bool(cursor.fetchone()[0])
+
+
+def ensure_pg_tables(date_str):
+    day = datetime.strptime(date_str, '%Y%m%d')
+    start_dt = NY_TZ.localize(day)
+    end_dt = start_dt + pd.Timedelta(days=1)
+    start_ts = float(start_dt.timestamp())
+    end_ts = float(end_dt.timestamp())
+
+    conn = _get_pg_conn()
+    conn.autocommit = True
+    c = conn.cursor()
+    try:
+        for tbl in ['market_bars_1s', 'market_bars_1m', 'market_bars_5m']:
+            c.execute(f"""
+                CREATE TABLE IF NOT EXISTS {tbl} (
+                    symbol TEXT,
+                    ts DOUBLE PRECISION,
+                    open DOUBLE PRECISION,
+                    high DOUBLE PRECISION,
+                    low DOUBLE PRECISION,
+                    close DOUBLE PRECISION,
+                    volume DOUBLE PRECISION,
+                    PRIMARY KEY (symbol, ts)
+                ) PARTITION BY RANGE (ts);
+            """)
+
+        for tbl in ['option_snapshots_1s', 'option_snapshots_1m', 'option_snapshots_5m']:
+            c.execute(f"""
+                CREATE TABLE IF NOT EXISTS {tbl} (
+                    symbol TEXT,
+                    ts DOUBLE PRECISION,
+                    buckets_json JSONB,
+                    PRIMARY KEY (symbol, ts)
+                ) PARTITION BY RANGE (ts);
+            """)
+
+        for table in [
+            'market_bars_1s', 'market_bars_1m', 'market_bars_5m',
+            'option_snapshots_1s', 'option_snapshots_1m', 'option_snapshots_5m',
+        ]:
+            part_name = f"{table}_{date_str}"
+            c.execute(f"""
+                CREATE TABLE IF NOT EXISTS {part_name} PARTITION OF {table}
+                FOR VALUES FROM ({start_ts}) TO ({end_ts});
+            """)
+    finally:
+        c.close()
+        conn.close()
+
+
+def _truncate_pg_seed_day(date_str):
+    conn = _get_pg_conn()
+    c = conn.cursor()
+    try:
+        truncated = []
+        for table in [
+            'market_bars_1s', 'market_bars_1m', 'market_bars_5m',
+            'option_snapshots_1s', 'option_snapshots_1m', 'option_snapshots_5m',
+        ]:
+            part_name = f"{table}_{date_str}"
+            if _pg_partition_exists(c, part_name):
+                c.execute(f"TRUNCATE TABLE {part_name}")
+                truncated.append(part_name)
+        conn.commit()
+        if truncated:
+            logging.info(f"🧹 [PG Mirror Clean] {date_str}: {', '.join(truncated)}")
+    finally:
+        c.close()
+        conn.close()
+
+
+def _prepare_pg_day(date_str):
+    if not PG_MIRROR_ENABLED or date_str in PG_PREPARED_DATES:
+        return
+    ensure_pg_tables(date_str)
+    if PG_MIRROR_CLEAN:
+        _truncate_pg_seed_day(date_str)
+    PG_PREPARED_DATES.add(date_str)
+
+
+def write_data_to_pg(date_str, table_name, data):
+    if not PG_MIRROR_ENABLED or not data:
+        return
+
+    _prepare_pg_day(date_str)
+    conn = _get_pg_conn()
+    c = conn.cursor()
+    try:
+        if 'option' in table_name:
+            pg_rows = [(row[0], row[1], row[3]) for row in data]
+            c.executemany(f"""
+                INSERT INTO {table_name} (symbol, ts, buckets_json)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (symbol, ts) DO UPDATE SET buckets_json=EXCLUDED.buckets_json
+            """, pg_rows)
+        else:
+            pg_rows = [(row[0], row[1], row[3], row[4], row[5], row[6], row[7]) for row in data]
+            c.executemany(f"""
+                INSERT INTO {table_name} (symbol, ts, open, high, low, close, volume)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (symbol, ts) DO UPDATE SET
+                    open=EXCLUDED.open,
+                    high=EXCLUDED.high,
+                    low=EXCLUDED.low,
+                    close=EXCLUDED.close,
+                    volume=EXCLUDED.volume
+            """, pg_rows)
+        conn.commit()
+    finally:
+        c.close()
+        conn.close()
 
 # ================= 数据库与检查逻辑 =================
 def init_full_db_schema(db_path):
@@ -112,6 +269,19 @@ def write_data_to_sqlite(db_path, table_name, data):
     conn.commit()
     conn.close()
 
+
+def write_data_dual(db_path, date_str, table_name, data):
+    write_data_to_sqlite(db_path, table_name, data)
+    write_data_to_pg(date_str, table_name, data)
+
+
+def should_skip_sqlite_seed(db_path, table_name, symbol):
+    # 当启用 PG mirror 且会先清 PG 时，不能再因为 sqlite 已有数据而整段跳过，
+    # 否则会出现“PG 被清空，但没有重新写回”的问题。
+    if PG_MIRROR_ENABLED and PG_MIRROR_CLEAN:
+        return False
+    return is_data_seeded(db_path, table_name, symbol)
+
 # ================= 智能数据处理流程 =================
 def process_stock_data_1s(sym):
     table_name = 'market_bars_1s'
@@ -133,7 +303,7 @@ def process_stock_data_1s(sym):
             date_str_from_file = date_str_raw.replace('-', '')
             db_path = DB_DIR / f"market_{date_str_from_file}.db"
             
-            if is_data_seeded(db_path, table_name, sym): continue
+            if should_skip_sqlite_seed(db_path, table_name, sym): continue
 
             df_stock = pd.read_parquet(p_file)
             if df_stock.empty: continue
@@ -170,13 +340,13 @@ def process_stock_data_1s(sym):
             if records:
                 logging.info(f"🔍 [Sample Stock] First 3 records for {sym}:")
                 for r in records[:3]: logging.info(f"   {r}")
-                write_data_to_sqlite(db_path, 'market_bars_1s', records)
+                write_data_dual(db_path, date_str_from_file, 'market_bars_1s', records)
             
             # [新增] 自动降采样同步 1m/5m 表
             for res_min in [1, 5]:
                 res_suffix = f'{res_min}m'
                 table_res = f'market_bars_{res_suffix}'
-                if is_data_seeded(db_path, table_res, sym): continue
+                if should_skip_sqlite_seed(db_path, table_res, sym): continue
                 
                 df_res = df_stock.set_index('timestamp').resample(f'{res_min}T').agg({
                     'open': 'first', 'high': 'max', 'low': 'min', target_col: 'last', 'volume': 'sum'
@@ -192,7 +362,7 @@ def process_stock_data_1s(sym):
                         float(row.volume)
                     ))
                 if res_records:
-                    write_data_to_sqlite(db_path, table_res, res_records)
+                    write_data_dual(db_path, date_str_from_file, table_res, res_records)
 
             del df_stock; gc.collect()
         except Exception as e:
@@ -222,7 +392,7 @@ def process_option_data_1s(sym):
             if sym == TARGET_SYMBOLS[0]: # 只需要打印一次
                 logging.info(f"🚀 [DB_DEBUG] Writing to absolute path: {db_path.absolute()}")
             
-            if is_data_seeded(db_path, table_name, sym): continue
+            if should_skip_sqlite_seed(db_path, table_name, sym): continue
             
             df_day = pd.read_parquet(p_file)
             if df_day.empty or 'bucket_id' not in df_day.columns: continue
@@ -295,7 +465,7 @@ def process_option_data_1s(sym):
                 df_focus = df_aligned.copy() 
                 # [DEBUG] Sample check
                 logging.info(f"✅ [Option 1s] Converted to Aligned Grid: {len(records)} seconds for {sym}")
-                write_data_to_sqlite(db_path, 'option_snapshots_1s', records)
+                write_data_dual(db_path, date_str_from_file, 'option_snapshots_1s', records)
 
             # =========================================================
             # 🚀 [核心修复] 期权快照 1m/5m 降采样：精准提取"最后一秒"
@@ -304,7 +474,7 @@ def process_option_data_1s(sym):
             for res_min in [1, 5]:
                 res_suffix = f'{res_min}m'
                 table_res = f'option_snapshots_{res_suffix}'
-                if is_data_seeded(db_path, table_res, sym): continue
+                if should_skip_sqlite_seed(db_path, table_res, sym): continue
                 
                 # 🚀 1. 给每秒数据打上左闭合的分钟标签 (10:13:59 -> 10:13:00)
                 df_focus['bin_label'] = df_focus['timestamp'].dt.floor(f'{res_min}min')
@@ -343,7 +513,7 @@ def process_option_data_1s(sym):
                     ))
 
                 if res_records:
-                    write_data_to_sqlite(db_path, table_res, res_records)
+                    write_data_dual(db_path, date_str_from_file, table_res, res_records)
                     
                 df_focus.drop(columns=['bin_label'], inplace=True)
 
@@ -355,6 +525,8 @@ if __name__ == "__main__":
     if not DB_DIR.exists(): DB_DIR.mkdir(parents=True)
     
     logging.info(f"🚀 Starting 1-Second High-Frequency SQLite Seeder. Filtering data >= {START_DATE} ...")
+    if PG_MIRROR_ENABLED:
+        logging.info(f"🪞 [Mirror] SQLite canonical seeder will mirror into PostgreSQL (clean={PG_MIRROR_CLEAN})")
     #'VIXY', 'SPY', 'QQQ'
     SKIP_OPTIONS_SYMBOLS = {} # 视你需要跳过ETF期权而定
     

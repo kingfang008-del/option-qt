@@ -22,8 +22,8 @@ BUCKET_NAME = "flatfiles"
 
 # [下载设置]
 S3_PREFIX = "us_options_opra/minute_aggs_v1"
-START_DATE = datetime.date(2026, 1, 1)
-END_DATE = datetime.date(2026, 3, 18) # 示例：下载5天
+START_DATE = datetime.date(2026, 3, 1)
+END_DATE = datetime.date(2026, 4, 10) # 示例：下载5天
 
 # [路径]
 # RAW_DIR: 临时存放 S3 原始大文件的目录 (处理完会删除)

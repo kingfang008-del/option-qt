@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class DataPersistenceServicePG:
-    def __init__(self):
+    def __init__(self, start_date=None):
         self.r = redis.Redis(
             host=REDIS_CFG['host'],
             port=REDIS_CFG['port'],
@@ -40,11 +40,14 @@ class DataPersistenceServicePG:
                     logger.error(f"Group Error ({stream}): {e}")
 
         self.conn = None
-        self.current_date = None
+        self.current_date = None # [Fix] Set to None initially to force _check_date_rotation to run on first call
+        self.target_start_date = str(start_date) if start_date else None
         
         # Buffer
+        self.bar_buffer_1s = {}
         self.bar_buffer = {}
         self.option_buffer = {}
+        self.option_buffer_1s = {}
         self.bar_buffer_5m = {}
         self.option_buffer_5m = {}
         
@@ -52,7 +55,13 @@ class DataPersistenceServicePG:
         self.alpha_buffer = []
         self.last_flush = time.time()
         
-        self._check_date_rotation() # This will init db and create today's partition
+        # [Fix] Enforce Master Tables exist on startup
+        try:
+            self._init_master_tables()
+        except Exception as e:
+            logger.error(f"Failed to auto-init Master Tables: {e}")
+            
+        self._check_date_rotation() # This will create the initial partition if needed
 
     def _get_pg_conn(self):
         if not self.conn or self.conn.closed != 0:
@@ -65,7 +74,7 @@ class DataPersistenceServicePG:
         c = conn.cursor()
         
         # 1. market_bars_1m & 5m
-        for tbl in ['market_bars_1m', 'market_bars_5m']:
+        for tbl in ['market_bars_1s', 'market_bars_1m', 'market_bars_5m']:
             c.execute(f"""
                 CREATE TABLE IF NOT EXISTS {tbl} (
                     symbol TEXT,
@@ -123,7 +132,7 @@ class DataPersistenceServicePG:
         c.execute("CREATE INDEX IF NOT EXISTS idx_alpha_ts ON alpha_logs (ts)")
 
         # 5. option_snapshots_1m & 5m
-        for tbl in ['option_snapshots_1m', 'option_snapshots_5m']:
+        for tbl in ['option_snapshots_1s', 'option_snapshots_1m', 'option_snapshots_5m']:
             c.execute(f"""
                 CREATE TABLE IF NOT EXISTS {tbl} (
                     symbol TEXT,
@@ -159,8 +168,11 @@ class DataPersistenceServicePG:
         date_str = ny_date.strftime('%Y%m%d')
         
         tables = [
-            'market_bars_1m', 'market_bars_5m', 'trade_logs', 'trade_logs_backtest', 
-            'alpha_logs', 'option_snapshots_1m', 'option_snapshots_5m', 'feature_logs'
+            'market_bars_1s', 'market_bars_1m', 'market_bars_5m',
+            'trade_logs', 'trade_logs_backtest',
+            'alpha_logs',
+            'option_snapshots_1s', 'option_snapshots_1m', 'option_snapshots_5m',
+            'feature_logs'
         ]
         
         # DDL 用独立的 autocommit 连接，防止异常污染主连接事务
@@ -182,16 +194,18 @@ class DataPersistenceServicePG:
         c.close()
         ddl_conn.close()
 
-    def _check_date_rotation(self):
+    def _check_date_rotation(self, ts=None):
         from config import NY_TZ
-        now_dt = datetime.now(NY_TZ)
+        now_dt = datetime.fromtimestamp(float(ts), NY_TZ) if ts is not None else datetime.now(NY_TZ)
         now_date_str = now_dt.strftime('%Y%m%d')
         
         if now_date_str != self.current_date:
             logger.info(f"📅 Date rotation: {self.current_date} -> {now_date_str}")
             self.current_date = now_date_str
+            self.bar_buffer_1s.clear()
             self.bar_buffer.clear()
             self.option_buffer.clear()
+            self.option_buffer_1s.clear()
             self.bar_buffer_5m.clear()
             self.option_buffer_5m.clear()
             self.trade_buffer.clear()
@@ -252,14 +266,28 @@ class DataPersistenceServicePG:
         try:
             ts = float(payload['ts'])
             symbol = payload['symbol']
+            self._check_date_rotation(ts)
+            second_ts = int(ts)
             
             minute_ts = int(ts) // 60 * 60
             key = (symbol, minute_ts)
+            key_1s = (symbol, second_ts)
 
             # 1min Bar
             stock = payload.get('stock', {})
             price = float(stock.get('close', 0.0))
             vol = float(stock.get('volume', 0.0))
+
+            if price > 0:
+                self.bar_buffer_1s[key_1s] = {
+                    'symbol': symbol,
+                    'ts': second_ts,
+                    'open': float(stock.get('open', price)),
+                    'high': float(stock.get('high', price)),
+                    'low': float(stock.get('low', price)),
+                    'close': price,
+                    'volume': vol,
+                }
             
             if price > 0:
                 if key not in self.bar_buffer:
@@ -279,9 +307,15 @@ class DataPersistenceServicePG:
             # 5min Bar
             stock_5m = payload.get('stock_5m', {})
             price_5m = float(stock_5m.get('close', 0.0))
-            if price_5m > 0:
-                self.bar_buffer_5m[key] = {
-                    'symbol': symbol, 'ts': minute_ts,
+            stock_5m_ts_raw = payload.get('stock_5m_ts')
+            if stock_5m_ts_raw is None:
+                stock_5m_ts = minute_ts if minute_ts % 300 == 0 else None
+            else:
+                stock_5m_ts = int(float(stock_5m_ts_raw))
+            if price_5m > 0 and stock_5m_ts == minute_ts and minute_ts % 300 == 0:
+                key_5m = (symbol, stock_5m_ts)
+                self.bar_buffer_5m[key_5m] = {
+                    'symbol': symbol, 'ts': stock_5m_ts,
                     'open': float(stock_5m['open']), 'high': float(stock_5m['high']),
                     'low': float(stock_5m['low']), 'close': price_5m,
                     'volume': float(stock_5m['volume'])
@@ -293,23 +327,42 @@ class DataPersistenceServicePG:
                 contracts = payload.get('option_contracts', [])
                 if contracts:
                     snap_obj = {'buckets': payload['option_buckets'], 'contracts': contracts}
+                self.option_buffer_1s[key_1s] = json.dumps(snap_obj)
                 self.option_buffer[key] = json.dumps(snap_obj)
 
             # 5min Options Fallback (🚀 复用 1min 桶填补 5min 缺口)
             opt_buckets_5m = payload.get('option_buckets_5m')
-            if not opt_buckets_5m and (minute_ts % 300 == 0):
-                opt_buckets_5m = payload.get('option_buckets')
+            option_5m_ts_raw = payload.get('option_5m_ts')
+            if opt_buckets_5m and option_5m_ts_raw is None:
+                has_current_option_5m = minute_ts % 300 == 0
+                option_5m_ts = minute_ts
+            elif opt_buckets_5m:
+                option_5m_ts = int(float(option_5m_ts_raw))
+                has_current_option_5m = option_5m_ts == minute_ts and minute_ts % 300 == 0
+            else:
+                option_5m_ts = minute_ts
+                has_current_option_5m = False
 
-            if opt_buckets_5m:
-                contracts = payload.get('option_contracts', [])
+            if has_current_option_5m:
+                contracts = payload.get('option_contracts_5m') or payload.get('option_contracts', [])
                 snap_obj_5m = {'buckets': opt_buckets_5m, 'contracts': contracts} if contracts else opt_buckets_5m
+                self.option_buffer_5m[(symbol, option_5m_ts)] = json.dumps(snap_obj_5m)
+            elif minute_ts % 300 == 0 and payload.get('option_buckets'):
+                contracts = payload.get('option_contracts', [])
+                fallback_5m = payload.get('option_buckets')
+                snap_obj_5m = {'buckets': fallback_5m, 'contracts': contracts} if contracts else fallback_5m
                 self.option_buffer_5m[key] = json.dumps(snap_obj_5m)
                 
         except Exception as e:
             pass
 
     def flush(self):
-        if not (self.bar_buffer or self.trade_buffer or self.option_buffer or self.alpha_buffer): return
+        if not (
+            self.bar_buffer_1s or self.bar_buffer or self.bar_buffer_5m
+            or self.option_buffer_1s or self.option_buffer or self.option_buffer_5m
+            or self.trade_buffer or self.alpha_buffer
+        ):
+            return
         
         try:
             conn = self._get_pg_conn()
@@ -317,7 +370,11 @@ class DataPersistenceServicePG:
             current_cutoff = time.time() - 300 
             
             # 1. Bars (1m & 5m)
-            for buf, tbl in [(self.bar_buffer, 'market_bars_1m'), (self.bar_buffer_5m, 'market_bars_5m')]:
+            for buf, tbl in [
+                (self.bar_buffer_1s, 'market_bars_1s'),
+                (self.bar_buffer, 'market_bars_1m'),
+                (self.bar_buffer_5m, 'market_bars_5m'),
+            ]:
                 if buf:
                     rows = []
                     keys_to_del = []
@@ -334,7 +391,11 @@ class DataPersistenceServicePG:
                     for k in keys_to_del: del buf[k]
 
             # 2. Options (1m & 5m)
-            for buf, tbl in [(self.option_buffer, 'option_snapshots_1m'), (self.option_buffer_5m, 'option_snapshots_5m')]:
+            for buf, tbl in [
+                (self.option_buffer_1s, 'option_snapshots_1s'),
+                (self.option_buffer, 'option_snapshots_1m'),
+                (self.option_buffer_5m, 'option_snapshots_5m'),
+            ]:
                 if buf:
                     rows = []
                     keys_to_del = []

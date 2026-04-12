@@ -9,7 +9,7 @@
 import os
 # 🚀 必须在最顶层注入，确保后续 import 的 config.py 以及启动的子进程都能继承！
 os.environ['RUN_MODE'] = 'BACKTEST'
-os.environ['RECALC_GREEKS'] = '1'
+os.environ['RECALC_GREEKS'] = '0'
 import asyncio
 import threading
 import time

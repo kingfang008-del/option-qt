@@ -817,7 +817,7 @@ class FeatureComputeService:
         参数:
             replay_features (bool): 是否将数据推入 Normalizer 重建 2000 窗口的 Z-Score 状态。
         """
-        logger.info(f"🔥 Starting Warmup from SQLite (Replay Features={replay_features})...")
+        logger.info(f"🔥 Starting Warmup from PostgreSQL (Replay Features={replay_features})...")
         from config import DB_DIR, NY_TZ
         from datetime import datetime, time as dt_time
         import os 
@@ -2244,12 +2244,15 @@ class FeatureComputeService:
         rth_end = label_floor.replace(hour=16, minute=0, second=0, microsecond=0)
 
         hist_lens = []
+        total_hist_lens = []
         for s in batch_symbols:
             df_hist = self.history_1min.get(s, pd.DataFrame())
             if df_hist is None or df_hist.empty:
                 hist_lens.append(0)
+                total_hist_lens.append(0)
                 continue
             try:
+                total_hist_lens.append(int(len(df_hist)))
                 idx = df_hist.index
                 if getattr(idx, "tz", None) is None:
                     idx = idx.tz_localize(NY_TZ)
@@ -2257,15 +2260,22 @@ class FeatureComputeService:
                 hist_lens.append(int(np.count_nonzero(rth_mask)))
             except Exception:
                 hist_lens.append(0)
+                total_hist_lens.append(0)
 
         real_history_len = int(min(hist_lens)) if hist_lens else 0
+        total_history_len = int(min(total_hist_lens)) if total_hist_lens else 0
         # 为保证秒级/分钟级发球机起跑时点一致（无预热时均从 10:00 开始），
         # 两种模式统一采用 31 根门槛。
         warmup_required_len = 31
-        is_warmed_up = bool(real_history_len >= warmup_required_len)
         # 额外保留归一化样本长度，便于诊断但不用于全局放行门控。
         valid_counts = [int(self.normalizers[s].count) for s in batch_symbols if s in self.normalizers]
         real_norm_history_len = int(min(valid_counts)) if valid_counts else 0
+        has_cross_day_warmup = bool(
+            real_history_len > 0
+            and total_history_len >= warmup_required_len
+            and real_norm_history_len >= warmup_required_len
+        )
+        is_warmed_up = bool(real_history_len >= warmup_required_len or has_cross_day_warmup)
 
         vol_z_dict = self._compute_payload_vol_z(
             batch_symbols,
@@ -2294,8 +2304,10 @@ class FeatureComputeService:
             'is_new_minute': is_new_minute,  
             'is_warmed_up': is_warmed_up,
             'real_history_len': real_history_len,
+            'total_history_len': total_history_len,
             'real_norm_history_len': real_norm_history_len,
             'warmup_required_len': int(warmup_required_len),
+            'has_cross_day_warmup': has_cross_day_warmup,
             'cheat_call': cheat_call, 'cheat_put': cheat_put,
             'cheat_call_bid': cheat_call_bid, 'cheat_call_ask': cheat_call_ask,
             'cheat_put_bid': cheat_put_bid, 'cheat_put_ask': cheat_put_ask,
@@ -2431,7 +2443,9 @@ class FeatureComputeService:
                     valid_mask=np.asarray([int(valid_mask[self.symbols.index(nvda_sym)])], dtype=np.int32),
                     normalizer_count=np.asarray([int(self.normalizers[nvda_sym].count)], dtype=np.int32),
                     real_history_len=np.asarray([int(real_history_len)], dtype=np.int32),
+                    total_history_len=np.asarray([int(total_history_len)], dtype=np.int32),
                     real_norm_history_len=np.asarray([int(real_norm_history_len)], dtype=np.int32),
+                    has_cross_day_warmup=np.asarray([int(has_cross_day_warmup)], dtype=np.int32),
                     alpha_label_ts=np.asarray([int(alpha_label_ts)], dtype=np.int64),
                     history_tail_ts=tail_ts,
                 )
@@ -2677,7 +2691,9 @@ class FeatureComputeService:
                 logger.info(
                     f"⏳ [Warmup-Diag] ts={int(payload.get('ts', 0))} "
                     f"| real_history_len={payload.get('real_history_len', 0)}/{payload.get('warmup_required_len', 31)} "
+                    f"| total_history_len={payload.get('total_history_len', 0)} "
                     f"| real_norm_history_len={payload.get('real_norm_history_len', 0)} "
+                    f"| cross_day={payload.get('has_cross_day_warmup', False)} "
                     f"| symbols={len(payload.get('symbols', []))}"
                 )
                 self._warmup_diag_log_count = getattr(self, '_warmup_diag_log_count', 0) + 1
