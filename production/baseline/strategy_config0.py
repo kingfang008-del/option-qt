@@ -52,12 +52,15 @@ class StrategyConfig:
     
     # ================= 6. Risk & Event =================
     # V0 核心版本中对 Stock Hard Stop 的定义
-    # [默认值] VIX 平静时使用的宽松止损
+    # [默认值] 平静市使用 0.003 / 0.005
     STOCK_HARD_STOP_TIGHT: float = 0.003
     STOCK_HARD_STOP_LOOSE: float = 0.005
-    # [波动值] VIX 波动 (Regime Choppy) 时自动收紧的止损
-    STOCK_HARD_STOP_TIGHT_VOLATILE: float = 0.003
-    STOCK_HARD_STOP_LOOSE_VOLATILE: float = 0.005
+    # [中间值] 轻度洗盘时先温和收紧，避免一刀切
+    STOCK_HARD_STOP_TIGHT_MIXED: float = 0.0022
+    STOCK_HARD_STOP_LOOSE_MIXED: float = 0.0040
+    # [波动值] 横盘洗盘 / VIXY 扰动明显时收紧到 0.0015 / 0.003
+    STOCK_HARD_STOP_TIGHT_VOLATILE: float = 0.0015
+    STOCK_HARD_STOP_LOOSE_VOLATILE: float = 0.0030
     STOCK_HARD_STOP_EVENT: float = 0.008  
     EVENT_PROB_THRESHOLD: float = 0.7     
     EVENT_HODL_MINS: int = 30              
@@ -155,12 +158,16 @@ class StrategyConfig:
     # ================= 16. Market Regime Guard (Choppiness Filter) =================
     REGIME_GUARD_ENABLED: bool = False
     REGIME_ENTRY_GUARD_ENABLED: bool = True
-    REGIME_ADAPTIVE_STOCK_STOP_ENABLED: bool = False
+    REGIME_ADAPTIVE_STOCK_STOP_ENABLED: bool = True
     REGIME_REVERSAL_THRESHOLD: int = 6         # 30分钟内 > 5次 0.15% 反转即拦截
     REGIME_WINDOW_MINS: int = 30
-    REGIME_REVERSAL_PERCENT: float = 0.0012     # 0.15% 反转阈值
+    REGIME_REVERSAL_PERCENT: float = 0.0015     # 0.15% 反转阈值
     REGIME_VIXY_ROC_THRESHOLD: float = 0.003   # VIXY 5分钟正向跳升超过 0.3% 时标记波动候选
     REGIME_REQUIRE_NEUTRAL_INDEX_FOR_ENTRY_GUARD: bool = True  # 只有大盘方向不清楚时才启用 regime 入场拦截
+    REGIME_MIXED_SCORE_THRESHOLD: float = 0.60
+    REGIME_VOLATILE_SCORE_THRESHOLD: float = 1.00
+    REGIME_BAND_ENTER_CONFIRM_BARS: int = 2
+    REGIME_BAND_EXIT_CONFIRM_BARS: int = 4
 
     # ================= 17. Guard Switches (V0 Context) =================
     ENTRY_MOMENTUM_GUARD_ENABLED: bool = True

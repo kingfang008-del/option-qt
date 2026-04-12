@@ -804,6 +804,73 @@ def build_intraday_alpha_diff(pg_df, replay_df, tolerance=1e-6):
         detail = detail.sort_values(by='alpha_diff', key=lambda s: s.abs(), ascending=False)
     return metrics, rolling, detail
 
+
+@st.cache_data(ttl=20)
+def load_alpha_diff_context(ts_val, symbol, replay_source="SQLite Replay DB"):
+    """读取 diff 明细对应时刻的上下文，帮助定位输入侧偏差。"""
+    context = {
+        'live_alpha': pd.DataFrame(),
+        'live_bar': pd.DataFrame(),
+        'live_option': pd.DataFrame(),
+        'replay_alpha': pd.DataFrame(),
+    }
+    try:
+        conn = psycopg2.connect(PG_DB_URL)
+        context['live_alpha'] = pd.read_sql(
+            f"""
+            SELECT ts, symbol, alpha, iv, price, vol_z
+            FROM alpha_logs
+            WHERE ts = {int(ts_val)} AND symbol = '{symbol}'
+            """,
+            conn,
+        )
+        context['live_bar'] = pd.read_sql(
+            f"""
+            SELECT ts, symbol, open, high, low, close, volume
+            FROM market_bars_1m
+            WHERE ts = {int(ts_val)} AND symbol = '{symbol}'
+            """,
+            conn,
+        )
+        context['live_option'] = pd.read_sql(
+            f"""
+            SELECT ts, symbol, buckets_json
+            FROM option_snapshots_1m
+            WHERE ts = {int(ts_val)} AND symbol = '{symbol}'
+            """,
+            conn,
+        )
+        conn.close()
+    except Exception as e:
+        print(f"Error loading live alpha diff context: {e}")
+
+    try:
+        if replay_source == "SQLite Replay DB":
+            date_str = pd.to_datetime(ts_val, unit='s', utc=True).tz_convert('America/New_York').strftime("%Y%m%d")
+            db_path = SQLITE_DATA_DIR / f"market_{date_str}.db"
+            if db_path.exists():
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                context['replay_alpha'] = pd.read_sql(
+                    f"""
+                    SELECT ts, symbol, alpha, iv, price, vol_z
+                    FROM alpha_logs
+                    WHERE ts = {int(ts_val)} AND symbol = '{symbol}'
+                    """,
+                    conn,
+                )
+                conn.close()
+        else:
+            p = Path.home() / "quant_project" / "logs" / "alpha_audit.csv"
+            if p.exists():
+                df = pd.read_csv(p)
+                df = df.rename(columns={'timestamp': 'ts'})
+                df['ts'] = pd.to_numeric(df['ts'], errors='coerce')
+                context['replay_alpha'] = df[(df['ts'] == float(ts_val)) & (df['symbol'] == symbol)].copy()
+    except Exception as e:
+        print(f"Error loading replay alpha context: {e}")
+
+    return context
+
 # ================= 3. 业务逻辑与计算 (Logic) =================
 def calculate_model_health(df):
     """计算 IC 和 Forward Return (修复冷启动报错)"""
@@ -2269,6 +2336,23 @@ with tab9:
 
     diff_metrics, diff_rolling, diff_detail = build_intraday_alpha_diff(live_alpha_df, replay_alpha_df, tolerance=float(diff_tol))
 
+    alert_msgs = []
+    if diff_metrics['matched_rows'] == 0 and (diff_metrics['live_rows'] > 0 or diff_metrics['replay_rows'] > 0):
+        alert_msgs.append("No overlapping live/replay alpha rows.")
+    if diff_metrics['coverage_live'] < 0.95 and diff_metrics['live_rows'] > 0:
+        alert_msgs.append(f"Live coverage dropped to {diff_metrics['coverage_live']:.1%}.")
+    if pd.notna(diff_metrics['alpha_max_diff']) and diff_metrics['alpha_max_diff'] > max(float(diff_tol) * 10.0, 0.05):
+        alert_msgs.append(f"Alpha max diff too large: {diff_metrics['alpha_max_diff']:.6f}.")
+    if pd.notna(diff_metrics['price_max_diff']) and diff_metrics['price_max_diff'] > 0.01:
+        alert_msgs.append(f"Price max diff too large: {diff_metrics['price_max_diff']:.6f}.")
+    if pd.notna(diff_metrics['iv_max_diff']) and diff_metrics['iv_max_diff'] > 0.01:
+        alert_msgs.append(f"IV max diff too large: {diff_metrics['iv_max_diff']:.6f}.")
+
+    if alert_msgs:
+        st.error(" | ".join(alert_msgs))
+    else:
+        st.success("Intraday live/replay alpha diff is within current alert thresholds.")
+
     d1, d2, d3, d4, d5, d6 = st.columns(6)
     d1.metric("Live Rows", f"{diff_metrics['live_rows']}")
     d2.metric("Replay Rows", f"{diff_metrics['replay_rows']}")
@@ -2349,6 +2433,43 @@ with tab9:
         ]
         final_cols = [c for c in show_cols if c in preview.columns]
         st.dataframe(preview[final_cols], use_container_width=True)
+
+        inspect_df = preview.copy().head(20).reset_index(drop=True)
+        inspect_df['label'] = inspect_df.apply(
+            lambda r: f"{pd.to_datetime(r['ts'], unit='s', utc=True).tz_convert('America/New_York').strftime('%H:%M:%S')} | {r['symbol']} | alpha_diff={r.get('alpha_diff', np.nan):.6f}",
+            axis=1
+        )
+        selected_label = st.selectbox("Inspect mismatch context", inspect_df['label'].tolist(), key="alpha_diff_inspect")
+        selected_row = inspect_df[inspect_df['label'] == selected_label].iloc[0]
+        ctx = load_alpha_diff_context(int(selected_row['ts']), selected_row['symbol'], compare_source)
+
+        st.markdown("#### Raw Context")
+        c_live1, c_live2 = st.columns(2)
+        with c_live1:
+            st.caption("Live alpha row")
+            if not ctx['live_alpha'].empty:
+                st.dataframe(ctx['live_alpha'], use_container_width=True)
+            else:
+                st.info("No live alpha row.")
+            st.caption("Live market bar")
+            if not ctx['live_bar'].empty:
+                st.dataframe(ctx['live_bar'], use_container_width=True)
+            else:
+                st.info("No live market bar.")
+        with c_live2:
+            st.caption(f"Replay alpha row ({compare_source})")
+            if not ctx['replay_alpha'].empty:
+                st.dataframe(ctx['replay_alpha'], use_container_width=True)
+            else:
+                st.info("No replay alpha row.")
+            st.caption("Live option snapshot raw JSON")
+            if not ctx['live_option'].empty:
+                opt_df = ctx['live_option'].copy()
+                if 'buckets_json' in opt_df.columns:
+                    opt_df['buckets_json'] = opt_df['buckets_json'].astype(str).str.slice(0, 500)
+                st.dataframe(opt_df, use_container_width=True)
+            else:
+                st.info("No live option snapshot row.")
     else:
         st.info("No mismatch detail to show yet.")
 

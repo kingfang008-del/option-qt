@@ -393,21 +393,23 @@ class StrategyCoreV0:
 
         alpha_val = ctx.get('alpha_z', 0.0)
         
-        # [🔥 Regime-Adaptive] 根据 VIX 波动状态动态选择止损参数
-        # 波动市 (Choppy) → 收紧止损线 (0.0015 / 0.003)
-        # 平静市 (Calm)   → 放宽止损线 (0.003 / 0.005)
+        # [🔥 Regime-Adaptive] 根据全局市场状态切换正股止损档位
+        # calm     -> 0.003 / 0.005
+        # mixed    -> 0.0022 / 0.004
+        # volatile -> 0.0015 / 0.003
         is_volatile_regime = False
+        regime_band = str(ctx.get('regime_band', 'calm') or 'calm').lower()
         if getattr(self.cfg, 'REGIME_ADAPTIVE_STOCK_STOP_ENABLED', False):
-            if 'is_volatile_regime' in ctx:
-                is_volatile_regime = bool(ctx.get('is_volatile_regime'))
+            if regime_band == 'volatile':
+                is_volatile_regime = True
+                tight_sl = getattr(self.cfg, 'STOCK_HARD_STOP_TIGHT_VOLATILE', self.cfg.STOCK_HARD_STOP_TIGHT)
+                loose_sl = getattr(self.cfg, 'STOCK_HARD_STOP_LOOSE_VOLATILE', self.cfg.STOCK_HARD_STOP_LOOSE)
+            elif regime_band == 'mixed':
+                tight_sl = getattr(self.cfg, 'STOCK_HARD_STOP_TIGHT_MIXED', self.cfg.STOCK_HARD_STOP_TIGHT)
+                loose_sl = getattr(self.cfg, 'STOCK_HARD_STOP_LOOSE_MIXED', self.cfg.STOCK_HARD_STOP_LOOSE)
             else:
-                reversal_count = ctx.get('regime_reversal_count', 0)
-                regime_limit = getattr(self.cfg, 'REGIME_REVERSAL_THRESHOLD', 6)
-                is_volatile_regime = (reversal_count > regime_limit)
-        
-        if is_volatile_regime:
-            tight_sl = getattr(self.cfg, 'STOCK_HARD_STOP_TIGHT_VOLATILE', self.cfg.STOCK_HARD_STOP_TIGHT)
-            loose_sl = getattr(self.cfg, 'STOCK_HARD_STOP_LOOSE_VOLATILE', self.cfg.STOCK_HARD_STOP_LOOSE)
+                tight_sl = self.cfg.STOCK_HARD_STOP_TIGHT
+                loose_sl = self.cfg.STOCK_HARD_STOP_LOOSE
         else:
             tight_sl = self.cfg.STOCK_HARD_STOP_TIGHT
             loose_sl = self.cfg.STOCK_HARD_STOP_LOOSE
@@ -419,7 +421,7 @@ class StrategyCoreV0:
         is_in_buffer = held_mins < 3.0
         current_th = max(base_th * 3.0, 0.005) if is_in_buffer else base_th
         tag = "(BUFFER)" if is_in_buffer else ""
-        regime_tag = "[VOL]" if is_volatile_regime else "[CALM]"
+        regime_tag = f"[{regime_band.upper()}]"
 
         if (pos['dir'] == 1 and stock_roi < -current_th) or (pos['dir'] == -1 and stock_roi > current_th):
             return {'action': 'SELL', 'reason': f"STOCK_STOP{regime_tag}{tag}:{stock_roi:.2%}(Th:{current_th:.2%})"}

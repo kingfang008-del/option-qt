@@ -1142,7 +1142,7 @@ class SignalEngineV8:
         return metrics
         
     # 🚀 [零干扰修复] 签名增加 should_update_full，用于决定是否写 Alpha Log
-    async def _evaluate_symbol_signals(self, i, sym, metrics, opt_data, ny_now, curr_ts, spy_roc, qqq_roc, is_zombie_market, index_trend=0, global_regime_reversal_cnt=0, global_is_volatile_regime=None, should_update_full=True):
+    async def _evaluate_symbol_signals(self, i, sym, metrics, opt_data, ny_now, curr_ts, spy_roc, qqq_roc, is_zombie_market, index_trend=0, global_regime_reversal_cnt=0, global_is_volatile_regime=None, global_regime_band='calm', global_regime_score=0.0, should_update_full=True):
         """[Refactor] 核心策略评价 logic (平仓与开仓信号收集) - 修复空仓不交易BUG"""
         from config import USE_BID_ASK_PRICING
         st = metrics['st']
@@ -1241,6 +1241,8 @@ class SignalEngineV8:
             'global_regime_reversal_cnt': global_regime_reversal_cnt, # 🚀 [NEW]
             'regime_reversal_count': global_regime_reversal_cnt,     # For V0 compatibility
             'is_volatile_regime': bool(global_is_volatile_regime),
+            'regime_band': str(global_regime_band or 'calm'),
+            'regime_score': float(global_regime_score or 0.0),
             'state': st
         }
         
@@ -1992,8 +1994,11 @@ class SignalEngineV8:
         vixy_st = self.states.get('VIXY')
         global_regime_reversal_cnt = 0
         global_is_volatile_regime = False
+        global_regime_score = 0.0
+        global_regime_band = getattr(self, 'last_global_regime_band', 'calm')
         vixy_roc_5m = 0.0
         raw_vixy_volatile_regime = False
+        raw_regime_band = 'calm'
         if vixy_st:
             # [Fix] 增加 getattr 鲁棒性，应对 Config 尚未刷新但 Engine 已升级的情况
             regime_window = getattr(self.cfg, 'REGIME_WINDOW_MINS', 30)
@@ -2005,24 +2010,70 @@ class SignalEngineV8:
             regime_limit = getattr(self.cfg, 'REGIME_REVERSAL_THRESHOLD', 6)
             vixy_roc_5m, _, _, _ = vixy_st.get_strategy_metrics()
             vixy_roc_threshold = getattr(self.cfg, 'REGIME_VIXY_ROC_THRESHOLD', 0.003)
+            reversal_ratio = float(global_regime_reversal_cnt) / max(1.0, float(regime_limit))
+            roc_ratio = float(max(vixy_roc_5m, 0.0)) / max(float(vixy_roc_threshold), 1e-9)
+            global_regime_score = max(reversal_ratio, roc_ratio)
+            mixed_score_threshold = getattr(self.cfg, 'REGIME_MIXED_SCORE_THRESHOLD', 0.60)
+            volatile_score_threshold = getattr(self.cfg, 'REGIME_VOLATILE_SCORE_THRESHOLD', 1.00)
+            if global_regime_score >= volatile_score_threshold:
+                raw_regime_band = 'volatile'
+            elif global_regime_score >= mixed_score_threshold:
+                raw_regime_band = 'mixed'
+            else:
+                raw_regime_band = 'calm'
             raw_vixy_volatile_regime = (
                 global_regime_reversal_cnt > regime_limit
                 or vixy_roc_5m >= vixy_roc_threshold
             )
-            require_neutral_index = getattr(self.cfg, 'REGIME_REQUIRE_NEUTRAL_INDEX_FOR_TIGHT_STOP', True)
+            require_neutral_index = getattr(
+                self.cfg,
+                'REGIME_REQUIRE_NEUTRAL_INDEX_FOR_ENTRY_GUARD',
+                True,
+            )
             global_is_volatile_regime = (
                 raw_vixy_volatile_regime
                 and (not require_neutral_index or index_trend == 0)
             )
+        prev_raw_band = getattr(self, '_regime_raw_band_prev', None)
+        prev_raw_count = getattr(self, '_regime_raw_band_count', 0)
+        if raw_regime_band == prev_raw_band:
+            raw_band_count = prev_raw_count + 1
+        else:
+            raw_band_count = 1
+        self._regime_raw_band_prev = raw_regime_band
+        self._regime_raw_band_count = raw_band_count
+
+        confirmed_regime_band = getattr(self, 'last_global_regime_band', 'calm')
+        enter_confirm_bars = max(1, int(getattr(self.cfg, 'REGIME_BAND_ENTER_CONFIRM_BARS', 2)))
+        exit_confirm_bars = max(1, int(getattr(self.cfg, 'REGIME_BAND_EXIT_CONFIRM_BARS', 4)))
+        if raw_regime_band != confirmed_regime_band:
+            if raw_regime_band == 'calm':
+                needed = exit_confirm_bars
+            elif confirmed_regime_band == 'volatile' and raw_regime_band == 'mixed':
+                needed = exit_confirm_bars
+            else:
+                needed = enter_confirm_bars
+            if raw_band_count >= needed:
+                confirmed_regime_band = raw_regime_band
+
         self.last_global_regime_reversal_cnt = int(global_regime_reversal_cnt)
         prev_regime_flag = getattr(self, 'last_global_is_volatile_regime', None)
         self.last_global_is_volatile_regime = bool(global_is_volatile_regime)
+        prev_regime_band = getattr(self, 'last_global_regime_band', None)
+        self.last_global_regime_band = str(confirmed_regime_band)
+        self.last_global_regime_score = float(global_regime_score)
         if prev_regime_flag is None or prev_regime_flag != self.last_global_is_volatile_regime:
             logger.info(
                 f"🧭 [Regime Audit] VIXY_ROC_5M={vixy_roc_5m:.4%} | "
                 f"VIXY_Reversals={int(global_regime_reversal_cnt)} | "
                 f"IndexTrend={index_trend} | RawVol={raw_vixy_volatile_regime} | "
                 f"Volatile={self.last_global_is_volatile_regime}"
+            )
+        if prev_regime_band is None or prev_regime_band != self.last_global_regime_band:
+            logger.info(
+                f"🧭 [Regime Band] Score={global_regime_score:.2f} | "
+                f"Raw={raw_regime_band}({raw_band_count}) | "
+                f"Confirmed={self.last_global_regime_band}"
             )
         
         # 9. 符号处理循环 (更新分钟指标 & 评估入场信号)
@@ -2072,6 +2123,8 @@ class SignalEngineV8:
                 getattr(self, 'last_is_zombie', False), index_trend, 
                 global_regime_reversal_cnt=global_regime_reversal_cnt, # 🚀 [NEW]
                 global_is_volatile_regime=global_is_volatile_regime,
+                global_regime_band=self.last_global_regime_band,
+                global_regime_score=global_regime_score,
                 should_update_full=True
             )
             if entry_sig:
@@ -2170,6 +2223,9 @@ class SignalEngineV8:
                 self.last_spy_roc_val, self.last_qqq_roc_val, 
                 getattr(self, 'last_is_zombie', False), self.last_index_trend,
                 global_regime_reversal_cnt=getattr(self, 'last_global_regime_reversal_cnt', 0),
+                global_is_volatile_regime=getattr(self, 'last_global_is_volatile_regime', False),
+                global_regime_band=getattr(self, 'last_global_regime_band', 'calm'),
+                global_regime_score=getattr(self, 'last_global_regime_score', 0.0),
                 should_update_full=False
             )
 
