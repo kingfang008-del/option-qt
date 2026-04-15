@@ -164,3 +164,4 @@ replay_0105_audit.txt
 replay_0108_audit.txt
 production/preprocess/backtest/tools/archive.zip
 *.zip
+.DS_Store
