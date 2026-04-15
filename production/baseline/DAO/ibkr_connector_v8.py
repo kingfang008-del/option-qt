@@ -482,8 +482,8 @@ class IBKRConnectorFinal:
             
             # 保留 5 秒 Bar 作为 OHLCV / fallback 数据源，但不再作为低延迟发布的唯一触发器。
             self.ib.reqRealTimeBars(contract, 5, 'TRADES', False)
-            # 订阅实时行情，用于 tick 驱动的低延迟发布与价格更新。
-            self.ib.reqMktData(contract, '', False, False)
+            # 订阅实时行情，用于 tick 驱动的低延迟发布与价格更新。加入 100(Volume), 233(RTVolume) 保证成交量推送
+            self.ib.reqMktData(contract, '100,233,236', False, False)
             # logger.info(f"✅ Subscribed Stock: {original_key}")
 
             # C. 恢复/搜索 期权 (Immediate Check)
@@ -525,7 +525,7 @@ class IBKRConnectorFinal:
             logger.error(f"❌ Init failed for {sym}: {e}")
 
     def _on_stock_bar(self, bars, hasNew):
-        """收到正股 5秒 Bar -> [🔥 Vectorized] 触发全市场联合推送 (Soft Batching)"""
+        """收到正股 5秒 Bar -> [Fallback] 兜底发布"""
         if not hasNew: return
         
         # 1. 记录最新的正股价格与存活状态
@@ -535,20 +535,23 @@ class IBKRConnectorFinal:
         self.last_spot_prices[sym] = b.close
         self.last_tick_time[sym] = time.time()
         
-        # 缓存当前的 Bar 数据到内存，供 Sweep 使用
-        if not hasattr(self, '_last_bar_cache'): self._last_bar_cache = {}
-        self._last_bar_cache[sym] = {
-            'open': b.open_, 'high': b.high, 'low': b.low, 'close': b.close, 'volume': b.volume,
-            'ts': b.time.timestamp()
-        }
+        # 🚀 [核心修复 1] 如果开启了 Tick 驱动，绝对禁止 5秒 Bar 覆写缓存！
+        # 否则会破坏 _on_pending_tickers 精心维护的秒级 Volume Delta 累加机制！
+        if not self._use_tick_driven_publish:
+            # 缓存当前的 Bar 数据到内存，供 Sweep 使用
+            if not hasattr(self, '_last_bar_cache'): self._last_bar_cache = {}
+            self._last_bar_cache[sym] = {
+                'open': b.open_, 'high': b.high, 'low': b.low, 'close': b.close, 'volume': b.volume,
+                'ts': b.time.timestamp()
+            }
 
-        # 2. [Fallback] 若未开启 tick 驱动，则仍使用 5 秒 Bar 触发整帧发布。
-        ts_val = b.time.timestamp()
-        if not hasattr(self, '_last_published_batch_ts'): self._last_published_batch_ts = 0
-        if not self._use_tick_driven_publish and ts_val > self._last_published_batch_ts:
-            if self._collecting_ts != ts_val:
-                self._collecting_ts = ts_val
-                asyncio.create_task(self._debounced_publish(ts_val))
+            # 2. [Fallback] 若未开启 tick 驱动，则仍使用 5 秒 Bar 触发整帧发布。
+            ts_val = b.time.timestamp()
+            if not hasattr(self, '_last_published_batch_ts'): self._last_published_batch_ts = 0
+            if ts_val > self._last_published_batch_ts:
+                if self._collecting_ts != ts_val:
+                    self._collecting_ts = ts_val
+                    asyncio.create_task(self._debounced_publish(ts_val))
 
     @staticmethod
     def _safe_float(val):
@@ -607,22 +610,32 @@ class IBKRConnectorFinal:
                     if prev_total is not None and total_vol >= prev_total:
                         delta_vol = total_vol - prev_total
                     self._last_total_volume[sym] = total_vol
+                else:
+                    # 如果 reqMktData 没有 volume (例如盘前)，我们尝试提取 RTVolume
+                    rt_vol = getattr(ticker, 'rtVolume', None)
+                    if rt_vol is not None and rt_vol > 0:
+                        prev_rt = self._last_total_volume.get(sym)
+                        if prev_rt is not None and rt_vol >= prev_rt:
+                            delta_vol = rt_vol - prev_rt
+                        self._last_total_volume[sym] = rt_vol
 
                 bar = self._last_bar_cache.get(sym)
+                current_vol = float(bar.get('volume', 0.0)) if bar else 0.0
+                
                 if bar is None or int(bar.get('ts', 0)) != int(second_ts):
                     self._last_bar_cache[sym] = {
                         'open': price,
                         'high': price,
                         'low': price,
                         'close': price,
-                        'volume': max(0.0, delta_vol),
+                        'volume': current_vol + max(0.0, delta_vol),
                         'ts': second_ts,
                     }
                 else:
                     bar['high'] = max(float(bar['high']), price)
                     bar['low'] = min(float(bar['low']), price)
                     bar['close'] = price
-                    bar['volume'] = float(bar.get('volume', 0.0)) + max(0.0, delta_vol)
+                    bar['volume'] = current_vol + max(0.0, delta_vol)
 
                 self.last_spot_prices[sym] = price
                 self.last_tick_time[sym] = now_ts
@@ -667,9 +680,15 @@ class IBKRConnectorFinal:
                 'ts': ts_val,
                 'stock': {
                     'open': bar_data['open'], 'high': bar_data['high'],
-                    'low': bar_data['low'], 'close': bar_data['close'], 'volume': bar_data['volume']
+                    'low': bar_data['low'], 'close': bar_data['close'],
+                    'volume': bar_data['volume']
                 }
             }
+            
+            # 🚀 [核心修复: 秒级成交量隔离] 
+            # 把当前这 1 秒内的累加成交量发送给下游后，必须在本地清零！
+            # 否则下游 persistence service 在累加分钟级 VWAP (pv_sum) 时会发生指数级重复计算。
+            bar_data['volume'] = 0.0
             
             # 收集期权数据 (如果有锁定的话)
             opt_buckets, opt_contracts = self._collect_option_buckets(sym)

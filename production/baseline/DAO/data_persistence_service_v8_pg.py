@@ -51,6 +51,10 @@ class DataPersistenceServicePG:
         self.bar_buffer_5m = {}
         self.option_buffer_5m = {}
         
+        # [NEW] 5min Accumulator to ensure market_bars_5m is synthesized correctly
+        self.acc_5m = {} # {(symbol, 5m_ts): [bars]}
+        self.last_synthesized = {} # {symbol: last_5m_ts}
+        
         self.trade_buffer = []
         self.alpha_buffer = []
         self.last_flush = time.time()
@@ -84,6 +88,7 @@ class DataPersistenceServicePG:
                     low DOUBLE PRECISION,
                     close DOUBLE PRECISION,
                     volume DOUBLE PRECISION,
+                    vwap DOUBLE PRECISION,
                     PRIMARY KEY (symbol, ts)
                 ) PARTITION BY RANGE (ts);
             """)
@@ -208,6 +213,8 @@ class DataPersistenceServicePG:
             self.option_buffer_1s.clear()
             self.bar_buffer_5m.clear()
             self.option_buffer_5m.clear()
+            self.acc_5m.clear()
+            self.last_synthesized.clear()
             self.trade_buffer.clear()
             try:
                 self._init_master_tables()
@@ -258,6 +265,58 @@ class DataPersistenceServicePG:
                     """, rows_to_insert)
                     conn.commit()
                     c.close()
+
+                # 🚀 [SDS 2.0 Greeks 强制绑定逻辑]
+                # 检查是否存在期权快照计算结果，如果存在，则将其同步写入 option_snapshots_1m 表。
+                # ！！注意：FCS 下发的键名是 'live_options'，必须保持一致！！
+                option_snapshots = payload.get('live_options') or payload.get('option_snapshots')
+                if option_snapshots and isinstance(option_snapshots, dict):
+                    opt_rows = []
+                    sample_sym = None
+                    sample_g_sum = 0
+                    
+                    for opt_sym, opt_data in option_snapshots.items():
+                        # 只有在 buckets 字段不为空时才处理
+                        buckets = opt_data.get('buckets')
+                        if buckets:
+                            opt_rows.append((opt_sym, ts, json.dumps(opt_data)))
+                            
+                            # [诊断日志抽样] 检查希腊值是否真的有效（非 0）
+                            if sample_sym is None and isinstance(buckets, list) and len(buckets) > 0:
+                                # 抽样检查第一行的 Greeks 列 (1,2,3,4)
+                                first_row = buckets[0]
+                                if len(first_row) > 5:
+                                    g_sum = sum(abs(x) for x in first_row[1:5])
+                                    if g_sum > 1e-6:
+                                        sample_sym = opt_sym
+                                        sample_g_sum = g_sum
+
+                    if opt_rows:
+                        if sample_sym:
+                            logger.info(f"📊 [PG-Greeks-Bind] Detected enriched Greeks for {sample_sym} (sum={sample_g_sum:.4f}). Upserting {len(opt_rows)} symbols.")
+                        
+                        conn = self._get_pg_conn()
+                        c = conn.cursor()
+                        
+                        # 1. 写入分钟表 (仅在分钟结算点触发)
+                        if payload.get('is_new_minute'):
+                            psycopg2.extras.execute_batch(c, """
+                                INSERT INTO option_snapshots_1m (symbol, ts, buckets_json) 
+                                VALUES (%s, %s, %s)
+                                ON CONFLICT (symbol, ts) DO UPDATE 
+                                SET buckets_json = EXCLUDED.buckets_json
+                            """, opt_rows)
+                        
+                        # 2. 写入秒级表 (每秒实时更新，包含最新求解结果)
+                        psycopg2.extras.execute_batch(c, """
+                            INSERT INTO option_snapshots_1s (symbol, ts, buckets_json) 
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (symbol, ts) DO UPDATE 
+                            SET buckets_json = EXCLUDED.buckets_json
+                        """, opt_rows)
+                        
+                        conn.commit()
+                        c.close()
                 
         except Exception as e:
             logger.error(f"Feature Write Error: {e}")
@@ -277,6 +336,7 @@ class DataPersistenceServicePG:
             stock = payload.get('stock', {})
             price = float(stock.get('close', 0.0))
             vol = float(stock.get('volume', 0.0))
+            vwap_val = float(stock.get('vwap', price))
 
             if price > 0:
                 self.bar_buffer_1s[key_1s] = {
@@ -287,6 +347,7 @@ class DataPersistenceServicePG:
                     'low': float(stock.get('low', price)),
                     'close': price,
                     'volume': vol,
+                    'vwap': vwap_val,
                 }
             
             if price > 0:
@@ -295,7 +356,8 @@ class DataPersistenceServicePG:
                         'symbol': symbol, 
                         'ts': minute_ts,
                         'open': price, 'high': price, 'low': price, 'close': price,
-                        'volume': vol
+                        'volume': vol,
+                        'pv_sum': vwap_val * vol
                     }
                 else:
                     b = self.bar_buffer[key]
@@ -303,24 +365,49 @@ class DataPersistenceServicePG:
                     b['low'] = min(b['low'], price)
                     b['close'] = price
                     b['volume'] += vol
+                    b['pv_sum'] += vwap_val * vol
             
-            # 5min Bar
-            stock_5m = payload.get('stock_5m', {})
-            price_5m = float(stock_5m.get('close', 0.0))
-            stock_5m_ts_raw = payload.get('stock_5m_ts')
-            if stock_5m_ts_raw is None:
-                stock_5m_ts = minute_ts if minute_ts % 300 == 0 else None
-            else:
-                stock_5m_ts = int(float(stock_5m_ts_raw))
-            if price_5m > 0 and stock_5m_ts == minute_ts and minute_ts % 300 == 0:
-                key_5m = (symbol, stock_5m_ts)
-                self.bar_buffer_5m[key_5m] = {
-                    'symbol': symbol, 'ts': stock_5m_ts,
-                    'open': float(stock_5m['open']), 'high': float(stock_5m['high']),
-                    'low': float(stock_5m['low']), 'close': price_5m,
-                    'volume': float(stock_5m['volume'])
+            # 5min Bar (🚀 自动合成逻辑：基于 acc_5m 累加器实现稳健合成)
+            # 🚀 [强制收敛] 5min Bar: 彻底废弃上游推送，100% 依赖 1m 线底层滚动聚合
+            five_min_ts = (minute_ts // 300) * 300 
+            acc_key = (symbol, five_min_ts)
+            
+            if acc_key not in self.acc_5m: 
+                self.acc_5m[acc_key] = []
+                
+            b1m = self.bar_buffer.get(key)
+            if b1m:
+                # 将当前真实的 1min 线存入累加器（自动去重）
+                if not self.acc_5m[acc_key] or self.acc_5m[acc_key][-1]['ts'] < b1m['ts']:
+                    self.acc_5m[acc_key].append(b1m.copy())
+                else:
+                    # 🚀 [关键修复] 如果是同一分钟，则更新最后一条记录，确保成交量累加被反映到 5m 聚合中
+                    self.acc_5m[acc_key][-1] = b1m.copy()
+                    
+                # 仅保留最近 5 分钟的数据防止内存无限增长
+                if len(self.acc_5m[acc_key]) > 10: 
+                    self.acc_5m[acc_key] = self.acc_5m[acc_key][-10:]
+            
+            # 实时计算当前 5m 桶的最新状态（利用真实的 O H L C V 聚合）
+            bars = self.acc_5m[acc_key]
+            if bars:
+                total_vol = sum(b['volume'] for b in bars)
+                total_pv = sum(b['pv_sum'] for b in bars)
+                
+                self.bar_buffer_5m[acc_key] = {
+                    'symbol': symbol, 
+                    'ts': five_min_ts,
+                    'open': bars[0]['open'],
+                    'high': max(b['high'] for b in bars),
+                    'low': min(b['low'] for b in bars),
+                    'close': bars[-1]['close'],
+                    'volume': total_vol,
+                    # 真实滚动 VWAP 保护：如果总交易量为 0，则 fallback 到最新收盘价
+                    'vwap': total_pv / total_vol if total_vol > 0 else bars[-1]['close']
                 }
-
+                
+                if time.time() % 60 < 2: # 降低日志频率，每分钟只打一次心跳
+                    logger.info(f"🔄 [Rolling-5m] 强制本地聚合 {symbol} @ {five_min_ts} (Accumulated {len(bars)}/5 bars)")
             # 1min Options
             if 'option_buckets' in payload:
                 snap_obj = payload['option_buckets']
@@ -328,7 +415,8 @@ class DataPersistenceServicePG:
                 if contracts:
                     snap_obj = {'buckets': payload['option_buckets'], 'contracts': contracts}
                 self.option_buffer_1s[key_1s] = json.dumps(snap_obj)
-                self.option_buffer[key] = json.dumps(snap_obj)
+                # 1m 快照改由 process_feature_data 的 live_options 统一落库，
+                # 避免 raw 行情快照反复覆盖分钟级 Greeks 结果。
 
             # 5min Options Fallback (🚀 复用 1min 桶填补 5min 缺口)
             opt_buckets_5m = payload.get('option_buckets_5m')
@@ -354,7 +442,7 @@ class DataPersistenceServicePG:
                 self.option_buffer_5m[key] = json.dumps(snap_obj_5m)
                 
         except Exception as e:
-            pass
+            logger.error(f"❌ [Market Process Error] Symbol: {symbol}, TS: {ts}, Error: {e}", exc_info=True)
 
     def flush(self):
         if not (
@@ -373,27 +461,34 @@ class DataPersistenceServicePG:
             for buf, tbl in [
                 (self.bar_buffer_1s, 'market_bars_1s'),
                 (self.bar_buffer, 'market_bars_1m'),
-                (self.bar_buffer_5m, 'market_bars_5m'),
+                (self.bar_buffer_5m, 'market_bars_5m'), # 🚀 [核心修复] 补上 5 分钟 K 线的落盘队列
             ]:
                 if buf:
                     rows = []
                     keys_to_del = []
                     for key, b in buf.items():
-                        rows.append((b['symbol'], b['ts'], b['open'], b['high'], b['low'], b['close'], b['volume']))
+                        v_val = b.get('volume', 0.0)
+                        vwap_val = b.get('vwap')
+                        if vwap_val is None:
+                            pv = b.get('pv_sum', 0.0)
+                            vwap_val = pv / v_val if v_val > 0 else b['close']
+                        
+                        rows.append((b['symbol'], b['ts'], b['open'], b['high'], b['low'], b['close'], v_val, vwap_val))
                         if key[1] < current_cutoff: keys_to_del.append(key)
                     
-                    psycopg2.extras.execute_batch(c, f"""
-                        INSERT INTO {tbl} (symbol, ts, open, high, low, close, volume) 
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (symbol, ts) DO UPDATE 
-                        SET open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close, volume=EXCLUDED.volume
-                    """, rows)
+                    if rows:
+                        logger.info(f"📊 [Flush-Check] Inserting {len(rows)} rows into {tbl} (Sample TS: {rows[0][1]})")
+                        psycopg2.extras.execute_batch(c, f"""
+                            INSERT INTO {tbl} (symbol, ts, open, high, low, close, volume, vwap) 
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (symbol, ts) DO UPDATE 
+                            SET open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close, volume=EXCLUDED.volume, vwap=EXCLUDED.vwap
+                        """, rows)
                     for k in keys_to_del: del buf[k]
 
             # 2. Options (1m & 5m)
             for buf, tbl in [
                 (self.option_buffer_1s, 'option_snapshots_1s'),
-                (self.option_buffer, 'option_snapshots_1m'),
                 (self.option_buffer_5m, 'option_snapshots_5m'),
             ]:
                 if buf:
@@ -533,6 +628,14 @@ class DataPersistenceServicePG:
                     self.r.xgroup_create(stream, REDIS_CFG['pg_group'], mkstream=True, id='0')
                 except Exception: pass
             
+            # [Diagnostic] Check Group Status
+            try:
+                groups = self.r.xinfo_groups(STREAM_FUSED_MARKET)
+                for g in groups:
+                    if g[b'name'].decode() == REDIS_CFG['pg_group']:
+                        logger.info(f"🚩 [Stream-Status] Group: {REDIS_CFG['pg_group']}, Last-Delivered-ID: {g[b'last-delivered-id'].decode()}, Pending: {g[b'pending']}")
+            except Exception: pass
+            
         logger.info(f"💾 PG Persistence Service Started (Tracking Date: {self.current_date}, DB: {target_db})")
         streams = {STREAM_FUSED_MARKET: '>',
                    STREAM_TRADE_LOG: '>',
@@ -589,7 +692,7 @@ class DataPersistenceServicePG:
                                                 float(payload.get('alpha', 0)),
                                                 float(payload.get('iv', 0)),
                                                 float(payload.get('price', 0)),
-                                                float(payload.get('vol_z', 0))
+                                                float(payload.get('vol_z', 0)),
                                             ))
                                         else:
                                             mode = payload.get('mode', 'REALTIME')

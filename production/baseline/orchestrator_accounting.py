@@ -24,6 +24,18 @@ class OrchestratorAccounting:
             return mode_override
         return "BACKTEST" if getattr(os.environ, 'get', None) and os.environ.get('RUN_MODE') == 'LIVEREPLAY' else None
 
+    def _safe_json_dumps(self, data):
+        """[Fix] 移除 bytes key 导致的 JSON 序列化失败"""
+        if not isinstance(data, dict):
+            return json.dumps(data)
+        
+        clean_data = {}
+        for k, v in data.items():
+            key = k.decode('utf-8') if isinstance(k, bytes) else str(k)
+            val = v.decode('utf-8') if isinstance(v, bytes) else v
+            clean_data[key] = val
+        return json.dumps(clean_data)
+
     def _emit_trade_log(self, payload):
         """发送交易日志到 Redis Stream供 Dashboard 展示"""
         try:
@@ -72,6 +84,16 @@ class OrchestratorAccounting:
         st.entry_iv = sig.get('meta', {}).get('iv', st.last_valid_iv)
         st.max_roi = 0.0
 
+        # 🚀 [Defensive] 确保特征是浮点数而非字典/对象
+        def _get_float(val):
+            if isinstance(val, dict): return 0.0
+            try: return float(val)
+            except: return 0.0
+            
+        st.entry_spy_roc = _get_float(st.entry_spy_roc)
+        st.entry_alpha_z = _get_float(st.entry_alpha_z)
+        st.entry_iv = _get_float(st.entry_iv)
+
         timing_fields = timing_fields or {}
         reason = sig.get('reason', '')
         if note_suffix:
@@ -86,7 +108,7 @@ class OrchestratorAccounting:
             'price': fill_price,
             'stock_price': stock_price,
             **timing_fields,
-            'strategy_note': json.dumps({
+            'strategy_note': self._safe_json_dumps({
                 'tag': sig.get('tag'),
                 'reason': reason,
                 'iv': getattr(st, 'last_valid_iv', 0.0),
@@ -114,8 +136,16 @@ class OrchestratorAccounting:
         
         # 逆势统计 - 使用 pos_for_accounting 替代 st.position
         cached_index_trend = getattr(st, 'entry_index_trend', 0)
-        is_ct_long = (cached_index_trend == -1) or (st.entry_spy_roc < -0.0001 and pos_for_accounting == 1)
-        is_ct_short = (cached_index_trend == 1) or (st.entry_spy_roc > 0.0001 and pos_for_accounting == -1)
+        
+        # 🚀 [Defensive Fix] 强制转换，防止 numpy 对象或 dict 导致 '>' 报错
+        def _to_f(v):
+            try: return float(v)
+            except: return 0.0
+            
+        spy_roc_val = _to_f(getattr(st, 'entry_spy_roc', 0.0))
+        
+        is_ct_long = (cached_index_trend == -1) or (spy_roc_val < -0.0001 and pos_for_accounting == 1)
+        is_ct_short = (cached_index_trend == 1) or (spy_roc_val > 0.0001 and pos_for_accounting == -1)
         
         if is_ct_long and pos_for_accounting == 1:
             self.orch.stats_counter_trend_long_count += 1
@@ -170,6 +200,9 @@ class OrchestratorAccounting:
         self.orch.trade_count += 1
         if gross_pnl > 0: self.orch.win_count += 1
         elif gross_pnl < 0: self.orch.loss_count += 1
+
+        # 💰 [AUDIT] 实时打印全局战果
+        logger.info(f"💰 [TOTAL AUDIT] 累计平仓数: {self.orch.trade_count} | 策略池累计净收益: ${self.orch.realized_pnl:.2f}")
 
         self.orch.daily_trades.append({
             'symbol': sym, 'opt_type': st.opt_type, 'position': pos_for_accounting,

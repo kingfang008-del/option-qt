@@ -52,10 +52,11 @@ async def main():
     }
 
     try:
-        from config import TARGET_SYMBOLS
+        from config import TARGET_SYMBOLS, RUN_MODE, IS_SIMULATED, TRADING_ENABLED
     except ImportError:
         logger.error(f"❌ Failed to import SYMBOLS from config")
         return
+    logger.info(f"🧭 Runtime Mode: RUN_MODE={RUN_MODE} | IS_SIMULATED={IS_SIMULATED} | TRADING_ENABLED={TRADING_ENABLED}")
 
     try:
         engine = SignalEngineV8(

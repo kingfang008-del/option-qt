@@ -62,8 +62,8 @@ def resolve_db_path(args):
     """[Critical Fix] 严格锁定并寻找 history_sqlite_1m 目录下的权威数据库"""
     CURRENT_DIR = Path(__file__).resolve().parent
     # 🚀 既然确定了是在 history_sqlite_1m 下，我们直接锁定这个路径，不做任何模糊搜索
-    HIST_DIR = CURRENT_DIR.parent / "preprocess" / "backtest" / "history_sqlite_1m"
-    
+    #HIST_DIR = CURRENT_DIR.parent / "preprocess" / "backtest" / "history_sqlite_1m"
+    HIST_DIR = Path("/home/kingfang007/quant_project/data/history_sqlite_1m")
     if args.date:
         db_name = f"market_{args.date}.db"
         p = HIST_DIR / db_name

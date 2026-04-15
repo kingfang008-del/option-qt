@@ -137,14 +137,13 @@ class DataPersistenceServiceSQLite:
                 iv REAL,
                 price REAL,
                 vol_z REAL,
-                event_prob REAL,
                 PRIMARY KEY (symbol, ts)
             )
         """)
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_alpha_ts ON alpha_logs (ts)")
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_trd_bk_sym_ts ON trade_logs_backtest (symbol, ts)")
 
-        # [Migration] 如果表已存在但没有 datetime_ny 或 event_prob 列，补全
+        # [Migration] 如果表已存在但没有 datetime_ny 列，补全
         for table in ['trade_logs', 'trade_logs_backtest']:
             try:
                 self.cursor.execute(f"SELECT datetime_ny FROM {table} LIMIT 1")
@@ -155,11 +154,6 @@ class DataPersistenceServiceSQLite:
             self.cursor.execute("SELECT vwap FROM market_bars_1m LIMIT 1")
         except:
             self.cursor.execute("ALTER TABLE market_bars_1m ADD COLUMN vwap REAL")
-
-        try:
-            self.cursor.execute("SELECT event_prob FROM alpha_logs LIMIT 1")
-        except:
-            self.cursor.execute("ALTER TABLE alpha_logs ADD COLUMN event_prob REAL DEFAULT 0.0")
 
         # [新增] 3. 建表: 期权快照 (1分钟聚合)
         self.cursor.execute("""
@@ -444,13 +438,13 @@ class DataPersistenceServiceSQLite:
             if self.alpha_buffer:
                 alpha_rows = []
                 for item in self.alpha_buffer:
-                    # item = (ts, symbol, alpha, iv, price, vol_z, event_prob)
+                    # item = (ts, symbol, alpha, iv, price, vol_z)
                     ts = item[0]
                     from config import NY_TZ
                     dt_ny = datetime.fromtimestamp(ts, NY_TZ).strftime('%Y-%m-%d %H:%M:%S')
-                    alpha_rows.append((ts, dt_ny, item[1], item[2], item[3], item[4], item[5], item[6]))
+                    alpha_rows.append((ts, dt_ny, item[1], item[2], item[3], item[4], item[5]))
                 
-                self.cursor.executemany("REPLACE INTO alpha_logs VALUES (?,?,?,?,?,?,?,?)", alpha_rows)
+                self.cursor.executemany("REPLACE INTO alpha_logs VALUES (?,?,?,?,?,?,?)", alpha_rows)
                 self.alpha_buffer = []
 
             self.conn.commit()
@@ -506,14 +500,13 @@ class DataPersistenceServiceSQLite:
                                         
                                         if action == 'ALPHA':
                                             # Alpha Log 写入 buffer
-                                            # payload: {ts, symbol, action='ALPHA', alpha, iv, price, vol_z, event_prob}
+                                            # payload: {ts, symbol, action='ALPHA', alpha, iv, price, vol_z}
                                             self.alpha_buffer.append((
                                                 payload['ts'], payload['symbol'], 
                                                 float(payload.get('alpha', 0)),
                                                 float(payload.get('iv', 0)),
                                                 float(payload.get('price', 0)),
-                                                float(payload.get('vol_z', 0)),
-                                                float(payload.get('event_prob', 0))
+                                                float(payload.get('vol_z', 0))
                                             ))
                                         else:
                                             # Trade Log 写入 buffer

@@ -110,7 +110,7 @@ class BatchSQLiteDriver:
                 has_5m = c.fetchone() is not None
                 
                 if has_5m:
-                    df_bars_5m = pd.read_sql("SELECT symbol, ts, open, high, low, close, volume, vwap FROM market_bars_5m ORDER BY ts ASC", conn)
+                    df_bars_5m = pd.read_sql("SELECT symbol, ts, open, high, low, close, volume  FROM market_bars_5m ORDER BY ts ASC", conn)
                     df_opts_5m = pd.read_sql("SELECT symbol, ts, buckets_json FROM option_snapshots_5m ORDER BY ts ASC", conn)
                 else:
                     df_bars_5m = pd.DataFrame()

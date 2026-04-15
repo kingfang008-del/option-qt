@@ -27,9 +27,9 @@ import re
 import pandas as pd
 import os
 import psycopg2
+import config
 from config import PG_DB_URL
 import threading
-import os
 from pathlib import Path
 from datetime import datetime, time as dt_time, timedelta
 from collections import deque
@@ -74,7 +74,6 @@ from config import (
     MAX_TRADE_CAP,              # 单笔交易最大金额
     GLOBAL_EXPOSURE_LIMIT,      # 全局风险敞口上限
     COMMISSION_PER_CONTRACT,    # 期权手续费 ($/手)
-    USE_BID_ASK_PRICING,        # [New] 价格模式开关
     NON_TRADABLE_SYMBOLS,
     ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS,
     INDEX_TREND_SYMBOLS,
@@ -363,10 +362,15 @@ class SymbolState:
         self.pending_exit_first_ts = data.get('pending_exit_first_ts', 0.0)
 
 class SignalEngineV8:
-    def __init__(self, symbols, mode='realtime', config_paths=None, model_paths=None):
+    def __init__(self, symbols, mode='realtime', config_paths=None, model_paths=None, ibkr=None, shared_signal_queue=None):
         print(f"DEBUG: V8Orchestrator Initializing... Mode={mode}")
         self.mode = mode
         self.symbols = symbols
+        
+        # [🔥 Dependency Injection] 允许外部注入底座实例 (如 MockIBKR)
+        self.ibkr = ibkr
+        self.signal_queue = shared_signal_queue
+        self.use_shared_mem = (shared_signal_queue is not None)
         self.strategy = StrategyCore(StrategyConfig())
         self.cfg = self.strategy.cfg
         logger.info(f"🧭 Active strategy core: {ACTIVE_STRATEGY_CORE_VERSION}")
@@ -389,7 +393,14 @@ class SignalEngineV8:
         # Global State Defaults
         # [已统一] 所有的策略、风控参数通过 self.cfg 访问
         self.last_date = None
-        self.mock_cash = self.cfg.INITIAL_ACCOUNT
+        # 如果注入了 ibkr (特别是 MockIBKR)，优先同步其资金状态
+        if self.ibkr:
+            if hasattr(self.ibkr, 'cash'):
+                self.mock_cash = float(self.ibkr.cash)
+            elif hasattr(self.ibkr, 'initial_capital'):
+                self.mock_cash = float(self.ibkr.initial_capital)
+        else:
+            self.mock_cash = self.cfg.INITIAL_ACCOUNT
         self.index_opening_prices = {}
         self.consecutive_stop_losses = 0
         self.global_cooldown_until = 0
@@ -490,7 +501,7 @@ class SignalEngineV8:
             logger.info(f"📊 [Audit] Alpha Audit logging enabled: {self.audit_log_path}")
 
         # [NEW] 模式启动声明
-        mode_str = "✅ [Bid/Ask + BSM 校准模式]" if USE_BID_ASK_PRICING else "⚠️ [成交价模式 (Transaction Price Mode)]"
+        mode_str = "✅ [Fair Price (Mid) + BSM 校准模式]" 
         logger.info(f"📊 Orchestrator 启动! 当前价格计算模式: {mode_str}")
 
     def _is_high_freq_tick(self, st, curr_ts):
@@ -703,8 +714,6 @@ class SignalEngineV8:
         [NEW] 统一计算期权公允市价
         如果是真空切片 (Bid/Ask 均为 0)，且 Last Price 与前一秒偏差超过 10%，则沿用上一秒价格。
         """
-        if not USE_BID_ASK_PRICING:
-            return base_price
 
         # 计算市场价 (Mid)
         if bid > 0.01 and ask > 0.01:
@@ -725,6 +734,13 @@ class SignalEngineV8:
 
     async def _process_fast_fused_tick(self, payload: dict):
         """[高频通道] 处理来自 fused_market_stream 的混合 Tick，执行毫秒级平仓保护"""
+        # 🚀 [核心对齐修复: 屏蔽高频插针平仓]
+        # 如果处于回测/回放模式并且开启了降频 (converge_to_single)，则直接屏蔽此流入口！
+        converge_to_single = os.environ.get('DUAL_CONVERGE_TO_SINGLE') == '1'
+        is_backtest_env = (self.mode == 'backtest' or os.environ.get('RUN_MODE') in ['BACKTEST', 'LIVEREPLAY'])
+        if converge_to_single and is_backtest_env:
+            return
+
         from config import HASH_OPTION_SNAPSHOT, TARGET_SYMBOLS
         is_live_replay = IS_LIVEREPLAY
         
@@ -955,6 +971,15 @@ class SignalEngineV8:
                 res['put_bid_size'] = float(buckets[idx_p][10]) if len(buckets[idx_p]) > 10 else 0.0
                 res['put_ask_size'] = float(buckets[idx_p][11]) if len(buckets[idx_p]) > 11 else 0.0
                 
+                # 🚀 [Parity & Guard Logic] 
+                # 0: 原始模式 (不干预) | 1: 严格过滤 (总深度>100) | 2: 基准对齐 (强制100)
+                from config import STRICT_LIQUIDITY_MODE
+                if STRICT_LIQUIDITY_MODE == 2:
+                    res['call_bid_size'] = 100.0
+                    res['call_ask_size'] = 100.0
+                    res['put_bid_size']  = 100.0
+                    res['put_ask_size']  = 100.0
+
                 res['has_feed'] = True
         except Exception as e:
             logger.warning(f"Failed to parse live option snapshot for {sym}: {e}")
@@ -965,8 +990,14 @@ class SignalEngineV8:
         if not hasattr(self, 'r'):
             return
         self.r.set("sync:orch_done", str(curr_ts))
+        self.r.expire("sync:orch_done", 120)
         if frame_id:
             self.r.set("sync:orch_done_frame_id", str(frame_id))
+            self.r.expire("sync:orch_done_frame_id", 120)
+        try:
+            self.r.hincrby("diag:se:counters", "orch_done", 1)
+        except Exception:
+            pass
 
     def _is_duplicate_frame(self, frame_id: str) -> bool:
         if not frame_id:
@@ -1144,7 +1175,7 @@ class SignalEngineV8:
     # 🚀 [零干扰修复] 签名增加 should_update_full，用于决定是否写 Alpha Log
     async def _evaluate_symbol_signals(self, i, sym, metrics, opt_data, ny_now, curr_ts, spy_roc, qqq_roc, is_zombie_market, index_trend=0, global_regime_reversal_cnt=0, global_is_volatile_regime=None, global_regime_band='calm', global_regime_score=0.0, should_update_full=True):
         """[Refactor] 核心策略评价 logic (平仓与开仓信号收集) - 修复空仓不交易BUG"""
-        from config import USE_BID_ASK_PRICING
+        from config import TAG_TO_INDEX
         st = metrics['st']
         if global_is_volatile_regime is None:
             global_is_volatile_regime = getattr(self, 'last_global_is_volatile_regime', False)
@@ -1348,13 +1379,10 @@ class SignalEngineV8:
             t_bs     = opt_data['call_bid_size'] if is_call else opt_data['put_bid_size']
             t_as     = opt_data['call_ask_size'] if is_call else opt_data['put_ask_size']
 
-            if USE_BID_ASK_PRICING:
-                if t_bid <= 0 or t_ask <= 0:
-                    t_bid = t_price
-                    t_ask = t_price
-            else:
-                if t_price <= 0:
-                    return None
+            # 🚀 [放宽实盘与回测限制] 不再要求 Size > 0。如果 Bid/Ask 为 0，统一使用 Last Price 兜底放行
+            if t_bid <= 0 or t_ask <= 0:
+                t_bid = t_price
+                t_ask = t_price
 
             fair_p = self._get_fair_market_price(t_price, t_bid, t_ask)
             if fair_p < 0.05:
@@ -1385,7 +1413,6 @@ class SignalEngineV8:
 
     async def _evaluate_symbol_signals_back(self, i, sym, metrics, opt_data, ny_now, curr_ts, spy_roc, qqq_roc, is_zombie_market, index_trend=0):
         """[Refactor] 核心策略评价 logic (平仓与开仓信号收集)"""
-        from config import USE_BID_ASK_PRICING
         st = metrics['st']
         price = metrics['price']
         final_alpha = metrics['final_alpha']
@@ -1578,15 +1605,16 @@ class SignalEngineV8:
             t_bs     = opt_data['call_bid_size'] if is_call else opt_data['put_bid_size']
             t_as     = opt_data['call_ask_size'] if is_call else opt_data['put_ask_size']
 
-            if USE_BID_ASK_PRICING:
-                # 🚀 [放宽实盘与回测限制] 不再要求 Size > 0。如果 Bid/Ask 为 0，统一使用 Last Price 兜底放行
-                if t_bid <= 0 or t_ask <= 0:
-                    t_bid = t_price
-                    t_ask = t_price
-            else:
-                if t_price <= 0:
-                    logger.warning(f"🚫 [严格防线] {sym} 拦截! 成交价为零")
-                    return None
+            # 🛡️ [New] 流动性过滤门槛 (仅在 STRICT_LIQUIDITY_MODE=1 时启用)
+            from config import STRICT_LIQUIDITY_MODE
+            if STRICT_LIQUIDITY_MODE == 1 and (t_bs + t_as) <= 50:
+                logger.info(f"🚫 [SE-Gate] {sym} Liquidity Filtered: bid_size+ask_size = {t_bs+t_as} <= 100")
+                return None
+
+            # 🚀 [放宽实盘与回测限制] 不再要求 Size > 0。如果 Bid/Ask 为 0，统一使用 Last Price 兜底放行
+            if t_bid <= 0 or t_ask <= 0:
+                t_bid = t_price
+                t_ask = t_price
 
             fair_p = self._get_fair_market_price(t_price, t_bid, t_ask)
             if fair_p < 0.05:
@@ -1821,7 +1849,7 @@ class SignalEngineV8:
             not parity_mode_1s and
             (self.mode == 'realtime' or os.environ.get('RUN_MODE') == 'LIVEREPLAY' or os.environ.get('FORCE_HIGH_FREQ') == '1')
         )
-        is_new_minute = batch.get('is_new_minute', True)
+        # is_new_minute = batch.get('is_new_minute', True) # [REMOVED - Re-defined below with safe fallback]
         symbols = batch.get('symbols', [])
         stock_prices = batch.get('stock_price', [])
         frame_id = str(batch.get('frame_id')) if batch.get('frame_id') is not None else None
@@ -1856,10 +1884,17 @@ class SignalEngineV8:
         # 分钟级回测模式：每一帧都是 should_update_full，确保计算不被缓存拦截
         # 秒级模式 (LIVEREPLAY)：只有在 is_new_minute 为 True 时才是 should_update_full (由特征服务结算驱动)
         converge_to_single = os.environ.get('DUAL_CONVERGE_TO_SINGLE') == '1'
+        
+        # 🚀 [Parity Fix] 如果 batch 里没有传 is_new_minute (Standalone Pitcher)，则安全回退到 ts 跨越逻辑
+        is_new_minute = batch.get('is_new_minute', is_new_min_crossing)
+
         if is_high_freq:
             # 🚨 [关键修复]：高频回放模式下，强制信任来自特征服务的结算信号！
-            # 防止因为 ts 抖动 (10:00:00 -> 10:01:01) 导致的二次误触发。
             should_update_full = is_new_minute or (last_t == 0)
+            
+            # 🚀 [Parity Fix] 如果开启了 1s 物理对齐模式，则每一秒都强制进入全量评价流程 (对齐 S4)
+            if parity_mode_1s:
+                should_update_full = True
         else:
             # 分钟级回测/普通模式：沿用 K 线跨越检查
             should_update_full = is_new_min_crossing
@@ -1880,7 +1915,14 @@ class SignalEngineV8:
                 self.states[s_t].update_tick_state(stock_prices[idx_t], bid, ask)
 
         # 2. 秒级风控扫荡（持仓止损、止盈判定）
-        if not (converge_to_single and self.mode == 'backtest'):
+        # 🚀 [核心修复 2] 彻底认领 LIVEREPLAY 为回测环境，禁止高频插针平仓
+        # 👑 [对齐总线] 只要检测到强制对齐标志位，无论是哪种运行模式，都视同 BACKTEST 对待
+        is_backtest_env = (
+            self.mode == 'backtest' or 
+            os.environ.get('RUN_MODE') in ['BACKTEST', 'LIVEREPLAY'] or
+            config.is_forced_deterministic(self.r)
+        )
+        if not (converge_to_single and is_backtest_env):
             await self._process_exits(batch)
 
         # ✅ [核心重构] 第二阶段：分钟级策略（仅在分钟跨越或非高频模式下执行）
@@ -2077,13 +2119,17 @@ class SignalEngineV8:
             )
         
         # 9. 符号处理循环 (更新分钟指标 & 评估入场信号)
+        # 9. 符号处理循环 (更新分钟指标 & 评估入场信号)
         entry_candidates = []
         metrics_batch = {
             'alpha_mean': mean_a,
             'alpha_std': std_a,
             'vol_z_dict': vol_z_dict,
             'curr_ts': curr_ts,
-            'fast_vol': raw_vols
+            'fast_vol': raw_vols,
+            # 🚀 [日志修复] 补充提取时间戳，供 _prep_symbol_metrics 读取
+            'alpha_label_ts': batch.get('alpha_label_ts', [0.0] * len(symbols)),
+            'alpha_available_ts': batch.get('alpha_available_ts', [0.0] * len(symbols))
         }
         final_alphas_for_ic = np.zeros(len(symbols))
         
@@ -2142,7 +2188,8 @@ class SignalEngineV8:
                 })
 
         # 10. 截面排序与开仓执行
-        min_symbols = 10
+        # 🚀 [PARITY] 在回测或仿真模式下，放宽最小品种数门槛，便于单品种或小规模测试
+        min_symbols = 1 if (IS_BACKTEST or IS_SIMULATED or os.environ.get('RUN_MODE') == 'LIVEREPLAY') else 10
         max_entries = 3
         
         if entry_candidates and len(symbols) >= min_symbols:
@@ -2167,7 +2214,6 @@ class SignalEngineV8:
 
         # 🚀 [Surgery 16] 回放同步锁解除逻辑
         # 发送心跳以防在没有信号的分钟内导致 Orchestrator 停滞
-        from config import IS_SIMULATED
         if IS_SIMULATED:
             heartbeat_payload = {'ts': curr_ts, 'action': 'HEARTBEAT'}
             self.r.xadd('orch_trade_signals', {'data': ser.pack(heartbeat_payload)}, maxlen=5000)
@@ -2187,20 +2233,36 @@ class SignalEngineV8:
         has_any_pos = any(st.position != 0 for st in self.states.values())
         if not has_any_pos: return
 
-        # 2. 遍历检查所有持仓标的
-        for i, sym in enumerate(symbols):
-            st = self.states.get(sym)
-            if not st or st.position == 0: continue
+        # 2. 扫描所有持仓标的 (改为“持仓驱动”，确保即便这一秒行情缺失也会进行风控扫荡)
+        # 先建立当前 batch 的快速索引
+        sym_to_idx = {s: idx for idx, s in enumerate(symbols)}
+        
+        active_positions = [st for st in self.states.values() if st.position != 0]
+        
+        for st in active_positions:
+            sym = st.symbol
+            idx_in_batch = sym_to_idx.get(sym)
             
-            # 3. 获取期权合约数据 (适配实时或回测模式)
-            if self.mode == 'realtime' or os.environ.get('RUN_MODE') == 'LIVEREPLAY':
-                opt_data = self._get_opt_data_realtime(sym, st, ny_now, prices[i], batch)
+            # 3. 确定行情数据源
+            if idx_in_batch is not None:
+                # 这一秒有新数据，使用最新的
+                curr_price = float(prices[idx_in_batch])
+                if self.mode == 'realtime' or os.environ.get('RUN_MODE') == 'LIVEREPLAY':
+                    opt_data = self._get_opt_data_realtime(sym, st, ny_now, curr_price, batch)
+                else:
+                    opt_data = self._get_opt_data_backtest(batch, idx_in_batch, sym, st)
             else:
-                opt_data = self._get_opt_data_backtest(batch, i, sym, st)
+                # 这一秒没新数据，使用上一秒的缓存
+                curr_price = getattr(st, 'last_tick_price', 0.0)
+                opt_data = getattr(st, 'last_tick_opt_data', None)
+                
+                # 如果连缓存都没有（刚恢复还没收到第一笔），只能跳过
+                if not opt_data or curr_price <= 0.01:
+                    continue
 
             # 🚀 [核心对齐] 出场检查使用的是：
-            # 1. 当前秒级的最新价格 (prices[i])
-            # 2. 上一分钟结算好的稳定指标快照 (get_strategy_metrics)
+            # 1. 当前秒级的价格 (curr_price)
+            # 2. 上一分钟结算好的稳健指标快照 (get_strategy_metrics)
             roc_5m, macd, macd_slope, snap_roc = st.get_strategy_metrics()
             
             market_opt_price = opt_data['call_price'] if st.position == 1 else opt_data['put_price']
@@ -2211,15 +2273,15 @@ class SignalEngineV8:
             st.last_opt_price = raw_price
             
             metrics = {
-                'price': float(prices[i]),
+                'price': float(curr_price),
                 'roc_5m': roc_5m, 'macd': macd, 'macd_slope': macd_slope,
                 'snap_roc': snap_roc, 'st': st, 
                 'final_alpha': st.last_alpha_z, 'vol_z': st.last_vol_z
             }
                 
-            # 4. 执行信号检查 (should_update_full=False 会跳过入场逻辑)
+            # 4. 提交风控评价 (should_update_full=False 确保只执行平仓逻辑，不触动开仓评价)
             await self._evaluate_symbol_signals(
-                i, sym, metrics, opt_data, ny_now, curr_ts, 
+                0, sym, metrics, opt_data, ny_now, curr_ts, 
                 self.last_spy_roc_val, self.last_qqq_roc_val, 
                 getattr(self, 'last_is_zombie', False), self.last_index_trend,
                 global_regime_reversal_cnt=getattr(self, 'last_global_regime_reversal_cnt', 0),
@@ -2242,33 +2304,22 @@ class SignalEngineV8:
             sync_payload = {'action': 'SYNC', 'ts': curr_ts, 'prices': latest_prices}
             await self.signal_queue.put(sync_payload)
             # await self.signal_queue.join() # ❌ [BUG FIX] S4 driver consumes queue sequentially *after* process_tick returns. Calling join() here causes an infinite deadlock.
-            if hasattr(self, 'r'):
+            # only_log_alpha 下若未启 OMS，保留直写兜底，防止发球机等待超时
+            if hasattr(self, 'r') and getattr(self, 'only_log_alpha', False):
                 self._mark_orch_done(curr_ts, frame_id=frame_id)
             return
 
         # 2. Redis 模式 (s2 / Realtime)
         if hasattr(self, 'r'):
             from utils import serialization_utils as ser
-            payload = {'action': 'SYNC', 'ts': curr_ts, 'prices': latest_prices}
+            payload = {'action': 'SYNC', 'ts': curr_ts, 'prices': latest_prices, 'frame_id': frame_id}
             self.r.xadd('orch_trade_signals', {'data': ser.pack(payload)}, maxlen=5000)
-            
-            # 🚀 [核心修复] 如果是纯推理模式 (only_log_alpha=True)，SE 就是终点站，直接更新打卡
+            # 屏障由 OMS 在处理 SYNC 后回写，SE 不再提前 ACK。
+            # 仅在 only_log_alpha 场景下保留 SE 兜底 ACK。
             if getattr(self, 'only_log_alpha', False):
                 self._mark_orch_done(curr_ts, frame_id=frame_id)
-            else:
-                # 否则需要等待执行引擎 (OMS) 真正撮合完毕
-                wait_start = time.time()
-                while True:
-                    oms_done = self.r.get("sync:orch_done")
-                    if oms_done and float(oms_done) >= curr_ts: break
-                    await asyncio.sleep(0.005) 
-                    if time.time() - wait_start > 30: 
-                        logger.error(f"🚨 [SE Deadlock] OMS Sync Timeout at TS: {curr_ts}")
-                        # 自救措施：强制更新同步位，防止 Driver 彻底卡死
-                        self._mark_orch_done(curr_ts, frame_id=frame_id)
-                        break
-
-    def _prepare_ny_time(self, batch: dict):
+            return
+    def _prepare_ny_time(self, batch):
         """[Refactor] 统一解析美东时间及处理保存逻辑"""
         from datetime import timezone as dt_timezone
         from pytz import timezone
@@ -2333,10 +2384,9 @@ class SignalEngineV8:
             st.pending_action = 'SELL'
             sig['original_position'] = original_position
             
-            # 🚀 [对齐单引擎] 立即释放方向锁 (position)
-            # 单引擎中 _execute_exit 同步执行，在符号循环中间就清零了 position。
-            # 这里模拟相同行为：释放槽位让同一帧的后续符号可以开仓。
-            st.position = 0
+            # 🛑 绝对禁止在这里写 st.position = 0！
+            # 在共享内存 (S4) 下，如果 SE 提前清零，执行侧 (EE) 会因为找不到持仓而拒绝执行 SELL。
+            # 必须留给 EE 在真正处理完平仓后再亲自清零。
             
             # 🛑 绝对禁止在这里写 st.entry_price = 0 或 st.qty = 0！
             # 必须把这些带着成本记忆的原始数据，原封不动地留在共享内存里。
@@ -2370,8 +2420,14 @@ class SignalEngineV8:
     def _sync_state_from_oms(self):
         """[核心解耦] 每次评估前，从 OMS 获取最真实的仓位与成本"""
         if getattr(self, 'use_shared_mem', False):
-            # 🚀 共享内存下，OMS 如果接受了订单，早已把 is_pending 设为 False。
-            # 任何存留到现在的 is_pending，绝对是资金不足或风控触发的拒单。瞬间解锁！
+            # 🚀 [Parity Fix] 在 S4 单进程回测或秒级同步模式下，绝对禁止主动清空 is_pending
+            # 该标志位必须由 ExecutionEngine 在处理完信号后亲自清空。
+            # 如果在这里清零，会导致同一分钟内的后续秒级 Tick 重复发单，造成严重的风控拒单风暴。
+            from config import IS_BACKTEST, IS_SIMULATED
+            if IS_BACKTEST or IS_SIMULATED or os.environ.get('RUN_MODE') == 'LIVEREPLAY':
+                return
+                
+            # 只有在非回放的实时共享内存模式下，才保留这种“强制解锁”自救机制。
             for sym, st in self.states.items():
                 if getattr(st, 'is_pending', False):
                     st.is_pending = False
@@ -2430,7 +2486,7 @@ class SignalEngineV8:
             if sym not in active_syms:
                 # 如果是刚刚发出的 BUY 指令，OMS 还没来得及确认，我们容忍几帧
                 if getattr(st, 'is_pending', False) and getattr(st, 'pending_action', '') == 'BUY':
-                    from config import IS_SIMULATED
+                     
                     threshold = 0 if IS_SIMULATED else 3
                     st._pending_frames = getattr(st, '_pending_frames', 0) + 1
                     if st._pending_frames > threshold:
@@ -2512,6 +2568,8 @@ class SignalEngineV8:
         
         # [新增] 心跳计时器
         last_heartbeat = time.time()
+        last_stats_log = time.time()
+        stats = {'msgs': 0, 'payloads': 0, 'sync_calls': 0}
         # 定义心跳超时阈值 (秒)
         HEARTBEAT_TIMEOUT = 120 
         
@@ -2563,6 +2621,8 @@ class SignalEngineV8:
                 
                 #logger.info(f"📩 Orchestrator received {sum(len(msgs) for _, msgs in resp)} messages from {len(resp)} streams")
                 current_ts_to_sync = None  # 记录本轮最后处理的时间戳
+                current_frame_id = None    # 记录本轮的帧 ID
+                stats['msgs'] += sum(len(msgs) for _, msgs in resp)
 
                 for stream_name, msgs in resp:
                     stream_str = stream_name.decode('utf-8') if isinstance(stream_name, bytes) else stream_name
@@ -2577,14 +2637,30 @@ class SignalEngineV8:
                             payloads = [ser.unpack(data[b'pickle'])]
 
                         for payload in payloads:
+                            stats['payloads'] += 1
                             if stream_str == STREAM_FUSED_MARKET:
                                 await self._process_fast_fused_tick(payload)
                             else:
                                 await self.process_batch(payload)
-                            # 提取逻辑时间戳
+                            # 提取逻辑时间戳与帧ID
                             current_ts_to_sync = payload.get('ts', current_ts_to_sync)
+                            current_frame_id = payload.get('frame_id', current_frame_id)
                             
                         self.r.xack(stream_name, REDIS_CFG.get('orch_group'), msg_id)
+
+                # 🚀 [核心修复] 在处理完本轮所有消息后，统一发起一次同步锁
+                # 只有发起 SYNC，OMS 才会更新 sync:orch_done，发球机才能继续推进
+                if current_ts_to_sync:
+                    await self._oms_sync(current_ts_to_sync, frame_id=current_frame_id)
+                    stats['sync_calls'] += 1
+
+                if time.time() - last_stats_log >= 60:
+                    logger.info(
+                        f"📊 [SE-Stats] 60s msgs={stats['msgs']} payloads={stats['payloads']} sync_calls={stats['sync_calls']}"
+                    )
+                    stats = {'msgs': 0, 'payloads': 0, 'sync_calls': 0}
+                    last_stats_log = time.time()
+
 
 
             except redis.exceptions.ResponseError as e:

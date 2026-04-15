@@ -42,6 +42,11 @@ class MockIBKRHistorical:
 
 
 
+    @property
+    def cash(self):
+        """兼容性接口：对接执行引擎与信号引擎的 cash 注入检查"""
+        return self.initial_capital
+
     def _create_mock_ib(self):
         class MockIBInternal:
             def isConnected(self): return True

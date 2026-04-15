@@ -91,12 +91,12 @@ class BatchPostgresDriver1s:
             return None, None, None, None
 
         try:
-            if partition_exists(cur, f"alpha_logs_{date_str}"):
-                cur.execute(f"TRUNCATE TABLE alpha_logs_{date_str}")
-            if partition_exists(cur, f"trade_logs_{date_str}"):
-                cur.execute(f"TRUNCATE TABLE trade_logs_{date_str}")
-            if partition_exists(cur, f"trade_logs_backtest_{date_str}"):
-                cur.execute(f"TRUNCATE TABLE trade_logs_backtest_{date_str}")
+            # if partition_exists(cur, f"alpha_logs_{date_str}"):
+            #     cur.execute(f"TRUNCATE TABLE alpha_logs_{date_str}")
+            # if partition_exists(cur, f"trade_logs_{date_str}"):
+            #     cur.execute(f"TRUNCATE TABLE trade_logs_{date_str}")
+            # if partition_exists(cur, f"trade_logs_backtest_{date_str}"):
+            #     cur.execute(f"TRUNCATE TABLE trade_logs_backtest_{date_str}")
             conn.commit()
         except Exception:
             conn.rollback()

@@ -141,10 +141,6 @@ def calculate_bucket_greeks(buckets: np.ndarray, S: float, T: float, r: float = 
         price = float(buckets[i, IDX_PRICE])
         strike = float(buckets[i, IDX_STRIKE])
         
-        # 🧪 [RAW_DATA_DEBUG] 强制打印，看看到底有没有价格进入计算循环
-        # if log_id < 10:
-        #     print(f">>>> [MATH_TRACE] Row {i} Input | Ticker: {ticker} | Price: {price:.4f} | Strike: {strike:.2f}")
-
         if strike < 0.01: continue
         
         iv = 0.0
@@ -155,12 +151,15 @@ def calculate_bucket_greeks(buckets: np.ndarray, S: float, T: float, r: float = 
                     np.array([T]), np.array([r]), opt_type, return_as='numpy', on_error='ignore'
                 )
                 iv = float(res[0]) if not np.isnan(res[0]) else 0.0
-                # if log_id < 20:
-                #     print(f">>>> [MATH_TRACE] Row {i} | Ticker: {ticker} | P: {price:.4f} | S: {S:.2f} | K: {strike:.2f} | T: {T:.8f} | IV: {iv:.4f}")
             except Exception as e:
-                #if log_id < 20: print(f">>>> [MATH_TRACE] Row {i} Calc Error: {e}")
                 iv = 0.0
-        
+
+        # 🚀 [MATH_TRACE] 用户请求：打印计算核参
+        if show_log:
+            from datetime import datetime
+            dt_str = datetime.fromtimestamp(current_ts).strftime('%Y-%m-%d %H:%M:%S') if current_ts else "N/A"
+            print(f">>>> [MATH_TRACE] {ticker} | {dt_str} | S:{S:.2f} | K:{strike:.2f} | P:{price:.4f} | IV:{iv:.4f}")
+
         # 🚨 [SECURITY_FIX] 严禁覆写 Index 0 (Price) 或 Index 5 (Strike)
         # 结果必须精准归位于 Index 7 (IV)
         buckets[i, IDX_IV] = iv
@@ -179,6 +178,6 @@ def calculate_bucket_greeks(buckets: np.ndarray, S: float, T: float, r: float = 
             except Exception as e:
                 pass
 
-    #if log_id < 20:
-    #    print(f">>>> [MATH_TRACE] Done. IV Max in bucket: {buckets[:, IDX_IV].max():.4f}")
+    if show_log:
+        print(f">>>> [MATH_TRACE] Bucket calculation completed for batch.")
     return buckets

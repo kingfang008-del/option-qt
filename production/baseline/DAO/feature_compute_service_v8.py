@@ -47,7 +47,8 @@ from config import (
     FEATURE_SERVICE_STATE_FILE as STATE_FILE, DB_DIR,
     LOG_DIR, USE_5M_OPTION_DATA, NON_TRADABLE_SYMBOLS,
     OPTION_GATE_MIN_CONSECUTIVE_PASS, OPTION_GATE_MAX_CONSECUTIVE_FAIL, OPTION_GATE_MIN_IV,
-    OPTION_GATE_GRACE_MINUTES, OPTION_GATE_REQUIRE_FRAME_CONSISTENCY
+    OPTION_GATE_GRACE_MINUTES, OPTION_GATE_REQUIRE_FRAME_CONSISTENCY,
+    ENABLE_DEEP_WARMUP
 )
 
 logging.basicConfig(
@@ -394,9 +395,10 @@ class FeatureComputeService:
         self.last_wait_log_time = 0
         self.state_file = Path(STATE_FILE)
 
-        self.latest_opt_buckets = {}
-        self.latest_opt_contracts = {}
+        self.latest_opt_buckets = {s: np.zeros((6, 12), dtype=np.float32) for s in self.symbols}
+        self.latest_opt_contracts = {s: [] for s in self.symbols}
         self.option_minute_agg = OptionMinuteAggregator()
+        self.pending_finalization = {} # 🚀 [SDS 2.0] 结算挂起队列
         self.preaggregated_1m_mode = False
         self._preagg_mode_logged = False
         self.sym_vol_mean = {}
@@ -741,7 +743,10 @@ class FeatureComputeService:
                     rows_slow.append([ts, sym, created_at] + clean_vals)
                     
                 if rows_slow:
+                    # 🚀 [Diagnostic Log]
+                    logger.info(f"📁 [Debug-Write] Writing {len(rows_slow)} symbols to {table_name} at ts={ts}")
                     c.executemany(f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders}) ON CONFLICT (ts, symbol) DO NOTHING", rows_slow)
+                    logger.info(f"✅ [Debug-Write] Success for {table_name}")
             
             c.close()
         except Exception as e:
@@ -770,6 +775,9 @@ class FeatureComputeService:
     def _load_service_state(self):
         """尝试从磁盘加载 Normalizer 状态，若失败、跨日或样本不足则启动深度预热"""
         if not self.state_file.exists():
+            if not ENABLE_DEEP_WARMUP:
+                logger.info("⏭️ [Warmup] No state file found and Deep Warmup is DISABLED via config. Starting cold.")
+                return
             logger.info("ℹ️ No state file found, starting fresh (Deep Warmup).")
             # 状态丢失，启动深度预热
             self._warmup_from_history(replay_features=True)
@@ -784,6 +792,9 @@ class FeatureComputeService:
             now_ny = datetime.now(NY_TZ)
             
             if state_time.date() != now_ny.date():
+                if not ENABLE_DEEP_WARMUP:
+                    logger.info(f"⏭️ [Warmup] State is from previous day ({state_time.date()}) and Deep Warmup is DISABLED. Starting cold.")
+                    return
                 logger.warning(f"⚠️ State file is from previous day ({state_time.date()}), starting fresh (Deep Warmup).")
                 self._warmup_from_history(replay_features=True) 
                 return
@@ -801,6 +812,9 @@ class FeatureComputeService:
                         is_fully_warmed = False
             
             if not is_fully_warmed:
+                if not ENABLE_DEEP_WARMUP:
+                    logger.info("⏭️ [Warmup] State incomplete but Deep Warmup is DISABLED via config. Starting cold.")
+                    return
                 logger.warning("⚠️ State file is from today but INCOMPLETE (count < 500). Forcing Deep Warmup!")
                 self._warmup_from_history(replay_features=True)
             else:
@@ -856,7 +870,7 @@ class FeatureComputeService:
             # 1. 批量抓取 1min 预热数据
             logger.info(f"📥 Bulk Loading 1m bars for {len(all_symbols)} symbols...")
             c.execute("""
-                SELECT symbol, ts, open, high, low, close, volume 
+                SELECT symbol, ts, open, high, low, close, volume, vwap 
                 FROM market_bars_1m 
                 WHERE symbol IN %s AND ts < %s 
                 ORDER BY ts DESC
@@ -872,7 +886,7 @@ class FeatureComputeService:
             # 2. 批量抓取 5min 预热数据 
             logger.info(f"📥 Bulk Loading 5m bars...")
             c.execute("""
-                SELECT symbol, ts, open, high, low, close, volume 
+                SELECT symbol, ts, open, high, low, close, volume, vwap 
                 FROM market_bars_5m 
                 WHERE symbol IN %s AND ts < %s 
                 ORDER BY ts DESC
@@ -914,7 +928,7 @@ class FeatureComputeService:
                     dt_ny = datetime.fromtimestamp(r[0], NY_TZ).replace(second=0, microsecond=0)
                     t = dt_ny.time()
                     if dt_time(9, 30) <= t < dt_time(16, 0):
-                        raw_bars_1m.append({'ts': dt_ny, 'open': r[1], 'high': r[2], 'low': r[3], 'close': r[4], 'volume': r[5]})
+                        raw_bars_1m.append({'ts': dt_ny, 'open': r[1], 'high': r[2], 'low': r[3], 'close': r[4], 'volume': r[5], 'vwap': r[6] if len(r) > 6 else r[4]})
                 
                 if raw_bars_1m:
                     df_hist_1m = pd.DataFrame(raw_bars_1m).drop_duplicates(subset=['ts']).set_index('ts').sort_index()
@@ -927,7 +941,7 @@ class FeatureComputeService:
                     dt_ny = datetime.fromtimestamp(r[0], NY_TZ).replace(second=0, microsecond=0)
                     t = dt_ny.time()
                     if dt_time(9, 30) <= t < dt_time(16, 0):
-                        raw_bars_5m.append({'ts': dt_ny, 'open': r[1], 'high': r[2], 'low': r[3], 'close': r[4], 'volume': r[5]})
+                        raw_bars_5m.append({'ts': dt_ny, 'open': r[1], 'high': r[2], 'low': r[3], 'close': r[4], 'volume': r[5], 'vwap': r[6] if len(r) > 6 else r[4]})
                 
                 if raw_bars_5m:
                     df_hist_5m = pd.DataFrame(raw_bars_5m).drop_duplicates(subset=['ts']).set_index('ts').sort_index()
@@ -1195,8 +1209,10 @@ class FeatureComputeService:
                                 if agg_update_ts is not None:
                                     self.last_option_update_ts[s] = float(agg_update_ts)
                                 
-                                # 结算并生成 K 线 (包含0成交延续逻辑和正确的Volume累加)
-                                self._finalize_1min_bar(s, self.global_last_minute, cleanup=True)
+                                # 🚀 [SDS 2.0 延迟结算修复] 不再立即结算，而是挂起到 pending 队列。
+                                # 等待后续的 run_compute_cycle 完成希腊值补算后，再由 finalization_barrier 统一触发。
+                                self.pending_finalization[s] = self.global_last_minute
+                                # self._finalize_1min_bar(s, self.global_last_minute, cleanup=True)
                             
                             # 逐分钟递增，严密填补断流鸿沟
                             self.global_last_minute += timedelta(minutes=1)
@@ -1672,11 +1688,10 @@ class FeatureComputeService:
                 logger.warning(f"⚠️ [IV-Gate] PG metrics write failed: {pg_e}")
         except Exception as e:
             logger.warning(f"⚠️ [IV-Gate] metrics publish failed: {e}")
-    
+
     def _finalize_1min_bar(self, sym, dt, cleanup=True):
         bars = self.current_bars_5s.get(sym, [])
         
-        # 🚀 [终极修复]：灵活兼容！如果 b 里面没有 'stock' 键，说明 b 本身就是 stock 字典！
         def gvx(b, k, alt, default=0): 
             s_data = b.get('stock', b) 
             return float(s_data.get(k, s_data.get(alt, default)))
@@ -1698,25 +1713,58 @@ class FeatureComputeService:
             h = max(max(gvx(b, 'high', 'h', c_raw), gvx(b, 'close', 'c', c_raw)) for b in valid_ticks)
             l = min(min(gvx(b, 'low', 'l', c_raw), gvx(b, 'close', 'c', c_raw)) for b in valid_ticks)
             
-            # 🚀 Volume 终于可以完美累加了！
             v = sum(max(0.0, gvx(b, 'volume', 'v', 0.0)) for b in valid_ticks)
             pv_sum = sum(gvx(b, 'close', 'c', c_raw) * max(0.0, gvx(b, 'volume', 'v', 0.0)) for b in valid_ticks)
             vwap = pv_sum / (v + 1e-10) if v > 0 else c_raw
 
-        last_opt_tick = next((b for b in reversed(bars) if b.get('buckets') or b.get('option_buckets')), None)
-        if last_opt_tick:
-            o_buckets_raw = last_opt_tick.get('buckets', last_opt_tick.get('option_buckets', []))
-            o_contracts = last_opt_tick.get('contracts', last_opt_tick.get('option_contracts', []))
-        else:
+        # 🚀 [Greeks Persistence Fix] 优先使用经过 BSM 补算的最新 Buckets (包含 Greeks)
+        # 只有在没有计算过的 Buckets 时，才退而求其次使用 raw tick
+        o_buckets_raw = None
+        o_contracts = None
+        
+        # 1. 尝试使用经过 BSM 计算过的“热”Buckets (包含 Greeks)
+        enriched_buckets = getattr(self, 'frozen_latest_opt_buckets', self.latest_opt_buckets).get(sym)
+        if enriched_buckets is not None and self.recalc_greeks:
+            o_buckets_raw = enriched_buckets
+            o_contracts = getattr(self, 'frozen_latest_opt_contracts', self.latest_opt_contracts).get(sym, [])
+        
+        # 2. 如果没找到热数据，尝试使用当前分钟内的原始 Tick (可能无 Greeks)
+        if o_buckets_raw is None:
+            last_opt_tick = next((b for b in reversed(bars) if b.get('buckets') or b.get('option_buckets')), None)
+            if last_opt_tick:
+                o_buckets_raw = last_opt_tick.get('buckets', last_opt_tick.get('option_buckets', []))
+                o_contracts = last_opt_tick.get('contracts', last_opt_tick.get('option_contracts', []))
+        
+        # 3. 兜底方案：使用最后记录的原始数据
+        if o_buckets_raw is None:
             o_buckets_raw = getattr(self, 'frozen_latest_opt_buckets', self.latest_opt_buckets).get(sym, [])
             o_contracts = getattr(self, 'frozen_latest_opt_contracts', self.latest_opt_contracts).get(sym, [])
 
-        snap = getattr(self, 'frozen_option_snapshot', self.option_snapshot).get(sym)
+        # [Fix] 刷新 snap 变量，确保后续提取的 atm_iv 也是最新补全版
+        snap = o_buckets_raw 
         atm_c_iv, atm_p_iv = self._extract_tagged_atm_iv(snap)
         
         ts_key = int(bar_time.timestamp())
         o_buckets = o_buckets_raw.tolist() if hasattr(o_buckets_raw, 'tolist') else o_buckets_raw
         if isinstance(o_contracts, np.ndarray): o_contracts = o_contracts.tolist()
+        
+        # [Verification Log] 仅在有实际行情数据（Price 或 Strike 不为 0）时，检查希腊值是否缺失
+        if isinstance(o_buckets_raw, np.ndarray) and o_buckets_raw.shape == (6, 12):
+            has_price_content = np.sum(np.abs(o_buckets_raw[:, [0, 5]])) > 1e-6
+            if has_price_content:
+                g_sum = np.sum(np.abs(o_buckets_raw[:, 1:5]))
+                if g_sum > 0:
+                    logger.debug(f"✅ [Greeks-Check] {sym} snapshot contains Greeks (sum={g_sum:.4f})")
+                    # 💡 [抽样打印] 如果是 NVDA 或者该分钟还没打印过，则展示一行具体的希腊值数据
+                    if sym == 'NVDA' or not hasattr(self, '_last_sampled_ts') or getattr(self, '_last_sampled_ts') != ts_key:
+                        self._last_sampled_ts = ts_key
+                        # 抽样第 0 行 (ATM Put)，展示其价格、执行价、Delta 和 IV
+                        p_row = o_buckets_raw[0]
+                        logger.info(f"📊 [Data-Sample] {sym} @ {bar_time.strftime('%H:%M:%S')} | ATM_P_K: {p_row[5]:.2f} | P_Price: {p_row[0]:.4f} | Delta: {p_row[1]:.4f} | IV: {p_row[7]:.4f}")
+                else:
+                    logger.warning(f"⚠️ [Greeks-Check] {sym} snapshot has DATA but ZERO Greeks. Calculation failed?")
+            # 如果没有价格数据，属于正常的空帧，静默处理即可
+
 
         bar_payload = {
             'open': float(o), 'high': float(h), 'low': float(l), 
@@ -1745,18 +1793,41 @@ class FeatureComputeService:
             self._sync_history_from_redis(sym)
             self._sync_option_history_from_redis(sym)
         else:
+            from config import NY_TZ
             new_ts = pd.Timestamp(ts_key, unit='s', tz=NY_TZ)
             for k, val in bar_payload.items():
                 self.history_1min[sym].loc[new_ts, k] = val
             if len(self.history_1min[sym]) > 500:
                 self.history_1min[sym] = self.history_1min[sym].iloc[-500:]
 
+        # 🚀 [终极修复] 回归标准固定窗口的 5m Resample，匹配下游数据库的整数倍时间戳
         df_1m = self.history_1min[sym]
-        if not df_1m.empty and len(df_1m) >= 5:
+        if not df_1m.empty:
             df_5m = df_1m.resample('5min', closed='left', label='left').agg({
                 'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
-            }).dropna()
+            })
+            
+            if 'vwap' in df_1m.columns:
+                pv = df_1m['vwap'] * df_1m['volume']
+                vwap_5m = pv.resample('5min', closed='left', label='left').sum() / (df_5m['volume'] + 1e-10)
+                df_5m['vwap'] = np.where(df_5m['volume'] > 0, vwap_5m, df_5m['close'])
+            else:
+                df_5m['vwap'] = df_5m['close']
+                
+            df_5m = df_5m.dropna(subset=['open', 'close'])
             self.history_5min[sym] = df_5m.iloc[-100:]
+            
+            if not df_5m.empty:
+                last_5m = df_5m.iloc[-1]
+                ts_5m_key = int(df_5m.index[-1].timestamp())
+                bar_5m_payload = {
+                    'open': float(last_5m['open']), 'high': float(last_5m['high']),
+                    'low': float(last_5m['low']), 'close': float(last_5m['close']),
+                    'volume': float(last_5m['volume']), 'vwap': float(last_5m['vwap'])
+                }
+                try:
+                    self.r.hset(f"BAR:5M:{sym}", str(ts_5m_key), json.dumps(bar_5m_payload))
+                except Exception: pass
 
         if cleanup:
             self.current_bars_5s[sym] = []
@@ -1774,7 +1845,6 @@ class FeatureComputeService:
             self._finalize_1min_bar(sym, dt, cleanup=True)
             # 释放锁
             self.pending_finalization.pop(sym, None)
-            self.finalization_snapshots.pop(sym, None)
             
     def _calc_and_inject_option_features(self, sym):
         if self.history_1min[sym].empty: return
@@ -2004,8 +2074,8 @@ class FeatureComputeService:
                         'allow': bool(is_valid)
                     }
 
-                    if is_valid and res_sym.get('updated_buckets') is not None:
-                        enriched = res_sym['updated_buckets']
+                    enriched = res_sym.get('updated_buckets')
+                    if enriched is not None:
                         self.latest_opt_buckets[sym] = enriched
                         if self.runtime_payload_audit_enabled:
                             df_s = self.history_1min.get(sym)
@@ -2028,6 +2098,7 @@ class FeatureComputeService:
                             self.frozen_latest_opt_buckets[sym] = enriched
                         if is_new_minute and hasattr(self, 'frozen_option_snapshot'):
                             self.frozen_option_snapshot[sym] = np.asarray(enriched, dtype=np.float32).copy()
+
 
                         try:
                             atm_c_iv = float(enriched[2, 7]) if enriched.shape[0] > 2 else 0.0
@@ -2080,7 +2151,11 @@ class FeatureComputeService:
                 batch_raw.append(raw_vec); valid_mask.append(is_valid)
 
             self.cached_results_map, self.cached_batch_raw, self.cached_valid_mask = results_map, batch_raw, valid_mask
+            
+            # 🚀 [SDS 2.0 结算屏障修复] 确保所有标的的 latest_opt_buckets 都已通过上面的循环完成补全，
+            # 此时再触发结算，才能保证 _finalize_1min_bar 拿到的是包含 Greeks 的最新矩阵。
             if is_new_minute:
+                self.finalization_barrier()
                 self._publish_option_gate_metrics(alpha_label_ts, gate_audit)
         else:
             results_map, batch_raw, valid_mask = self.cached_results_map, self.cached_batch_raw, self.cached_valid_mask
@@ -2138,9 +2213,10 @@ class FeatureComputeService:
         cheat_put_bid, cheat_put_ask, cheat_call_iv, cheat_put_iv = [], [], [], []
         valid_b_indices = []
 
-        # 🚀 [时光冻结机制] 取回含有完美 Greeks 的上一分钟末期权快照，保证时序严格对齐
-        source_opt_buckets = getattr(self, 'frozen_latest_opt_buckets', self.latest_opt_buckets) if is_new_minute else self.latest_opt_buckets
-        source_snap_for_payload = getattr(self, 'frozen_option_snapshot', self.option_snapshot) if is_new_minute else self.option_snapshot
+        # 🚀 [Greeks 写盘修复] payload 必须优先使用补算后的 latest_opt_buckets，
+        # 否则会把 raw snapshot（Greeks 常为 0）写到 option_snapshots_1m。
+        source_opt_buckets = self.latest_opt_buckets
+        source_snap_for_payload = self.option_snapshot
 
         for b_idx, sym in enumerate(self.symbols):
             if sym not in ready_symbols or sym not in results_map:
@@ -2177,10 +2253,10 @@ class FeatureComputeService:
             idx_vol = self.feat_name_to_idx.get('fast_vol')
             batch_fast_vols.append(raw_mat[b_idx, idx_vol] if idx_vol is not None else 0.0)
             
-            # 提取期权快照
-            snap = source_snap_for_payload.get(sym)
+            # 提取期权快照：优先使用 Greeks 补算后的 buckets，raw snapshot 仅做兜底
+            snap = source_opt_buckets.get(sym)
             if snap is None:
-                snap = source_opt_buckets.get(sym)
+                snap = source_snap_for_payload.get(sym)
 
             if snap is not None and isinstance(snap, np.ndarray) and snap.shape[0] >= 6:
                 c_iv, p_iv = snap[2, 7], snap[0, 7]
@@ -2218,9 +2294,10 @@ class FeatureComputeService:
         source_contracts = getattr(self, 'frozen_latest_opt_contracts', self.latest_opt_contracts) if is_new_minute else self.latest_opt_contracts # 🚀
 
         for sym in batch_symbols:
-            snap_live = source_snap_for_payload.get(sym)
+            # live_options 同样保持“补算优先、raw 兜底”，避免 1m 落库被零 Greeks 污染
+            snap_live = source_opt_buckets.get(sym)
             if snap_live is None:
-                snap_live = source_opt_buckets.get(sym, [])
+                snap_live = source_snap_for_payload.get(sym, [])
             live_options[sym] = {
                 'buckets': snap_live.tolist() if isinstance(snap_live, np.ndarray) else snap_live,
                 'contracts': source_contracts.get(sym, []) # 🚀 强绑定
@@ -2521,6 +2598,7 @@ class FeatureComputeService:
             ts_field = str(int(ts_val))
             symbols = payload.get('symbols', []) or []
             live_options = payload.get('live_options', {}) or {}
+            missing_option_syms = []
 
             packed_payload = ser.pack(payload)
             pipe = self.r.pipeline(transaction=True)
@@ -2529,6 +2607,8 @@ class FeatureComputeService:
                 opt = live_options.get(sym, {}) or {}
                 buckets = opt.get('buckets', [])
                 contracts = opt.get('contracts', [])
+                if not buckets:
+                    missing_option_syms.append(sym)
 
                 c_iv, p_iv = self._extract_tagged_atm_iv(buckets)
                 opt_payload = {
@@ -2542,6 +2622,9 @@ class FeatureComputeService:
             pipe.xadd(self.redis_cfg['output_stream'], {'data': packed_payload}, maxlen=100)
             pipe.set("sync:feature_calc_done", str(ts_val))
             pipe.set("sync:feature_calc_done_frame_id", frame_id)
+            pipe.expire("sync:feature_calc_done", 120)
+            pipe.expire("sync:feature_calc_done_frame_id", 120)
+            pipe.hincrby("diag:fcs:counters", "minute_commits", 1)
             pipe.hset("monitor:feature_commit:last", mapping={
                 'ts': str(ts_val),
                 'symbols': str(len(symbols)),
@@ -2550,7 +2633,18 @@ class FeatureComputeService:
                 'frame_seq': str(frame_seq)
             })
             pipe.expire("monitor:feature_commit:last", 3600)
+            if missing_option_syms:
+                pipe.hset("monitor:option_1m:missing_last", mapping={
+                    'ts': str(ts_val),
+                    'missing_count': str(len(missing_option_syms)),
+                    'missing_sample': json.dumps(missing_option_syms[:8])
+                })
+                pipe.expire("monitor:option_1m:missing_last", 3600)
             pipe.execute()
+            if missing_option_syms:
+                logger.warning(
+                    f"⚠️ [Option1M-Missing] ts={int(ts_val)} missing={len(missing_option_syms)}/{len(symbols)} sample={missing_option_syms[:5]}"
+                )
             return True
         except Exception as e:
             logger.error(f"❌ [Atomic Commit] Failed at ts={payload.get('ts')}, frame_id={payload.get('frame_id')}: {e}")
@@ -2563,8 +2657,11 @@ class FeatureComputeService:
             return
         try:
             self.r.set("sync:feature_calc_done", str(float(ts_val)))
+            self.r.expire("sync:feature_calc_done", 120)
             if frame_id:
                 self.r.set("sync:feature_calc_done_frame_id", str(frame_id))
+                self.r.expire("sync:feature_calc_done_frame_id", 120)
+            self.r.hincrby("diag:fcs:counters", "sync_ack", 1)
         except Exception:
             pass
     
@@ -2603,7 +2700,9 @@ class FeatureComputeService:
                         self.frozen_latest_opt_buckets[s] = self.latest_opt_buckets.get(s, [])
                         self.frozen_latest_opt_contracts[s] = self.latest_opt_contracts.get(s, [])
 
-                        self._finalize_1min_bar(s, self.global_last_minute, cleanup=True)
+                        # 🚀 [SDS 2.0 结算同步修复] 改为挂起到延迟队列，等待 compute_cycle 算完希腊值后再写盘
+                        self.pending_finalization[s] = self.global_last_minute
+                        # self._finalize_1min_bar(s, self.global_last_minute, cleanup=True)
 
                     self.global_last_minute += timedelta(minutes=1)
         else:
@@ -2738,6 +2837,8 @@ class FeatureComputeService:
          
         
         last_save = time.time()
+        last_stats_log = time.time()
+        stats = {'msgs': 0, 'acks': 0, 'compute': 0}
         streams = {self.redis_cfg['raw_stream']: '>'}
         
         while True:
@@ -2752,38 +2853,97 @@ class FeatureComputeService:
                 resp = self.r.xreadgroup(self.redis_cfg['group'], self.redis_cfg['consumer'], streams, count=100, block=100)
                 if resp:
                     for _, msgs in resp:
+                        stats['msgs'] += len(msgs)
                         for mid, data in msgs:
                             current_batch_ts = None
-                            if b'batch' in data:
-                                try:
-                                    batch = ser.unpack(data[b'batch'])
-                                    for payload in batch:
-                                        await self.process_market_data([payload]) # 🚀 [Unified] Use list for single payload
-                                        if not current_batch_ts: current_batch_ts = payload.get('ts')
-                                except Exception as e:
-                                    logger.error(f"❌ Batch Unpack Error: {e}")
-                                    
-                            elif b'pickle' in data:
-                                payload = ser.unpack(data[b'pickle'])
-                                await self.process_market_data([payload]) # 🚀 [Unified] Use list for single payload
-                                current_batch_ts = payload.get('ts')
-                            
-                            # [🔥 核心修复] 每一帧数据（或 Batch）处理完后，立刻触发计算，并回传正确的同步旗标
-                            
-                                # 🚀 [FCS-Trace] Trace NVDA at 10:00:00
-                                last_row = self.history_1min["NVDA"].iloc[-1]
-                                logger.info(f"📁 [TRACE-NVDA] OHLCV Parity | TS: {current_batch_ts} | Close: {last_row['close']:.4f} | Vol: {last_row['volume']:.0f}")
-                            
-                            # 🚀 [性能优化] 移除计算期间的 Redis 强制同步。
-                            # 所有的 1m 结算已在 process_market_data 中完成了内存与 Redis 的写透同步。
+                            try:
+                                if b'batch' in data:
+                                    try:
+                                        batch = ser.unpack(data[b'batch'])
+                                        for payload in batch:
+                                            await self.process_market_data([payload]) # 🚀 [Unified] Use list for single payload
+                                            if not current_batch_ts:
+                                                current_batch_ts = payload.get('ts')
+                                    except Exception as e:
+                                        logger.error(f"❌ Batch Unpack Error: {e}")
+                                        
+                                elif b'pickle' in data:
+                                    payload = ser.unpack(data[b'pickle'])
+                                    await self.process_market_data([payload]) # 🚀 [Unified] Use list for single payload
+                                    current_batch_ts = payload.get('ts')
+                                elif b'data' in data:
+                                    payload = ser.unpack(data[b'data'])
+                                    await self.process_market_data([payload])
+                                    current_batch_ts = payload.get('ts')
 
-                            await self.run_compute_cycle(ts_from_payload=current_batch_ts)
-                            
-                            self.r.xack(self.redis_cfg['raw_stream'], self.redis_cfg['group'], mid)
+                                # [🔥 核心修复] 每一帧数据（或 Batch）处理完后，立刻触发计算，并回传正确的同步旗标
+                                if current_batch_ts is not None:
+                                    # 🚀 [FCS-Trace] Trace NVDA at minute boundary
+                                    try:
+                                        if "NVDA" in self.history_1min and not self.history_1min["NVDA"].empty:
+                                            last_row = self.history_1min["NVDA"].iloc[-1]
+                                            logger.info(f"📁 [TRACE-NVDA] OHLCV Parity | TS: {current_batch_ts} | Close: {last_row['close']:.4f} | Vol: {last_row['volume']:.0f}")
+                                    except Exception:
+                                        pass
+
+                                    # 🚀 [性能优化] 移除计算期间的 Redis 强制同步。
+                                    # 所有的 1m 结算已在 process_market_data 中完成了内存与 Redis 的写透同步。
+                                    compute_payload = await self.run_compute_cycle(ts_from_payload=current_batch_ts, return_payload=True)
+                                    stats['compute'] += 1
+
+                                    # 🚀 [Persistence-Check Log] 帮助用户排查为何不写库
+                                    if compute_payload:
+                                        p_min = compute_payload.get('is_new_minute', False)
+                                        p_warm = compute_payload.get('is_warmed_up', False)
+                                        # 仅在整分或者每 30s 打印一次状态，避免日志爆炸
+                                        if p_min or (int(time.time()) % 30 == 0):
+                                            logger.info(f"🔍 [Cycle-Status] ts={current_batch_ts} | is_new_minute={p_min} | is_warmed_up={p_warm} | Ready_Syms={len(compute_payload.get('symbols', []))}")
+
+                                        # 🚀 [Parity Fix] 恢复丢失的 PostgreSQL Debug 表持久化写入
+                                        # [优化] 只要是分钟边界就尝试写入特征，不再等待 30 根线的 Alpha 预热
+                                        if p_min:
+                                            try:
+                                                ts_val = compute_payload.get('ts')
+                                                date_str = datetime.fromtimestamp(ts_val, NY_TZ).strftime('%Y%m%d')
+                                                
+                                                # 准备 slow_data_list
+                                                batch_syms = compute_payload.get('symbols', [])
+                                                feats_dict = compute_payload.get('features_dict', {})
+                                                
+                                                slow_data_list = []
+                                                for i, sym in enumerate(batch_syms):
+                                                    # 提取该 symbol 在当前分钟 (索引 -1) 的所有 slow 特征值
+                                                    vals = []
+                                                    for fn in self.slow_feat_names:
+                                                        f_tensor = feats_dict.get(fn)
+                                                        if f_tensor is not None and i < f_tensor.shape[0]:
+                                                            vals.append(float(f_tensor[i, -1]))
+                                                        else:
+                                                            vals.append(0.0)
+                                                    slow_data_list.append((sym, vals))
+                                                
+                                                if slow_data_list:
+                                                    sample_sym, sample_vals = slow_data_list[0]
+                                                    logger.info(f"📊 [Persistence-Prep] ts={ts_val} | Symbols={len(slow_data_list)} | Sample={sample_sym} | First 3 Feats={sample_vals[:3]}")
+                                                    self._write_debug_batch(ts_val, date_str, fast_data_list=[], slow_data_list=slow_data_list)
+                                                else:
+                                                    logger.warning(f"⚠️ [Persistence-Skip] slow_data_list is empty for ts={ts_val}")
+                                            except Exception as pe:
+                                                logger.error(f"❌ Persistence Error in loop: {pe}")
+                            finally:
+                                self.r.xack(self.redis_cfg['raw_stream'], self.redis_cfg['group'], mid)
+                                stats['acks'] += 1
                 
                 from config import IS_SIMULATED
                 if not IS_SIMULATED:
                     await asyncio.sleep(0.001)
+
+                if time.time() - last_stats_log >= 60:
+                    logger.info(
+                        f"📊 [FCS-Stats] 60s msgs={stats['msgs']} acked={stats['acks']} compute={stats['compute']}"
+                    )
+                    stats = {'msgs': 0, 'acks': 0, 'compute': 0}
+                    last_stats_log = time.time()
                 
             except redis.exceptions.ResponseError as e:
                 if "NOGROUP" in str(e):

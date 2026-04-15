@@ -34,20 +34,52 @@ for p in [DATA_DIR, LOG_DIR, DB_DIR, CACHE_DIR]:
 FEATURE_SERVICE_STATE_FILE = CACHE_DIR / "feature_service_state.pkl"
 
 # ================= 系统运行模式 (单一事实来源) =================
-# 模式枚举: 'REALTIME' (实盘), 'LIVEREPLAY' (流式回放), 'BACKTEST' (极速回测)
+# 模式枚举:
+# - 'REALTIME'      : 实盘链路 + 可下单 (默认)
+# - 'REALTIME_DRY'  : 实盘链路 + 禁止下单 (Dry Run)
+# - 'LIVEREPLAY'    : 流式回放 (模拟)
+# - 'BACKTEST'      : 极速回测 (模拟)
 # 通过环境变量隔离，确保所有子进程对当前环境的认知绝对一致
 RUN_MODE = os.environ.get("RUN_MODE", "REALTIME").upper()
 
 IS_LIVEREPLAY = (RUN_MODE == 'LIVEREPLAY')
 IS_BACKTEST   = (RUN_MODE == 'BACKTEST')
+IS_REALTIME_DRY = (RUN_MODE == 'REALTIME_DRY')
 IS_SIMULATED  = (RUN_MODE in ['BACKTEST', 'LIVEREPLAY'])
 
-# 全局交易开关 (如果在仿真模式下，强制关闭真实交易，保护实盘资金)
-TRADING_ENABLED = False if IS_SIMULATED else True
+# 全局交易开关:
+# - 仿真模式 (BACKTEST/LIVEREPLAY): 强制 False
+# - 实盘 Dry 模式 (REALTIME_DRY): 强制 False
+# - REALTIME: 默认 True，可通过环境变量 TRADING_ENABLED 显式关闭
+TRADING_ENABLED = (
+    _env_flag("TRADING_ENABLED", True)
+    and not IS_SIMULATED
+    and not IS_REALTIME_DRY
+)
 
-# ================= 影子系统验证 (Shadow Validation) =================
-ONLY_LOG_ALPHA = False  # [新增] 仅记录 Alpha 信号，不执行任何交易 (用于影子系统验证)
+def is_forced_deterministic(r=None) -> bool:
+    """
+    检查是否处于强制确定性模式 (用于 S4 对齐)
+    优先级: 环境变量 > Redis 标志位
+    """
+    # 1. 优先检查环境变量 (这是最强硬的开关)
+    if os.environ.get("SYNC_EXECUTION") == "1" or os.environ.get("RUN_MODE") == "BACKTEST":
+        return True
+        
+    # 2. 如果提供了 Redis 客户端，检查全局对齐总线
+    if r is not None:
+        try:
+            flag = r.get("sync:force_backtest_mode")
+            if flag and (flag.decode('utf-8') if isinstance(flag, bytes) else str(flag)) == "1":
+                return True
+        except:
+            pass
+            
+    return False
 
+# 0: 原始模式 (不干预) | 1: 严格过滤 (总深度>100) | 2: 基准对齐 (强制100)
+STRICT_LIQUIDITY_MODE = int(os.environ.get("STRICT_LIQUIDITY_MODE", "0"))
+ 
 # 动态获取 Redis DB
 def get_redis_db():
     if os.environ.get('REDIS_DB'):
@@ -96,13 +128,12 @@ PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.
 # ================= 核心交易标的 =================
 # GS 先注释掉，生产的时候再恢复，因为秒级回测数据里没有 GS 的期权数据，可能会导致回测失败
 TARGET_SYMBOLS =  [
-    'VIXY', 'SPY',  
     # --- Tier 1: 巨无霸 ---
-    'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'UNH', 'AMZN', 'AMD', 'MSTR', 'COIN',
+    'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'UNH', 'AMZN', 'AMD', 'MSTR', 'QQQ',
     # --- Tier 2: 核心蓝筹 ---
-    'NFLX', 'CRWV', 'AVGO', 'MSFT', 'HOOD', 'MU', 'APP', 'GOOGL', 'WMT', 'QQQ', 
+    'NFLX', 'CRWV', 'AVGO', 'MSFT', 'HOOD', 'MU',  'GOOGL', 'WMT', 'COIN', 'SPY',
     # --- Tier 3: 高流动性 --- 
-    'SMCI', 'ADBE', 'CRM', 'ORCL', 'NKE', 'XOM', 'INTC', 'DELL', 'IWM', 'GLD'
+    'SMCI', 'ADBE', 'ORCL', 'NKE', 'XOM', 'INTC', 'DELL', 'IWM', 'GLD', 'VIXY'
 ]
 
 # ================= 交易与归一化白/黑名单 =================
@@ -116,6 +147,9 @@ ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS = ['SPY', 'VIXY']
 INDEX_TREND_SYMBOLS = ['SPY', 'QQQ']
 
 # ================= 期权快照完整性门控（防发球机抖动） =================
+# 核心特征预热开关 (实盘建议开启，保证开盘即稳定；研究/重放模式建议根据需求关闭)
+ENABLE_DEEP_WARMUP = _env_flag("ENABLE_DEEP_WARMUP", True) 
+
 # 连续通过 N 个分钟边界才放行到模型输入（非阻塞）
 OPTION_GATE_MIN_CONSECUTIVE_PASS = 2
 # 放行后连续失败 M 个分钟边界才撤销放行（防抖）
@@ -128,7 +162,6 @@ OPTION_GATE_MIN_IV = 0.01
 OPTION_GATE_REQUIRE_FRAME_CONSISTENCY = True
 
 # ================= 价格模式 =================
-USE_BID_ASK_PRICING = True  # True=使用 Bid/Ask 中间价及 BSM 校准, False=仅使用最新成交价
 USE_5M_OPTION_DATA  = True  # 关闭 5min 维度期权数据，用于排查爆仓问题
 
 # ================= 资金管理与风控 =================
@@ -140,7 +173,7 @@ GLOBAL_EXPOSURE_LIMIT   = 0.90        # 全局风险敞口上限
 COMMISSION_PER_CONTRACT = 0.65        # 手续费 ($/手)
 
 # ================= BSM 定价参数 =================
- 
+ONLY_LOG_ALPHA=False
 
 # ================= Alpha / 信号 =================
 ROLLING_WINDOW = 30               # Alpha 滚动窗口
@@ -151,7 +184,7 @@ CORR_THRESHOLD = -0.1             # 反转相关性阈值
 # 可选值:
 # - V0: strategy_core_v0.py + strategy_config0.py
 # - V1: strategy_core_v1.py + strategy_config.py
-STRATEGY_CORE_VERSION = os.environ.get("STRATEGY_CORE_VERSION", "V1").strip().upper()
+STRATEGY_CORE_VERSION = os.environ.get("STRATEGY_CORE_VERSION", "V0").strip().upper()
 
 # ================= 订单执行 =================
 ORDER_TIMEOUT_SECONDS = 30         # 挂单超时
@@ -162,8 +195,8 @@ LIMIT_BUFFER_EXIT     = 0.97       # 卖出限价缓冲 (Bid * 0.97)
 SLIPPAGE_ENTRY_PCT    = 0.001      # 建仓滑点 (0.1%)
 SLIPPAGE_EXIT_PCT     = 0.001      # 平仓滑点 (0.1%)
 EXIT_ORDER_TYPE       = 'MKT'      # 平仓订单类型 (MKT/LMT)
-DISABLE_ICEBERG       = False      # [新增] 是否禁用冰山拆单逻辑 (用于对比秒级与分钟级一致性)
-SYNC_EXECUTION        = False      # [新增] 同步执行模式 (用于 bit-perfect 确定性回放验证)
+DISABLE_ICEBERG       = _env_flag("DISABLE_ICEBERG", False)      # [新增] 是否禁用冰山拆单逻辑 (用于对比秒级与分钟级一致性)
+SYNC_EXECUTION        = _env_flag("SYNC_EXECUTION", False)       # [新增] 同步执行模式 (用于 bit-perfect 确定性回放验证)
 # 通用执行延迟: 作为 OMS 与 Mock IBKR 的统一来源。
 # 1min 级回测优先使用 bars，1s 级高仿真回测可使用 seconds。
 EXECUTION_DELAY_BARS = int(

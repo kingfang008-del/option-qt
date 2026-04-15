@@ -591,15 +591,16 @@ class BatchSQLiteDriver1s:
                             payload = ser.unpack(data_str)
                             
                             if payload.get('action') == 'ALPHA':
-                                alpha_row_sqlite = (
+                                # 与当前 persistence schema 对齐：6-tuple (不包含 event_prob/spy_roc_5min/qqq_roc_5min)
+                                alpha_row_v8 = (
                                     payload['ts'], payload['symbol'], 
                                     float(payload.get('alpha', 0)), float(payload.get('iv', 0)),
-                                    float(payload.get('price', 0)), float(payload.get('vol_z', 0)),
-                                    float(payload.get('event_prob', 0))
+                                    float(payload.get('price', 0)), float(payload.get('vol_z', 0))
                                 )
-                                persist_svc.alpha_buffer.append(alpha_row_sqlite)
+                                persist_svc.alpha_buffer.append(alpha_row_v8)
                                 if pg_persist_svc:
-                                    pg_persist_svc.alpha_buffer.append(alpha_row_sqlite[:6])
+                                    # PG Mirror 同步写入同结构 tuple
+                                    pg_persist_svc.alpha_buffer.append(alpha_row_v8)
                         except Exception as e:
                             pass # 静默丢弃非标准格式，不影响主流程
                             

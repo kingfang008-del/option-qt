@@ -51,9 +51,14 @@ from orchestrator_reconciler import OrchestratorReconciler
 
 # 动态引入组件
 try:
-    from mock_ibkr_historical import MockIBKRHistorical
+    from mock_ibkr_historical import MockIBKRHistorical as MockIBKRHistoricalDefault
 except ImportError:
-    MockIBKRHistorical = None
+    MockIBKRHistoricalDefault = None
+
+try:
+    from mock_ibkr_historical_1s import MockIBKRHistorical as MockIBKRHistorical1S
+except ImportError:
+    MockIBKRHistorical1S = None
 
 try:
     from ibkr_connector_v8 import IBKRConnectorFinal
@@ -71,7 +76,6 @@ from config import (
     MAX_TRADE_CAP,              # 单笔交易最大金额
     GLOBAL_EXPOSURE_LIMIT,      # 全局风险敞口上限
     COMMISSION_PER_CONTRACT,    # 期权手续费 ($/手)
-    USE_BID_ASK_PRICING,        # [New] 价格模式开关
     NON_TRADABLE_SYMBOLS,
     ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS,
     IS_LIVEREPLAY,
@@ -91,6 +95,15 @@ from config import LOG_DIR
 file_handler = logging.FileHandler(LOG_DIR / "Orchestrator.log", mode='a', encoding='utf-8')
 file_handler.setFormatter(logging.Formatter('%(asctime)s - [V8_Orch] - %(levelname)s - %(message)s'))
 logger.addHandler(file_handler)
+
+
+def _resolve_mock_ibkr_class():
+    variant = os.environ.get("MOCK_IBKR_VARIANT", "").strip().upper()
+    if variant == "1S":
+        return MockIBKRHistorical1S, "1S"
+    if variant in {"DEFAULT", "1M", "MINUTE"}:
+        return MockIBKRHistoricalDefault, "DEFAULT"
+    return MockIBKRHistoricalDefault, "DEFAULT"
 
  
 # Log Stream Key
@@ -443,8 +456,16 @@ class V8Orchestrator:
             else: 
                 raise ImportError("IBKRConnectorFinal missing!")
         else:
-            logger.info("🎞️ V8 Backtest/Replay Mode Init (Mock IBKR)...")
-            self.ibkr = MockIBKRHistorical()
+            mock_cls, mock_variant = _resolve_mock_ibkr_class()
+            logger.info("🎞️ V8 Backtest/Replay Mode Init (Mock IBKR, variant=%s)...", mock_variant)
+            if mock_cls is None:
+                raise ImportError(f"MockIBKRHistorical missing for variant={mock_variant}")
+            self.ibkr = mock_cls()
+            logger.info(
+                "🧪 Mock IBKR class loaded: %s.%s",
+                getattr(mock_cls, "__module__", "unknown"),
+                getattr(mock_cls, "__name__", "UnknownMock"),
+            )
         
         # [Shadow Validation] Alpha Only Mode
         from config import ONLY_LOG_ALPHA
@@ -453,7 +474,7 @@ class V8Orchestrator:
             logger.info("🕵️ Shadow System: ONLY_LOG_ALPHA mode enabled. Trading is strictly disabled.")
 
         # [NEW] 模式启动声明
-        mode_str = "✅ [Bid/Ask + BSM 校准模式]" if USE_BID_ASK_PRICING else "⚠️ [成交价模式 (Transaction Price Mode)]"
+        mode_str = "✅ [Fair Price (Mid) + BSM 校准模式]" 
         logger.info(f"📊 Orchestrator 启动! 当前价格计算模式: {mode_str}")
 
     def _load_state(self):
@@ -626,12 +647,9 @@ class V8Orchestrator:
     def _get_fair_market_price(base_price: float, bid: float, ask: float, last_price: float = 0.0) -> float:
         """
         [NEW] 统一计算期权公允市价
-        1. 如果 USE_BID_ASK_PRICING 为 False, 始终返回成交价 (base_price).
-        2. 如果为 True, 优先使用 Bid/Ask 中间价.
-        3. 如果 Bid/Ask 缺失, 使用 last_price 作为锚点, 否则 fallback to base_price.
+        1. 优先使用 Bid/Ask 中间价.
+        2. 如果 Bid/Ask 缺失, 使用 last_price 作为锚点, 否则 fallback to base_price.
         """
-        if not USE_BID_ASK_PRICING:
-            return base_price
 
         # 计算市场价 (Mid)
         if bid > 0.01 and ask > 0.01:
@@ -1045,7 +1063,7 @@ class V8Orchestrator:
 
     async def _evaluate_symbol_signals(self, i, sym, metrics, opt_data, ny_now, curr_ts, spy_roc, qqq_roc, is_zombie_market, index_trend=0, regime_reversal_count=0):
         """[Refactor] 核心策略评价 logic (平仓与开仓信号收集) - 修复空仓不交易BUG"""
-        from config import USE_BID_ASK_PRICING
+        from config import TAG_TO_INDEX
         st = metrics['st']
         price = metrics['price']
         final_alpha = metrics['final_alpha']
@@ -1175,13 +1193,10 @@ class V8Orchestrator:
             t_bs     = opt_data['call_bid_size'] if is_call else opt_data['put_bid_size']
             t_as     = opt_data['call_ask_size'] if is_call else opt_data['put_ask_size']
 
-            if USE_BID_ASK_PRICING:
-                if t_bid <= 0 or t_ask <= 0:
-                    t_bid = t_price
-                    t_ask = t_price
-            else:
-                if t_price <= 0:
-                    return None
+            # 🚀 [放宽实盘与回测限制] 不再要求 Size > 0。如果 Bid/Ask 为 0，统一使用 Last Price 兜底放行
+            if t_bid <= 0 or t_ask <= 0:
+                t_bid = t_price
+                t_ask = t_price
 
             fair_p = self._get_fair_market_price(t_price, t_bid, t_ask, last_price=t_price)
             if fair_p < 0.05 or not t_id: return None
@@ -1206,7 +1221,6 @@ class V8Orchestrator:
 
     async def _evaluate_symbol_signals_back(self, i, sym, metrics, opt_data, ny_now, curr_ts, spy_roc, qqq_roc, is_zombie_market, index_trend=0):
         """[Refactor] 核心策略评价 logic (平仓与开仓信号收集)"""
-        from config import USE_BID_ASK_PRICING
         st = metrics['st']
         price = metrics['price']
         final_alpha = metrics['final_alpha']
@@ -1351,15 +1365,10 @@ class V8Orchestrator:
             t_bs     = opt_data['call_bid_size'] if is_call else opt_data['put_bid_size']
             t_as     = opt_data['call_ask_size'] if is_call else opt_data['put_ask_size']
 
-            if USE_BID_ASK_PRICING:
-                # 🚀 [放宽实盘与回测限制] 不再要求 Size > 0。如果 Bid/Ask 为 0，统一使用 Last Price 兜底放行
-                if t_bid <= 0 or t_ask <= 0:
-                    t_bid = t_price
-                    t_ask = t_price
-            else:
-                if t_price <= 0:
-                    logger.warning(f"🚫 [严格防线] {sym} 拦截! 成交价为零")
-                    return None
+            # 🚀 [放宽实盘与回测限制] 不再要求 Size > 0。如果 Bid/Ask 为 0，统一使用 Last Price 兜底放行
+            if t_bid <= 0 or t_ask <= 0:
+                t_bid = t_price
+                t_ask = t_price
 
             fair_p = self._get_fair_market_price(t_price, t_bid, t_ask, last_price=t_price)
             if fair_p < 0.05 or not t_id: return None

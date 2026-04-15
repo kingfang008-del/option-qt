@@ -20,8 +20,11 @@ def _msgpack_numpy_encoder(obj):
 
 def _msgpack_numpy_decoder(obj):
     """Custom decoder for Numpy types from Msgpack-compatible format."""
+    # 🚀 [Fix] 支持 both bytes and str keys (compatible with raw=False)
     if b'__nd__' in obj:
         return np.frombuffer(obj[b'data'], dtype=obj[b'dtype']).reshape(obj[b'shape'])
+    elif '__nd__' in obj:
+        return np.frombuffer(obj['data'], dtype=obj['dtype']).reshape(obj['shape'])
     return obj
 
 def pack(data, use_msgpack=True):

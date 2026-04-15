@@ -21,6 +21,7 @@ import json
 import math
 from typing import Dict, List, Optional, Tuple
 import pytz
+from datetime import datetime, timedelta
 import ta  # 引入与离线完全对齐的 ta 库
 
 # 🚀 [Parity Fix] 屏蔽 Pandas 未来版本关于 silent downcasting 的警告
@@ -122,6 +123,7 @@ class RealTimeFeatureEngine:
         # 定义必须在 Pandas 原始分钟频率下预计算的特征
         self.PANDAS_FEATS = [
             'close_log_return', 'open_log_return', 'price_z_score','volume_ratio', 'vwap_diff',
+            # 'vwap_log_return', 'return_divergence', # 🚀 [核心修复 3] 补齐特征注册表
             'rsi', 'garman_klass_vol', 'adx_smooth_10', 'k', 'cci',
             'price_slope_norm_by_atr', 'price_dist_from_ma_atr', 'poc_deviation'
         ]
@@ -131,68 +133,92 @@ class RealTimeFeatureEngine:
             with open(path, 'r') as f: return json.load(f)
         except: return {}
 
+    def _sync_risk_free_rates(self, force=False):
+        """
+        [Ghost Fix] 每日自动从 FRED 更新 3M 美债利率。
+        逻辑：本地存在则先删除，确保加载的是当日最新数据。
+        """
+        # 🚀 [Parity Fix] 多路径探测，支持 Dev 和 Prod 环境
+        possible_dirs = ['/home/kingfang007', os.getcwd()]
+        rfr_dir = next((d for d in possible_dirs if os.path.exists(d) and os.access(d, os.W_OK)), os.getcwd())
+        rfr_file = os.path.join(rfr_dir, 'risk_free_rates.parquet')
+        
+        # 1. 检查今日是否已同步 (内存锁)
+        today_str = datetime.now(pytz.timezone('America/New_York')).strftime('%Y%m%d')
+        if not force and getattr(self, '_last_rfr_sync_date', None) == today_str:
+            return
+            
+        try:
+            import pandas_datareader.data as web
+            
+            # 2. 本地存在则先删除，强制刷新 [User Request]
+            if os.path.exists(rfr_file):
+                os.remove(rfr_file)
+                logger.info(f"🗑️ 已删除旧的 RFR 缓存: {rfr_file}")
+
+            fetch_start = pd.Timestamp("2026-01-01").normalize()
+            fetch_end = pd.Timestamp(datetime.now() + timedelta(days=1)).normalize()
+            
+            logger.info(f"📡 正在从 FRED 下载最新的 RFR 数据 (DGS3MO)...")
+            new_data = web.DataReader('DGS3MO', 'fred', fetch_start, fetch_end)
+            new_data.index = pd.to_datetime(new_data.index).normalize()
+            
+            # 填充及格式化
+            rfr_df = new_data.resample('D').ffill().fillna(method='bfill').fillna(0.045)
+            rfr_df.to_parquet(rfr_file)
+            
+            self._last_rfr_sync_date = today_str
+            logger.info(f"✅ RFR 利率数据已同步并保存至: {rfr_file}")
+            
+        except Exception as e:
+            logger.error(f"❌ RFR 同步失败: {e}. 将回退到现有缓存或默认值。")
+            self._last_rfr_sync_date = today_str # 即使失败今日也不再重试，防止死循环
+
     def supplement_greeks(self, symbol: str, buckets: np.ndarray, contracts: list, stock_price: float, timestamp: float):
         if buckets is None or len(buckets) == 0:
             return buckets
 
+        # 🚀 [Ghost Fix] 每分钟进入时尝试同步一次 RFR (内部会有今日限流逻辑)
+        self._sync_risk_free_rates()
+
         out = np.asarray(buckets, dtype=np.float32).copy()
         try:
+            # 🚀 [Parity Fix] 修正时区处理逻辑，杜绝 tz_localize 崩溃
             ts_ny = pd.Timestamp(timestamp, unit='s', tz='UTC').tz_convert('America/New_York')
-            # 🚀 [Surgery 8] IV 锚点精准对齐
-            # 注意：在 1s 结算帧中，timestamp 已经过 Surgery 4 回刷 60s (如 10:01:00 -> 10:00:00)
-            # 这里 floor('1min') 确保即使 timestamp 带微妙秒，也会严格锁定在分钟起始点。
-            ts_anchor = ts_ny.floor('1min')
+            # 使用 replace(tzinfo=None) 替代 tz_localize(None) 更加稳健
+            ts_naive = ts_ny.replace(tzinfo=None)
+            ts_anchor = ts_naive.floor('1min')
             
-            # 🚀 [核心修复 3：动态读取真实的无风险利率 RFR，消除 0.347 vs 0.350 的偏差]
-            r_val = None
-            date_str = ts_ny.strftime('%Y%m%d')
-            if not hasattr(self, 'rfr_cache'):
-                self.rfr_cache = {}
-            
-            if date_str in self.rfr_cache:
-                r_val = self.rfr_cache[date_str]
-            else:
-                rfr_file = '/home/kingfang007/risk_free_rates.parquet'
-                if os.path.exists(rfr_file):
-                    
-                    df_rfr = pd.read_parquet(rfr_file)
-                    search_date = ts_ny.replace(hour=0, minute=0, second=0, microsecond=0).tz_localize(None)
-                    idx = df_rfr.index.searchsorted(search_date)
-                    idx = np.clip(idx, 0, len(df_rfr) - 1)
-                    latest_r = float(df_rfr['DGS3MO'].iloc[idx])
-                    if latest_r > 1.0:
-                        latest_r /= 100.0
-                    self.rfr_cache[date_str] = latest_r
-                    r_val = latest_r
-
-            import re
             n_rows = min(len(out), len(contracts) if contracts is not None else 0)
             for i in range(n_rows):
                 tkr = contracts[i]
-                if not tkr or len(tkr) <= 15:
-                    continue
+                if not tkr or len(tkr) <= 15: continue
 
-                ext = tkr.replace('O:', '')
+                # 解析到期日 (YYMMDD)
+                import re
+                ext = str(tkr).replace('O:', '')
                 m = re.search(r'\d{6}', ext)
-                if not m:
-                    continue
+                if not m: continue
 
-                expiry_dt = pd.to_datetime(m.group(0), format='%y%m%d').tz_localize('America/New_York') + pd.Timedelta(hours=16)
+                # 锚定到期日 pm4:00 [Standard Expiry]
+                expiry_dt = pd.to_datetime(m.group(0), format='%y%m%d') + pd.Timedelta(hours=16)
                 time_diff = (expiry_dt - ts_anchor).total_seconds()
                 t_years = max(1e-6, time_diff / 31557600.0)
 
                 row_bucket = out[i:i+1, :].copy()
+                # 🚀 [Reduction] 利率自标定通过 greeks_math 内部 get_current_rfr 完成
                 calculate_bucket_greeks(
                     row_bucket,
                     stock_price,
                     t_years,
-                    r=r_val,
+                    r=None, # 强制设为 None，触发 greeks_math 内部的文件检索
                     contracts=[tkr],
                     current_ts=timestamp
                 )
                 out[i, :row_bucket.shape[1]] = row_bucket[0]
         except Exception as e:
-            logger.error(f"Error in supplement_greeks for {symbol}: {e}")
+            # 仅在 Debug 模式打印详情，生产环境避免刷屏
+            logger.error(f"⚠️ [{symbol}] supplement_greeks 异常: {e}")
 
         return out
 
@@ -242,7 +268,7 @@ class RealTimeFeatureEngine:
                 ctx['vix_ma_5'] = torch.tensor(close, device=self.device)
                 
         return ctx
-
+    
     def _pandas_compute_features(self, df_in: pd.DataFrame, active_feats: List[str]) -> pd.DataFrame:
         """
         [极致对齐]：在原始分钟频率上，完全使用离线 feature_merge_option_raw.py 的逻辑
@@ -274,12 +300,11 @@ class RealTimeFeatureEngine:
 
         needs_vwap = any(f in active_feats for f in ['vwap_diff', 'vwap_log_return', 'return_divergence', 'poc_deviation'])
         if needs_vwap:
-            # VWAP 必须对应“完整分钟 bar”的分钟内成交加权均价。
-            # 如果上游已提供精确的 bar VWAP，就直接使用；否则不能退化成
-            # 日内累计 VWAP（那会改变特征语义并放大 parity 偏差），只做保守近似。
-            if 'vwap' in df.columns:
+            if 'vwap' in df.columns and not df['vwap'].dropna().empty and (df['vwap'] != 0).any():
                 vwap = pd.to_numeric(df['vwap'], errors='coerce').astype(np.float64)
             else:
+                if 'vwap' in active_feats or 'vwap_log_return' in active_feats:
+                    logger.warning(f"⚠️ [vwap-Missing] fallback to close for symbol. Columns: {df.columns.tolist()}")
                 vwap = close_ff.copy()
 
             vwap = vwap.replace(0, np.nan).ffill()
@@ -288,6 +313,7 @@ class RealTimeFeatureEngine:
             if 'vwap_diff' in active_feats: 
                 df['vwap_diff'] = (df['close'] - vwap) / (vwap + self.epsilon)
             
+            # 🚀 [核心修复 4] 安全的 Log 运算，杜绝产生 -inf 或 NaN
             if 'vwap_log_return' in active_feats:
                 df['vwap_log_return'] = np.log(vwap / prev_close).fillna(0.0)
                 
@@ -300,9 +326,6 @@ class RealTimeFeatureEngine:
             # [🔥 修正] 重新对齐训练集 POC 逻辑：50窗口 + 50价格桶
             if 'poc_deviation' in active_feats:
                 df['poc_deviation'] = self._calculate_poc_realtime(df)
-        
-        
-        
         
         # 3. 量比 (Volume Ratio)
         if 'volume_ratio' in active_feats:
@@ -323,8 +346,6 @@ class RealTimeFeatureEngine:
                 cci_raw = ta.trend.CCIIndicator(
                     high=df['high'], low=df['low'], close=df['close'], window=20
                 ).cci()
-                # CCI 必须建立在 20 根完整分钟 K 线之上；对窗口未成熟阶段保持 NaN，
-                # 避免把“不完整分钟/未成熟窗口”硬填成 0 混入序列。
                 cci_raw.iloc[:19] = np.nan
                 df['cci'] = cci_raw.ffill().fillna(0.0)
             else:
@@ -422,8 +443,7 @@ class RealTimeFeatureEngine:
         ready_syns: List[str]
     ) -> Tuple[Dict[str, pd.DataFrame], Optional[pd.Index]]:
         """
-        从 1min 主历史直接派生 5min K 线，避免维护独立 5min 历史引入异步相位。
-        所有 5min 特征都建立在同一套 1min master timeline 之上。
+        从 1min 主历史使用标准 Resample 派生 5min K 线
         """
         derived_history_5m: Dict[str, pd.DataFrame] = {}
         master_index_5m = None
@@ -438,18 +458,30 @@ class RealTimeFeatureEngine:
                 continue
 
             df_ohlcv = df_1m[base_cols].sort_index()
+            
+            # 🚀 还原为标准的 Resample (对应数据库的 00, 05, 10 整点切分)
             df_5m = df_ohlcv.resample('5min', closed='left', label='left').agg({
                 'open': 'first',
                 'high': 'max',
                 'low': 'min',
                 'close': 'last',
                 'volume': 'sum'
-            }).dropna(subset=['open', 'high', 'low', 'close'], how='any')
+            })
+
+            if 'vwap' in df_1m.columns:
+                pv = df_1m['vwap'] * df_1m['volume']
+                vwap_5m = pv.resample('5min', closed='left', label='left').sum() / (df_5m['volume'] + 1e-10)
+                df_5m['vwap'] = np.where(df_5m['volume'] > 0, vwap_5m, df_5m['close'])
+            else:
+                df_5m['vwap'] = df_5m['close']
+                
+            df_5m = df_5m.dropna(subset=['open', 'close'])
 
             if df_5m.empty:
                 continue
 
             derived_history_5m[sym] = df_5m
+            
             if master_index_5m is None:
                 master_index_5m = df_5m.index
             else:
@@ -514,7 +546,8 @@ class RealTimeFeatureEngine:
                 global_ctx[feat_name] = torch.tensor(aligned_roc, dtype=torch.float32, device=self.device)
 
         # 3. 准备混合张量 (Hybrid Tensors)
-        ready_syns = [s for s, df in history_1min.items() if not df.empty and s not in EXCLUDED_MODEL_SYMBOLS]
+        # 🚀 [SDS 2.0 补全修复] 不再排除 SPY/VIXY，确保所有标的都能进行 Greeks 补算与特征生成
+        ready_syns = [s for s, df in history_1min.items() if not df.empty]
         if not ready_syns: return results
         
         # 区分 1min 和 5min 特征
@@ -629,9 +662,9 @@ class RealTimeFeatureEngine:
                 'updated_buckets': option_snapshots[s] if option_snapshots and s in option_snapshots else None
             }
         
-        # 🚀 [SDS 2.0 计算屏障] 希腊值/IV 计算已全部入库，现在可以由于安全物理执行延迟结算
-        if hasattr(self, 'service'):
-            self.service.finalization_barrier()
+        # 🚀 [SDS 2.0 计算屏障已解耦] 希腊值/IV 计算已入库，结算权已归还给 Service 主动调用。
+        # if hasattr(self, 'service'):
+        #     self.service.finalization_barrier()
             
         return results
 

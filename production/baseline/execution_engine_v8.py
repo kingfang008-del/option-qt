@@ -35,6 +35,7 @@ from datetime import datetime, time as dt_time, timedelta
 from collections import deque
 from pytz import timezone
 from scipy.stats import norm 
+import traceback
 
 # 引入纯策略核心
 
@@ -46,16 +47,15 @@ from orchestrator_execution import OrchestratorExecution
 from orchestrator_reconciler import OrchestratorReconciler
 from utils import serialization_utils as ser
 
-# 动态引入组件
-try:
-    from mock_ibkr_historical import MockIBKRHistorical
-except ImportError:
-    MockIBKRHistorical = None
-
-try:
-    from ibkr_connector_v8 import IBKRConnectorFinal
-except ImportError:
-    IBKRConnectorFinal = None
+ 
+    # 🚀 [Fix] 切换为秒级专用模拟器 (1s Precision)
+from mock_ibkr_historical_1s import MockIBKRHistorical
+     
+ 
+ 
+from ibkr_connector_v8 import IBKRConnectorFinal
+ 
+from config import get_redis_db, RUN_MODE, REDIS_CFG
 
 # Log Stream Key
 from config import (
@@ -70,14 +70,14 @@ from config import (
     MAX_TRADE_CAP,              # 单笔交易最大金额
     GLOBAL_EXPOSURE_LIMIT,      # 全局风险敞口上限
     COMMISSION_PER_CONTRACT,    # 期权手续费 ($/手)
-    USE_BID_ASK_PRICING,        # [New] 价格模式开关
     SLIPPAGE_ENTRY_PCT,         # [Fix] Added to imports
     SLIPPAGE_EXIT_PCT,          # [Fix] Added to imports
     OMS_SIGNAL_DELAY_BARS,
     OMS_SIGNAL_DELAY_ACTIONS,
     IS_LIVEREPLAY,
     IS_BACKTEST,
-    IS_SIMULATED
+    IS_SIMULATED,
+    IS_REALTIME_DRY
 )
 
 
@@ -141,6 +141,8 @@ class SymbolState:
         self.latest_put_id = ""  
         self.is_pending = False
         self.pending_side = None
+        self.pending_action = None # [幽灵 C] 记录当前锁定的动作
+        self.pending_ts = 0.0      # [幽灵 C] 记录加锁时间戳
 
         self.prev_macd_hist = 0.0
         
@@ -155,6 +157,13 @@ class SymbolState:
         self.last_snap_roc = 0.0
         self.last_vol_z = 0.0
         self.last_min_ts = 0
+        # [State Safety] 初始化持久化字段，防止 to_dict/from_dict 期间 AttributeError
+        self.correction_mode = 'NORMAL'
+        self.alpha_history = deque(maxlen=120)
+        self.pct_history = deque(maxlen=120)
+        self.ema_fast_val = None
+        self.ema_slow_val = None
+        self.dea_val = None
 
     def get_reversal_count(self, window_mins=30, threshold=0.001):
         """[Market Regime Guard] 计算过去 N 分钟内价格反转(洗盘)的频率"""
@@ -271,6 +280,23 @@ class ExecutionEngineV8:
         # Redis Init
         self.r = redis.Redis(**{k:v for k,v in REDIS_CFG.items() if k in ['host','port','db']})
         print("DEBUG: Redis Initialized.")
+        
+        # IBKR backend selection:
+        # - REALTIME / REALTIME_DRY: real connector
+        # - BACKTEST / LIVEREPLAY: mock connector
+        try:
+            if self.mode == 'realtime' and not IS_SIMULATED:
+                self.ibkr = IBKRConnectorFinal(client_id=999)
+                logger.info(
+                    "🔌 [OMS] IBKR backend=REAL | RUN_MODE=%s | IS_REALTIME_DRY=%s | TRADING_ENABLED=%s",
+                    RUN_MODE, IS_REALTIME_DRY, TRADING_ENABLED
+                )
+            else:
+                self.ibkr = MockIBKRHistorical()
+                logger.info("🧪 [OMS] IBKR backend=MOCK | RUN_MODE=%s", RUN_MODE)
+        except Exception as e:
+            logger.error(f"❌ [OMS] IBKR backend init failed: {e}")
+            self.ibkr = None
 
         # =========================================================
         # 🚀 [新增] 动态 Alpha 归一化追踪器 (Dynamic Alpha Tracker)
@@ -296,6 +322,9 @@ class ExecutionEngineV8:
         self.consecutive_stop_losses = 0
         self.global_cooldown_until = 0
         
+        # [新增] 延时信号队列
+        self.delayed_signal_queue = []
+        
         # 兼容性重定向 (指向统一的 config 对象)
         self.CIRCUIT_BREAKER_THRESHOLD = self.cfg.CIRCUIT_BREAKER_THRESHOLD
         self.CIRCUIT_BREAKER_MINUTES = self.cfg.CIRCUIT_BREAKER_MINUTES
@@ -315,6 +344,7 @@ class ExecutionEngineV8:
 
         # [🔥 核心 PnL 监控 - Ground Truth]
         self.realized_pnl = 0.0          # 累计已实现盈亏 (扣除手续费)
+        self.last_broadcast_ts = 0.0
         self.total_commission = 0.0      # 累计手续费
         self.trade_count = 0             # 总交易笔数
         self.win_count = 0               # 盈利笔数
@@ -325,11 +355,63 @@ class ExecutionEngineV8:
         self.last_index_trend = 0 
         self.spy_ema_roc = 0.0     # [NEW] 5min EMA ROC (势能平滑)
         self.qqq_ema_roc = 0.0
-        self.delayed_signal_queue = []
         
         # 赋予一个先验初始值 (防止冷启动期间的极端缩放)
         self.dynamic_vol_mean = 0.0739 
         self.dynamic_vol_std = 0.1106
+        
+    def _deep_decode_bytes(self, data):
+        """[Diagnostics] 递归将字典/列表中的所有 bytes 键值对转换为 str，根治 JSON 报错"""
+        if isinstance(data, bytes):
+            return data.decode('utf-8', errors='replace')
+        if isinstance(data, list):
+            return [self._deep_decode_bytes(i) for i in data]
+        if isinstance(data, dict):
+            return {
+                (k.decode('utf-8', errors='replace') if isinstance(k, bytes) else k): self._deep_decode_bytes(v)
+                for k, v in data.items()
+            }
+        return data
+
+    def _reconstruct_market_packet(self, payload_list):
+        """[Parity] 将 Pitcher 发来的分品种 Payload 列表重组为 S4 模拟器所需的 Batch 格式"""
+        if not payload_list or not isinstance(payload_list, list):
+            return None
+        
+        # 提取公共时间戳
+        ts = payload_list[0].get('ts', 0.0)
+        
+        reconstructed = {
+            'ts': float(ts),
+            'symbols': [],
+            'stock_price': [],
+            'feed_call_price': [],
+            'feed_put_price': [],
+            'feed_call_bid': [],
+            'feed_call_ask': [],
+            'feed_put_bid': [],
+            'feed_put_ask': []
+        }
+        
+        for p in payload_list:
+            reconstructed['symbols'].append(p.get('symbol'))
+            reconstructed['stock_price'].append(p.get('stock', {}).get('close', 0.0))
+            
+            buckets = p.get('option_buckets', [])
+            # 索引对齐 S4 (s4_run_historical_replay_pg_1s.py): Bucket 0=Put, 2=Call
+            put_bk = buckets[0] if len(buckets) > 0 else []
+            call_bk = buckets[2] if len(buckets) > 2 else []
+            
+            # 数值对齐 S4: 0=mid/price, 8=bid, 9=ask
+            reconstructed['feed_put_price'].append(float(put_bk[0]) if len(put_bk) > 0 else 0.0)
+            reconstructed['feed_put_bid'].append(float(put_bk[8]) if len(put_bk) > 8 else 0.0)
+            reconstructed['feed_put_ask'].append(float(put_bk[9]) if len(put_bk) > 9 else 0.0)
+            
+            reconstructed['feed_call_price'].append(float(call_bk[0]) if len(call_bk) > 0 else 0.0)
+            reconstructed['feed_call_bid'].append(float(call_bk[8]) if len(call_bk) > 8 else 0.0)
+            reconstructed['feed_call_ask'].append(float(call_bk[9]) if len(call_bk) > 9 else 0.0)
+            
+        return reconstructed
 
 
        
@@ -338,14 +420,30 @@ class ExecutionEngineV8:
 
         
 
+    def _mark_exec_done(self, curr_ts: float, frame_id: str = None):
+        """[Parity] 向 Redis 报告执行引擎已完成当前帧的处理，解除发球机阻塞"""
+        if not hasattr(self, 'r'): return
+        # 🚀 [S5 对齐] 发球机在等待这个特定格式的 Key
+        sync_key = f"sync:orch_done:{int(curr_ts)}"
+        self.r.set(sync_key, "1")
+        self.r.expire(sync_key, 60)
+        
+        # 兼容旧版汇报
+        self.r.set("sync:exec_done", str(curr_ts))
+        self.r.expire("sync:exec_done", 120)
+        if frame_id:
+            self.r.set("sync:exec_done_frame_id", str(frame_id))
+            self.r.expire("sync:exec_done_frame_id", 120)
+        try:
+            self.r.hincrby("diag:ee:counters", "exec_done", 1)
+        except Exception:
+            pass
+
     def _get_fair_market_price(self, base_price: float, bid: float, ask: float, prev_price: float = 0.0) -> float:
         """
-        [NEW] 统一计算期权公允市价
+        [NEW]统一计算期权公允市价
         如果是真空切片 (Bid/Ask 均为 0)，且 Last Price 与前一秒偏差超过 10%，则沿用上一秒价格。
         """
-        if not USE_BID_ASK_PRICING:
-            return base_price
-
         # 计算市场价 (Mid)
         if bid > 0.01 and ask > 0.01:
             market_price = (bid + ask) / 2.0
@@ -518,12 +616,11 @@ class ExecutionEngineV8:
         """确保所需的 Redis 消费者组存在"""
         from config import STREAM_FUSED_MARKET, IS_SIMULATED
         
-        # 🚀 [核心修复] 优先采用外部注入的 'group' 键，并以 GROUP_OMS 为最终兜底
-        target_group = REDIS_CFG.get('group') or REDIS_CFG.get('orch_group') or GROUP_OMS
-        target_stream = REDIS_CFG.get('input_stream') or STREAM_ORCH_SIGNAL
-        
-       # 🚀 [致命死锁修复] 必须定义 target_stream 才能供下方使用！
-        target_stream = REDIS_CFG.get('input_stream', "orch_trade_signals")
+        # 🚀 [核心修复] OMS 必须优先寻找自己的专有组和专有流，防止被通用的 GROUP_FEATURE 带偏
+        from config import GROUP_OMS, STREAM_ORCH_SIGNAL
+        target_group = REDIS_CFG.get('oms_group') or REDIS_CFG.get('orch_group') or GROUP_OMS
+        self._oms_group = target_group
+        target_stream = REDIS_CFG.get('signal_stream') or STREAM_ORCH_SIGNAL
         
         streams_to_init = [target_stream]
         if self.mode != 'backtest' or IS_SIMULATED:
@@ -542,12 +639,70 @@ class ExecutionEngineV8:
                 if not group_exists:
                     group_id = '0' if IS_SIMULATED else '$'
                     self.r.xgroup_create(s, target_group, mkstream=True, id=group_id)
-                    logger.info(f"✅ [OMS] Created consumer group {target_group} for stream {s} with ID {group_id}")
+                    db_idx = self.r.connection_pool.connection_kwargs.get('db')
+                    logger.info(f"✅ [OMS] Created group {target_group} on DB {db_idx} stream {s} with ID {group_id}")
             except redis.exceptions.ResponseError as e:
                 if "BUSYGROUP" not in str(e): 
                     logger.error(f"Group Create Error on {s}: {e}")
 
     # 在 SystemOrchestratorV8 类中添加以下方法
+
+    async def _evaluate_shadow_signals(self, payload: dict):
+        """
+        🚀 [Shadow Logic] 基于融合包内的 Alpha 直接生成交易指令
+        仅在 PURE_ALPHA_REPLAY 模式下激活。
+        """
+        ts = payload.get('ts')
+        symbols = payload.get('symbols', [])
+        alphas = payload.get('precalc_alpha', [])
+        stock_prices = payload.get('stock_price', [])
+        
+        for i, sym in enumerate(symbols):
+            alpha = float(alphas[i])
+            s_price = float(stock_prices[i])
+            st = self.states.get(sym)
+            if not st: continue
+            
+            # 1. 出场评估 (如有持仓)
+            if st.position != 0:
+                # 逻辑出场：如果 Alpha 强度反转或彻底消失 (与 S4 保持一致)
+                should_exit = False
+                if st.position == 1 and alpha < 0.2: # CALL 出场
+                    should_exit = True
+                elif st.position == -1 and alpha > -0.2: # PUT 出场
+                    should_exit = True
+                
+                # 特殊出场：Alpha 方向性完全调转 (FLIP)
+                if (st.position == 1 and alpha < -0.6) or (st.position == -1 and alpha > 0.6):
+                    should_exit = True
+                
+                if should_exit:
+                    exit_payload = {
+                        'symbol': sym,
+                        'action': 'SELL',
+                        'sig': {'reason': 'SHADOW_EXIT', 'alpha': alpha},
+                        'stock_price': s_price,
+                        'ts': ts
+                    }
+                    await self._handle_trade_signal(exit_payload, allow_delay_queue=False)
+            
+            # 2. 进场评估 (如为空仓且 Alpha 足够强)
+            else:
+                if abs(alpha) > 0.8:
+                    action = 'BUY'
+                    side = 'CALL' if alpha > 0 else 'PUT'
+                    entry_payload = {
+                        'symbol': sym,
+                        'action': 'BUY',
+                        'sig': {
+                            'reason': f'SHADOW_ENTRY_{side}',
+                            'alpha': alpha,
+                            'target_side': 1 if side == 'CALL' else -1
+                        },
+                        'stock_price': s_price,
+                        'ts': ts
+                    }
+                    await self._handle_trade_signal(entry_payload, allow_delay_queue=False)
 
     async def _broadcast_state_to_redis(self):
         """将当前 OMS 的真实持仓快照发布到 Redis，供 Signal Engine 对齐"""
@@ -557,6 +712,10 @@ class ExecutionEngineV8:
         active_states = {}
         
         for sym, st in self.states.items():
+            # 🚀 [核心修复] 如果 sym 是 bytes (来自 Redis)，必须转换为 str 否则 json.dumps 会触发 TypeError
+            if isinstance(sym, bytes):
+                sym = sym.decode('utf-8')
+                
             # 只要 OMS 确认持仓，或者正在处理订单，就广播出去
             if st.position != 0 or st.is_pending:
                 active_states[sym] = json.dumps({
@@ -587,9 +746,37 @@ class ExecutionEngineV8:
         pipe.execute()
 
     async def _handle_trade_signal(self, payload: dict, allow_delay_queue: bool = True):
-        action = payload.get('action')
+        source = payload.get('source')
         curr_ts = payload.get('ts')
         curr_ts_float = float(curr_ts) if curr_ts is not None else None
+        
+        # 🚀 [Fused Replay Protocol] 下一代高速对齐协议支持
+        if source == 'fused_replay_v8':
+            if curr_ts_float is not None:
+                # 1. 价格对齐：从 Fused 包同步当前瞬间的 Mid 价格
+                symbols = payload.get('symbols', [])
+                for i, sym in enumerate(symbols):
+                    if sym in self.states:
+                        # 注入正股价格与 Alpha 到状态机
+                        self.states[sym].last_stock_price = payload['stock_price'][i]
+                        # 更新期权基准价 (s5 发送的是 Mid 基准)
+                        # 注意：s5 并不直接发送期权价格，而是通过 MockIBKR 记录
+                        # 我们这里手动更新 st.last_opt_price 以供止损评估使用
+                        # 止损评估需要的是期权当前 Mid
+                        pass
+                
+                # 2. 影子信号评估 (Shadow Logic)
+                # 如果开启了 PURE_ALPHA_REPLAY，我们直接在此处通过 Alpha 生成买卖决策
+                pure_alpha_mode = os.environ.get('PURE_ALPHA_REPLAY') == '1'
+                if pure_alpha_mode:
+                    await self._evaluate_shadow_signals(payload)
+                
+                # 3. 🚨 [CRITICAL] 释放屏障：无论是否有交易，必须通知发球机本帧已处理完毕
+                self.r.set(f"sync:orch_done:{int(curr_ts_float)}", "1")
+                self.r.expire(f"sync:orch_done:{int(curr_ts_float)}", 60)
+            return
+
+        action = payload.get('action')
 
         if curr_ts_float is not None:
             self.last_curr_ts = curr_ts_float
@@ -607,11 +794,18 @@ class ExecutionEngineV8:
                 for sym, price in latest_prices.items():
                     if sym in self.states:
                         self.states[sym].last_opt_price = price
-                        
-                # 🚀 [Bug3 修复] OMS 是唯一写 sync:orch_done 的地方！
-                # SE 不再写此 key，由 OMS 在处理完 SYNC 后统一写，
-                # 确保 Driver 在 OMS 记账完毕后才推进到下一帧。
-                self.r.set("sync:orch_done", str(curr_ts))
+                
+                # ✅ SYNC 由 OMS 侧确认完成后再释放 orch 屏障，避免 SE 提前 ACK 造成时序漂移
+                try:
+                    self.r.set("sync:orch_done", str(curr_ts))
+                    self.r.expire("sync:orch_done", 120)
+                    frame_id = payload.get('frame_id')
+                    if frame_id:
+                        self.r.set("sync:orch_done_frame_id", str(frame_id))
+                        self.r.expire("sync:orch_done_frame_id", 120)
+                    self.r.hincrby("diag:ee:counters", "sync_ack", 1)
+                except Exception as e:
+                    logger.warning(f"⚠️ [OMS-SYNC] failed to set orch_done: {e}")
             return
             
         sym = payload.get('symbol')
@@ -628,149 +822,177 @@ class ExecutionEngineV8:
         
         logger.info(f"📥 [OMS] Received {action} signal for {sym}: {sig.get('reason', '')}")
         
-        # [🔥 避免竞争] 如果当前状态被锁，直接拒绝新的发单 (仅针对开仓)
-        if action == 'BUY':
-            if payload.get('_delay_released'):
+        if action in ('BUY', 'SELL'):
+            # 🚀 [核心修复: 全生命周期锁保护]
+            # 我们将检查、加锁、执行和解锁全部纳入 try...finally 闭环
+            try:
+                # 1. 拦截正在处理中的订单 [Ghost C]
+                if st.is_pending and not getattr(self, 'use_shared_mem', False):
+                    # 如果当前已经锁死超过 60 秒，强制解锁 (自救机制)
+                    pending_duration = time.time() - getattr(st, 'pending_ts', 0)
+                    if pending_duration > 60:
+                        logger.warning(f"⚠️ [{sym}] 检出长延时 Pending ({pending_duration:.1f}s)，强制解锁！")
+                        st.is_pending = False
+                    else:
+                        logger.warning(f"🛡️ [{sym}] 信号重叠拦截: {action} (当前 Pending: {st.pending_action or st.pending_side})")
+                        return
+
+                # 2. 同步加锁
+                st.is_pending = True
+                st.pending_action = action
+                st.pending_ts = time.time()
+                st.pending_side = action
+
+                if action == 'BUY':
+                    if st.position != 0:
+                        logger.warning(f"🚫 [OMS] {sym} already has position! Ignoring BUY signal.")
+                        return
+                    # 3. 阻塞执行
+                    await self._execute_entry(sym, sig, stock_price, curr_ts, batch_idx)
+                else: # SELL
+                    # 🚀 [修复 1] 共享内存下，SE 为了光速复用资金已提前将 position 清 0，OMS 必须无条件放行平仓单！
+                    if st.position == 0 and not getattr(self, 'use_shared_mem', False):
+                        logger.warning(f"🚫 [OMS] {sym} has no position! Ignoring SELL signal.")
+                        return
+                    # 3. 阻塞执行
+                    await self._execute_exit(sym, sig, stock_price, curr_ts, batch_idx)
+            except Exception as e:
+                logger.error(f"❌ [OMS] Error executing {action} for {sym}: {e}")
+            finally:
+                # 🛡️ 最终防线：无论成交与否，只要完成了本轮逻辑，必须释放标志位
                 st.is_pending = False
+                st.pending_action = None
                 st.pending_side = None
-            if st.is_pending and not getattr(self, 'use_shared_mem', False):
-                logger.warning(f"🚫 [OMS] {sym} is pending! Ignoring BUY signal.")
-                return
-            if st.position != 0:
-                logger.warning(f"🚫 [OMS] {sym} already has position! Ignoring BUY signal.")
-                return
-                
-            await self._execute_entry(sym, sig, stock_price, curr_ts, batch_idx)
-            
-        elif action == 'SELL':
-            if payload.get('_delay_released'):
-                st.is_pending = False
-                st.pending_side = None
-            # 🚀 [修复 1] 共享内存下，SE 为了光速复用资金已提前将 position 清 0，OMS 必须无条件放行平仓单！
-            if st.position == 0 and not getattr(self, 'use_shared_mem', False):
-                logger.warning(f"🚫 [OMS] {sym} has no position! Ignoring SELL signal.")
-                return
-                
-            await self._execute_exit(sym, sig, stock_price, curr_ts, batch_idx)
         
-        # 👑 处理完毕后，全网广播最新的真实持仓状态！
+        # 👑 处理完毕后 (仅限交易信号)，全网广播最新的真实持仓状态！
         await self._broadcast_state_to_redis()
 
     async def process_trade_signal(self, payload: dict):
         await self._handle_trade_signal(payload, allow_delay_queue=True)
 
     async def run(self):
-        from config import get_redis_db, RUN_MODE
-        target_db = get_redis_db()
-        self.r = __import__('redis').Redis(host=REDIS_CFG['host'], port=REDIS_CFG['port'], db=target_db)
+        """
+        [V8 终极执行引擎主循环]
+        采用非阻塞异步 Redis 流消费，完美兼容 LiveReplay 发球机架构与实盘。
+        """
+        from config import REDIS_CFG, STREAM_ORCH_SIGNAL, STREAM_FUSED_MARKET, IS_LIVEREPLAY, SYNC_EXECUTION, TRADING_ENABLED
+        import os
+        import traceback
+        import asyncio
+        import redis
+        from utils import serialization_utils as ser
         
-        # 🛡️ 预创建消费者组
+        logger.info(f"🔥 Execution Engine (OMS) Started (DB: {self.r.connection_pool.connection_kwargs.get('db')})")
+        
+        # 1. 确保消费组存在
         self._ensure_consumer_group()
         
-        from config import IS_SIMULATED, IS_LIVEREPLAY, TRADING_ENABLED, SYNC_EXECUTION
-        if self.mode == 'realtime' and not IS_SIMULATED: 
-            await self.ibkr.connect()
-            if hasattr(self.ibkr, 'get_account_balance'):
-                real_bal = await self.ibkr.get_account_balance()
-                if TRADING_ENABLED and real_bal is not None and real_bal > 0:
-                    self.mock_cash = float(real_bal)
-                    logger.info(f"💰 REAL ACCOUNT BALANCE LOADED: ${self.mock_cash:,.2f}")
-                    
-        target_stream = REDIS_CFG.get('input_stream', "orch_trade_signals")
-        streams_to_read = {target_stream: '>'} 
-        if self.mode != 'backtest' or IS_LIVEREPLAY:
-            # 让 OMS 也兼听高频行情，用来更新 last_opt_price 和 last_curr_ts
-            streams_to_read[STREAM_FUSED_MARKET] = '>'
-
-        # Load State
-        if self.mode == 'backtest':
-            self._recover_warmup_from_sqlite()
-        elif self.mode == 'realtime' and not IS_SIMULATED:
-            self._recover_warmup_from_pg()
-            
-        logger.info(f"🔥 Execution Engine (OMS) Started (DB: {target_db})")
-        
+        # 2. 启动后台监控任务 (非回放模式或启用同步时)
         if not IS_LIVEREPLAY and not SYNC_EXECUTION:
-            import asyncio
             asyncio.create_task(self._pnl_monitor_loop())
-            
-        if not IS_LIVEREPLAY and not SYNC_EXECUTION and TRADING_ENABLED:
-            import asyncio
-            asyncio.create_task(self.reconciler.run_reconciliation_loop())
-            
-        if getattr(self, 'use_shared_mem', False):
-            logger.info("⚡ [OMS] 引擎已切换至 [共享内存 + Asyncio Queue] 极速模式！")
-            while True:
-                # 0 延迟从内存拉取 SE 发来的订单
-                payload = await self.signal_queue.get()
-                try:
-                    await self.process_trade_signal(payload)
-                except Exception as e:
-                    logger.error(f"OMS Queue Error: {e}")
-                finally:
-                    # 🛑 魔法时刻：通知 Queue 该笔订单已物理处理完毕
-                    self.signal_queue.task_done() 
-        else:
-            if self.mode == 'backtest':
-                logger.info("🎬 [OMS] 引擎已启动 [Redis Stream] 极速回测模式！")
-            else:
-                logger.info("🌐 [OMS] 引擎已切换至 [Redis Stream] 分布式实盘模式！")
-            while True:
-                try:
-                    # 🛡️ 强制动态获取流名称，与 _ensure_consumer_group 保持一致
-                    target_stream = REDIS_CFG.get('input_stream') or STREAM_ORCH_SIGNAL
-                    target_group = REDIS_CFG.get('group') or REDIS_CFG.get('orch_group') or GROUP_OMS
-                    
-                    # 🚀 [逻辑修复] 使用循环外部动态拼装的 streams_to_read！
-                    # 不要写死 {target_stream: '>'}，否则 OMS 将失去秒级逃生能力！
-                    resp = self.r.xreadgroup(target_group, "oms_client_1", streams_to_read, count=50, block=100)
-                    if not resp:
-                        import asyncio
-                        await asyncio.sleep(0.01)
-                        continue
-                        
+            if TRADING_ENABLED:
+                asyncio.create_task(self.reconciler.run_reconciliation_loop())
+        
+        target_group = getattr(self, '_oms_group', REDIS_CFG.get('oms_group') or REDIS_CFG.get('orch_group') or GROUP_OMS)
+        consumer_name = f"oms_consumer_{os.getpid()}"
+        
+        # 我们需要同时监听信号流(指令)和行情流(兜底/状态同步)
+        streams = {STREAM_ORCH_SIGNAL: '>', STREAM_FUSED_MARKET: '>'}
+        last_stats_log = time.time()
+        stats = {'msgs': 0, 'signal': 0, 'fused': 0, 'acks': 0}
+        
+        while True:
+            try:
+                # 3. 优先消费未确认的历史消息 (Pending)
+                pending = self.r.xreadgroup(
+                    groupname=target_group,
+                    consumername=consumer_name,
+                    streams={STREAM_ORCH_SIGNAL: '0', STREAM_FUSED_MARKET: '0'},
+                    count=100
+                )
+                
+                if pending:
+                    messages = pending
+                    logger.debug(f"🔍 [OMS] Found {len(pending)} pending messages in streams.")
+                else:
+                    messages = self.r.xreadgroup(
+                        groupname=target_group,
+                        consumername=consumer_name,
+                        streams=streams,
+                        count=10,
+                        block=1 
+                    )
 
-                    for stream_name, msgs in resp:
-                        for msg_id, data in msgs:
-                            try:
-                                # 🛡️ [多重兼容性解析] 支持多种 Key 格式 (data, pickle, batch)
-                                raw_data = data.get(b'data') or data.get(b'pickle') or data.get(b'batch') or b''
-                                
-                                # 🛡️ 拦截 Driver 发送的结束控制信令，防止解包崩溃
-                                if raw_data == b'DONE':
-                                    logger.info("🏁 [OMS] Ignored DONE signal.")
-                                    self.r.xack(stream_name, target_group, msg_id)
-                                    continue
-                                    
-                                payload = ser.unpack(raw_data)
-                                
-                                if payload is None:
-                                    self.r.xack(stream_name, target_group, msg_id)
-                                    continue
+                if not messages:
+                    await asyncio.sleep(0.001)
+                    continue
 
-                                # 🛡️ 拦截误入的行情数据流（确保只处理带有 action 开平仓指令的真实信号）
-                                if 'action' not in payload:
-                                    self.r.xack(stream_name, target_group, msg_id)
-                                    continue
-                                    
-                                import asyncio
-                                await self.process_trade_signal(payload)
+                # 5. 处理消息
+                for stream, msgs in messages:
+                    stats['msgs'] += len(msgs)
+                    stream_str = stream.decode('utf-8') if isinstance(stream, bytes) else stream
+                    for msg_id, data in msgs:
+                        # 🚀 [Debug] 捕获所有流量
+                        logger.info(f"📥 [OMS] Received msg {msg_id} from {stream_str}")
+                        try:
+                            raw_data = data.get(b'data') or data.get(b'pickle') or data.get(b'batch') or b''
+                            if raw_data == b'DONE':
+                                logger.info(f"🏁 [OMS] Received DONE on {stream_str}")
+                                self.r.xack(stream_str, target_group, msg_id)
+                                continue
                                 
-                            except redis.exceptions.ResponseError as e:
-                                if "NOGROUP" in str(e):
-                                    self._ensure_consumer_group()
-                                else:
-                                    logger.error(f"Redis Stream Error: {e}")
-                            except Exception as e:
-                                logger.error(f"❌ Failed to parse signal: {e}")
-                                
+                            payload = ser.unpack(raw_data)
+                            if payload:
+                                payload = self._deep_decode_bytes(payload)
+                                if stream_str == STREAM_ORCH_SIGNAL:
+                                    # 处理交易信号 (包含 fused_replay 协议)
+                                    logger.info(f"⚡ [OMS] Processing trade/fused signal (ts={payload.get('ts')})")
+                                    await self.process_trade_signal(payload)
+                                    stats['signal'] += 1
+                                elif stream_str == STREAM_FUSED_MARKET:
+                                    if self.ibkr and hasattr(self.ibkr, 'record_market_data'):
+                                        market_packet = self._reconstruct_market_packet(payload)
+                                        if market_packet:
+                                            self.ibkr.record_market_data(market_packet)
+                                    stats['fused'] += 1
+                            
                             try:
-                                self.r.xack(stream_name, target_group, msg_id)
-                            except: pass
-                except Exception as e:
-                    import asyncio
-                    logger.error(f"OMS Error: {e}", exc_info=True)
+                                self.r.xack(stream_str, target_group, msg_id)
+                                stats['acks'] += 1
+                                
+                                # [Parity Barrier] 如果开启了回放模式，处理完后报备锁
+                                ts_val = payload.get('ts') if isinstance(payload, dict) else None
+                                if IS_LIVEREPLAY and ts_val:
+                                    logger.info(f"🔓 [OMS] Releasing barrier for ts={ts_val}")
+                                    self._mark_exec_done(ts_val)
+                                elif IS_LIVEREPLAY:
+                                    logger.warning(f"⚠️ [OMS] IS_LIVEREPLAY active but ts missing in payload from {stream_str}")
+                            except Exception as ack_err:
+                                logger.error(f"ACK/Sync Error: {ack_err}")
+                                
+                        except Exception as msg_err:
+                            logger.error(f"OMS Error processing msg_id {msg_id}: {msg_err}")
+                            self.r.xack(stream_str, target_group, msg_id) # 即使失败也确认，防止死转
+                            stats['acks'] += 1
+                            
+                await asyncio.sleep(0.001)
+                if time.time() - last_stats_log >= 60:
+                    logger.info(
+                        f"📊 [OMS-Stats] 60s msgs={stats['msgs']} signal={stats['signal']} fused={stats['fused']} acked={stats['acks']}"
+                    )
+                    stats = {'msgs': 0, 'signal': 0, 'fused': 0, 'acks': 0}
+                    last_stats_log = time.time()
+                
+            except redis.exceptions.ResponseError as e:
+                if "NOGROUP" in str(e):
+                    self._ensure_consumer_group()
+                else:
+                    logger.error(f"Redis Stream Error: {e}")
                     await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"OMS Fatal Loop Error: {e}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                await asyncio.sleep(1)
 
 
 if __name__ == "__main__":

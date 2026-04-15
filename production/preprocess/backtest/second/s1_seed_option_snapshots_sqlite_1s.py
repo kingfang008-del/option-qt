@@ -112,6 +112,7 @@ def ensure_pg_tables(date_str):
                     low DOUBLE PRECISION,
                     close DOUBLE PRECISION,
                     volume DOUBLE PRECISION,
+                    vwap DOUBLE PRECISION,
                     PRIMARY KEY (symbol, ts)
                 ) PARTITION BY RANGE (ts);
             """)

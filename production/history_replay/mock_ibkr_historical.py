@@ -51,7 +51,21 @@ class MockIBKRHistorical:
     def get_contract(self, symbol, tag):
         return MockContract(symbol, tag)
 
-    def place_option_order(self, contract, action, qty, order_type, lmt_price, reason="", custom_time=None, stock_price=0.0, stop_loss_pct=0.07, chunks=1, liq_reason=""):
+    def place_option_order(
+        self,
+        contract,
+        action,
+        qty,
+        order_type,
+        lmt_price,
+        reason="",
+        custom_time=None,
+        stock_price=0.0,
+        stop_loss_pct=0.07,
+        chunks=1,
+        liq_reason="",
+        order_ref=None,
+    ):
         # 🧪 [Debug] 核实引擎是否连接到了本柜台实例
         print(f"🧪 [MockIBKR Debug] Order Received: {getattr(contract, 'symbol', 'Unknown')} | {action} | qty:{qty} | price:{lmt_price}")
         
@@ -97,7 +111,8 @@ class MockIBKRHistorical:
             'opt_dir': opt_dir,         # [New]
             'reason': reason,
             'liq_chunks': chunks,       # [New]
-            'liq_reason': liq_reason    # [New]
+            'liq_reason': liq_reason,   # [New]
+            'order_ref': str(order_ref or ""),
         })
 
     def record_market_data(self, batch, alphas=None):

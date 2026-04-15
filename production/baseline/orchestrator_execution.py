@@ -7,10 +7,11 @@ import asyncio
 import os
 from datetime import datetime, timedelta, time as dt_time
 from pytz import timezone
+import config
 from config import (
     COMMISSION_PER_CONTRACT, MAX_POSITIONS, POSITION_RATIO, MAX_TRADE_CAP, 
     GLOBAL_EXPOSURE_LIMIT, SLIPPAGE_ENTRY_PCT, SLIPPAGE_EXIT_PCT, 
-    USE_BID_ASK_PRICING, EXIT_ORDER_TYPE, TRADING_ENABLED, IS_LIVEREPLAY,
+    EXIT_ORDER_TYPE, TRADING_ENABLED, IS_LIVEREPLAY,
     DISABLE_ICEBERG, SYNC_EXECUTION, BACKTEST_1S_DISABLE_ICEBERG
 )
 from liquidity_rules import LiquidityRiskManager
@@ -117,10 +118,13 @@ class OrchestratorExecution:
     async def _execute_entry(self, sym, sig, stock_price, curr_ts, batch_idx):
         st = self.orch.states[sym]
         
-        # 🚀 [修复 2] 共享内存下，忽略 SE 刚打上的 is_pending 锁，因为 OMS 此时正要处理它！
-        if getattr(st, 'is_pending', False) and not getattr(self.orch, 'use_shared_mem', False):
-            logger.warning(f"✋ [并发锁防线 - {sym}] 当前品种正处于发单锁定状态 (is_pending)，拒绝重复建仓！")
-            return
+        # 🛡️ 移除此处重复的 is_pending 检查，该逻辑已统一上移至 ExecutionEngineV8 处理。
+        # 这里只管真正的执行。
+        
+        # 物理加锁
+        if not getattr(self.orch, 'use_shared_mem', False):
+            st.is_pending = True
+            st.locked_cash = 0.0 # 初始化锁定金额，防止 NaN
             
         if st.position != 0:
             return
@@ -195,10 +199,9 @@ class OrchestratorExecution:
 
         logger.info(f"🚀 [交易柜台 - 真正发单] {sym} 通过所有风控检查！准备买入 {sig['tag']} @ {price}")
         
-        if self.orch.mode == 'backtest' or SYNC_EXECUTION: 
-            fill_price = round(price * (1 + SLIPPAGE_ENTRY_PCT), 2)
-        else: 
-            fill_price = price
+        #if self.orch.mode == 'backtest' or SYNC_EXECUTION: 
+        # 🚀 [架构对齐 1] S4 和 Pitcher 统一使用纯净原价进行资金分配与数量计算
+        fill_price = price
 
         cost_per_contract = (fill_price * 100) + COMMISSION_PER_CONTRACT
         target_qty = int(final_alloc // cost_per_contract)
@@ -212,10 +215,12 @@ class OrchestratorExecution:
         self.orch.mock_cash -= (total_est_cost + total_est_comm)
         st.locked_cash = (total_est_cost + total_est_comm)
         
-        # =========== 冰山发单分流 ===========
-        if chunks > 1 and self.orch.mode == 'realtime' and not DISABLE_ICEBERG and not SYNC_EXECUTION:
-            st.is_pending = True
-            asyncio.create_task(self._iceberg_open_order(sym, sig, stock_price, curr_ts, target_qty, chunks, fill_price, total_est_cost, total_est_comm))
+        # =========== 冰山发单分流 [Ghost A: 冰山保护] ===========
+        # 🚀 [对齐对冲] 如果处于强制确定性模式，即使是 realtime 也必须禁用冰山，对齐 S4 Atomic Fill
+        is_deterministic = config.is_forced_deterministic(self.orch.r)
+        
+        if chunks > 1 and self.orch.mode == 'realtime' and not DISABLE_ICEBERG and not SYNC_EXECUTION and not is_deterministic:
+            asyncio.create_task(self._smart_entry_order(sym, sig, stock_price, curr_ts, target_qty, chunks, fill_price, total_est_cost, total_est_comm))
             return
             
         st.position = sig['dir']
@@ -251,11 +256,16 @@ class OrchestratorExecution:
             f"| execution={self._fmt_ny_time(curr_ts)}"
         )
         
-        if self.orch.mode == 'backtest' or SYNC_EXECUTION:
+        # 🚀 [核心修复] 增加 LIVEREPLAY 识别，防止发球机走实盘漏斗
+        is_simulated_env = (self.orch.mode == 'backtest' or os.environ.get('RUN_MODE') == 'LIVEREPLAY')
+        if is_simulated_env or SYNC_EXECUTION:
             order_submit_ts = float(curr_ts)
             fill_ts = float(st.entry_ts)
             timing_fields = self._build_timing_fields(alpha_label_ts, alpha_available_ts, order_submit_ts, fill_ts)
-            fill_price = round(price * (1 + SLIPPAGE_ENTRY_PCT), 2)
+            
+            # 🚀 [架构对齐 2] 统一计算包含滑点的最终成交价
+            simulated_fill_price = round(fill_price * (1 + SLIPPAGE_ENTRY_PCT), 2)
+            
             contract = type('MockContract', (), {'symbol': sym, 'localSymbol': st.contract_id, 'tag': sig['tag'], 'secType': 'OPT'})()
             
             liq_chunks = liq_eval.get('chunks', 1)
@@ -269,7 +279,7 @@ class OrchestratorExecution:
                         'BUY',
                         chunk_qty,
                         'LMT',
-                        st.entry_price,
+                        simulated_fill_price, # 👈 发送含滑点的价格给 MockIBKR
                         reason=sig['reason'],
                         custom_time=st.entry_ts + (chunk_idx * 1e-6),
                         stock_price=stock_price,
@@ -280,7 +290,7 @@ class OrchestratorExecution:
                 sym,
                 st,
                 st.qty,
-                fill_price,
+                simulated_fill_price, # 👈 使用含滑点的价格进行财务记账
                 stock_price,
                 st.entry_ts,
                 sig,
@@ -292,86 +302,95 @@ class OrchestratorExecution:
             )
             # 🚀 [修复 3] 执行完毕后立刻释放 pending 锁，形成完美闭环！
             st.is_pending = False
-        elif self.orch.mode == 'realtime' and not SYNC_EXECUTION:    
-            limit_price = self._get_entry_limit_price(sig, fill_price, attempt_no=0)
-            if limit_price < 0.05:
-                return
-            
-            if not USE_BID_ASK_PRICING: limit_price = round(st.entry_price, 2)
-                    
-            tag = sig.get('tag')
-            real_contract = None
-            if hasattr(self.orch.ibkr, 'locked_contracts'):
-                real_contract = self.orch.ibkr.locked_contracts.get(sym, {}).get(tag)
-            
-            if not real_contract:
-                from ib_insync import Contract
-                real_contract = Contract()
-                real_contract.secType = 'OPT'
-                real_contract.symbol = sym
-                real_contract.localSymbol = st.contract_id
-                real_contract.exchange = 'SMART'
-                real_contract.currency = 'USD'
-            
-            stop_loss = abs(self.orch.strategy.cfg.STOP_LOSS)
-            start_time = time.time()
-            trade = self.orch.ibkr.place_option_order(real_contract, 'BUY', st.qty, 'LMT', lmt_price=limit_price, stop_loss_pct=stop_loss, custom_time=curr_ts)
-            if trade:
-                st.is_pending = True
-                asyncio.create_task(
-                    self._monitor_realtime_order(
-                        sym,
-                        trade,
-                        real_contract,
-                        total_est_cost,
-                        total_est_comm,
-                        st.qty,
-                        start_time,
-                        limit_price,
-                        stock_price,
-                        sig,
-                        st,
+        elif self.orch.mode == 'realtime' and not SYNC_EXECUTION:
+            try:    
+                limit_price = self._get_entry_limit_price(sig, fill_price, attempt_no=0)
+                if limit_price < 0.05:
+                    return
+                
+                # Removing redundant limit_price override as fairness is now standard
+                        
+                tag = sig.get('tag')
+                real_contract = None
+                if hasattr(self.orch.ibkr, 'locked_contracts'):
+                    real_contract = self.orch.ibkr.locked_contracts.get(sym, {}).get(tag)
+                
+                if not real_contract:
+                    from ib_insync import Contract
+                    real_contract = Contract()
+                    real_contract.secType = 'OPT'
+                    real_contract.symbol = sym
+                    real_contract.localSymbol = st.contract_id
+                    real_contract.exchange = 'SMART'
+                    real_contract.currency = 'USD'
+                
+                stop_loss = abs(self.orch.strategy.cfg.STOP_LOSS)
+                start_time = time.time()
+                trade = self.orch.ibkr.place_option_order(real_contract, 'BUY', st.qty, 'LMT', lmt_price=limit_price, stop_loss_pct=stop_loss, custom_time=curr_ts)
+                if trade:
+                    st.is_pending = True
+                    asyncio.create_task(
+                        self._monitor_realtime_order(
+                            sym,
+                            trade,
+                            real_contract,
+                            total_est_cost,
+                            total_est_comm,
+                            st.qty,
+                            start_time,
+                            limit_price,
+                            stock_price,
+                            sig,
+                            st,
+                        )
                     )
-                )
-            else:
-                from config import TRADING_ENABLED, IS_LIVEREPLAY
-                if not TRADING_ENABLED:
-                    logger.info(f"ℹ️ {sym} 开仓被拦截 (DRY RUN 极速结算)。")
-                    simulated_fill_price = round(limit_price * (1 + SLIPPAGE_ENTRY_PCT), 2)
-                    st.entry_price = simulated_fill_price  
-                    
-                    log_ts = curr_ts if IS_LIVEREPLAY else time.time()
-                    timing_fields = self._build_timing_fields(alpha_label_ts, alpha_available_ts, start_time, log_ts)
-                    self.orch.accounting._process_open_accounting(
-                        sym,
-                        st,
-                        st.qty,
-                        simulated_fill_price,
-                        stock_price,
-                        log_ts,
-                        sig,
-                        duration=0.0,
-                        ratio=1.0,
-                        timing_fields=timing_fields,
-                        mode_override='LIVEREPLAY',
-                    )
-                    st.is_pending = False
+                    return # 监控异步处理
                 else:
-                    logger.error(f"❌ [实盘异常] {sym} 订单被拒！回退资金。")
-                    self.orch.mock_cash += (total_est_cost + total_est_comm)
-                    self._reset_failed_entry_state(st)
+                    from config import TRADING_ENABLED, IS_LIVEREPLAY
+                    if not TRADING_ENABLED:
+                        logger.info(f"ℹ️ {sym} 开仓被拦截 (DRY RUN 极速结算)。")
+                        simulated_fill_price = round(limit_price * (1 + SLIPPAGE_ENTRY_PCT), 2)
+                        st.entry_price = simulated_fill_price  
+                        
+                        log_ts = curr_ts if IS_LIVEREPLAY else time.time()
+                        timing_fields = self._build_timing_fields(alpha_label_ts, alpha_available_ts, start_time, log_ts)
+                        self.orch.accounting._process_open_accounting(
+                            sym,
+                            st,
+                            st.qty,
+                            simulated_fill_price,
+                            stock_price,
+                            log_ts,
+                            sig,
+                            duration=0.0,
+                            ratio=1.0,
+                            timing_fields=timing_fields,
+                            mode_override='LIVEREPLAY',
+                        )
+                    else:
+                        logger.error(f"❌ [实盘异常] {sym} 订单被拒！回退资金。")
+                        self.orch.mock_cash += (total_est_cost + total_est_comm)
+                        self._reset_failed_entry_state(st)
+            finally:
+                # 只有在非监控模式下才在这里释放
+                if not (self.orch.mode == 'realtime' and trade):
                     st.is_pending = False
                     
         self.orch.state_manager.save_state()
 
     async def _execute_exit(self, sym, sig, stock_price, curr_ts, batch_idx):
         st = self.orch.states[sym]
+        
+        # --- [Ghost Plan B: 退出点差保护] ---
+        # 强制至少持仓 60 秒，防止因为开仓后的剧烈波动（或点差洗盘）立即被止损/触发平仓数据噪音
+        is_urgent = any(keyword in sig.get('reason', '') for keyword in ["STOP", "FLIP", "EOD", "FORCE"])
+        if not is_urgent and curr_ts - st.entry_ts < 60:
+            logger.warning(f"🛡️ [Ghost B] {sym} 处于平仓保护期 (已持仓 {curr_ts - st.entry_ts:.1f}s < 60s)，忽略该信号。")
+            return
+
         logger.info(f"🚪 [Exit 准入] {sym} | 信号: {sig.get('reason')} | 持仓: {st.position} | 数量: {st.qty} | Pending: {st.is_pending}")
         
-        # 🚀 [修复 4] 忽略 SELL 信号的 is_pending 锁
-        if getattr(st, 'is_pending', False) and not getattr(self.orch, 'use_shared_mem', False):
-            logger.warning(f"⏳ [Exit 跳过] {sym} 尚有在途订单 (is_pending=True)，拒绝重复平仓。")
-            return 
+        # 🛡️ 移除此处重复的 is_pending 检查，该逻辑已统一上移至 ExecutionEngineV8 处理。
         
         bid = sig.get('bid', 0.0)
         ask = sig.get('ask', 0.0)
@@ -392,43 +411,45 @@ class OrchestratorExecution:
 
         logger.info(f"🚀 [Exit 定价完成] {sym} | 最终执行价: {raw_price:.2f} | 理由: {reason} | 紧急: {is_urgent}")
 
-        if self.orch.mode == 'backtest' or SYNC_EXECUTION:
-            # 在同步比对模式下，必须假设无限流动性，否则状态机必分叉！
-            actual_fill_qty = exit_qty 
-            final_price = round(raw_price * (1 - SLIPPAGE_EXIT_PCT), 2)
-            final_price = max(final_price, 0.01)
+        #if self.orch.mode == 'backtest' or SYNC_EXECUTION:
+        try:
+            # 🚀 [对齐对冲] 只要处于强制确定性模式，就必须使用 Atomic Fill 对齐 S4
+            is_deterministic = config.is_forced_deterministic(self.orch.r)
+            is_simulated_env = (self.orch.mode == 'backtest' or os.environ.get('RUN_MODE') == 'LIVEREPLAY' or is_deterministic)
             
-            # 🚀 [Bug2 修复] 从信号中恢复原始方向，防止共享内存下 st.position 已被 SE 清零
-            original_position = sig.get('original_position', st.position)
-            
-            logger.info(f"📊 [Exit 记账-Backtest] {sym} | 结算价: {final_price} | 成交量: {actual_fill_qty} | 原始方向: {original_position}")
-            self.orch.accounting._process_exit_accounting(sym, st, actual_fill_qty, final_price, stock_price, curr_ts, reason, 0.0, 1.0, original_position=original_position)
-            # 🚀 [Shared Mem Fix] 在极速回溯模式下，完成后物理释放该品种的平仓锁
-            st.is_pending = False
-            
-            contract = type('MockContract', (), {'symbol': sym, 'localSymbol': st.contract_id, 'tag': 'EXIT', 'secType': 'OPT'})()
-            if hasattr(self.orch.ibkr, 'place_option_order'):
-                self.orch.ibkr.place_option_order(contract, 'SELL', actual_fill_qty, 'MKT', final_price, reason=reason, custom_time=curr_ts, stock_price=stock_price)
-            st.is_pending = False
-            
-        elif self.orch.mode == 'realtime' and not SYNC_EXECUTION:
-            real_contract = None
-            if hasattr(self.orch.ibkr, 'locked_contracts'):
-                locks = self.orch.ibkr.locked_contracts.get(sym, {})
-                for tag, c in locks.items():
-                    if c.localSymbol == st.contract_id:
-                        real_contract = c; break
-            
-            if not real_contract:
-                from ib_insync import Contract
-                real_contract = Contract()
-                real_contract.secType = 'OPT'; real_contract.symbol = sym
-                real_contract.localSymbol = st.contract_id; real_contract.exchange = 'SMART'; real_contract.currency = 'USD'
+            if is_simulated_env or SYNC_EXECUTION:
+                # 在同步比对模式下，必须假设无限流动性，否则状态机必分叉！
+                actual_fill_qty = exit_qty 
+                final_price = round(raw_price * (1 - SLIPPAGE_EXIT_PCT), 2)
+                final_price = max(final_price, 0.01)
                 
-            st.is_pending = True 
-            original_position = sig.get('original_position', st.position)
-            
-            try:
+                # 🚀 [Bug2 修复] 从信号中恢复原始方向，防止共享内存下 st.position 已被 SE 清零
+                original_position = sig.get('original_position', st.position)
+                
+                logger.info(f"📊 [Exit 记账-Backtest] {sym} | 结算价: {final_price} | 成交量: {actual_fill_qty} | 原始方向: {original_position}")
+                self.orch.accounting._process_exit_accounting(sym, st, actual_fill_qty, final_price, stock_price, curr_ts, reason, 0.0, 1.0, original_position=original_position)
+                
+                contract = type('MockContract', (), {'symbol': sym, 'localSymbol': st.contract_id, 'tag': 'EXIT', 'secType': 'OPT'})()
+                if hasattr(self.orch.ibkr, 'place_option_order'):
+                    self.orch.ibkr.place_option_order(contract, 'SELL', actual_fill_qty, 'MKT', final_price, reason=reason, custom_time=curr_ts, stock_price=stock_price)
+                
+            elif self.orch.mode == 'realtime' and not SYNC_EXECUTION:
+                real_contract = None
+                if hasattr(self.orch.ibkr, 'locked_contracts'):
+                    locks = self.orch.ibkr.locked_contracts.get(sym, {})
+                    for tag, c in locks.items():
+                        if c.localSymbol == st.contract_id:
+                            real_contract = c; break
+                
+                if not real_contract:
+                    from ib_insync import Contract
+                    real_contract = Contract()
+                    real_contract.secType = 'OPT'; real_contract.symbol = sym
+                    real_contract.localSymbol = st.contract_id; real_contract.exchange = 'SMART'; real_contract.currency = 'USD'
+                    
+                st.is_pending = True 
+                original_position = sig.get('original_position', st.position)
+                
                 if not TRADING_ENABLED:
                     available_size = sig.get('bid_size', 100) if original_position == 1 else sig.get('ask_size', 100)
                     actual_fill_qty = min(exit_qty, int(available_size))
@@ -438,18 +459,22 @@ class OrchestratorExecution:
                     self.orch.accounting._process_exit_accounting(sym, st, actual_fill_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0, original_position=original_position)
                 else:
                     asyncio.create_task(self._smart_exit_order(sym, real_contract, exit_qty, raw_price, stock_price, curr_ts=curr_ts, is_force=is_urgent, bid=bid, ask=ask, reason=reason))
-            finally:
-                if not TRADING_ENABLED:
-                    st.is_pending = False
-        
-        self.orch.state_manager.save_state()
+                    return # 监控异步处理
+        finally:
+            if not (self.orch.mode == 'realtime' and TRADING_ENABLED):
+                st.is_pending = False
+            self.orch.state_manager.save_state()
 
-    async def _iceberg_open_order(self, sym, sig, stock_price, curr_ts, target_total_qty, chunks, fill_price, total_est_cost, total_est_comm):
+    async def _smart_entry_order(self, sym, sig, stock_price, curr_ts, target_total_qty, chunks, fill_price, total_est_cost, total_est_comm):
         st = self.orch.states.get(sym)
         if not st: return
         
+        # 🚀 [Ghost A Protections]
+        MAX_ICEBERG_DURATION = 3.0     # 子单熔断超时
+        MAX_SLIPPAGE_TOLERANCE = 0.02 # 滑点熔断阈值 (2%)
+        
         try:
-            logger.info(f"🧊 [Iceberg Start] {sym} 开始执行冰山拆单...")
+            logger.info(f"🧊 [Iceberg Start] {sym} 开始执行冰山拆单 (Ghost A Protection Enabled)...")
             if target_total_qty < 1: return
                 
             base_chunk_qty = target_total_qty // chunks
@@ -459,19 +484,17 @@ class OrchestratorExecution:
             real_contract = None
             if hasattr(self.orch.ibkr, 'locked_contracts'):
                 real_contract = self.orch.ibkr.locked_contracts.get(sym, {}).get(tag)
-            if not real_contract:
-                from ib_insync import Contract
-                real_contract = Contract()
-                real_contract.secType = 'OPT'; real_contract.symbol = sym
-                real_contract.localSymbol = sig.get('meta', {}).get('contract_id', '')
-                real_contract.exchange = 'SMART'; real_contract.currency = 'USD'
-                
+            
             total_qty_filled = 0
             total_actual_cost = 0.0
             total_actual_comm = 0.0
             iceberg_start_time = time.time()
             
             for i in range(chunks):
+                if time.time() - iceberg_start_time > 15.0: # 总拆单不能过长 (15s)
+                    logger.warning(f"🧊 [Iceberg Melt] {sym} 拆单总耗时过长，强制熔断结算。")
+                    break
+
                 chunk_num = i + 1
                 qty_this_chunk = base_chunk_qty + (1 if i < remainder_qty else 0)
                 if qty_this_chunk < 1: continue
@@ -489,28 +512,33 @@ class OrchestratorExecution:
                         total_actual_comm += chunk_est_comm
                     continue
                     
-                wait_step = 1
-                max_wait = 15 
-                for _ in range(max_wait // wait_step):
-                    await asyncio.sleep(wait_step)
-                    if trade.orderStatus.status == 'Filled': break
-                    
+                # [Ghost A] 3秒极速等待，超时不候
+                try:
+                    await asyncio.wait_for(self._wait_for_fill(trade), timeout=MAX_ICEBERG_DURATION)
+                except asyncio.TimeoutError:
+                    logger.warning(f"🧊 [Iceberg Timeout] {sym} 子单 {chunk_num} 超时，执行 Melt 熔断。")
+                    if hasattr(self.orch.ibkr, 'ib'): 
+                        self.orch.ib.cancelOrder(trade.order)
+                    await asyncio.sleep(0.5)
+
                 filled_qty = int(trade.orderStatus.filled)
                 avg_fill_price = float(trade.orderStatus.avgFillPrice) if trade.orderStatus.avgFillPrice else float(limit_price)
                 
-                if trade.orderStatus.status != 'Filled':
-                    if hasattr(self.orch.ibkr, 'ib'): self.orch.ib.cancelOrder(trade.order)
-                    await asyncio.sleep(2)  
-                    filled_qty = int(trade.orderStatus.filled)
-                    avg_fill_price = float(trade.orderStatus.avgFillPrice) if trade.orderStatus.avgFillPrice else float(limit_price)
-                
+                # [Ghost A] 价格偏离熔断
+                if avg_fill_price > limit_price * (1 + MAX_SLIPPAGE_TOLERANCE):
+                    logger.warning(f"🧊 [Iceberg Slippage] {sym} 价格跳涨过快 ({avg_fill_price} > {limit_price}), 直接熔断！")
+                    total_qty_filled += filled_qty
+                    break
+
                 total_qty_filled += filled_qty
                 total_actual_cost += filled_qty * avg_fill_price * 100
                 total_actual_comm += filled_qty * COMMISSION_PER_CONTRACT
                 
+                if total_qty_filled >= target_total_qty:
+                    break
+
                 if chunk_num < chunks:
-                    import random
-                    await asyncio.sleep(random.uniform(5.0, 10.0) if TRADING_ENABLED else random.uniform(0.5, 1.5))
+                    await asyncio.sleep(0.5) # 降低间隔，加速成交
 
             unspent_cash = (total_est_cost + total_est_comm) - (total_actual_cost + total_actual_comm)
             self.orch.mock_cash += unspent_cash
@@ -523,25 +551,17 @@ class OrchestratorExecution:
                 st.opt_type = 'call' if st.position == 1 else 'put'
                 st.entry_ts = curr_ts
                 st.entry_spy_roc = sig.get('meta', {}).get('spy_roc', 0.0)
+                st.entry_index_trend = sig.get('meta', {}).get('index_trend', 0)
+                st.entry_alpha_z = sig.get('meta', {}).get('alpha_z', 0.0)
+                st.entry_iv = sig.get('meta', {}).get('iv', st.last_valid_iv)
                 st.max_roi = 0.0
-                alpha_label_ts = sig.get('meta', {}).get('alpha_label_ts', 0.0)
-                alpha_available_ts = sig.get('meta', {}).get('alpha_available_ts', curr_ts)
-                fill_ts = time.time()
-                timing_fields = self._build_timing_fields(alpha_label_ts, alpha_available_ts, iceberg_start_time, fill_ts)
+                st.contract_id = sig.get('meta', {}).get('contract_id', '')
                 
+                fill_ts = time.time()
                 self.orch.accounting._process_open_accounting(
-                    sym,
-                    st,
-                    total_qty_filled,
-                    st.entry_price,
-                    stock_price,
-                    fill_ts,
-                    sig,
-                    duration=fill_ts - iceberg_start_time,
-                    ratio=(total_qty_filled / target_total_qty),
-                    timing_fields=timing_fields,
-                    mode_override='REALTIME',
-                    note_suffix=f"|ICEB_{chunks}",
+                    sym, st, total_qty_filled, st.entry_price, stock_price, fill_ts, sig,
+                    duration=fill_ts - iceberg_start_time, ratio=(total_qty_filled / target_total_qty),
+                    mode_override='REALTIME', note_suffix=f"|GHOST_A_{chunks}",
                 )
             else:
                 self._reset_failed_entry_state(st)
@@ -550,8 +570,16 @@ class OrchestratorExecution:
             logger.error(f"🚨 [Iceberg Error] {sym}: {e}", exc_info=True)
         finally:
             st.locked_cash = 0  
-            st.is_pending = False
+            st.is_pending = False # [Ghost C]
             self.orch.state_manager.save_state()
+
+    async def _wait_for_fill(self, trade):
+        """Helper to wait for trade fill status"""
+        while trade.orderStatus.status not in ['Filled', 'Cancelled', 'Inactive']:
+            await asyncio.sleep(0.5)
+            if trade.orderStatus.status == 'Filled':
+                return True
+        return trade.orderStatus.status == 'Filled'
 
     async def _monitor_realtime_order(self, sym, trade, real_contract, cost, commission, expected_qty, start_time, limit_price, stock_price, sig, st):
         """实盘超时看门狗"""
@@ -764,7 +792,8 @@ class OrchestratorExecution:
                 idx = symbols.index(sym) if in_batch else -1
                 curr_stock = float(stock_prices[idx]) if in_batch else st.entry_stock
                 
-                if self.orch.mode == 'backtest' or SYNC_EXECUTION:
+                is_simulated_env = (self.orch.mode == 'backtest' or os.environ.get('RUN_MODE') == 'LIVEREPLAY')
+                if is_simulated_env or SYNC_EXECUTION:
                     if in_batch:
                         opt_data = self.orch._get_opt_data_backtest(batch, idx, sym, st)
                         raw_price = self.orch._get_fair_market_price(
