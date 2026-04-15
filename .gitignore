@@ -162,3 +162,5 @@ replay_diag_log.txt
 replay_final_audit.txt
 replay_0105_audit.txt
 replay_0108_audit.txt
+production/preprocess/backtest/tools/archive.zip
+*.zip
