@@ -12,7 +12,8 @@ from config import (
     COMMISSION_PER_CONTRACT, MAX_POSITIONS, POSITION_RATIO, MAX_TRADE_CAP, 
     GLOBAL_EXPOSURE_LIMIT, SLIPPAGE_ENTRY_PCT, SLIPPAGE_EXIT_PCT, 
     EXIT_ORDER_TYPE, TRADING_ENABLED, IS_LIVEREPLAY,
-    DISABLE_ICEBERG, SYNC_EXECUTION, BACKTEST_1S_DISABLE_ICEBERG
+    DISABLE_ICEBERG, SYNC_EXECUTION, BACKTEST_1S_DISABLE_ICEBERG,
+    ENTRY_MAX_REQUOTE_SLIPPAGE_PCT
 )
 from liquidity_rules import LiquidityRiskManager
 
@@ -31,6 +32,20 @@ class OrchestratorExecution:
             return datetime.fromtimestamp(float(ts), tz=timezone('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')
         except Exception:
             return ""
+
+    def _cfg_value(self, key, default):
+        cfg = getattr(self.orch, 'cfg', None)
+        if cfg is None:
+            return default
+        return getattr(cfg, key, default)
+
+    def _entry_requote_cap_price(self, reference_price: float) -> float:
+        ref = float(reference_price or 0.0)
+        if ref <= 0.0:
+            return float("inf")
+        cap_pct = float(self._cfg_value("ENTRY_MAX_REQUOTE_SLIPPAGE_PCT", ENTRY_MAX_REQUOTE_SLIPPAGE_PCT))
+        cap_pct = max(0.0, cap_pct)
+        return ref * (1.0 + cap_pct)
 
     @staticmethod
     def _build_timing_fields(alpha_label_ts: float, alpha_available_ts: float, order_submit_ts: float, fill_ts: float) -> dict:
@@ -81,26 +96,28 @@ class OrchestratorExecution:
         ibkr_mod = getattr(getattr(self.orch, 'ibkr', None), '__module__', '') or ''
         return BACKTEST_1S_DISABLE_ICEBERG and 'mock_ibkr_historical_1s' in ibkr_mod
 
-    @staticmethod
-    def _get_entry_limit_price(sig, base_price, attempt_no=0):
+    def _get_entry_limit_price(self, sig, base_price, attempt_no=0):
         bid = float(sig.get('meta', {}).get('bid', 0.0) or 0.0)
         ask = float(sig.get('meta', {}).get('ask', 0.0) or 0.0)
         base_price = float(base_price or 0.0)
+        limit_buffer_entry = float(self._cfg_value('LIMIT_BUFFER_ENTRY', config.LIMIT_BUFFER_ENTRY))
 
         if bid > 0.0 and ask > 0.0 and ask >= bid:
             mid = (bid + ask) / 2.0
             improvement = min(0.01 * max(attempt_no, 0), max((ask - mid), 0.0))
-            return round(min(mid + 0.02 + improvement, ask), 2)
+            return round(min(mid * limit_buffer_entry + improvement, ask), 2)
 
         if base_price <= 0.0:
             return 0.0
-        return round(base_price * (1 + (0.005 * max(attempt_no, 0))), 2)
+        fallback_buf = max(limit_buffer_entry, 1.0)
+        requote_step = 0.005 * max(attempt_no, 0)
+        return round(base_price * (fallback_buf + requote_step), 2)
 
-    @staticmethod
-    def _get_exit_limit_price(base_price, bid=0.0, ask=0.0, is_urgent=False, attempt_no=0):
+    def _get_exit_limit_price(self, base_price, bid=0.0, ask=0.0, is_urgent=False, attempt_no=0):
         bid = float(bid or 0.0)
         ask = float(ask or 0.0)
         base_price = float(base_price or 0.0)
+        limit_buffer_exit = float(self._cfg_value('LIMIT_BUFFER_EXIT', config.LIMIT_BUFFER_EXIT))
 
         if bid > 0.01:
             if is_urgent:
@@ -112,8 +129,10 @@ class OrchestratorExecution:
 
         if base_price <= 0.0:
             return 0.01
-        discount = 0.005 * max(attempt_no, 0)
-        return round(max(base_price * (1 - discount), 0.01), 2)
+        requote_discount = 0.005 * max(attempt_no, 0)
+        base_discount = max(0.0, 1.0 - limit_buffer_exit)
+        total_discount = base_discount + requote_discount
+        return round(max(base_price * (1 - total_discount), 0.01), 2)
 
     async def _execute_entry(self, sym, sig, stock_price, curr_ts, batch_idx):
         st = self.orch.states[sym]
@@ -161,11 +180,16 @@ class OrchestratorExecution:
             from config import INITIAL_ACCOUNT
             self.orch.mock_cash = float(INITIAL_ACCOUNT)
 
+        position_ratio = float(self._cfg_value('POSITION_RATIO', POSITION_RATIO))
+        global_exposure_limit = float(self._cfg_value('GLOBAL_EXPOSURE_LIMIT', GLOBAL_EXPOSURE_LIMIT))
+        max_trade_cap = float(self._cfg_value('MAX_TRADE_CAP', MAX_TRADE_CAP))
+        commission_per_contract = float(self._cfg_value('COMMISSION_PER_CONTRACT', COMMISSION_PER_CONTRACT))
+
         bot_total_capital = self.orch.mock_cash + locked_cash_by_bot
-        raw_alloc = bot_total_capital * POSITION_RATIO
-        max_exposure = bot_total_capital * GLOBAL_EXPOSURE_LIMIT
+        raw_alloc = bot_total_capital * position_ratio
+        max_exposure = bot_total_capital * global_exposure_limit
         remaining_quota = max_exposure - locked_cash_by_bot
-        final_alloc = min(raw_alloc, remaining_quota, self.orch.mock_cash, MAX_TRADE_CAP)
+        final_alloc = min(raw_alloc, remaining_quota, self.orch.mock_cash, max_trade_cap)
         
         if final_alloc < 200: return
         
@@ -203,13 +227,13 @@ class OrchestratorExecution:
         # 🚀 [架构对齐 1] S4 和 Pitcher 统一使用纯净原价进行资金分配与数量计算
         fill_price = price
 
-        cost_per_contract = (fill_price * 100) + COMMISSION_PER_CONTRACT
+        cost_per_contract = (fill_price * 100) + commission_per_contract
         target_qty = int(final_alloc // cost_per_contract)
         
         if target_qty < 1: return
         
         total_est_cost = target_qty * fill_price * 100
-        total_est_comm = target_qty * COMMISSION_PER_CONTRACT
+        total_est_comm = target_qty * commission_per_contract
         
         # 扣款
         self.orch.mock_cash -= (total_est_cost + total_est_comm)
@@ -264,7 +288,8 @@ class OrchestratorExecution:
             timing_fields = self._build_timing_fields(alpha_label_ts, alpha_available_ts, order_submit_ts, fill_ts)
             
             # 🚀 [架构对齐 2] 统一计算包含滑点的最终成交价
-            simulated_fill_price = round(fill_price * (1 + SLIPPAGE_ENTRY_PCT), 2)
+            slippage_entry_pct = float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value('SLIPPAGE_ENTRY_PCT', SLIPPAGE_ENTRY_PCT)))
+            simulated_fill_price = round(fill_price * (1 + slippage_entry_pct), 2)
             
             contract = type('MockContract', (), {'symbol': sym, 'localSymbol': st.contract_id, 'tag': sig['tag'], 'secType': 'OPT'})()
             
@@ -303,9 +328,17 @@ class OrchestratorExecution:
             # 🚀 [修复 3] 执行完毕后立刻释放 pending 锁，形成完美闭环！
             st.is_pending = False
         elif self.orch.mode == 'realtime' and not SYNC_EXECUTION:
+            trade = None
             try:    
                 limit_price = self._get_entry_limit_price(sig, fill_price, attempt_no=0)
                 if limit_price < 0.05:
+                    return
+                entry_ref_price = float(sig.get('price', fill_price) or fill_price or 0.0)
+                cap_price = self._entry_requote_cap_price(entry_ref_price)
+                if limit_price > cap_price:
+                    logger.warning(
+                        f"🛑 [Entry Cap] {sym} 初始限价 {limit_price:.4f} 超过追价上限 {cap_price:.4f}，中止开仓。"
+                    )
                     return
                 
                 # Removing redundant limit_price override as fairness is now standard
@@ -349,7 +382,8 @@ class OrchestratorExecution:
                     from config import TRADING_ENABLED, IS_LIVEREPLAY
                     if not TRADING_ENABLED:
                         logger.info(f"ℹ️ {sym} 开仓被拦截 (DRY RUN 极速结算)。")
-                        simulated_fill_price = round(limit_price * (1 + SLIPPAGE_ENTRY_PCT), 2)
+                        slippage_entry_pct = float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value('SLIPPAGE_ENTRY_PCT', SLIPPAGE_ENTRY_PCT)))
+                        simulated_fill_price = round(limit_price * (1 + slippage_entry_pct), 2)
                         st.entry_price = simulated_fill_price  
                         
                         log_ts = curr_ts if IS_LIVEREPLAY else time.time()
@@ -373,7 +407,7 @@ class OrchestratorExecution:
                         self._reset_failed_entry_state(st)
             finally:
                 # 只有在非监控模式下才在这里释放
-                if not (self.orch.mode == 'realtime' and trade):
+                if not (self.orch.mode == 'realtime' and trade is not None):
                     st.is_pending = False
                     
         self.orch.state_manager.save_state()
@@ -420,7 +454,8 @@ class OrchestratorExecution:
             if is_simulated_env or SYNC_EXECUTION:
                 # 在同步比对模式下，必须假设无限流动性，否则状态机必分叉！
                 actual_fill_qty = exit_qty 
-                final_price = round(raw_price * (1 - SLIPPAGE_EXIT_PCT), 2)
+                slippage_exit_pct = float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value('SLIPPAGE_EXIT_PCT', SLIPPAGE_EXIT_PCT)))
+                final_price = round(raw_price * (1 - slippage_exit_pct), 2)
                 final_price = max(final_price, 0.01)
                 
                 # 🚀 [Bug2 修复] 从信号中恢复原始方向，防止共享内存下 st.position 已被 SE 清零
@@ -451,11 +486,13 @@ class OrchestratorExecution:
                 original_position = sig.get('original_position', st.position)
                 
                 if not TRADING_ENABLED:
-                    available_size = sig.get('bid_size', 100) if original_position == 1 else sig.get('ask_size', 100)
+                    # SELL 平仓始终吃买盘深度；bid_size 缺失时回退 ask_size。
+                    available_size = sig.get('bid_size', sig.get('ask_size', 100))
                     actual_fill_qty = min(exit_qty, int(available_size))
                     if actual_fill_qty <= 0: return 
                     
-                    simulated_exit_price = max(round(raw_price * (1 - SLIPPAGE_EXIT_PCT), 2), 0.01)
+                    slippage_exit_pct = float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value('SLIPPAGE_EXIT_PCT', SLIPPAGE_EXIT_PCT)))
+                    simulated_exit_price = max(round(raw_price * (1 - slippage_exit_pct), 2), 0.01)
                     self.orch.accounting._process_exit_accounting(sym, st, actual_fill_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0, original_position=original_position)
                 else:
                     asyncio.create_task(self._smart_exit_order(sym, real_contract, exit_qty, raw_price, stock_price, curr_ts=curr_ts, is_force=is_urgent, bid=bid, ask=ask, reason=reason))
@@ -476,6 +513,7 @@ class OrchestratorExecution:
         try:
             logger.info(f"🧊 [Iceberg Start] {sym} 开始执行冰山拆单 (Ghost A Protection Enabled)...")
             if target_total_qty < 1: return
+            commission_per_contract = float(self._cfg_value('COMMISSION_PER_CONTRACT', COMMISSION_PER_CONTRACT))
                 
             base_chunk_qty = target_total_qty // chunks
             remainder_qty = target_total_qty % chunks
@@ -501,7 +539,7 @@ class OrchestratorExecution:
                 
                 limit_price = fill_price  
                 chunk_est_cost = qty_this_chunk * limit_price * 100
-                chunk_est_comm = qty_this_chunk * COMMISSION_PER_CONTRACT
+                chunk_est_comm = qty_this_chunk * commission_per_contract
                 
                 trade = self.orch.ibkr.place_option_order(real_contract, 'BUY', qty_this_chunk, 'LMT', lmt_price=limit_price, custom_time=curr_ts)
                 
@@ -532,7 +570,7 @@ class OrchestratorExecution:
 
                 total_qty_filled += filled_qty
                 total_actual_cost += filled_qty * avg_fill_price * 100
-                total_actual_comm += filled_qty * COMMISSION_PER_CONTRACT
+                total_actual_comm += filled_qty * commission_per_contract
                 
                 if total_qty_filled >= target_total_qty:
                     break
@@ -584,13 +622,16 @@ class OrchestratorExecution:
     async def _monitor_realtime_order(self, sym, trade, real_contract, cost, commission, expected_qty, start_time, limit_price, stock_price, sig, st):
         """实盘超时看门狗"""
         try:
-            max_attempts = 3
-            wait_per_attempt = 10
+            commission_per_contract = float(self._cfg_value('COMMISSION_PER_CONTRACT', COMMISSION_PER_CONTRACT))
+            max_attempts = max(1, int(self._cfg_value('ORDER_MAX_RETRIES', config.ORDER_MAX_RETRIES)))
+            wait_per_attempt = max(1, int(self._cfg_value('ORDER_TIMEOUT_SECONDS', config.ORDER_TIMEOUT_SECONDS)))
             total_filled_qty = 0
             total_actual_cost = 0.0
             remaining_qty = int(expected_qty)
             current_trade = trade
             current_limit_price = float(limit_price)
+            entry_ref_price = float(sig.get('price', limit_price) or limit_price or 0.0)
+            cap_price = self._entry_requote_cap_price(entry_ref_price)
 
             for attempt_no in range(max_attempts):
                 for _ in range(wait_per_attempt):
@@ -621,6 +662,11 @@ class OrchestratorExecution:
                 current_limit_price = self._get_entry_limit_price(sig, current_limit_price, attempt_no=attempt_no + 1)
                 if current_limit_price < 0.05:
                     break
+                if current_limit_price > cap_price:
+                    logger.warning(
+                        f"🛑 [Entry Requote Cap] {sym} 追价 {current_limit_price:.4f} 超过上限 {cap_price:.4f}，停止追价。"
+                    )
+                    break
 
                 next_trade = self.orch.ibkr.place_option_order(
                     real_contract,
@@ -636,7 +682,7 @@ class OrchestratorExecution:
                     break
                 current_trade = next_trade
 
-            actual_commission = total_filled_qty * COMMISSION_PER_CONTRACT
+            actual_commission = total_filled_qty * commission_per_contract
             refund = (cost + commission) - (total_actual_cost + actual_commission)
             self.orch.mock_cash += refund
             
@@ -676,16 +722,20 @@ class OrchestratorExecution:
         start_time = time.time() 
         
         try:
-            if EXIT_ORDER_TYPE == 'MKT':
+            slippage_exit_pct = float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value('SLIPPAGE_EXIT_PCT', SLIPPAGE_EXIT_PCT)))
+            configured_exit_order_type = str(self._cfg_value('EXIT_ORDER_TYPE', EXIT_ORDER_TYPE)).upper()
+            max_attempts = max(1, int(self._cfg_value('ORDER_MAX_RETRIES', config.ORDER_MAX_RETRIES)))
+            order_timeout_seconds = max(1, int(self._cfg_value('ORDER_TIMEOUT_SECONDS', config.ORDER_TIMEOUT_SECONDS)))
+
+            if configured_exit_order_type == 'MKT':
                 trade = self.orch.ibkr.place_option_order(real_contract, 'SELL', total_qty, 'MKT', base_price, custom_time=curr_ts, reason=reason)
                 if not trade: 
-                    simulated_exit_price = max(round(base_price * (1 - SLIPPAGE_EXIT_PCT), 2), 0.01)
+                    simulated_exit_price = max(round(base_price * (1 - slippage_exit_pct), 2), 0.01)
                     self.orch.accounting._process_exit_accounting(sym, st, total_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0)
                 return
                 
             is_urgent = is_force or any(keyword in reason for keyword in ["STOP", "FLIP", "EOD", "FORCE"])
-            max_attempts = 3
-            wait_per_attempt = 8 if is_urgent else 12
+            wait_per_attempt = max(1, order_timeout_seconds // 2) if is_urgent else order_timeout_seconds
             remaining_qty = int(total_qty)
             total_filled_qty = 0
             total_exit_value = 0.0
@@ -693,7 +743,7 @@ class OrchestratorExecution:
             limit_sell_price = self._get_exit_limit_price(base_price, bid=bid, ask=ask, is_urgent=is_urgent, attempt_no=0)
             current_trade = self.orch.ibkr.place_option_order(real_contract, 'SELL', remaining_qty, 'LMT', lmt_price=limit_sell_price, custom_time=curr_ts, reason=reason)
             if not current_trade:
-                 simulated_exit_price = max(round(limit_sell_price * (1 - SLIPPAGE_EXIT_PCT), 2), 0.01)
+                 simulated_exit_price = max(round(limit_sell_price * (1 - slippage_exit_pct), 2), 0.01)
                  self.orch.accounting._process_exit_accounting(sym, st, total_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0)
                  return
 
@@ -814,7 +864,8 @@ class OrchestratorExecution:
                         if raw_price < 0.05:
                             raw_price = st.entry_price if st.entry_price > 0 else 0.01
 
-                    final_p = max(round(raw_price * (1 - SLIPPAGE_EXIT_PCT), 2), 0.01)
+                    slippage_exit_pct = float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value('SLIPPAGE_EXIT_PCT', SLIPPAGE_EXIT_PCT)))
+                    final_p = max(round(raw_price * (1 - slippage_exit_pct), 2), 0.01)
                     self.orch.accounting._process_exit_accounting(sym, st, st.qty, final_p, curr_stock, custom_ts, f"FORCE_{reason}", 0.0, 1.0)
                     if hasattr(self.orch.ibkr, 'place_option_order'):
                         contract = type('MockContract', (), {'symbol': sym, 'localSymbol': st.contract_id, 'tag': 'EXIT', 'secType': 'OPT'})()
@@ -822,7 +873,8 @@ class OrchestratorExecution:
                 else:
                     st.is_pending = True 
                     if not TRADING_ENABLED:
-                        sim_exit = max(round(raw_price * (1 - SLIPPAGE_EXIT_PCT), 2), 0.01)
+                        slippage_exit_pct = float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value('SLIPPAGE_EXIT_PCT', SLIPPAGE_EXIT_PCT)))
+                        sim_exit = max(round(raw_price * (1 - slippage_exit_pct), 2), 0.01)
                         self.orch.accounting._process_exit_accounting(sym, st, st.qty, sim_exit, curr_stock, custom_ts, f"FORCE_{reason}", 0.0, 1.0)
                         st.is_pending = False
                     else:

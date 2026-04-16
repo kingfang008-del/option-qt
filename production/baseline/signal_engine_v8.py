@@ -40,6 +40,8 @@ from scipy.stats import norm
 import sys, os
 MODEL_DIR = os.path.join(os.path.dirname(__file__), '../model')
 if MODEL_DIR not in sys.path: sys.path.insert(0, MODEL_DIR)
+DAO_DIR = os.path.join(os.path.dirname(__file__), 'DAO')
+if DAO_DIR not in sys.path: sys.path.insert(0, DAO_DIR)
 
 # 引入纯策略核心
 from strategy_selector import ACTIVE_STRATEGY_CORE_VERSION, StrategyCore, StrategyConfig
@@ -49,6 +51,7 @@ from orchestrator_state_manager import OrchestratorStateManager
 from orchestrator_accounting import OrchestratorAccounting
 from orchestrator_execution import OrchestratorExecution
 from orchestrator_reconciler import OrchestratorReconciler
+from fcs_market_profile import build_market_profile
 
 from utils import serialization_utils as ser
 
@@ -459,6 +462,17 @@ class SignalEngineV8:
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"DEBUG: Device: {self.device}")
+        profile_name = os.environ.get("MARKET_PROFILE", "equity_us")
+        warmup_len = int(os.environ.get("FCS_WARMUP_REQUIRED_LEN", "31"))
+        self.market_profile = build_market_profile(
+            profile_name,
+            ny_tz=timezone('America/New_York'),
+            warmup_required_len=warmup_len,
+            non_tradable_symbols=NON_TRADABLE_SYMBOLS,
+        )
+        self.non_tradable_symbols = self.market_profile.get_non_tradable_set()
+        self.alpha_norm_exclude_symbols = set(ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS) | self.non_tradable_symbols
+        logger.info(f"🧭 Signal Market Profile: {self.market_profile.name}")
 
         # [Fix] 提前将模型属性初始化为 None
         # 若 _load_models 因路径缺失或 import 失败未执行，process_batch 可以给出明确报错而非 AttributeError
@@ -678,33 +692,7 @@ class SignalEngineV8:
         
         start_dt = datetime.fromtimestamp(start_ts, tz=timezone('America/New_York'))
         end_dt = datetime.fromtimestamp(end_ts, tz=timezone('America/New_York'))
-        
-        minutes = 0.0
-        curr = start_dt
-        ny_tz = timezone('America/New_York')
-        while curr.date() <= end_dt.date():
-            # 获取当日开收盘时间 (使用 localize 避免 DST 陷阱)
-            market_open = ny_tz.localize(datetime.combine(curr.date(), dt_time(9, 30)))
-            market_close = ny_tz.localize(datetime.combine(curr.date(), dt_time(16, 0)))
-            
-            # 排除周末
-            if curr.weekday() >= 5: 
-                curr += timedelta(days=1)
-                curr = curr.replace(hour=9, minute=30)
-                continue
-                
-            # 计算当日有效区间
-            daily_start = max(curr, market_open)
-            daily_end = min(end_dt, market_close)
-            
-            if daily_start < daily_end:
-                diff = (daily_end - daily_start).total_seconds() / 60.0
-                minutes += diff
-            
-            curr += timedelta(days=1)
-            curr = curr.replace(hour=9, minute=30)
-            
-        return max(0.0, minutes)
+        return float(self.market_profile.calc_effective_minutes(start_dt, end_dt))
 
 
 
@@ -1108,7 +1096,7 @@ class SignalEngineV8:
 
         # Alpha & Vol 缩放
         vol_z_dict = metrics_batch.get('vol_z_dict', {})
-        if sym in NON_TRADABLE_SYMBOLS:
+        if sym in self.non_tradable_symbols:
             if sym in vol_z_dict:
                 try:
                     st.last_vol_z = float(vol_z_dict[sym])
@@ -1934,7 +1922,8 @@ class SignalEngineV8:
             return
 
         # 🚀 以下逻辑仅在分钟整点运行 🚀
-        if not use_precalc_feed and not bool(batch.get('is_warmed_up', False)):
+        allow_dry_alpha_during_warmup = (os.environ.get('RUN_MODE', '').upper() == 'REALTIME_DRY')
+        if not use_precalc_feed and not bool(batch.get('is_warmed_up', False)) and not allow_dry_alpha_during_warmup:
             if getattr(self, '_warmup_gate_log_count', 0) < 10:
                 logger.info(
                     f"⏳ [SE-Warmup-Gate] Skip inference at {ny_now.strftime('%H:%M:%S')} "
@@ -1946,6 +1935,13 @@ class SignalEngineV8:
                 self._warmup_gate_log_count = getattr(self, '_warmup_gate_log_count', 0) + 1
             await self._oms_sync(curr_ts, frame_id=frame_id)
             return
+        elif allow_dry_alpha_during_warmup and not bool(batch.get('is_warmed_up', False)):
+            if getattr(self, '_dry_warmup_bypass_log_count', 0) < 10:
+                logger.info(
+                    f"🧪 [SE-Dry-Warmup-Bypass] Continue alpha emission in REALTIME_DRY "
+                    f"| real_history_len={batch.get('real_history_len', 0)}/{batch.get('warmup_required_len', 31)}"
+                )
+                self._dry_warmup_bypass_log_count = getattr(self, '_dry_warmup_bypass_log_count', 0) + 1
         
         # 3. 记录行情数据 (为 Alpha 日志准备时间戳)
         # 🚀 [Surgery 24] 逻辑时间戳对齐：如果是整分结算，强制用 ts (逻辑上代表的那一分钟)，否则用 log_ts (物理时间)
@@ -1996,7 +1992,7 @@ class SignalEngineV8:
 
         # 7. 自适应归一化 (仅在分钟边界更新均值/标差)
         # 🚀 [Parity Fix] 排除指数标的 (SPY, QQQ, VIXY) 对截面均值的污染，确保与 1m 离线基准对齐
-        exclude_indices = {i for i, s in enumerate(symbols) if s in ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS}
+        exclude_indices = {i for i, s in enumerate(symbols) if s in self.alpha_norm_exclude_symbols}
         valid_alphas = [a for i, a in enumerate(raw_alphas) if i not in exclude_indices]
         
         if valid_alphas:
@@ -2021,14 +2017,25 @@ class SignalEngineV8:
         # 8. 波动率 Z-Score 与 市场状态判定
         # 优先消费上游 FCS 已计算好的分钟事实，避免下游二次递推产生路径漂移。
         vol_z_dict = batch.get('vol_z_dict')
-        if isinstance(vol_z_dict, dict) and vol_z_dict:
+        use_upstream_volz = isinstance(vol_z_dict, dict) and bool(vol_z_dict)
+        if use_upstream_volz:
+            valid_vals = []
             for s_v, v_v in vol_z_dict.items():
                 try:
-                    self.cached_vol_z[s_v] = float(v_v)
+                    fv = float(v_v)
+                    if np.isfinite(fv):
+                        valid_vals.append(abs(fv))
+                    self.cached_vol_z[s_v] = fv
                     if s_v in self.states:
-                        self.states[s_v].last_vol_z = float(v_v)
+                        self.states[s_v].last_vol_z = fv
                 except Exception:
                     pass
+            # 质量兜底：若上游 vol_z_dict 退化为全 0（或全部无效），则本地重算，避免 alpha_logs 全量写 0。
+            if (not valid_vals) or (max(valid_vals) < 1e-9):
+                if getattr(self, '_volz_fallback_log_count', 0) < 10:
+                    logger.warning("⚠️ [VolZ-Fallback] Upstream vol_z_dict is degenerate(all-zero/invalid), recomputing locally.")
+                    self._volz_fallback_log_count = getattr(self, '_volz_fallback_log_count', 0) + 1
+                vol_z_dict = self._update_volatility_metrics(batch, symbols)
         else:
             vol_z_dict = self._update_volatility_metrics(batch, symbols)
 
@@ -2353,11 +2360,7 @@ class SignalEngineV8:
             self.last_pnl_report_ts = curr_ts
         
         # 交易时间过滤
-        market_open = dt_time(9, 30)
-        market_close = dt_time(16, 0)
-        current_time = ny_now.time()
-        
-        if current_time < market_open or current_time > market_close:
+        if not self.market_profile.is_rth_minute(ny_now):
             has_position = any(st.position != 0 for st in self.states.values())
             if not has_position:
                 return None, None
@@ -2419,12 +2422,13 @@ class SignalEngineV8:
     # ================= 新增：从 OMS 同步真实账本的方法 =================
     def _sync_state_from_oms(self):
         """[核心解耦] 每次评估前，从 OMS 获取最真实的仓位与成本"""
+        is_simulated_runtime = bool(IS_SIMULATED)
+        is_backtest_runtime = bool(IS_BACKTEST)
         if getattr(self, 'use_shared_mem', False):
             # 🚀 [Parity Fix] 在 S4 单进程回测或秒级同步模式下，绝对禁止主动清空 is_pending
             # 该标志位必须由 ExecutionEngine 在处理完信号后亲自清空。
             # 如果在这里清零，会导致同一分钟内的后续秒级 Tick 重复发单，造成严重的风控拒单风暴。
-            from config import IS_BACKTEST, IS_SIMULATED
-            if IS_BACKTEST or IS_SIMULATED or os.environ.get('RUN_MODE') == 'LIVEREPLAY':
+            if is_backtest_runtime or is_simulated_runtime or os.environ.get('RUN_MODE') == 'LIVEREPLAY':
                 return
                 
             # 只有在非回放的实时共享内存模式下，才保留这种“强制解锁”自救机制。
@@ -2487,7 +2491,7 @@ class SignalEngineV8:
                 # 如果是刚刚发出的 BUY 指令，OMS 还没来得及确认，我们容忍几帧
                 if getattr(st, 'is_pending', False) and getattr(st, 'pending_action', '') == 'BUY':
                      
-                    threshold = 0 if IS_SIMULATED else 3
+                    threshold = 0 if is_simulated_runtime else 3
                     st._pending_frames = getattr(st, '_pending_frames', 0) + 1
                     if st._pending_frames > threshold:
                         logger.debug(f"🚨 [SE_SYNC] Rejected by OMS for {sym}! Releasing lock.")
@@ -2592,8 +2596,7 @@ class SignalEngineV8:
                     # 2. 有持仓需要保护
                     # 非交易时段 (开盘前/收盘后) 的数据断流是正常现象，不应误触发撤单
                     ny_now_hb = datetime.fromtimestamp(time.time(), tz=timezone('America/New_York'))
-                    ny_time_hb = ny_now_hb.time()
-                    is_rth = dt_time(9, 30) <= ny_time_hb <= dt_time(16, 0)
+                    is_rth = bool(self.market_profile.is_rth_minute(ny_now_hb))
                     has_open_positions = any(st.position != 0 for st in self.states.values())
                     
                     if is_rth and has_open_positions:

@@ -135,44 +135,75 @@ class RealTimeFeatureEngine:
 
     def _sync_risk_free_rates(self, force=False):
         """
-        [Ghost Fix] 每日自动从 FRED 更新 3M 美债利率。
-        逻辑：本地存在则先删除，确保加载的是当日最新数据。
+        每日从 FRED 拉取 3M 美债利率 (DGS3MO)。
+
+        - 下载成功且数据非空 → 原子写入 parquet (tmp → rename)，更新内存锁。
+        - 下载失败 / 数据为空 / 列缺失 → 直接 raise RuntimeError，由上游中断；
+          绝不回退到 0.045 这类静态默认值（会污染 Greeks 口径）。
+        - 失败时 **不** 更新 `_last_rfr_sync_date`，允许下一条 tick 触发重试。
         """
-        # 🚀 [Parity Fix] 多路径探测，支持 Dev 和 Prod 环境
+        # 多路径探测可写目录
         possible_dirs = ['/home/kingfang007', os.getcwd()]
         rfr_dir = next((d for d in possible_dirs if os.path.exists(d) and os.access(d, os.W_OK)), os.getcwd())
         rfr_file = os.path.join(rfr_dir, 'risk_free_rates.parquet')
-        
-        # 1. 检查今日是否已同步 (内存锁)
+
         today_str = datetime.now(pytz.timezone('America/New_York')).strftime('%Y%m%d')
         if not force and getattr(self, '_last_rfr_sync_date', None) == today_str:
             return
-            
+
         try:
             import pandas_datareader.data as web
-            
-            # 2. 本地存在则先删除，强制刷新 [User Request]
-            if os.path.exists(rfr_file):
-                os.remove(rfr_file)
-                logger.info(f"🗑️ 已删除旧的 RFR 缓存: {rfr_file}")
+        except ImportError as e:
+            raise RuntimeError(
+                "❌ [RFR-FATAL] pandas_datareader 未安装，无法同步 DGS3MO，"
+                "Greeks 计算将因利率缺失失败。请先 `pip install pandas_datareader`。"
+            ) from e
 
-            fetch_start = pd.Timestamp("2026-01-01").normalize()
-            fetch_end = pd.Timestamp(datetime.now() + timedelta(days=1)).normalize()
-            
-            logger.info(f"📡 正在从 FRED 下载最新的 RFR 数据 (DGS3MO)...")
+        fetch_start = pd.Timestamp("2026-01-01").normalize()
+        fetch_end = pd.Timestamp(datetime.now() + timedelta(days=1)).normalize()
+
+        logger.info(f"📡 正在从 FRED 下载最新的 RFR 数据 (DGS3MO) [{fetch_start.date()} → {fetch_end.date()}]...")
+        try:
             new_data = web.DataReader('DGS3MO', 'fred', fetch_start, fetch_end)
-            new_data.index = pd.to_datetime(new_data.index).normalize()
-            
-            # 填充及格式化
-            rfr_df = new_data.resample('D').ffill().fillna(method='bfill').fillna(0.045)
-            rfr_df.to_parquet(rfr_file)
-            
-            self._last_rfr_sync_date = today_str
-            logger.info(f"✅ RFR 利率数据已同步并保存至: {rfr_file}")
-            
         except Exception as e:
-            logger.error(f"❌ RFR 同步失败: {e}. 将回退到现有缓存或默认值。")
-            self._last_rfr_sync_date = today_str # 即使失败今日也不再重试，防止死循环
+            raise RuntimeError(
+                f"❌ [RFR-FATAL] 从 FRED 下载 DGS3MO 失败: {e}. "
+                f"拒绝使用静态默认利率，服务中断。请检查网络 / FRED 可达性后重启。"
+            ) from e
+
+        if new_data is None or new_data.empty:
+            raise RuntimeError(
+                f"❌ [RFR-FATAL] FRED 返回空数据集 (DGS3MO, {fetch_start.date()}→{fetch_end.date()}). "
+                f"拒绝写入缓存，服务中断。"
+            )
+        if 'DGS3MO' not in new_data.columns:
+            raise RuntimeError(
+                f"❌ [RFR-FATAL] FRED 返回数据缺少 DGS3MO 列，实际列: {list(new_data.columns)}"
+            )
+
+        new_data.index = pd.to_datetime(new_data.index).normalize()
+        # 只做日频对齐 + 前向填充（缺失的 day-1 由 bfill 补）；不再用 0.045 覆盖最终 NaN。
+        rfr_df = new_data.resample('D').ffill().bfill()
+        if rfr_df['DGS3MO'].isna().all():
+            raise RuntimeError(
+                "❌ [RFR-FATAL] 重采样后 DGS3MO 全部为 NaN，下载样本可能全部无效，服务中断。"
+            )
+
+        # 原子替换：先写 tmp 再 rename，失败不会破坏既有缓存。
+        tmp_file = rfr_file + f".tmp.{os.getpid()}"
+        try:
+            rfr_df.to_parquet(tmp_file)
+            os.replace(tmp_file, rfr_file)
+        except Exception as e:
+            try:
+                if os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+            except Exception:
+                pass
+            raise RuntimeError(f"❌ [RFR-FATAL] 写入 RFR parquet 失败: {e}") from e
+
+        self._last_rfr_sync_date = today_str
+        logger.info(f"✅ RFR 利率数据已同步并保存至: {rfr_file} (rows={len(rfr_df)})")
 
     def supplement_greeks(self, symbol: str, buckets: np.ndarray, contracts: list, stock_price: float, timestamp: float):
         if buckets is None or len(buckets) == 0:
@@ -509,7 +540,13 @@ class RealTimeFeatureEngine:
                            feat_resolutions: Optional[Dict[str, str]] = None,
                            skip_scaling: bool = False,
                            current_ts: Optional[float] = None,
-                           recalc_greeks: bool = True) -> Dict[str, Dict]:
+                           recalc_greeks: bool = True,
+                           is_new_minute: bool = True) -> Dict[str, Dict]:
+        """
+        `is_new_minute=False` 表示调用方明确处于"秒内刷新 / 分钟未翻页"阶段，
+        此时仅透传最新的 price/bid/ask，不再触发代价高昂的 `supplement_greeks`
+        （BSM + IV 反解每秒重算）。只有分钟翻页或冷启动时才算一次 Greeks。
+        """
         results = {}
         all_feats = list(set(fast_feats + slow_feats))
         if not history_1min: return results
@@ -575,7 +612,10 @@ class RealTimeFeatureEngine:
                   if df_s is not None and not df_s.empty:
                       last_row = df_s.iloc[-1]
                       # 🚀 [Parity Fix] 使用传入的 option_contracts 透传给 Greeks 补算
-                      if recalc_greeks and option_contracts and s in option_contracts:
+                      # [秒级优化] 非分钟翻页阶段跳过 BSM 重算，沿用上一分钟的 Greeks；
+                      #            raw_snap 里的 price/bid/ask 由上游 pipeline 更新，Delta/IV 等结构性特征
+                      #            在下一分钟翻页时再统一重算。
+                      if recalc_greeks and is_new_minute and option_contracts and s in option_contracts:
                           # 🚀 [Parity Fix] 显式透传 current_ts (或 fallback 到 last_ts) 确保到期时间计算正确
                           target_ts = current_ts if current_ts else last_ts.timestamp()
                           raw_snap = self.supplement_greeks(

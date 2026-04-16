@@ -349,7 +349,26 @@ class BatchSQLiteDriver1s:
                     time.sleep(0.0005) 
                     timeout += 1
                     if timeout > 60000: # 30s
-                        logger.warning(f"⚠️ [STALL] Sync Timeout at ts={ts_val}. Feat:{feat_ts} Orch:{orch_ts}")
+                        diag = {}
+                        try:
+                            groups = self.r.xinfo_groups(STREAM_FUSED_MARKET)
+                            for g in groups:
+                                name = g.get('name')
+                                if isinstance(name, bytes):
+                                    name = name.decode('utf-8')
+                                if name in [GROUP_FEATURE, GROUP_ORCH]:
+                                    diag[name] = {
+                                        'pending': g.get('pending'),
+                                        'consumers': g.get('consumers'),
+                                        'entries_read': g.get('entries-read', g.get('entries_read')),
+                                        'lag': g.get('lag'),
+                                        'last_delivered_id': g.get('last-delivered-id', g.get('last_delivered_id')),
+                                    }
+                        except Exception:
+                            pass
+                        logger.warning(
+                            f"⚠️ [STALL] Sync Timeout at ts={ts_val}. Feat:{feat_ts} Orch:{orch_ts} | frame_id={frame_id} | fused_group_diag={diag}"
+                        )
                         break
                         
                 count += 1
@@ -663,7 +682,14 @@ class BatchSQLiteDriver1s:
                                 'volume': 0.0
                             }
                             
-                    if sym in o1_ts: payload.update(o1_ts[sym])
+                    if sym in o1_ts:
+                        opt_data = o1_ts[sym]
+                        if isinstance(opt_data, dict):
+                            payload['option_buckets'] = opt_data.get('buckets', [])
+                            payload['option_contracts'] = opt_data.get('contracts', [])
+                        else:
+                            payload['option_buckets'] = opt_data
+                            payload['option_contracts'] = []
                     
                     if sym in b5_ts or sym in o5_ts:
                         if sym not in last_5m_state: last_5m_state[sym] = {}
@@ -875,9 +901,21 @@ async def main():
             logger.info("⚡ [Turbo Mode] Skipping Feature Compute Service subprocess; in-process FCS will warm up with replay clock.")
         else:
             logger.info("🚀 Starting Feature Compute Service (Subprocess)...")
+            baseline_dir = PROJECT_ROOT / "baseline"
+            fcs_entry_candidates = [
+                baseline_dir / "DAO" / "feature_compute_service_v8.py",
+                baseline_dir / "feature_compute_service_v8.py",
+            ]
+            fcs_entry = next((p for p in fcs_entry_candidates if p.exists()), None)
+            if fcs_entry is None:
+                logger.error(
+                    "❌ Feature Compute Service entry not found. checked=%s",
+                    [str(p) for p in fcs_entry_candidates],
+                )
+                return
             feature_process = subprocess.Popen(
-                [sys.executable, "feature_compute_service_v8.py"],
-                cwd=str(PROJECT_ROOT/"baseline"),
+                [sys.executable, str(fcs_entry)],
+                cwd=str(baseline_dir),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -896,6 +934,9 @@ async def main():
 
             logger.info("⏳ Waiting for Engine Deep Warmup to complete...")
             if not ready_event.wait(timeout=60):
+                rc = feature_process.poll()
+                if rc is not None:
+                    logger.error(f"❌ Feature service exited during warmup. exit_code={rc}")
                 logger.error("❌ Warmup Timeout! Feature service failed to initialize.")
                 return
                 
@@ -1018,10 +1059,14 @@ async def main():
         data_persistence_service_v8_sqlite.DB_DIR = DB_DIR_1S 
         persistence_svc = data_persistence_service_v8_sqlite.DataPersistenceServiceSQLite(start_date=args.start_date)
         threading.Thread(target=persistence_svc.run, daemon=True).start()
+        pg_mirror_group = None
         if args.mirror_pg:
             logger.info("🪞 Starting PostgreSQL mirror persistence service...")
             persist_pg_cfg = copy.deepcopy(REDIS_CFG)
-            persist_pg_cfg['pg_group'] = GROUP_PERSISTENCE
+            # 🚨 PG mirror 必须使用独立 consumer group，避免与 sqlite writer 在同组抢消息。
+            pg_mirror_group = f"{GROUP_PERSISTENCE}_pg_mirror"
+            persist_pg_cfg['pg_group'] = pg_mirror_group
+            persist_pg_cfg['consumer'] = 'pg_writer_1s_mirror'
             data_persistence_service_v8_pg.REDIS_CFG = persist_pg_cfg
             target_dates_for_pg = sorted({p.stem.split('_')[1] for p in target_dbs})
             if pg_clean_enabled:
@@ -1072,8 +1117,13 @@ async def main():
         status_key = f"replay:status:{RUN_ID}"
         while True:
             await asyncio.sleep(2.0)
+            if feature_process is not None:
+                rc = feature_process.poll()
+                if rc is not None:
+                    logger.error(f"❌ Feature service subprocess exited unexpectedly. exit_code={rc}")
+                    break
             
-            fused_lag, orch_lag, persist_lag = 0, 0, 0
+            fused_lag, orch_lag, persist_lag, pg_persist_lag = 0, 0, 0, 0
             try:
                 for g in r.xinfo_groups(STREAM_FUSED_MARKET):
                     if g['name'] in [b'feature_group', 'feature_group']: fused_lag = g['pending']
@@ -1082,12 +1132,15 @@ async def main():
                 if r.exists(STREAM_TRADE_LOG):
                     for g in r.xinfo_groups(STREAM_TRADE_LOG):
                         if g['name'] in [b'persistence_group', 'persistence_group']: persist_lag = g['pending']
+                        if pg_mirror_group and g['name'] in [pg_mirror_group.encode('utf-8'), pg_mirror_group]:
+                            pg_persist_lag = g['pending']
             except: pass
 
             status_raw = r.get(status_key)
             status_str = status_raw.decode('utf-8') if status_raw else ""
 
-            if status_str == "DONE" and fused_lag == 0 and orch_lag == 0 and persist_lag == 0:
+            all_persist_done = (persist_lag == 0) and ((not args.mirror_pg) or (pg_persist_lag == 0))
+            if status_str == "DONE" and fused_lag == 0 and orch_lag == 0 and all_persist_done:
                 elapsed = time.time() - start_time
                 logger.info(f"\n🎉 ALL {len(target_dbs)} 1s Databases Processed Successfully in {elapsed:.1f}s!")
                 
@@ -1128,7 +1181,13 @@ async def main():
                 break
             
             if int(time.time()) % 10 == 0:
-                logger.info(f"❤️ 1s Heartbeat | Lag -> Fused:{fused_lag} Orch:{orch_lag} Persist:{persist_lag}")
+                if args.mirror_pg:
+                    logger.info(
+                        f"❤️ 1s Heartbeat | Lag -> Fused:{fused_lag} Orch:{orch_lag} "
+                        f"Persist(sqlite):{persist_lag} Persist(pg):{pg_persist_lag}"
+                    )
+                else:
+                    logger.info(f"❤️ 1s Heartbeat | Lag -> Fused:{fused_lag} Orch:{orch_lag} Persist:{persist_lag}")
 
     except KeyboardInterrupt:
         logger.warning("⚠️ Interrupted by user!")

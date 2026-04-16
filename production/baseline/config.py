@@ -87,6 +87,25 @@ def get_redis_db():
     # 仿真模式使用 DB 1，实盘使用 DB 0
     return 1 if IS_SIMULATED else 0
 
+def get_feature_service_state_file() -> Path:
+    """
+    为 FCS 状态文件生成环境隔离路径，避免实盘/回放互相覆盖。
+    优先级:
+    1. FCS_STATE_NAMESPACE 显式指定
+    2. RUN_MODE + realtime live/paper + redis db 自动生成
+    """
+    namespace = os.environ.get("FCS_STATE_NAMESPACE", "").strip()
+    if not namespace:
+        mode_label = RUN_MODE.lower()
+        if RUN_MODE.startswith("REALTIME"):
+            acct_label = "paper" if int(IBKR_PORT) == 4002 else "live"
+            namespace = f"{mode_label}_{acct_label}_db{get_redis_db()}"
+        else:
+            namespace = f"{mode_label}_db{get_redis_db()}"
+    return CACHE_DIR / f"feature_service_state_{namespace}.pkl"
+
+FCS_RECENT_STATE_MAX_HOURS = float(os.environ.get("FCS_RECENT_STATE_MAX_HOURS", "24"))
+
 # ================= IBKR 连接配置 =================
 IBKR_HOST       = '127.0.0.1'
 IBKR_PORT       = 4001          # 🚨 4002=Paper (模拟盘), 4001=Real (实盘)
@@ -161,6 +180,26 @@ OPTION_GATE_MIN_IV = 0.01
 # 是否启用 seq/frame_complete 强一致门控（无该字段时自动降级放行）
 OPTION_GATE_REQUIRE_FRAME_CONSISTENCY = True
 
+
+def get_option_gate_profile() -> dict:
+    """
+    返回统一的 Option Gate 配置剖面（可由环境变量覆盖）。
+    让 FCS 不感知具体市场细节，便于未来切换不同市场 profile。
+    """
+    require_frame_env = os.environ.get("OPTION_GATE_REQUIRE_FRAME_CONSISTENCY")
+    if require_frame_env is None:
+        require_frame = bool(OPTION_GATE_REQUIRE_FRAME_CONSISTENCY)
+    else:
+        require_frame = require_frame_env.strip().lower() not in {"0", "false", "no", "off"}
+
+    return {
+        "min_pass": max(1, int(os.environ.get("OPTION_GATE_MIN_PASS", OPTION_GATE_MIN_CONSECUTIVE_PASS))),
+        "max_fail": max(1, int(os.environ.get("OPTION_GATE_MAX_FAIL", OPTION_GATE_MAX_CONSECUTIVE_FAIL))),
+        "grace_minutes": max(0, int(os.environ.get("OPTION_GATE_GRACE_MINUTES", OPTION_GATE_GRACE_MINUTES))),
+        "min_iv": float(os.environ.get("OPTION_GATE_MIN_IV", OPTION_GATE_MIN_IV)),
+        "require_frame_consistency": bool(require_frame),
+    }
+
 # ================= 价格模式 =================
 USE_5M_OPTION_DATA  = True  # 关闭 5min 维度期权数据，用于排查爆仓问题
 
@@ -192,6 +231,7 @@ ORDER_MAX_RETRIES     = 3          # 最大追单次数
 COOLDOWN_MINUTES      = 60         # 止损后的品种冷却时间 (分钟)
 LIMIT_BUFFER_ENTRY    = 1.03       # 买入限价缓冲 (Ask * 1.03)
 LIMIT_BUFFER_EXIT     = 0.97       # 卖出限价缓冲 (Bid * 0.97)
+ENTRY_MAX_REQUOTE_SLIPPAGE_PCT = float(os.environ.get("ENTRY_MAX_REQUOTE_SLIPPAGE_PCT", "0.02"))  # 建仓追价最大偏离(相对初始信号价)
 SLIPPAGE_ENTRY_PCT    = 0.001      # 建仓滑点 (0.1%)
 SLIPPAGE_EXIT_PCT     = 0.001      # 平仓滑点 (0.1%)
 EXIT_ORDER_TYPE       = 'MKT'      # 平仓订单类型 (MKT/LMT)

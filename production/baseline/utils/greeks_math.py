@@ -9,6 +9,7 @@ except ImportError:
 
 # Constants
 IDX_PRICE, IDX_DELTA, IDX_GAMMA, IDX_VEGA, IDX_THETA, IDX_STRIKE, IDX_VOLUME, IDX_IV = 0, 1, 2, 3, 4, 5, 6, 7
+IDX_BID, IDX_ASK = 8, 9
 
 def find_iv(price, S, K, T, r, flag):
     """Fallback simple IV finder if py_vollib is missing"""
@@ -138,10 +139,22 @@ def calculate_bucket_greeks(buckets: np.ndarray, S: float, T: float, r: float = 
             opt_type = _parse_option_type(ticker)
         except ValueError:
             continue
-        price = float(buckets[i, IDX_PRICE])
         strike = float(buckets[i, IDX_STRIKE])
         
         if strike < 0.01: continue
+
+        # 强约束：Greeks 计算只允许使用 bid/ask，不允许使用成交价（IDX_PRICE）。
+        if buckets.shape[1] <= IDX_ASK:
+            continue
+        bid = float(buckets[i, IDX_BID])
+        ask = float(buckets[i, IDX_ASK])
+        if not (bid > 0.0 and ask >= bid):
+            # 无有效盘口则跳过该合约，保持 Greeks/IV 为 0
+            buckets[i, IDX_PRICE] = 0.0
+            continue
+        price = 0.5 * (bid + ask)
+        # 下游仍有对第0列的读取，统一回写为 mid，避免携带成交价语义
+        buckets[i, IDX_PRICE] = price
         
         iv = 0.0
         if price > 0.0001:

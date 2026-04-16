@@ -58,6 +58,10 @@ class DataPersistenceServicePG:
         self.trade_buffer = []
         self.alpha_buffer = []
         self.last_flush = time.time()
+        # 默认分钟表质量优先：只落 Greeks 已就绪的 option snapshot
+        flag_env = os.environ.get("OPTION_1M_WAIT_GREEKS_READY", "1").strip().lower()
+        self.option_1m_wait_greeks_ready = flag_env not in {"0", "false", "no", "off"}
+        logger.info(f"🧭 Option 1m write gate: wait_greeks_ready={self.option_1m_wait_greeks_ready}")
         
         # [Fix] Enforce Master Tables exist on startup
         try:
@@ -228,7 +232,7 @@ class DataPersistenceServicePG:
                 except Exception:
                     self.conn = None
 
-    def process_feature_data(self, payload):
+    def process_feature_data(self, payload, write_feature_logs=True, write_option_snapshots=True):
         try:
             ts = int(payload.get('ts', time.time()))
             
@@ -254,7 +258,7 @@ class DataPersistenceServicePG:
                     if fast_blob or slow_blob:
                         rows_to_insert.append((sym, ts, fast_blob, slow_blob))
                 
-                if rows_to_insert:
+                if write_feature_logs and rows_to_insert:
                     conn = self._get_pg_conn()
                     c = conn.cursor()
                     psycopg2.extras.execute_batch(c, """
@@ -270,42 +274,108 @@ class DataPersistenceServicePG:
                 # 检查是否存在期权快照计算结果，如果存在，则将其同步写入 option_snapshots_1m 表。
                 # ！！注意：FCS 下发的键名是 'live_options'，必须保持一致！！
                 option_snapshots = payload.get('live_options') or payload.get('option_snapshots')
-                if option_snapshots and isinstance(option_snapshots, dict):
-                    opt_rows = []
+                if write_option_snapshots and option_snapshots and isinstance(option_snapshots, dict):
+                    opt_rows_all = []
+                    opt_rows_1m = []
                     sample_sym = None
                     sample_g_sum = 0
+                    skipped_not_ready = 0
+                    is_new_minute = bool(payload.get('is_new_minute'))
+                    nvda_diag = None
                     
                     for opt_sym, opt_data in option_snapshots.items():
+                        if not isinstance(opt_data, dict):
+                            continue
                         # 只有在 buckets 字段不为空时才处理
                         buckets = opt_data.get('buckets')
-                        if buckets:
-                            opt_rows.append((opt_sym, ts, json.dumps(opt_data)))
-                            
-                            # [诊断日志抽样] 检查希腊值是否真的有效（非 0）
-                            if sample_sym is None and isinstance(buckets, list) and len(buckets) > 0:
-                                # 抽样检查第一行的 Greeks 列 (1,2,3,4)
-                                first_row = buckets[0]
-                                if len(first_row) > 5:
-                                    g_sum = sum(abs(x) for x in first_row[1:5])
-                                    if g_sum > 1e-6:
-                                        sample_sym = opt_sym
-                                        sample_g_sum = g_sum
+                        if buckets is None:
+                            continue
+                        # 兼容 list / np.ndarray；避免 ndarray 在 truth-value 判定时抛错
+                        if isinstance(buckets, np.ndarray):
+                            if buckets.size == 0:
+                                continue
+                            buckets_for_json = buckets.tolist()
+                        elif isinstance(buckets, list):
+                            if len(buckets) == 0:
+                                continue
+                            buckets_for_json = buckets
+                        else:
+                            continue
 
-                    if opt_rows:
+                        payload_opt = dict(opt_data)
+                        payload_opt['buckets'] = buckets_for_json
+                        row = (opt_sym, ts, json.dumps(payload_opt))
+                        opt_rows_all.append(row)
+
+                        greeks_ready = bool(opt_data.get('greeks_ready', True))
+                        if (not self.option_1m_wait_greeks_ready) or greeks_ready:
+                            opt_rows_1m.append(row)
+                        elif is_new_minute:
+                            skipped_not_ready += 1
+                            
+                        # [诊断日志抽样] 检查希腊值是否真的有效（非 0）
+                        if sample_sym is None and len(buckets_for_json) > 0:
+                            # 抽样检查第一行的 Greeks 列 (1,2,3,4)
+                            first_row = buckets_for_json[0]
+                            if isinstance(first_row, (list, tuple)) and len(first_row) > 5:
+                                g_sum = sum(abs(float(x)) for x in first_row[1:5])
+                                if g_sum > 1e-6:
+                                    sample_sym = opt_sym
+                                    sample_g_sum = g_sum
+
+                        # NVDA 专项写前校验：确认 Greeks 与 IV 已正确打包
+                        if str(opt_sym).upper() == 'NVDA':
+                            try:
+                                arr = np.asarray(buckets_for_json, dtype=np.float64)
+                                if arr.ndim == 2 and arr.shape[1] >= 8:
+                                    greeks_sum = float(np.sum(np.abs(arr[:, 1:5])))
+                                    call_iv = float(arr[2, 7]) if arr.shape[0] > 2 else 0.0
+                                    put_iv = float(arr[0, 7]) if arr.shape[0] > 0 else 0.0
+                                    nvda_diag = {
+                                        'greeks_sum': greeks_sum,
+                                        'call_iv': call_iv,
+                                        'put_iv': put_iv,
+                                        'greeks_ready': bool(opt_data.get('greeks_ready', True)),
+                                    }
+                            except Exception:
+                                nvda_diag = {'parse_error': True}
+
+                    if opt_rows_all:
+                        if nvda_diag is not None:
+                            if nvda_diag.get('parse_error'):
+                                logger.warning(f"⚠️ [PG-NVDA-Precheck] ts={ts} parse buckets failed before write.")
+                            else:
+                                if nvda_diag['greeks_sum'] > 1e-6:
+                                    logger.info(
+                                        f"🧪 [PG-NVDA-Precheck] ts={ts} greeks_sum={nvda_diag['greeks_sum']:.6f} "
+                                        f"call_iv={nvda_diag['call_iv']:.4f} put_iv={nvda_diag['put_iv']:.4f} "
+                                        f"ready={nvda_diag['greeks_ready']}"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"⚠️ [PG-NVDA-Precheck] ts={ts} ZERO greeks before write "
+                                        f"(call_iv={nvda_diag['call_iv']:.4f}, put_iv={nvda_diag['put_iv']:.4f}, "
+                                        f"ready={nvda_diag['greeks_ready']})"
+                                    )
+
                         if sample_sym:
-                            logger.info(f"📊 [PG-Greeks-Bind] Detected enriched Greeks for {sample_sym} (sum={sample_g_sum:.4f}). Upserting {len(opt_rows)} symbols.")
+                            logger.info(f"📊 [PG-Greeks-Bind] Detected enriched Greeks for {sample_sym} (sum={sample_g_sum:.4f}). Upserting {len(opt_rows_all)} symbols.")
+                        elif is_new_minute:
+                            logger.warning(f"⚠️ [PG-Greeks-Bind] Upserting {len(opt_rows_all)} symbols but sampled Greeks sum is zero.")
+                        if is_new_minute and skipped_not_ready > 0:
+                            logger.warning(f"⏳ [PG-Option1M-Gate] Skip {skipped_not_ready} symbols (greeks not ready) at ts={ts}.")
                         
                         conn = self._get_pg_conn()
                         c = conn.cursor()
                         
                         # 1. 写入分钟表 (仅在分钟结算点触发)
-                        if payload.get('is_new_minute'):
+                        if is_new_minute and opt_rows_1m:
                             psycopg2.extras.execute_batch(c, """
                                 INSERT INTO option_snapshots_1m (symbol, ts, buckets_json) 
                                 VALUES (%s, %s, %s)
                                 ON CONFLICT (symbol, ts) DO UPDATE 
                                 SET buckets_json = EXCLUDED.buckets_json
-                            """, opt_rows)
+                            """, opt_rows_1m)
                         
                         # 2. 写入秒级表 (每秒实时更新，包含最新求解结果)
                         psycopg2.extras.execute_batch(c, """
@@ -313,7 +383,7 @@ class DataPersistenceServicePG:
                             VALUES (%s, %s, %s)
                             ON CONFLICT (symbol, ts) DO UPDATE 
                             SET buckets_json = EXCLUDED.buckets_json
-                        """, opt_rows)
+                        """, opt_rows_all)
                         
                         conn.commit()
                         c.close()
@@ -406,8 +476,8 @@ class DataPersistenceServicePG:
                     'vwap': total_pv / total_vol if total_vol > 0 else bars[-1]['close']
                 }
                 
-                if time.time() % 60 < 2: # 降低日志频率，每分钟只打一次心跳
-                    logger.info(f"🔄 [Rolling-5m] 强制本地聚合 {symbol} @ {five_min_ts} (Accumulated {len(bars)}/5 bars)")
+                # if time.time() % 60 < 2: # 降低日志频率，每分钟只打一次心跳
+                #     logger.info(f"🔄 [Rolling-5m] 强制本地聚合 {symbol} @ {five_min_ts} (Accumulated {len(bars)}/5 bars)")
             # 1min Options
             if 'option_buckets' in payload:
                 snap_obj = payload['option_buckets']
@@ -477,7 +547,7 @@ class DataPersistenceServicePG:
                         if key[1] < current_cutoff: keys_to_del.append(key)
                     
                     if rows:
-                        logger.info(f"📊 [Flush-Check] Inserting {len(rows)} rows into {tbl} (Sample TS: {rows[0][1]})")
+                        #logger.info(f"📊 [Flush-Check] Inserting {len(rows)} rows into {tbl} (Sample TS: {rows[0][1]})")
                         psycopg2.extras.execute_batch(c, f"""
                             INSERT INTO {tbl} (symbol, ts, open, high, low, close, volume, vwap) 
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -665,12 +735,17 @@ class DataPersistenceServicePG:
                             try:
                                 payload = None
                                 if b'batch' in data:
-                                    # [New] Support for V8 Vectorized Batch payloads
+                                    # [New] Support for vectorized batch payloads (all streams)
                                     try:
                                         batch = ser.unpack(data[b'batch'])
-                                        for p in batch:
-                                            if stream_name == STREAM_FUSED_MARKET:
-                                                self.process_market_data(p)
+                                        if isinstance(batch, list):
+                                            for p in batch:
+                                                if stream_name == STREAM_FUSED_MARKET:
+                                                    self.process_market_data(p)
+                                                elif stream_name == STREAM_INFERENCE and isinstance(p, dict):
+                                                    self.process_feature_data(p)
+                                        elif isinstance(batch, dict):
+                                            payload = batch
                                     except Exception as e:
                                         logger.error(f"Batch Parse Error: {e}")
                                 elif b'pickle' in data:
@@ -721,8 +796,8 @@ class DataPersistenceServicePG:
 
                 # 🚀 [Heartbeat] Periodic throughput summary
                 if time.time() - last_throughput_log > 60:
-                    if msg_count > 0:
-                        logger.info(f"📊 [Persistence Heartbeat] Processed {msg_count} messages in last 60s.")
+                    # if msg_count > 0:
+                    #     logger.info(f"📊 [Persistence Heartbeat] Processed {msg_count} messages in last 60s.")
                     msg_count = 0
                     last_throughput_log = time.time()
 

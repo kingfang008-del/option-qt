@@ -138,6 +138,54 @@ def diff_detail(a, b):
     return detail
 
 
+def evaluate_threshold_diffs(left_map, right_map, thresholds, strict=False):
+    left_keys = set(left_map.keys())
+    right_keys = set(right_map.keys())
+    common = sorted(left_keys & right_keys)
+    left_only = sorted(left_keys - right_keys)
+    right_only = sorted(right_keys - left_keys)
+
+    failures = []
+    if left_only:
+        failures.append(f"Left-only keys: {', '.join(left_only)}")
+    if right_only:
+        failures.append(f"Right-only keys: {', '.join(right_only)}")
+
+    listed_results = []
+    other_diffs = []
+    differing_details = []
+    exact_match_count = 0
+
+    for key in common:
+        diff = max_abs_diff(left_map[key], right_map[key])
+        if diff <= 1e-12:
+            exact_match_count += 1
+        else:
+            differing_details.append((key, diff, diff_detail(left_map[key], right_map[key])))
+        if key in thresholds:
+            threshold = thresholds[key]
+            ok = diff <= threshold
+            listed_results.append((key, diff, threshold, ok))
+            if not ok:
+                failures.append(f"{key}: max_diff={diff:.8f} > threshold={threshold:.8f}")
+        elif diff > 1e-12:
+            other_diffs.append((key, diff))
+
+    if strict and other_diffs:
+        failures.append("Non-threshold keys also differ under --strict")
+
+    return {
+        "common": common,
+        "left_only": left_only,
+        "right_only": right_only,
+        "failures": failures,
+        "listed_results": listed_results,
+        "other_diffs": other_diffs,
+        "differing_details": differing_details,
+        "exact_match_count": exact_match_count,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Parity regression threshold checker")
     parser.add_argument("--left", required=True, help="Left NPZ snapshot")
@@ -168,43 +216,25 @@ def main():
     left_path, left = load_npz(args.left)
     right_path, right = load_npz(args.right)
 
-    left_keys = set(left.files)
-    right_keys = set(right.files)
-    common = sorted(left_keys & right_keys)
-    left_only = sorted(left_keys - right_keys)
-    right_only = sorted(right_keys - left_keys)
+    result = evaluate_threshold_diffs(
+        left_map={k: left[k] for k in left.files},
+        right_map={k: right[k] for k in right.files},
+        thresholds=thresholds,
+        strict=bool(args.strict),
+    )
+    common = result["common"]
+    left_only = result["left_only"]
+    right_only = result["right_only"]
+    failures = list(result["failures"])
+    listed_results = result["listed_results"]
+    other_diffs = result["other_diffs"]
+    differing_details = result["differing_details"]
+    exact_match_count = int(result["exact_match_count"])
 
     print(f"🧪 Threshold Audit")
     print(f"LEFT : {left_path}")
     print(f"RIGHT: {right_path}")
     print("-" * 100)
-
-    failures = []
-
-    if left_only:
-        failures.append(f"Left-only keys: {', '.join(left_only)}")
-    if right_only:
-        failures.append(f"Right-only keys: {', '.join(right_only)}")
-
-    listed_results = []
-    other_diffs = []
-    differing_details = []
-    exact_match_count = 0
-
-    for key in common:
-        diff = max_abs_diff(left[key], right[key])
-        if diff <= 1e-12:
-            exact_match_count += 1
-        else:
-            differing_details.append((key, diff, diff_detail(left[key], right[key])))
-        if key in thresholds:
-            threshold = thresholds[key]
-            ok = diff <= threshold
-            listed_results.append((key, diff, threshold, ok))
-            if not ok:
-                failures.append(f"{key}: max_diff={diff:.8f} > threshold={threshold:.8f}")
-        elif diff > 1e-12:
-            other_diffs.append((key, diff))
 
     print(f"Common keys      : {len(common)}")
     print(f"Exact matches    : {exact_match_count}")
@@ -224,8 +254,6 @@ def main():
         print("Other differing keys (informational):")
         for key, diff in sorted(other_diffs, key=lambda x: x[1], reverse=True)[:20]:
             print(f"  {key}: {diff:.8f}")
-        if args.strict:
-            failures.append("Non-threshold keys also differ under --strict")
 
     if differing_details:
         print("-" * 100)

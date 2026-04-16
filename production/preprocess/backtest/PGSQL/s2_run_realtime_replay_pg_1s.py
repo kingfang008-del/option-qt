@@ -265,13 +265,15 @@ class BatchPostgresDriver1s:
         *,
         write_market: bool = False,
         write_features: bool = False,
+        write_option_1m: bool = True,
         write_redis_alpha: bool = False,
     ):
         logger.info("🔥 [Turbo Mode] Starting PG 1s in-process replay...")
         logger.info(
-            "⚡ [Turbo Alpha-Only] write_market=%s | write_features=%s | write_redis_alpha=%s",
+            "⚡ [Turbo Alpha-Only] write_market=%s | write_features=%s | write_option_1m=%s | write_redis_alpha=%s",
             write_market,
             write_features,
+            write_option_1m,
             write_redis_alpha,
         )
         NY_TZ = pytz.timezone('America/New_York')
@@ -347,8 +349,12 @@ class BatchPostgresDriver1s:
                 if feat_payload:
                     if self.parity_mode and not bool(feat_payload.get('is_new_minute', False)):
                         continue
-                    if write_features:
-                        persist_svc.process_feature_data(feat_payload)
+                    if write_features or write_option_1m:
+                        persist_svc.process_feature_data(
+                            feat_payload,
+                            write_feature_logs=write_features,
+                            write_option_snapshots=write_option_1m,
+                        )
                     await signal_svc.process_batch(feat_payload)
 
                 if ts_val % 60 == 0:
@@ -368,6 +374,7 @@ async def main():
     parser.add_argument('--parity-mode', action='store_true')
     parser.add_argument('--turbo-write-market', action='store_true', help='Turbo 模式下仍回写 market_bars/option_snapshots；默认关闭以避免 PG 重复写入。')
     parser.add_argument('--turbo-write-features', action='store_true', help='Turbo 模式下仍写 feature_logs；默认关闭，仅生成 alpha_logs。')
+    parser.add_argument('--turbo-no-option-overwrite', action='store_true', help='Turbo 模式下关闭 option_snapshots_1m 覆写；默认开启用于修复/校验 Greeks。')
     parser.add_argument('--turbo-write-redis-alpha', action='store_true', help='Turbo 模式下仍把 ALPHA 写入 Redis Stream；默认关闭，仅截获后写 PG。')
     args = parser.parse_args()
 
@@ -441,9 +448,21 @@ async def main():
             logger.info("⚡ [Turbo Mode] Skipping Feature Compute Service subprocess; in-process FCS will warm up from PostgreSQL with replay clock.")
         else:
             logger.info("🚀 Starting Feature Compute Service (Subprocess)...")
+            baseline_dir = PROJECT_ROOT / "baseline"
+            fcs_entry_candidates = [
+                baseline_dir / "DAO" / "feature_compute_service_v8.py",
+                baseline_dir / "feature_compute_service_v8.py",
+            ]
+            fcs_entry = next((p for p in fcs_entry_candidates if p.exists()), None)
+            if fcs_entry is None:
+                logger.error(
+                    "❌ Feature Compute Service entry not found. checked=%s",
+                    [str(p) for p in fcs_entry_candidates],
+                )
+                return
             feature_process = subprocess.Popen(
-                [sys.executable, "feature_compute_service_v8.py"],
-                cwd=str(PROJECT_ROOT / "baseline"),
+                [sys.executable, str(fcs_entry)],
+                cwd=str(baseline_dir),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -461,6 +480,9 @@ async def main():
 
             threading.Thread(target=monitor_stdout, daemon=True).start()
             if not ready_event.wait(timeout=60):
+                rc = feature_process.poll()
+                if rc is not None:
+                    logger.error(f"❌ Feature service exited during warmup. exit_code={rc}")
                 logger.error("❌ Warmup Timeout! Feature service failed to initialize.")
                 return
 
@@ -517,6 +539,7 @@ async def main():
                 signal_svc,
                 write_market=args.turbo_write_market,
                 write_features=args.turbo_write_features,
+                write_option_1m=(not args.turbo_no_option_overwrite),
                 write_redis_alpha=args.turbo_write_redis_alpha,
             )
             logger.info("🏁 [Turbo Mode] PG 1s Replay Completed.")

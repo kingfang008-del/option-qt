@@ -86,6 +86,14 @@ class IBKRConnectorFinal:
             0.0,
             float(os.environ.get('IBKR_TICK_PUBLISH_DEBOUNCE_MS', '80')) / 1000.0
         )
+        self._max_ts_lead_sec = max(
+            0.0,
+            float(os.environ.get('IBKR_MAX_TS_LEAD_SEC', '1.0'))
+        )
+        self._max_batch_staleness_sec = max(
+            0.0,
+            float(os.environ.get('IBKR_BATCH_MAX_STALENESS_SEC', '1.5'))
+        )
         self._last_bar_cache = {}
         self._last_total_volume = {}
         self._collecting_ts = None
@@ -546,7 +554,7 @@ class IBKRConnectorFinal:
             }
 
             # 2. [Fallback] 若未开启 tick 驱动，则仍使用 5 秒 Bar 触发整帧发布。
-            ts_val = b.time.timestamp()
+            ts_val = self._sanitize_publish_ts(b.time.timestamp(), source_tag='realtime_bar_5s')
             if not hasattr(self, '_last_published_batch_ts'): self._last_published_batch_ts = 0
             if ts_val > self._last_published_batch_ts:
                 if self._collecting_ts != ts_val:
@@ -556,6 +564,22 @@ class IBKRConnectorFinal:
     @staticmethod
     def _safe_float(val):
         return float(val) if (val is not None and not np.isnan(val)) else 0.0
+
+    def _sanitize_publish_ts(self, ts_val: float, source_tag: str = "") -> float:
+        """防止发布时间戳超前 wall-clock，触发下游分钟标签提前。"""
+        try:
+            ts_float = float(ts_val)
+        except Exception:
+            ts_float = float(time.time())
+        wall_ts = float(time.time())
+        if (ts_float - wall_ts) > float(self._max_ts_lead_sec):
+            logger.warning(
+                f"⚠️ [IBKR-TimeGuard] source={source_tag or 'unknown'} "
+                f"lead={ts_float - wall_ts:.3f}s>{self._max_ts_lead_sec:.3f}s; "
+                f"clamp ts {ts_float:.3f}->{wall_ts:.3f}"
+            )
+            ts_float = wall_ts
+        return ts_float
 
     @staticmethod
     def _to_symbol(contract_sym: str) -> str:
@@ -649,6 +673,7 @@ class IBKRConnectorFinal:
         if not hasattr(self, '_last_published_batch_ts'):
             self._last_published_batch_ts = 0
 
+        second_ts = self._sanitize_publish_ts(second_ts, source_tag='pending_tickers_1s')
         if second_ts > self._last_published_batch_ts and self._collecting_ts != second_ts:
             self._collecting_ts = second_ts
             asyncio.create_task(self._debounced_publish(second_ts))
@@ -662,7 +687,9 @@ class IBKRConnectorFinal:
 
     def _publish_batch_snapshot(self, ts_val):
         """[🔥 Optimization] 全市场快照聚合发布"""
+        ts_val = self._sanitize_publish_ts(ts_val, source_tag='publish_batch_snapshot')
         batch_payloads = []
+        stale_skipped = 0
         
         # 扫描所有活跃标的 (含 SPY/QQQ 等无期权标的)
         for sym in self.active_stocks:
@@ -670,14 +697,18 @@ class IBKRConnectorFinal:
             bar_data = self._last_bar_cache.get(sym)
             if not bar_data: continue
             
-            # 如果缓存的数据太陈旧 (超过 10 秒)，说明该 symbol 已经由于某种原因断流了
-            if ts_val - bar_data['ts'] > 10.0:
+            # 仅允许非常小的滞后窗口，避免“旧秒数据被贴上新 ts”污染分钟边界。
+            # 旧实现允许 10s 会把陈旧行情伪装成当前秒，导致特征/标签错位。
+            bar_ts = float(bar_data.get('ts', 0.0))
+            if ts_val - bar_ts > self._max_batch_staleness_sec:
+                stale_skipped += 1
                 continue
                 
             # 组装 Payload (对齐 feature_compute_service_v8 的接口)
             payload = {
                 'symbol': sym,
-                'ts': ts_val,
+                # 使用该 symbol 自身 bar 的时间戳，杜绝“旧数据打新时间标签”。
+                'ts': bar_ts if bar_ts > 0 else ts_val,
                 'stock': {
                     'open': bar_data['open'], 'high': bar_data['high'],
                     'low': bar_data['low'], 'close': bar_data['close'],
@@ -705,6 +736,11 @@ class IBKRConnectorFinal:
                 # logger.info(f"🚀 [Soft Batch] Published synchronized frame for {len(batch_payloads)} symbols @ {ts_val}")
             except Exception as e:
                 logger.error(f"❌ Failed to publish soft batch: {e}")
+        elif stale_skipped > 0 and int(ts_val) % 10 == 0:
+            logger.warning(
+                f"⚠️ [IBKR-StaleDrop] ts={int(ts_val)} dropped={stale_skipped} "
+                f"(max_staleness={self._max_batch_staleness_sec:.2f}s)"
+            )
 
     def _collect_option_buckets(self, sym):
         """收集 6 个期权桶的实时快照 & 合约ID。

@@ -1235,6 +1235,181 @@ def draw_topology(status):
     )
     return fig
 
+def _safe_zscore(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors='coerce').replace([np.inf, -np.inf], np.nan)
+    if s.dropna().empty:
+        return pd.Series(np.zeros(len(s)), index=s.index, dtype=float)
+    std = float(s.std(ddof=0))
+    if std < 1e-9:
+        return pd.Series(np.zeros(len(s)), index=s.index, dtype=float)
+    mean = float(s.mean())
+    return ((s - mean) / std).fillna(0.0)
+
+@st.cache_data(ttl=5)
+def load_momentum_leaderboard(max_symbols=40):
+    """
+    从 PG 聚合实时动能榜：
+    - 价格动量: 5m/15m 收益
+    - 交易热度: vol_z
+    - 信号确认: 最新 alpha
+    """
+    try:
+        conn = psycopg2.connect(PG_DB_URL)
+        now_ts = int(time.time())
+        start_ts = now_ts - 3 * 24 * 3600
+
+        sql_px = f"""
+            WITH recent AS (
+                SELECT
+                    symbol,
+                    ts,
+                    close,
+                    volume,
+                    LAG(close, 5) OVER (PARTITION BY symbol ORDER BY ts)  AS close_5m_ago,
+                    LAG(close, 15) OVER (PARTITION BY symbol ORDER BY ts) AS close_15m_ago,
+                    AVG(volume) OVER (
+                        PARTITION BY symbol
+                        ORDER BY ts
+                        ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING
+                    ) AS vol_avg_20
+                FROM market_bars_1m
+                WHERE ts >= {start_ts}
+            ),
+            latest AS (
+                SELECT DISTINCT ON (symbol)
+                    symbol, ts, close, volume, close_5m_ago, close_15m_ago, vol_avg_20
+                FROM recent
+                ORDER BY symbol, ts DESC
+            )
+            SELECT *
+            FROM latest
+            WHERE close > 0
+        """
+        df_px = pd.read_sql(sql_px, conn)
+
+        sql_alpha = f"""
+            SELECT DISTINCT ON (symbol)
+                symbol, ts AS alpha_ts, alpha, iv, vol_z
+            FROM alpha_logs
+            WHERE ts >= {start_ts}
+            ORDER BY symbol, ts DESC
+        """
+        df_alpha = pd.read_sql(sql_alpha, conn)
+        conn.close()
+
+        if df_px.empty:
+            return pd.DataFrame(), pd.DataFrame(), {}
+
+        df = df_px.merge(df_alpha, on='symbol', how='left')
+        df['ret_5m'] = np.where(df['close_5m_ago'] > 0, df['close'] / df['close_5m_ago'] - 1.0, np.nan)
+        df['ret_15m'] = np.where(df['close_15m_ago'] > 0, df['close'] / df['close_15m_ago'] - 1.0, np.nan)
+        df['vol_impulse'] = np.where(df['vol_avg_20'] > 0, df['volume'] / df['vol_avg_20'] - 1.0, np.nan)
+
+        # 截面标准化，组成“动能冠军分”
+        z_ret_5m = _safe_zscore(df['ret_5m'])
+        z_ret_15m = _safe_zscore(df['ret_15m'])
+        z_alpha = _safe_zscore(df.get('alpha', 0.0))
+        z_volz = _safe_zscore(df.get('vol_z', 0.0))
+        z_impulse = _safe_zscore(df['vol_impulse'])
+
+        df['momentum_score'] = (
+            0.40 * z_ret_5m +
+            0.25 * z_ret_15m +
+            0.20 * z_alpha +
+            0.10 * z_volz +
+            0.05 * z_impulse
+        )
+
+        # 基础质量过滤（避免脏值进入榜单）
+        quality = (
+            pd.to_numeric(df['close'], errors='coerce').fillna(0) > 0
+        ) & (
+            pd.to_numeric(df['volume'], errors='coerce').fillna(0) >= 0
+        )
+        df = df[quality].copy()
+        if df.empty:
+            return pd.DataFrame(), pd.DataFrame(), {}
+
+        # 取最强/最弱
+        top_n = min(int(max_symbols), max(5, int(len(df) * 0.4)))
+        long_df = df.sort_values('momentum_score', ascending=False).head(top_n).copy()
+        short_df = df.sort_values('momentum_score', ascending=True).head(top_n).copy()
+
+        breadth = float((pd.to_numeric(df['ret_5m'], errors='coerce') > 0).mean())
+        median_ret_5m = float(pd.to_numeric(df['ret_5m'], errors='coerce').median())
+        top3_strength = float(long_df['momentum_score'].head(3).mean()) if not long_df.empty else 0.0
+
+        if breadth >= 0.60 and median_ret_5m > 0:
+            regime = "RISK-ON"
+        elif breadth <= 0.40 and median_ret_5m < 0:
+            regime = "RISK-OFF"
+        else:
+            regime = "CHOP"
+
+        stats = {
+            'regime': regime,
+            'breadth_up_ratio': breadth,
+            'median_ret_5m': median_ret_5m,
+            'top3_strength': top3_strength,
+            'sample_size': int(len(df)),
+            'latest_ts': int(pd.to_numeric(df['ts'], errors='coerce').max()),
+        }
+        return long_df, short_df, stats
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame(), {}
+
+def render_momentum_panel():
+    long_df, short_df, stats = load_momentum_leaderboard(max_symbols=5)
+    st.markdown("### 🏆 动能冠军 / 市场状态")
+
+    if not stats:
+        st.info("动能榜暂不可用，等待 market_bars_1m / alpha_logs 更新。")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Market Regime", stats.get('regime', 'N/A'))
+    c2.metric("Up Breadth", f"{stats.get('breadth_up_ratio', 0.0):.1%}")
+    c3.metric("Median 5m Return", f"{stats.get('median_ret_5m', 0.0):.2%}")
+    c4.metric("Top3 Strength", f"{stats.get('top3_strength', 0.0):.2f}")
+
+    left, right = st.columns(2)
+    with left:
+        st.caption("Top Long Leaders")
+        if long_df.empty:
+            st.info("暂无多头冠军")
+        else:
+            show_cols = ['symbol', 'momentum_score', 'ret_5m', 'ret_15m', 'alpha', 'vol_z']
+            disp = long_df[show_cols].copy()
+            st.dataframe(
+                disp.style.format({
+                    'momentum_score': '{:.2f}',
+                    'ret_5m': '{:.2%}',
+                    'ret_15m': '{:.2%}',
+                    'alpha': '{:.3f}',
+                    'vol_z': '{:.2f}',
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+    with right:
+        st.caption("Top Short Leaders")
+        if short_df.empty:
+            st.info("暂无空头冠军")
+        else:
+            show_cols = ['symbol', 'momentum_score', 'ret_5m', 'ret_15m', 'alpha', 'vol_z']
+            disp = short_df[show_cols].copy()
+            st.dataframe(
+                disp.style.format({
+                    'momentum_score': '{:.2f}',
+                    'ret_5m': '{:.2%}',
+                    'ret_15m': '{:.2%}',
+                    'alpha': '{:.3f}',
+                    'vol_z': '{:.2f}',
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+
 def render_debug_inspector():
     """读取每日统一 DB 并可视化 debug_slow/fast 原始特征"""
     st.markdown("## 🐞 特征引擎透视 (Feature Engine Inspector)")
@@ -1401,6 +1576,7 @@ with st.sidebar:
 # --- Top: Topology ---
 status = SystemStatus(r, symbol)
 st.plotly_chart(draw_topology(status), use_container_width=True)
+render_momentum_panel()
 
 # [New] Interactive Warmup Buttons
 c1, c2, c3, c4 = st.columns([1, 1, 1, 1])

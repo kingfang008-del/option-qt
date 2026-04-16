@@ -231,12 +231,23 @@ async def main():
 
     grouped = df.sort_values('ts', ascending=True).groupby('ts')
     unique_groups = df['ts'].nunique()
+    expected_symbol_count = len(symbols)
+    symbol_rows_per_tick = df.groupby('ts')['symbol'].nunique()
+    incomplete_ticks = int((symbol_rows_per_tick < expected_symbol_count).sum())
+    if incomplete_ticks > 0:
+        logger.warning(
+            "⚠️ [REPLAY_S2_1S-DIAG] symbol rows missing on %d/%d ticks (expected=%d)",
+            incomplete_ticks,
+            int(unique_groups),
+            expected_symbol_count,
+        )
 
     logger.info(f"🚀 Starting S2 1s replay bus ({unique_groups} ticks)...")
     start_time = time.time()
 
     ny_tz = pytz.timezone('America/New_York')
     last_minute = -1
+    minute_diag = None
 
     for ts_val, group in tqdm(grouped, desc="Replaying", total=unique_groups):
         dt_ny = datetime.fromtimestamp(ts_val, tz=pytz.utc).astimezone(ny_tz)
@@ -283,8 +294,47 @@ async def main():
             'feed_call_id': [""] * len(group),
         }
 
+        active_now = int((packet['precalc_alpha'] != 0).sum())
+        symbol_rows_now = len(symbols_list)
+
+        if minute_diag is None or minute_diag['minute'] != current_minute:
+            if minute_diag is not None and minute_diag['active_counts']:
+                ac = minute_diag['active_counts']
+                sc = minute_diag['symbol_rows']
+                logger.info(
+                    "📊 [REPLAY_S2_1S-DIAG] Minute %d | Active(min/avg/max)=%d/%.2f/%d | "
+                    "ticks=%d | symbol_rows(min/max)=%d/%d | missing_symbol_ticks=%d | zero_alpha_ticks=%d | boundary_window_ticks=%d",
+                    int(minute_diag['minute']),
+                    int(min(ac)),
+                    float(sum(ac) / len(ac)),
+                    int(max(ac)),
+                    int(len(ac)),
+                    int(min(sc)),
+                    int(max(sc)),
+                    int(minute_diag['missing_symbol_ticks']),
+                    int(minute_diag['zero_alpha_ticks']),
+                    int(minute_diag['boundary_window_ticks']),
+                )
+            minute_diag = {
+                'minute': current_minute,
+                'active_counts': [],
+                'symbol_rows': [],
+                'missing_symbol_ticks': 0,
+                'zero_alpha_ticks': 0,
+                'boundary_window_ticks': 0,
+            }
+
+        minute_diag['active_counts'].append(active_now)
+        minute_diag['symbol_rows'].append(symbol_rows_now)
+        if symbol_rows_now < expected_symbol_count:
+            minute_diag['missing_symbol_ticks'] += 1
+        if active_now == 0:
+            minute_diag['zero_alpha_ticks'] += 1
         if is_new_minute:
-            sig_count = int((packet['precalc_alpha'] != 0).sum())
+            minute_diag['boundary_window_ticks'] += 1
+
+        if is_new_minute:
+            sig_count = active_now
             if sig_count > 0:
                 logger.info(f"📡 [REPLAY_S2_1S] Minute {current_minute} | Active Signals: {sig_count}")
 
@@ -301,6 +351,24 @@ async def main():
 
         await exec_engine.process_trade_signal({'action': 'SYNC', 'ts': float(ts_val), 'payload': {}})
         signal_engine.mock_cash = exec_engine.mock_cash
+
+    if minute_diag is not None and minute_diag['active_counts']:
+        ac = minute_diag['active_counts']
+        sc = minute_diag['symbol_rows']
+        logger.info(
+            "📊 [REPLAY_S2_1S-DIAG] Minute %d | Active(min/avg/max)=%d/%.2f/%d | "
+            "ticks=%d | symbol_rows(min/max)=%d/%d | missing_symbol_ticks=%d | zero_alpha_ticks=%d | boundary_window_ticks=%d",
+            int(minute_diag['minute']),
+            int(min(ac)),
+            float(sum(ac) / len(ac)),
+            int(max(ac)),
+            int(len(ac)),
+            int(min(sc)),
+            int(max(sc)),
+            int(minute_diag['missing_symbol_ticks']),
+            int(minute_diag['zero_alpha_ticks']),
+            int(minute_diag['boundary_window_ticks']),
+        )
 
     elapsed = time.time() - start_time
     print(f"\n✅ S2 1S Replay Finished in {elapsed:.1f}s.")
