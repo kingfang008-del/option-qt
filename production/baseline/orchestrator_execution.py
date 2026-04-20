@@ -13,7 +13,7 @@ from config import (
     GLOBAL_EXPOSURE_LIMIT, SLIPPAGE_ENTRY_PCT, SLIPPAGE_EXIT_PCT, 
     EXIT_ORDER_TYPE, TRADING_ENABLED, IS_LIVEREPLAY,
     DISABLE_ICEBERG, SYNC_EXECUTION, BACKTEST_1S_DISABLE_ICEBERG,
-    ENTRY_MAX_REQUOTE_SLIPPAGE_PCT
+    ENTRY_MAX_REQUOTE_SLIPPAGE_PCT, ENTRY_REQUOTE_STEP_CAP_PCT, AUTO_TRADING_CAPITAL_RATIO
 )
 from liquidity_rules import LiquidityRiskManager
 
@@ -46,6 +46,66 @@ class OrchestratorExecution:
         cap_pct = float(self._cfg_value("ENTRY_MAX_REQUOTE_SLIPPAGE_PCT", ENTRY_MAX_REQUOTE_SLIPPAGE_PCT))
         cap_pct = max(0.0, cap_pct)
         return ref * (1.0 + cap_pct)
+
+    def _try_get_live_option_quote(self, contract):
+        """
+        尝试从实时 IB ticker 获取最新 bid/ask。
+        返回: (bid, ask)；失败或无效返回 (0.0, 0.0)。
+        """
+        try:
+            ibkr = getattr(self.orch, "ibkr", None)
+            ib = getattr(ibkr, "ib", None)
+            if ib is None:
+                return 0.0, 0.0
+            if not ib.isConnected():
+                return 0.0, 0.0
+            if contract is None:
+                return 0.0, 0.0
+            t = ib.ticker(contract)
+            if t is None:
+                return 0.0, 0.0
+            bid = float(getattr(t, "bid", 0.0) or 0.0)
+            ask = float(getattr(t, "ask", 0.0) or 0.0)
+            if bid > 0.0 and ask > 0.0 and ask >= bid:
+                return bid, ask
+            return 0.0, 0.0
+        except Exception:
+            return 0.0, 0.0
+
+    def _next_entry_requote_price(self, sig, prev_limit_price, attempt_no, cap_price, real_contract=None):
+        """
+        计算下一次建仓追价：
+        1) 优先使用实时 bid/ask（若可得）；
+        2) 总追价上限始终锚定首笔参考价 cap_price；
+        3) 单步追价上限（相对上一笔）限制跳变幅度，避免一次追太猛。
+        """
+        prev_limit_price = float(prev_limit_price or 0.0)
+        if prev_limit_price <= 0:
+            return 0.0
+
+        # 优先用实时盘口替换旧的 sig.meta，降低 3s 后的陈旧报价风险
+        bid_live, ask_live = self._try_get_live_option_quote(real_contract)
+        sig_for_price = sig
+        if bid_live > 0 and ask_live > 0:
+            sig_for_price = dict(sig)
+            meta = dict(sig.get("meta", {}))
+            meta["bid"] = bid_live
+            meta["ask"] = ask_live
+            sig_for_price["meta"] = meta
+            base_price = (bid_live + ask_live) / 2.0
+            candidate = self._get_entry_limit_price(sig_for_price, base_price, attempt_no=0)
+        else:
+            candidate = self._get_entry_limit_price(sig_for_price, prev_limit_price, attempt_no=attempt_no)
+
+        if candidate < 0.05:
+            return 0.0
+
+        # 单步追价上限（相对上一笔）
+        step_cap_pct = float(self._cfg_value("ENTRY_REQUOTE_STEP_CAP_PCT", ENTRY_REQUOTE_STEP_CAP_PCT))
+        step_cap_pct = max(0.0, step_cap_pct)
+        step_cap_price = prev_limit_price * (1.0 + step_cap_pct)
+
+        return min(candidate, step_cap_price, cap_price)
 
     @staticmethod
     def _build_timing_fields(alpha_label_ts: float, alpha_available_ts: float, order_submit_ts: float, fill_ts: float) -> dict:
@@ -168,11 +228,22 @@ class OrchestratorExecution:
                 else:
                     locked_cash_by_bot += (getattr(s_state, 'qty', 0) * getattr(s_state, 'entry_price', 0.0) * 100)
         
-        if os.environ.get('PARITY_MODE') == 'PLAN_A':
-            print(f"🔍 [PARITY_TRACE] {sym} | active_count: {active_count} | MAX_POSITIONS: {self.orch.cfg.MAX_POSITIONS} (BYPASSED)")
+        max_positions = max(1, int(self._cfg_value('MAX_POSITIONS', MAX_POSITIONS)))
+        parity_bypass = (
+            os.environ.get('PARITY_MODE') == 'PLAN_A'
+            and self.orch.mode == 'backtest'
+        )
+        if parity_bypass:
+            logger.info(
+                f"🔍 [PARITY_TRACE] {sym} | active_count={active_count} | "
+                f"MAX_POSITIONS={max_positions} (BYPASSED in backtest only)"
+            )
         else:
-            if active_count >= self.orch.cfg.MAX_POSITIONS: 
-                logger.warning(f"✋ [风控拒单 - {sym}] 当前已有 {active_count} 个持仓或挂单，达到上限 ({self.orch.cfg.MAX_POSITIONS})，拒绝开仓！")
+            if active_count >= max_positions:
+                logger.warning(
+                    f"✋ [风控拒单 - {sym}] 当前已有 {active_count} 个持仓或挂单，"
+                    f"达到上限 ({max_positions})，拒绝开仓！"
+                )
                 return
 
         if math.isnan(self.orch.mock_cash):
@@ -180,15 +251,25 @@ class OrchestratorExecution:
             from config import INITIAL_ACCOUNT
             self.orch.mock_cash = float(INITIAL_ACCOUNT)
 
-        position_ratio = float(self._cfg_value('POSITION_RATIO', POSITION_RATIO))
-        global_exposure_limit = float(self._cfg_value('GLOBAL_EXPOSURE_LIMIT', GLOBAL_EXPOSURE_LIMIT))
+        position_ratio = max(0.0, min(1.0, float(self._cfg_value('POSITION_RATIO', POSITION_RATIO))))
+        global_exposure_limit = max(0.0, min(1.0, float(self._cfg_value('GLOBAL_EXPOSURE_LIMIT', GLOBAL_EXPOSURE_LIMIT))))
         max_trade_cap = float(self._cfg_value('MAX_TRADE_CAP', MAX_TRADE_CAP))
         commission_per_contract = float(self._cfg_value('COMMISSION_PER_CONTRACT', COMMISSION_PER_CONTRACT))
+        auto_cap_ratio = float(self._cfg_value('AUTO_TRADING_CAPITAL_RATIO', AUTO_TRADING_CAPITAL_RATIO))
+        auto_cap_ratio = max(0.0, min(1.0, auto_cap_ratio))
+        if auto_cap_ratio <= 0.0:
+            logger.warning(f"✋ [风控拒单 - {sym}] AUTO_TRADING_CAPITAL_RATIO=0，自动交易资金池已关闭。")
+            return
+        if position_ratio <= 0.0:
+            logger.warning(f"✋ [风控拒单 - {sym}] POSITION_RATIO=0，单标的仓位分配为 0。")
+            return
 
         bot_total_capital = self.orch.mock_cash + locked_cash_by_bot
-        raw_alloc = bot_total_capital * position_ratio
-        max_exposure = bot_total_capital * global_exposure_limit
-        remaining_quota = max_exposure - locked_cash_by_bot
+        # 自动策略只允许使用自动资金池；手动池由 Dashboard 等人工触发通道使用。
+        auto_pool_capital = bot_total_capital * auto_cap_ratio
+        raw_alloc = auto_pool_capital * position_ratio
+        max_exposure = auto_pool_capital * global_exposure_limit
+        remaining_quota = max(0.0, max_exposure - locked_cash_by_bot)
         final_alloc = min(raw_alloc, remaining_quota, self.orch.mock_cash, max_trade_cap)
         
         if final_alloc < 200: return
@@ -234,10 +315,21 @@ class OrchestratorExecution:
         
         total_est_cost = target_qty * fill_price * 100
         total_est_comm = target_qty * commission_per_contract
+        total_new_locked = total_est_cost + total_est_comm
+
+        # 🛡️ [Hard Guard] 下单前最终敞口复核，确保不会突破自动资金池全局上限
+        projected_locked = locked_cash_by_bot + total_new_locked
+        if projected_locked - max_exposure > 1e-6:
+            logger.warning(
+                f"✋ [风控拒单 - {sym}] 预测敞口超限: projected=${projected_locked:,.2f} "
+                f"> max_exposure=${max_exposure:,.2f} | current_locked=${locked_cash_by_bot:,.2f} "
+                f"| new_locked=${total_new_locked:,.2f}"
+            )
+            return
         
         # 扣款
-        self.orch.mock_cash -= (total_est_cost + total_est_comm)
-        st.locked_cash = (total_est_cost + total_est_comm)
+        self.orch.mock_cash -= total_new_locked
+        st.locked_cash = total_new_locked
         
         # =========== 冰山发单分流 [Ghost A: 冰山保护] ===========
         # 🚀 [对齐对冲] 如果处于强制确定性模式，即使是 realtime 也必须禁用冰山，对齐 S4 Atomic Fill
@@ -659,7 +751,13 @@ class OrchestratorExecution:
                 if attempt_no >= max_attempts - 1:
                     break
 
-                current_limit_price = self._get_entry_limit_price(sig, current_limit_price, attempt_no=attempt_no + 1)
+                current_limit_price = self._next_entry_requote_price(
+                    sig=sig,
+                    prev_limit_price=current_limit_price,
+                    attempt_no=attempt_no + 1,
+                    cap_price=cap_price,
+                    real_contract=real_contract,
+                )
                 if current_limit_price < 0.05:
                     break
                 if current_limit_price > cap_price:

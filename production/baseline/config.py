@@ -211,6 +211,22 @@ MAX_TRADE_CAP           = 100000.0    # 单笔交易最大金额 ($)
 GLOBAL_EXPOSURE_LIMIT   = 0.90        # 全局风险敞口上限
 COMMISSION_PER_CONTRACT = 0.65        # 手续费 ($/手)
 
+# 自动/手动仓位池拆分:
+# - AUTO_TRADING_CAPITAL_RATIO: 自动策略可使用的总资金比例
+# - MANUAL_TRADING_CAPITAL_RATIO: 手动触发预留资金比例（自动计算为 1 - AUTO）
+# 默认 AUTO=1.0，保持历史行为不变；需要人工池时可设为例如 0.70。
+AUTO_TRADING_CAPITAL_RATIO = min(
+    1.0,
+    max(0.0, float(os.environ.get("AUTO_TRADING_CAPITAL_RATIO", "1.0")))
+)
+MANUAL_TRADING_CAPITAL_RATIO = max(0.0, 1.0 - AUTO_TRADING_CAPITAL_RATIO)
+
+# 手动触发单笔默认占用手动资金池比例（Dashboard 使用）
+MANUAL_ORDER_ALLOC_RATIO = min(
+    1.0,
+    max(0.01, float(os.environ.get("MANUAL_ORDER_ALLOC_RATIO", "0.25")))
+)
+
 # ================= BSM 定价参数 =================
 ONLY_LOG_ALPHA=False
 
@@ -226,12 +242,13 @@ CORR_THRESHOLD = -0.1             # 反转相关性阈值
 STRATEGY_CORE_VERSION = os.environ.get("STRATEGY_CORE_VERSION", "V0").strip().upper()
 
 # ================= 订单执行 =================
-ORDER_TIMEOUT_SECONDS = 30         # 挂单超时
+ORDER_TIMEOUT_SECONDS = 5          # 挂单超时
 ORDER_MAX_RETRIES     = 3          # 最大追单次数
 COOLDOWN_MINUTES      = 60         # 止损后的品种冷却时间 (分钟)
 LIMIT_BUFFER_ENTRY    = 1.03       # 买入限价缓冲 (Ask * 1.03)
 LIMIT_BUFFER_EXIT     = 0.97       # 卖出限价缓冲 (Bid * 0.97)
 ENTRY_MAX_REQUOTE_SLIPPAGE_PCT = float(os.environ.get("ENTRY_MAX_REQUOTE_SLIPPAGE_PCT", "0.02"))  # 建仓追价最大偏离(相对初始信号价)
+ENTRY_REQUOTE_STEP_CAP_PCT = float(os.environ.get("ENTRY_REQUOTE_STEP_CAP_PCT", "0.006"))  # 建仓单次重提最大涨幅(相对上一笔限价)
 SLIPPAGE_ENTRY_PCT    = 0.001      # 建仓滑点 (0.1%)
 SLIPPAGE_EXIT_PCT     = 0.001      # 平仓滑点 (0.1%)
 EXIT_ORDER_TYPE       = 'MKT'      # 平仓订单类型 (MKT/LMT)

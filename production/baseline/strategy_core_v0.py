@@ -25,13 +25,18 @@ from strategy_config0 import StrategyConfig
 class StrategyCoreV0:
     def __init__(self, config: StrategyConfig = None):
         self.cfg = config if config else StrategyConfig()
+        self._last_reject_reason = None
 
     def decide_entry(self, ctx: dict) -> dict:
         """
         [开仓决策 - 核心路由入口]
         """
+        self._last_reject_reason = None
         # 1. 基础状态与时间窗口拦截
-        if not self._check_entry_pre_conditions(ctx): return None
+        if not self._check_entry_pre_conditions(ctx):
+            if not self._last_reject_reason:
+                self._last_reject_reason = 'pre_conditions'
+            return None
 
         # 2. 优先判定: 慢牛绿灯通道 (Channel B)
         sig = None
@@ -42,10 +47,15 @@ class StrategyCoreV0:
         if not sig:
             sig = self._check_channel_a_momentum(ctx)
         
-        if not sig: return None
+        if not sig:
+            if not self._last_reject_reason:
+                self._last_reject_reason = 'both_channels_none'
+            return None
         
         # 4. 流动性与点差拦截
-        if not self._check_entry_liquidity_guard(ctx): return None
+        if not self._check_entry_liquidity_guard(ctx):
+            self._last_reject_reason = 'liquidity_guard'
+            return None
                 
         return sig
 

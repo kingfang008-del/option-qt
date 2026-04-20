@@ -13,6 +13,7 @@ from utils import serialization_utils as ser
 import pandas as pd
 import numpy as np
 import time
+import random
 
 import psycopg2
 import plotly.graph_objects as go
@@ -35,7 +36,9 @@ sys.path.append(str(Path(__file__).parent.parent)) # Add V8 root to path
 from config import (
     REDIS_CFG, DB_DIR, NY_TZ, DASHBOARD_REFRESH_RATE, DATA_DIR,
     HASH_OPTION_SNAPSHOT, STREAM_FUSED_MARKET, STREAM_INFERENCE,
-    STREAM_TRADE_LOG, BUCKET_SPECS, IBKR_PORT, PG_DB_URL # [New] 引入 PG_DB_URL
+    STREAM_TRADE_LOG, BUCKET_SPECS, TAG_TO_INDEX, IBKR_PORT, PG_DB_URL,
+    AUTO_TRADING_CAPITAL_RATIO, MANUAL_TRADING_CAPITAL_RATIO, MANUAL_ORDER_ALLOC_RATIO,
+    COMMISSION_PER_CONTRACT
 )
 
 # [Fix 1] 补全 Dashboard 所需的 Redis Key 映射
@@ -163,7 +166,202 @@ def get_redis_client():
     except Exception as e:
         st.error(f"Redis Connection Failed: {e}")
         return None
+
+def get_ibkr_connector_status(rds):
+    """读取 ibkr_connector_v8 上报的连接状态。"""
+    if rds is None:
+        return {}
+    try:
+        raw = rds.hget("live_ibkr_connector", "status")
+        if not raw:
+            return {}
+        data = ser.unpack(raw)
+        if isinstance(data, dict):
+            return data
+        return {}
+    except Exception:
+        return {}
     
+def _parse_account_metrics(account_values):
+    """从 IB accountValues 提取净值/可用资金（USD）。"""
+    out = {
+        "net_liq": None,
+        "available_funds": None,
+    }
+    if not account_values:
+        return out
+    for val in account_values:
+        if getattr(val, "tag", "") == "NetLiquidation" and getattr(val, "currency", "") == "USD":
+            try:
+                out["net_liq"] = float(val.value)
+            except Exception:
+                pass
+        if getattr(val, "tag", "") == "AvailableFunds" and getattr(val, "currency", "") == "USD":
+            try:
+                out["available_funds"] = float(val.value)
+            except Exception:
+                pass
+    return out
+
+def _calc_auto_open_notional_from_redis(rds):
+    """
+    统计自动引擎当前占用名义本金（来自 oms:live_positions）。
+    口径: sum(qty * entry_price * 100)，仅 position!=0 且 qty>0 的状态。
+    """
+    if rds is None:
+        return 0.0
+    total = 0.0
+    try:
+        raw_map = rds.hgetall("oms:live_positions") or {}
+        for _, raw_val in raw_map.items():
+            try:
+                if isinstance(raw_val, (bytes, bytearray)):
+                    txt = raw_val.decode("utf-8", errors="ignore")
+                else:
+                    txt = str(raw_val)
+                state = json.loads(txt)
+                pos = int(state.get("position", 0) or 0)
+                qty = float(state.get("qty", 0.0) or 0.0)
+                entry_price = float(state.get("entry_price", 0.0) or 0.0)
+                if pos != 0 and qty > 0 and entry_price > 0:
+                    total += qty * entry_price * 100.0
+            except Exception:
+                continue
+    except Exception:
+        return 0.0
+    return float(total)
+
+def _build_manual_capital_snapshot(total_equity, ib_portfolio, rds):
+    """
+    计算自动/手动资金池快照:
+    - auto_budget = total_equity * AUTO_TRADING_CAPITAL_RATIO
+    - manual_budget = total_equity - auto_budget
+    - auto_used = Redis 自动仓位占用
+    - ib_total_open = IB 当前全部持仓名义市值(绝对值)
+    - manual_used = max(0, ib_total_open - auto_used)  # 粗略分解
+    """
+    total_equity = float(total_equity or 0.0)
+    auto_budget = total_equity * float(AUTO_TRADING_CAPITAL_RATIO)
+    manual_budget = total_equity - auto_budget
+    auto_used = _calc_auto_open_notional_from_redis(rds)
+    ib_total_open = 0.0
+    for item in (ib_portfolio or []):
+        try:
+            ib_total_open += abs(float(getattr(item, "marketValue", 0.0) or 0.0))
+        except Exception:
+            continue
+    manual_used = max(0.0, ib_total_open - auto_used)
+    return {
+        "total_equity": total_equity,
+        "auto_budget": max(0.0, auto_budget),
+        "manual_budget": max(0.0, manual_budget),
+        "auto_used": max(0.0, auto_used),
+        "manual_used": max(0.0, manual_used),
+        "auto_available": max(0.0, auto_budget - auto_used),
+        "manual_available": max(0.0, manual_budget - manual_used),
+    }
+
+def _fetch_latest_option_snapshot(symbol):
+    """读取某 symbol 最新 buckets/contracts 快照（优先 Redis，失败回退 PG）。"""
+    # Redis 优先（实时）
+    try:
+        rds = get_redis_client()
+        if rds:
+            raw = rds.hget(HASH_OPTION_SNAPSHOT, symbol)
+            if raw:
+                snap = ser.unpack(raw)
+                if isinstance(snap, dict):
+                    return snap.get("buckets", []), snap.get("contracts", [])
+                if isinstance(snap, list):
+                    return snap, []
+    except Exception:
+        pass
+
+    # PG 回退（近似最新）
+    try:
+        conn = psycopg2.connect(PG_DB_URL)
+        c = conn.cursor()
+        c.execute(
+            "SELECT buckets_json FROM option_snapshots_1m WHERE symbol=%s ORDER BY ts DESC LIMIT 1",
+            (symbol,)
+        )
+        row = c.fetchone()
+        conn.close()
+        if row:
+            snap = row[0]
+            if isinstance(snap, str):
+                snap = json.loads(snap)
+            if isinstance(snap, dict):
+                return snap.get("buckets", []), snap.get("contracts", [])
+            if isinstance(snap, list):
+                return snap, []
+    except Exception:
+        pass
+    return [], []
+
+def _get_bucket_quote_and_contract(symbol, tag):
+    """
+    返回指定 symbol + bucket(tag) 的实时 quote 与合约标识。
+    """
+    idx = TAG_TO_INDEX.get(tag, -1)
+    if idx < 0:
+        return None
+    buckets, contracts = _fetch_latest_option_snapshot(symbol)
+    if not buckets or len(buckets) <= idx:
+        return None
+    row = buckets[idx]
+    if not isinstance(row, (list, tuple)) or len(row) < 10:
+        return None
+    bid = float(row[8] or 0.0) if len(row) > 8 else 0.0
+    ask = float(row[9] or 0.0) if len(row) > 9 else 0.0
+    last = float(row[0] or 0.0)
+    mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 and ask >= bid else (last if last > 0 else 0.0)
+    contract_txt = contracts[idx] if contracts and len(contracts) > idx else ""
+    return {
+        "bucket_idx": idx,
+        "bid": bid,
+        "ask": ask,
+        "last": last,
+        "mid": mid,
+        "contract_text": contract_txt,
+    }
+
+def _fetch_locked_contract_row(symbol, tag):
+    """
+    从 contract_locks 读取当日(若无则最近日期)锁定合约，供人工手动触发开仓使用。
+    """
+    try:
+        conn = psycopg2.connect(PG_DB_URL)
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT date, symbol, tag, conid, expiry, strike, p_right, multiplier, localsymbol, tradingclass
+            FROM contract_locks
+            WHERE symbol=%s AND tag=%s
+            ORDER BY date DESC
+            LIMIT 1
+            """,
+            (symbol, tag),
+        )
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {
+            "date": row[0],
+            "symbol": row[1],
+            "tag": row[2],
+            "conId": int(row[3]) if row[3] is not None else None,
+            "expiry": row[4],
+            "strike": float(row[5]) if row[5] is not None else 0.0,
+            "right": row[6],
+            "multiplier": str(row[7]) if row[7] is not None else "100",
+            "localSymbol": row[8] or "",
+            "tradingClass": row[9] or "",
+        }
+    except Exception:
+        return None
+
 
 def get_pg_health_status():
     """
@@ -1520,6 +1718,38 @@ with st.sidebar:
     env_text = "REAL MONEY" if IBKR_PORT == 4001 else "PAPER / SIM"
     st.markdown(f"**ENV**: <span style='color:{env_color}'>**{env_text}**</span> (Port {IBKR_PORT})", unsafe_allow_html=True)
     
+    # [NEW] 显示 IBKR Connector 实时连接状态（来自 ibkr_connector_v8 Redis 心跳）
+    conn_status = get_ibkr_connector_status(r)
+    if conn_status:
+        state = str(conn_status.get("state", "UNKNOWN"))
+        connected = bool(conn_status.get("connected", False))
+        ts_val = float(conn_status.get("ts", 0.0) or 0.0)
+        age_sec = max(0.0, time.time() - ts_val) if ts_val > 0 else 9999.0
+        host = conn_status.get("host", "127.0.0.1")
+        port = conn_status.get("port", IBKR_PORT)
+        client_id = conn_status.get("client_id", "N/A")
+        note = str(conn_status.get("note", "") or "")
+        last_error = str(conn_status.get("last_error", "") or "")
+        active_stocks = int(conn_status.get("active_stocks", 0) or 0)
+        locked_symbols = int(conn_status.get("locked_symbols", 0) or 0)
+
+        if connected and age_sec <= 5.0:
+            st.success(f"IBKR Connector: {state}")
+        elif connected:
+            st.warning(f"IBKR Connector: {state} (stale {age_sec:.1f}s)")
+        else:
+            st.error(f"IBKR Connector: {state}")
+        st.caption(
+            f"{host}:{port} | clientId={client_id} | age={age_sec:.1f}s | "
+            f"stocks={active_stocks} | locks={locked_symbols}"
+        )
+        if note:
+            st.caption(f"note: {note}")
+        if last_error:
+            st.caption(f"last_error: {last_error[:180]}")
+    else:
+        st.warning("IBKR Connector status: missing heartbeat")
+    
     # [NEW] 实时拉取 & 显示账户总资产
     try:
         raw_acct = r.hget('live_account_info', 'balance')
@@ -1738,127 +1968,566 @@ with tab10:
     st.header("🏦 Active Positions & IBKR Account")
     st.markdown("Retrieve live positions directly from IBKR Gateway and force close positions if needed.")
     
-    # helper for async ib connection
+    def _connect_ibkr_with_fallback(ib, host='127.0.0.1', port=IBKR_PORT, preferred_client_ids=None):
+        """
+        尽量避开 clientId 冲突：
+        1) 先试固定优先 ID（便于排错）
+        2) 再试随机区间（避开运行中引擎）
+        """
+        if preferred_client_ids is None:
+            preferred_client_ids = [111, 112, 113, 114, 115]
+
+        tried = []
+        candidates = list(preferred_client_ids)
+        candidates.extend(random.sample(range(1200, 1500), k=5))
+
+        last_err = None
+        for cid in candidates:
+            tried.append(cid)
+            try:
+                if ib.isConnected():
+                    ib.disconnect()
+                ib.connect(host, port, clientId=int(cid), timeout=4)
+                return True, int(cid), ""
+            except Exception as e:
+                last_err = str(e)
+                continue
+
+        return False, None, f"{last_err} (tried clientId={tried})"
+
     def fetch_ibkr_positions():
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
         import ib_insync
         ib = ib_insync.IB()
         try:
-            # Connect with a random client_id to avoid conflicts
-            ib.connect('127.0.0.1', IBKR_PORT, clientId=111)
+            ok, client_id, err = _connect_ibkr_with_fallback(ib)
+            if not ok:
+                return None, None, f"Connect failed: {err}"
+
             portfolio = ib.portfolio()
             account_values = ib.accountValues()
-            ib.disconnect()
-            return portfolio, account_values
+            return portfolio, account_values, None
         except Exception as e:
-            return None, str(e)
-            
-    def close_ibkr_position(contract, qty, action='SELL'):
-        import asyncio
-        import time # Added import for time
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            return None, None, str(e)
+        finally:
+            try:
+                if ib.isConnected():
+                    ib.disconnect()
+            except Exception:
+                pass
+
+    def close_ibkr_positions(position_rows):
+        """
+        批量平仓：单次连接、逐笔下单，返回每笔结果。
+        position_rows: [{'Account','Contract','Symbol','Qty','_RawContract'}, ...]
+        """
         import ib_insync
         ib = ib_insync.IB()
+        results = []
         try:
-            ib.connect('127.0.0.1', IBKR_PORT, clientId=112)
-            # Qualify the contract
-            ib.qualifyContracts(contract)
-            order = ib_insync.MarketOrder(action, abs(qty))
-            trade = ib.placeOrder(contract, order)
-            ib.sleep(2) # Give it 2 seconds to execute
-            ib.disconnect()
-            return True, "Order Placed"
-        except Exception as e:
-            return False, str(e)
+            ok, client_id, err = _connect_ibkr_with_fallback(ib, preferred_client_ids=[116, 117, 118, 119, 120])
+            if not ok:
+                return False, [{"ok": False, "contract": "ALL", "message": f"IBKR connect failed: {err}"}]
 
-    if st.button("🔄 Refresh Positions"):
-        with st.spinner("Connecting to IBKR..."):
-            portfolio, account_vals = fetch_ibkr_positions()
-            
-            if isinstance(account_vals, str):
-                st.error(f"Failed to connect to IBKR: {account_vals}")
+            for row in position_rows:
+                contract = row.get('_RawContract')
+                qty = float(row.get('Qty', 0) or 0)
+                if contract is None or abs(qty) < 1e-8:
+                    results.append({
+                        "ok": False,
+                        "contract": row.get('Contract', 'UNKNOWN'),
+                        "message": "invalid contract or zero qty"
+                    })
+                    continue
+
+                action = "SELL" if qty > 0 else "BUY"
+                order_qty = abs(qty)
+                account = row.get('Account', "")
+                contract_desc = row.get('Contract', getattr(contract, "localSymbol", "UNKNOWN"))
+
+                try:
+                    ib.qualifyContracts(contract)
+                    order = ib_insync.MarketOrder(action, order_qty)
+                    if account:
+                        order.account = account
+
+                    trade = ib.placeOrder(contract, order)
+                    ib.sleep(1.2)
+
+                    status = ""
+                    if trade is not None and getattr(trade, 'orderStatus', None) is not None:
+                        status = str(getattr(trade.orderStatus, 'status', '') or '')
+                    ok_status = status in {"Submitted", "PreSubmitted", "Filled", "PendingSubmit", "PendingCancel"}
+                    results.append({
+                        "ok": bool(ok_status),
+                        "contract": contract_desc,
+                        "message": f"{action} {order_qty} status={status or 'Unknown'} account={account or 'N/A'}"
+                    })
+                except Exception as e:
+                    results.append({
+                        "ok": False,
+                        "contract": contract_desc,
+                        "message": f"{action} {order_qty} failed: {e}"
+                    })
+        except Exception as e:
+            results.append({"ok": False, "contract": "ALL", "message": str(e)})
+        finally:
+            try:
+                if ib.isConnected():
+                    ib.disconnect()
+            except Exception:
+                pass
+
+        all_ok = all(item.get("ok", False) for item in results) if results else False
+        return all_ok, results
+
+    def place_manual_atm_order(symbol, tag, qty, account=""):
+        """
+        按 symbol + bucket tag（CALL_ATM / PUT_ATM）下手动单。
+        合约来源：contract_locks；价格来源：当前快照 mid/bid/ask（仅用于展示与估算）。
+        """
+        import ib_insync
+        qty = int(qty or 0)
+        if qty <= 0:
+            return False, "qty must be > 0", None
+
+        lock_row = _fetch_locked_contract_row(symbol, tag)
+        if not lock_row or not lock_row.get("conId"):
+            return False, f"No locked contract found for {symbol} {tag} in contract_locks", None
+
+        quote = _get_bucket_quote_and_contract(symbol, tag) or {}
+        ib = ib_insync.IB()
+        try:
+            ok, client_id, err = _connect_ibkr_with_fallback(ib, preferred_client_ids=[121, 122, 123, 124, 125])
+            if not ok:
+                return False, f"IBKR connect failed: {err}", None
+
+            contract = ib_insync.Contract()
+            contract.conId = int(lock_row["conId"])
+            contract.secType = "OPT"
+            contract.exchange = "SMART"
+            contract.currency = "USD"
+            contract.localSymbol = lock_row.get("localSymbol", "") or ""
+            if lock_row.get("tradingClass"):
+                contract.tradingClass = lock_row.get("tradingClass")
+            if lock_row.get("multiplier"):
+                contract.multiplier = str(lock_row.get("multiplier"))
+
+            ib.qualifyContracts(contract)
+            order = ib_insync.MarketOrder("BUY", int(qty))
+            if account:
+                order.account = account
+            trade = ib.placeOrder(contract, order)
+            ib.sleep(1.2)
+
+            status = ""
+            if trade is not None and getattr(trade, 'orderStatus', None) is not None:
+                status = str(getattr(trade.orderStatus, 'status', '') or '')
+            ok_status = status in {"Submitted", "PreSubmitted", "Filled", "PendingSubmit", "PendingCancel"}
+            msg = (
+                f"BUY {qty} {symbol} {tag} "
+                f"(conId={lock_row['conId']}, local={lock_row.get('localSymbol', '')}) "
+                f"status={status or 'Unknown'} account={account or 'N/A'}"
+            )
+            tracker_seed = {
+                "symbol": symbol,
+                "tag": tag,
+                "qty": int(qty),
+                "account": account or "",
+                "contract_key": lock_row.get("localSymbol", "") or str(lock_row["conId"]),
+                "entry_ref_price": float(quote.get("mid", 0.0) or 0.0),
+                "conId": int(lock_row["conId"]),
+            }
+            return bool(ok_status), msg, tracker_seed
+        except Exception as e:
+            return False, str(e), None
+        finally:
+            try:
+                if ib.isConnected():
+                    ib.disconnect()
+            except Exception:
+                pass
+
+    def _manual_trackers_init():
+        if "manual_trackers" not in st.session_state:
+            st.session_state["manual_trackers"] = []
+
+    def _upsert_manual_tracker(seed, stop_loss_pct, take_profit_pct, trailing_stop_pct):
+        _manual_trackers_init()
+        trackers = st.session_state["manual_trackers"]
+        key = f"{seed.get('contract_key')}|{seed.get('account')}"
+        now_ts = time.time()
+        for t in trackers:
+            if t.get("key") == key and t.get("active", True):
+                t["qty"] = int(seed.get("qty", t.get("qty", 0)))
+                t["entry_ref_price"] = float(seed.get("entry_ref_price", t.get("entry_ref_price", 0.0)))
+                t["stop_loss_pct"] = float(stop_loss_pct)
+                t["take_profit_pct"] = float(take_profit_pct)
+                t["trailing_stop_pct"] = float(trailing_stop_pct)
+                t["updated_ts"] = now_ts
+                return
+        trackers.append({
+            "key": key,
+            "active": True,
+            "symbol": seed.get("symbol", ""),
+            "tag": seed.get("tag", ""),
+            "account": seed.get("account", ""),
+            "qty": int(seed.get("qty", 0)),
+            "contract_key": seed.get("contract_key", ""),
+            "entry_ref_price": float(seed.get("entry_ref_price", 0.0)),
+            "highest_price": float(seed.get("entry_ref_price", 0.0)),
+            "stop_loss_pct": float(stop_loss_pct),
+            "take_profit_pct": float(take_profit_pct),
+            "trailing_stop_pct": float(trailing_stop_pct),
+            "created_ts": now_ts,
+            "updated_ts": now_ts,
+        })
+
+    def _sync_auto_trackers_with_portfolio(portfolio):
+        _manual_trackers_init()
+        trackers = st.session_state["manual_trackers"]
+        if not trackers:
+            return
+
+        # 建立 localSymbol -> row 映射
+        pos_map = {}
+        for item in (portfolio or []):
+            c = getattr(item, "contract", None)
+            if c is None:
+                continue
+            local = getattr(c, "localSymbol", "") or ""
+            con_id = str(getattr(c, "conId", "") or "")
+            key1 = f"{local}|{getattr(item, 'account', '')}"
+            key2 = f"{con_id}|{getattr(item, 'account', '')}"
+            pos_map[key1] = item
+            pos_map[key2] = item
+
+        to_close_rows = []
+        for t in trackers:
+            if not t.get("active", True):
+                continue
+            key = t.get("key", "")
+            pos_item = pos_map.get(key)
+            if pos_item is None:
+                # 仓位已经不存在，自动标记完成
+                t["active"] = False
+                t["updated_ts"] = time.time()
+                continue
+
+            qty = float(getattr(pos_item, "position", 0.0) or 0.0)
+            if abs(qty) < 1e-8:
+                t["active"] = False
+                t["updated_ts"] = time.time()
+                continue
+
+            mkt_price = float(getattr(pos_item, "marketPrice", 0.0) or 0.0)
+            if mkt_price <= 0:
+                continue
+
+            entry = float(t.get("entry_ref_price", 0.0) or 0.0)
+            if entry <= 0:
+                entry = mkt_price
+                t["entry_ref_price"] = entry
+                t["highest_price"] = max(float(t.get("highest_price", entry) or entry), mkt_price)
+                continue
+
+            highest = max(float(t.get("highest_price", entry) or entry), mkt_price)
+            t["highest_price"] = highest
+            roi = (mkt_price / entry) - 1.0
+            drawdown = (mkt_price / highest) - 1.0 if highest > 0 else 0.0
+
+            should_close = False
+            reason = ""
+            if roi <= -abs(float(t.get("stop_loss_pct", 0.0) or 0.0)):
+                should_close = True
+                reason = f"SL {roi:.2%}"
+            elif roi >= abs(float(t.get("take_profit_pct", 0.0) or 0.0)):
+                should_close = True
+                reason = f"TP {roi:.2%}"
+            elif drawdown <= -abs(float(t.get("trailing_stop_pct", 0.0) or 0.0)):
+                should_close = True
+                reason = f"TRAIL {drawdown:.2%}"
+
+            if should_close:
+                to_close_rows.append({
+                    "Account": getattr(pos_item, "account", ""),
+                    "Contract": f"{t.get('symbol', '')} {t.get('tag', '')} | {reason}",
+                    "Symbol": t.get("symbol", ""),
+                    "SecType": "OPT",
+                    "Qty": qty,
+                    "_RawContract": getattr(pos_item, "contract", None),
+                })
+                t["active"] = False
+                t["updated_ts"] = time.time()
             else:
-                # 1. Display Account Summary
-                st.subheader("Account Summary")
-                net_liq = "N/A"
-                av_funds = "N/A"
-                for val in account_vals:
-                    if val.tag == 'NetLiquidation' and val.currency == 'USD':
-                        net_liq = f"${float(val.value):,.2f}"
-                    if val.tag == 'AvailableFunds' and val.currency == 'USD':
-                        av_funds = f"${float(val.value):,.2f}"
-                
-                c1, c2 = st.columns(2)
-                c1.metric("Net Liquidation", net_liq)
-                c2.metric("Available Funds", av_funds)
-                
-                # 2. Display Positions
-                st.subheader("Active Positions")
-                if not portfolio:
-                    st.info("No active positions found in IBKR account.")
+                t["updated_ts"] = time.time()
+
+        if to_close_rows:
+            close_ibkr_positions(to_close_rows)
+
+    def _refresh_positions_cache():
+        portfolio, account_vals, err = fetch_ibkr_positions()
+        st.session_state['ibkr_pos_error'] = err
+        st.session_state['ibkr_portfolio'] = portfolio or []
+        st.session_state['ibkr_account_vals'] = account_vals or []
+        st.session_state['ibkr_pos_refreshed_at'] = datetime.now().strftime("%H:%M:%S")
+
+    if 'ibkr_portfolio' not in st.session_state:
+        st.session_state['ibkr_portfolio'] = []
+    if 'ibkr_account_vals' not in st.session_state:
+        st.session_state['ibkr_account_vals'] = []
+    if 'ibkr_pos_error' not in st.session_state:
+        st.session_state['ibkr_pos_error'] = None
+    if 'ibkr_pos_refreshed_at' not in st.session_state:
+        st.session_state['ibkr_pos_refreshed_at'] = None
+
+    c_refresh_1, c_refresh_2 = st.columns([1, 3])
+    if c_refresh_1.button("🔄 Refresh Positions"):
+        with st.spinner("Connecting to IBKR..."):
+            _refresh_positions_cache()
+    if st.session_state.get('ibkr_pos_refreshed_at'):
+        c_refresh_2.caption(f"Last refresh: {st.session_state['ibkr_pos_refreshed_at']}")
+
+    if st.session_state.get('ibkr_pos_error'):
+        st.error(f"Failed to connect to IBKR: {st.session_state['ibkr_pos_error']}")
+    else:
+        account_vals = st.session_state.get('ibkr_account_vals', [])
+        portfolio = st.session_state.get('ibkr_portfolio', [])
+
+        st.subheader("Account Summary")
+        net_liq = "N/A"
+        av_funds = "N/A"
+        for val in account_vals:
+            if getattr(val, 'tag', '') == 'NetLiquidation' and getattr(val, 'currency', '') == 'USD':
+                net_liq = f"${float(val.value):,.2f}"
+            if getattr(val, 'tag', '') == 'AvailableFunds' and getattr(val, 'currency', '') == 'USD':
+                av_funds = f"${float(val.value):,.2f}"
+        c1, c2 = st.columns(2)
+        c1.metric("Net Liquidation", net_liq)
+        c2.metric("Available Funds", av_funds)
+
+        # ================= 手动交易控制台（热度榜关联 ATM） =================
+        acct_metrics = _parse_account_metrics(account_vals)
+        total_equity = float(acct_metrics.get("net_liq") or 0.0)
+        cap = _build_manual_capital_snapshot(total_equity, portfolio, r)
+
+        st.markdown("### ⚙️ Capital Split (Auto vs Manual)")
+        sp1, sp2, sp3, sp4 = st.columns(4)
+        sp1.metric("Auto Pool Ratio", f"{AUTO_TRADING_CAPITAL_RATIO:.0%}", f"Budget ${cap['auto_budget']:,.0f}")
+        sp2.metric("Manual Pool Ratio", f"{MANUAL_TRADING_CAPITAL_RATIO:.0%}", f"Budget ${cap['manual_budget']:,.0f}")
+        sp3.metric("Auto Used / Avail", f"${cap['auto_used']:,.0f}", f"Avail ${cap['auto_available']:,.0f}")
+        sp4.metric("Manual Used / Avail", f"${cap['manual_used']:,.0f}", f"Avail ${cap['manual_available']:,.0f}")
+
+        st.caption(
+            "自动池=总资金×AUTO_TRADING_CAPITAL_RATIO；手动池为剩余部分。"
+            "自动占用来自 `oms:live_positions`，手动占用按 IB 持仓总额扣除自动占用近似估算。"
+        )
+
+        st.markdown("### 🚀 Momentum -> ATM Manual Trigger")
+        long_df, short_df, stats = load_momentum_leaderboard(max_symbols=10)
+        if not stats:
+            st.info("动能榜暂不可用，等待 market_bars_1m / alpha_logs 更新。")
+        else:
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Regime", stats.get("regime", "N/A"))
+            m2.metric("Breadth", f"{stats.get('breadth_up_ratio', 0.0):.1%}")
+            m3.metric("Top3 Strength", f"{stats.get('top3_strength', 0.0):.2f}")
+
+            direction = st.radio(
+                "Trigger Side",
+                options=["LONG (CALL_ATM)", "SHORT (PUT_ATM)"],
+                horizontal=True,
+                key="manual_trigger_side"
+            )
+            use_long = direction.startswith("LONG")
+            tag = "CALL_ATM" if use_long else "PUT_ATM"
+            candidate_df = long_df if use_long else short_df
+
+            if candidate_df.empty:
+                st.info("当前方向无候选标的。")
+            else:
+                candidate_symbols = candidate_df["symbol"].astype(str).tolist()
+                sel_symbol = st.selectbox(
+                    "Candidate Symbol",
+                    options=candidate_symbols,
+                    index=0,
+                    key="manual_trigger_symbol"
+                )
+                row = candidate_df[candidate_df["symbol"] == sel_symbol].head(1)
+                if not row.empty:
+                    row = row.iloc[0]
+                    st.caption(
+                        f"{sel_symbol} | score={float(row.get('momentum_score', 0.0)):.2f} "
+                        f"| ret5m={float(row.get('ret_5m', 0.0)):.2%} "
+                        f"| alpha={float(row.get('alpha', 0.0)):.3f} "
+                        f"| vol_z={float(row.get('vol_z', 0.0)):.2f}"
+                    )
+
+                quote = _get_bucket_quote_and_contract(sel_symbol, tag)
+                if not quote:
+                    st.warning(f"未找到 {sel_symbol} {tag} 的实时快照，无法估算下单数量。")
                 else:
-                    pos_data = []
-                    for item in portfolio:
-                        # Extract basic info from PortfolioItem
-                        p_contract = item.contract
-                        sym = p_contract.symbol
-                        sec_type = p_contract.secType
-                        qty = item.position
-                        avg_cost = item.averageCost
-                        mkt_price = item.marketPrice
-                        mkt_val = item.marketValue
-                        unrealized_pnl = item.unrealizedPNL
-                        
-                        desc = f"{sym} {sec_type}"
-                        if sec_type == 'OPT':
-                            desc = f"{sym} {p_contract.lastTradeDateOrContractMonth} {p_contract.strike} {p_contract.right}"
-                            
-                        # Use dict.get or ternary for safety in case some fields are None
-                        pos_data.append({
-                            "Account": item.account,
-                            "Contract": desc,
-                            "Symbol": sym,
-                            "SecType": sec_type,
-                            "Qty": qty,
-                            "Avg Cost": f"${avg_cost:.2f}" if avg_cost is not None else "N/A",
-                            "Mkt Price": f"${mkt_price:.2f}" if mkt_price is not None else "N/A",
-                            "Mkt Value": f"${mkt_val:.2f}" if mkt_val is not None else "N/A",
-                            "Unrealized PnL": f"${unrealized_pnl:.2f}" if unrealized_pnl is not None else "N/A",
-                            "_RawContract": p_contract # Store raw contract for close button
-                        })
-                    
-                    df_pos = pd.DataFrame(pos_data)
-                    st.dataframe(df_pos.drop(columns=['_RawContract']), use_container_width=True)
-                    
-                    # 3. Close Buttons
-                    st.subheader("Danger Zone: Close Positions")
-                    st.warning("Clicking these buttons will send a MARKET order directly to IBKR. Use with caution.")
-                    
-                    for idx, row in df_pos.iterrows():
-                        col1, col2 = st.columns([3, 1])
-                        col1.write(f"**{row['Contract']}** (Qty: {row['Qty']})")
-                        
-                        action_str = "SELL" if row['Qty'] > 0 else "BUY" # Cover short positions
-                        button_key = f"close_pos_{idx}_{row['Symbol']}"
-                        
-                        if col2.button(f"Close Position", key=button_key, type="secondary"):
-                            with st.spinner(f"Sending {action_str} MKT order for {row['Contract']}..."):
-                                success, msg = close_ibkr_position(row['_RawContract'], row['Qty'], action=action_str)
-                                if success:
-                                    st.success(f"Order sent! Refresh to verify.")
-                                    time.sleep(1)
-                                    st.rerun()
-                                else:
-                                    st.error(f"Failed to send order: {msg}")
+                    q1, q2, q3 = st.columns(3)
+                    q1.metric("ATM Mid", f"${quote.get('mid', 0.0):.3f}")
+                    q2.metric("Bid/Ask", f"{quote.get('bid', 0.0):.3f}/{quote.get('ask', 0.0):.3f}")
+                    q3.metric("Contract", quote.get("contract_text", "") or "N/A")
+
+                    alloc_ratio = st.slider(
+                        "Manual order alloc ratio (of manual available)",
+                        min_value=0.05, max_value=1.00,
+                        value=float(MANUAL_ORDER_ALLOC_RATIO), step=0.05,
+                        key="manual_order_alloc_ratio"
+                    )
+                    est_notional = cap["manual_available"] * float(alloc_ratio)
+                    est_cost_per_contract = (quote.get("mid", 0.0) * 100.0) + float(COMMISSION_PER_CONTRACT)
+                    est_qty = int(est_notional // est_cost_per_contract) if est_cost_per_contract > 0 else 0
+
+                    qa, qb = st.columns(2)
+                    qa.metric("Est. Notional", f"${est_notional:,.0f}")
+                    qb.metric("Est. Qty", f"{est_qty}")
+
+                    track_auto_exit = st.checkbox("Enable auto-track exit", value=True, key="manual_auto_track_exit")
+                    t1, t2, t3 = st.columns(3)
+                    stop_loss_pct = t1.number_input("Stop Loss %", min_value=0.005, max_value=0.50, value=0.08, step=0.005, key="manual_sl")
+                    take_profit_pct = t2.number_input("Take Profit %", min_value=0.005, max_value=1.00, value=0.15, step=0.005, key="manual_tp")
+                    trailing_stop_pct = t3.number_input("Trailing %", min_value=0.005, max_value=0.50, value=0.06, step=0.005, key="manual_trail")
+
+                    all_accounts = sorted([a for a in {getattr(p, "account", "") for p in portfolio if getattr(p, "account", "")} if a])
+                    account_pick = st.selectbox(
+                        "Order Account",
+                        options=(all_accounts if all_accounts else [""]),
+                        index=0,
+                        key="manual_trigger_account",
+                        help="若为空则不指定 account 字段，由 IB 默认账户处理。"
+                    )
+
+                    can_submit = est_qty >= 1 and cap["manual_available"] > 0
+                    if st.button(f"🟢 Manual BUY {tag} ({sel_symbol})", disabled=not can_submit, key="manual_buy_submit"):
+                        with st.spinner("Submitting manual ATM order..."):
+                            ok, msg, tracker_seed = place_manual_atm_order(
+                                symbol=sel_symbol,
+                                tag=tag,
+                                qty=est_qty,
+                                account=account_pick or ""
+                            )
+                            if ok:
+                                st.success(msg)
+                                if track_auto_exit and tracker_seed:
+                                    _upsert_manual_tracker(
+                                        tracker_seed,
+                                        stop_loss_pct=float(stop_loss_pct),
+                                        take_profit_pct=float(take_profit_pct),
+                                        trailing_stop_pct=float(trailing_stop_pct)
+                                    )
+                                    st.info("Auto-track exit enabled for this order.")
+                                _refresh_positions_cache()
+                                st.rerun()
+                            else:
+                                st.error(msg)
+
+        # 自动跟踪平仓（仅在 Dashboard 页面存活期间生效）
+        if st.session_state.get("manual_auto_track_exit", False):
+            _sync_auto_trackers_with_portfolio(portfolio)
+            trackers = st.session_state.get("manual_trackers", [])
+            active_trackers = [t for t in trackers if t.get("active", True)]
+            if active_trackers:
+                st.markdown("#### 🤖 Manual Auto-Exit Trackers")
+                st.dataframe(
+                    pd.DataFrame(active_trackers)[[
+                        "symbol", "tag", "account", "qty", "entry_ref_price",
+                        "highest_price", "stop_loss_pct", "take_profit_pct",
+                        "trailing_stop_pct", "updated_ts"
+                    ]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+        st.subheader("Active Positions")
+        if not portfolio:
+            st.info("No active positions found in IBKR account.")
+        else:
+            pos_data = []
+            for item in portfolio:
+                p_contract = item.contract
+                sym = p_contract.symbol
+                sec_type = p_contract.secType
+                qty = item.position
+                avg_cost = item.averageCost
+                mkt_price = item.marketPrice
+                mkt_val = item.marketValue
+                unrealized_pnl = item.unrealizedPNL
+
+                desc = f"{sym} {sec_type}"
+                if sec_type == 'OPT':
+                    desc = f"{sym} {p_contract.lastTradeDateOrContractMonth} {p_contract.strike} {p_contract.right}"
+
+                pos_data.append({
+                    "Account": item.account,
+                    "Contract": desc,
+                    "Symbol": sym,
+                    "SecType": sec_type,
+                    "Qty": qty,
+                    "Avg Cost": f"${avg_cost:.2f}" if avg_cost is not None else "N/A",
+                    "Mkt Price": f"${mkt_price:.2f}" if mkt_price is not None else "N/A",
+                    "Mkt Value": f"${mkt_val:.2f}" if mkt_val is not None else "N/A",
+                    "Unrealized PnL": f"${unrealized_pnl:.2f}" if unrealized_pnl is not None else "N/A",
+                    "_RawContract": p_contract
+                })
+
+            df_pos = pd.DataFrame(pos_data)
+            st.dataframe(df_pos.drop(columns=['_RawContract']), use_container_width=True)
+
+            st.subheader("Danger Zone: Close Positions")
+            st.warning("These actions send MARKET orders directly to IBKR. Please confirm account and quantity before submitting.")
+
+            all_accounts = sorted([a for a in df_pos['Account'].dropna().unique().tolist() if a])
+            selected_accounts = st.multiselect("Filter by account", options=all_accounts, default=all_accounts)
+            df_visible = df_pos[df_pos['Account'].isin(selected_accounts)] if selected_accounts else df_pos.iloc[0:0]
+
+            if df_visible.empty:
+                st.info("No positions visible under current account filter.")
+            else:
+                # 一键全平（可见范围）
+                st.markdown("**Batch Close (visible rows)**")
+                confirm_text = st.text_input(
+                    "Type `CLOSE ALL` to enable batch close",
+                    key="ibkr_close_all_confirm"
+                )
+                do_batch_close = st.button(
+                    f"🚨 Close ALL Visible Positions ({len(df_visible)})",
+                    disabled=(confirm_text.strip().upper() != "CLOSE ALL"),
+                    type="primary"
+                )
+                if do_batch_close:
+                    with st.spinner("Submitting batch market orders..."):
+                        rows = [row for _, row in df_visible.iterrows()]
+                        ok, results = close_ibkr_positions(rows)
+                        for item in results:
+                            if item.get("ok"):
+                                st.success(f"{item.get('contract')}: {item.get('message')}")
+                            else:
+                                st.error(f"{item.get('contract')}: {item.get('message')}")
+                        if ok:
+                            st.success("Batch close request submitted. Refreshing positions...")
+                        else:
+                            st.warning("Some orders failed. Please review errors above and retry.")
+                        _refresh_positions_cache()
+                        st.rerun()
+
+                st.markdown("---")
+                for idx, row in df_visible.iterrows():
+                    col1, col2 = st.columns([3, 1])
+                    col1.write(f"**{row['Contract']}** | Acct: `{row['Account']}` | Qty: {row['Qty']}")
+                    button_key = f"close_pos_{idx}_{row['Symbol']}_{row['Account']}"
+                    if col2.button("Close Position", key=button_key, type="secondary"):
+                        with st.spinner(f"Submitting market order for {row['Contract']}..."):
+                            ok, results = close_ibkr_positions([row])
+                            item = results[0] if results else {"ok": False, "message": "Unknown error"}
+                            if item.get("ok"):
+                                st.success(f"{item.get('contract')}: {item.get('message')}")
+                            else:
+                                st.error(f"{item.get('contract')}: {item.get('message')}")
+                            _refresh_positions_cache()
+                            st.rerun()
 
 # === Tab 2: 历史回溯 ===
 with tab2:

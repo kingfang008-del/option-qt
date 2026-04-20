@@ -900,9 +900,47 @@ class ExecutionEngineV8:
         streams = {STREAM_ORCH_SIGNAL: '>', STREAM_FUSED_MARKET: '>'}
         last_stats_log = time.time()
         stats = {'msgs': 0, 'signal': 0, 'fused': 0, 'acks': 0}
+        total_msgs_since_boot = 0
+        boot_wall_ts = time.time()
+        last_health_check_ts = 0.0
+        health_guard_warmup_sec = 30.0
+        health_check_interval_sec = 10.0
+
+        def _get_group_lag(stream_name: str, group_name: str) -> int:
+            """读取指定 stream/group 的 lag；异常时返回 0，避免影响主循环。"""
+            try:
+                groups = self.r.xinfo_groups(stream_name) or []
+                for g in groups:
+                    raw_name = g.get(b'name') if isinstance(g, dict) else None
+                    if raw_name is None and isinstance(g, dict):
+                        raw_name = g.get('name')
+                    name = raw_name.decode('utf-8') if isinstance(raw_name, bytes) else raw_name
+                    if name == group_name:
+                        raw_lag = g.get(b'lag') if isinstance(g, dict) else None
+                        if raw_lag is None and isinstance(g, dict):
+                            raw_lag = g.get('lag')
+                        return int(raw_lag or 0)
+            except Exception:
+                return 0
+            return 0
         
         while True:
             try:
+                now = time.time()
+                if now - last_health_check_ts >= health_check_interval_sec:
+                    last_health_check_ts = now
+                    if now - boot_wall_ts >= health_guard_warmup_sec and total_msgs_since_boot == 0:
+                        sig_lag = _get_group_lag(STREAM_ORCH_SIGNAL, target_group)
+                        fused_lag = _get_group_lag(STREAM_FUSED_MARKET, target_group)
+                        total_lag = sig_lag + fused_lag
+                        if total_lag > 0:
+                            logger.critical(
+                                f"🚨 [OMS-Health-Guard] No consumption after {int(now - boot_wall_ts)}s "
+                                f"but lag>0 (signal_lag={sig_lag}, fused_lag={fused_lag}, group={target_group}). "
+                                "Likely stream/group mismatch or stuck consumer; exiting OMS loop."
+                            )
+                            return
+
                 # 3. 优先消费未确认的历史消息 (Pending)
                 pending = self.r.xreadgroup(
                     groupname=target_group,
@@ -910,10 +948,14 @@ class ExecutionEngineV8:
                     streams={STREAM_ORCH_SIGNAL: '0', STREAM_FUSED_MARKET: '0'},
                     count=100
                 )
-                
-                if pending:
-                    messages = pending
-                    logger.debug(f"🔍 [OMS] Found {len(pending)} pending messages in streams.")
+
+                # redis-py 在 pending 为空时也可能返回 [(stream, []), ...]；
+                # 仅凭 `if pending` 会误判为有消息，导致永远不进入 `>` 新消息分支。
+                pending_with_msgs = [(s, msgs) for s, msgs in (pending or []) if msgs]
+                if pending_with_msgs:
+                    messages = pending_with_msgs
+                    pending_msg_count = sum(len(msgs) for _, msgs in pending_with_msgs)
+                    logger.debug(f"🔍 [OMS] Found {pending_msg_count} pending messages in streams.")
                 else:
                     messages = self.r.xreadgroup(
                         groupname=target_group,
@@ -930,6 +972,7 @@ class ExecutionEngineV8:
                 # 5. 处理消息
                 for stream, msgs in messages:
                     stats['msgs'] += len(msgs)
+                    total_msgs_since_boot += len(msgs)
                     stream_str = stream.decode('utf-8') if isinstance(stream, bytes) else stream
                     for msg_id, data in msgs:
                         # 🚀 [Debug] 捕获所有流量

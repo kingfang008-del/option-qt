@@ -384,9 +384,15 @@ class FeatureComputeService:
         self.last_total_volume = {s: 0.0 for s in self.symbols} # 🚀 [SDS 4.0] 存储昨日/上分末秒的累计成交量 (用于区间差分)
         self.history_1min = {s: pd.DataFrame() for s in self.symbols}
         self.history_5min = {s: pd.DataFrame() for s in self.symbols}
+        self.committed_history_1min = {s: pd.DataFrame() for s in self.symbols}
+        self.committed_history_5min = {s: pd.DataFrame() for s in self.symbols}
         self.current_bars_5s = {s: [] for s in self.symbols}    # 🚀 [SDS 4.0] 升级为 Full-Payload 缓冲区
+        self.minute_working_state = self.current_bars_5s
         self.option_snapshot = {s: np.zeros((6, 12), dtype=np.float32) for s in self.symbols}
         self.option_snapshot_5m = {s: np.zeros((6, 12), dtype=np.float32) for s in self.symbols}
+        self.committed_option_snapshot = {s: np.zeros((6, 12), dtype=np.float32) for s in self.symbols}
+        self.committed_option_contracts = {s: [] for s in self.symbols}
+        self.committed_latest_opt_buckets = {s: np.zeros((6, 12), dtype=np.float32) for s in self.symbols}
         self.latest_prices = {s: 0.0 for s in self.symbols}
         self.last_tick_price = {s: 0.0 for s in self.symbols}
         self.last_stock_update_ts = {s: None for s in self.symbols}
@@ -419,6 +425,13 @@ class FeatureComputeService:
         self.latest_opt_contracts = {s: [] for s in self.symbols}
         self.option_minute_agg = OptionMinuteAggregator()
         self.pending_finalization = {} # 🚀 [SDS 2.0] 结算挂起队列
+        # 全局 minute commit watermark：只有超过分钟末 + grace 才允许统一结算上一分钟
+        self.minute_commit_grace_sec = max(
+            0.0,
+            float(os.environ.get("FCS_MINUTE_COMMIT_GRACE_SEC", "1.0"))
+        )
+        self.committed_last_minute = None
+        self.global_last_minute = None
         self.preaggregated_1m_mode = False
         self._preagg_mode_logged = False
         self.sym_vol_mean = {}
@@ -436,6 +449,8 @@ class FeatureComputeService:
         self.runtime_payload_audit_enabled = os.environ.get("FCS_RUNTIME_AUDIT", "0").strip().lower() in {"1", "true", "yes", "on"}
         self.runtime_payload_audit_symbol = os.environ.get("FCS_RUNTIME_AUDIT_SYMBOL", "NVDA").strip() or "NVDA"
         self.runtime_payload_audit_ts = int(_safe_float_env("FCS_RUNTIME_AUDIT_TS", 1767373980.0))
+        self.minute_write_audit_enabled = os.environ.get("FCS_MINUTE_WRITE_AUDIT", "1").strip().lower() in {"1", "true", "yes", "on"}
+        self.minute_write_audit_symbol_limit = max(1, int(_safe_float_env("FCS_MINUTE_WRITE_AUDIT_SYMBOL_LIMIT", 5)))
         audit_dir_default = Path("/tmp/fcs_runtime_audit")
         self.runtime_payload_audit_dir = Path(os.environ.get("FCS_RUNTIME_AUDIT_DIR", str(audit_dir_default))).expanduser()
         self.runtime_payload_audit_written = set()
@@ -447,6 +462,11 @@ class FeatureComputeService:
             logger.info(
                 f"🧪 Runtime payload audit enabled | symbol={self.runtime_payload_audit_symbol} "
                 f"| ts={self.runtime_payload_audit_ts} | dir={self.runtime_payload_audit_dir}"
+            )
+        if self.minute_write_audit_enabled:
+            logger.info(
+                f"🧭 Minute write audit enabled | grace={self.minute_commit_grace_sec:.3f}s "
+                f"| sample_symbols={self.minute_write_audit_symbol_limit}"
             )
 
 
@@ -491,6 +511,98 @@ class FeatureComputeService:
             bucket_id=bucket_id,
         )
 
+    def _get_max_committable_label_ts(self, wall_ts: Optional[float] = None) -> int:
+        wall_ts = float(time.time() if wall_ts is None else wall_ts)
+        return int((wall_ts - float(self.minute_commit_grace_sec)) // 60) * 60 - 60
+
+    def _get_symbol_last_raw_tick_ts(self, symbol: str) -> Optional[float]:
+        bars = self.current_bars_5s.get(symbol, []) or []
+        for item in reversed(bars):
+            try:
+                ts_val = float(item.get('ts', 0.0))
+                if ts_val > 0:
+                    return ts_val
+            except Exception:
+                continue
+        return None
+
+    def _get_symbol_last_history_ts(self, symbol: str) -> Optional[float]:
+        df = self.history_1min.get(symbol)
+        if df is None or df.empty:
+            return None
+        try:
+            return float(df.index[-1].timestamp())
+        except Exception:
+            return None
+
+    def _build_minute_write_audit(
+        self,
+        *,
+        label_ts: float,
+        data_ts: Optional[float] = None,
+        wall_ts: Optional[float] = None,
+        symbols: Optional[list] = None,
+        extra: Optional[dict] = None,
+    ) -> dict:
+        label_ts = int(float(label_ts))
+        wall_ts = float(time.time() if wall_ts is None else wall_ts)
+        data_ts_val = None if data_ts is None else float(data_ts)
+        max_committable_label_ts = self._get_max_committable_label_ts(wall_ts)
+        earliest_commit_wall_ts = float(label_ts) + 60.0 + float(self.minute_commit_grace_sec)
+        chosen_symbols = list(symbols or self.symbols)[:self.minute_write_audit_symbol_limit]
+        symbol_state = {}
+        for sym in chosen_symbols:
+            symbol_state[sym] = {
+                'last_raw_tick_ts': self._get_symbol_last_raw_tick_ts(sym),
+                'last_history_ts': self._get_symbol_last_history_ts(sym),
+                'last_stock_update_ts': self.last_stock_update_ts.get(sym),
+                'last_option_update_ts': self.last_option_update_ts.get(sym),
+            }
+        payload = {
+            'label_ts': label_ts,
+            'label_ny': datetime.fromtimestamp(label_ts, NY_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+            'data_ts': data_ts_val,
+            'data_ny': datetime.fromtimestamp(data_ts_val, NY_TZ).strftime('%Y-%m-%d %H:%M:%S') if data_ts_val is not None else None,
+            'wall_ts': wall_ts,
+            'wall_ny': datetime.fromtimestamp(wall_ts, NY_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+            'grace_sec': float(self.minute_commit_grace_sec),
+            'earliest_commit_wall_ts': earliest_commit_wall_ts,
+            'earliest_commit_wall_ny': datetime.fromtimestamp(earliest_commit_wall_ts, NY_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+            'max_committable_label_ts': max_committable_label_ts,
+            'max_committable_label_ny': datetime.fromtimestamp(max_committable_label_ts, NY_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+            'is_early_vs_wall': bool(wall_ts + 1e-9 < earliest_commit_wall_ts),
+            'is_early_vs_max_label': bool(label_ts > max_committable_label_ts),
+            'symbols': chosen_symbols,
+            'symbol_state': symbol_state,
+        }
+        if extra:
+            payload.update(extra)
+        return payload
+
+    def _log_minute_write_audit(
+        self,
+        *,
+        stage: str,
+        label_ts: float,
+        data_ts: Optional[float] = None,
+        wall_ts: Optional[float] = None,
+        symbols: Optional[list] = None,
+        extra: Optional[dict] = None,
+        level: str = "info",
+        force: bool = False,
+    ):
+        if not force and not self.minute_write_audit_enabled:
+            return
+        audit = self._build_minute_write_audit(
+            label_ts=label_ts,
+            data_ts=data_ts,
+            wall_ts=wall_ts,
+            symbols=symbols,
+            extra=extra,
+        )
+        log_fn = getattr(logger, level, logger.info)
+        log_fn(f"🧭 [Minute-Write-Audit] stage={stage} | {json.dumps(audit, ensure_ascii=False, default=str)}")
+
     def _maybe_write_runtime_payload_audit(
         self,
         *,
@@ -533,8 +645,8 @@ class FeatureComputeService:
     def _ensure_debug_tables(self, date_str):
         return self.support_handler.ensure_debug_tables(date_str)
      
-    def _write_debug_batch(self, ts, date_str, fast_data_list, slow_data_list):
-        return self.support_handler.write_debug_batch(ts, date_str, fast_data_list, slow_data_list)
+    def _write_debug_batch(self, ts, date_str, fast_data_list, slow_data_list, source_ts=None):
+        return self.support_handler.write_debug_batch(ts, date_str, fast_data_list, slow_data_list, source_ts=source_ts)
 
     # --- 持久化方法 ---
     def _save_service_state(self):
@@ -677,12 +789,13 @@ class FeatureComputeService:
         """
         将最新特征块写入 raw_vec；函数式输入输出，避免调用侧堆叠条件。
         """
+        target_history_map = self.committed_history_1min if is_new_minute else self.history_1min
         for ftype, names, tensor_blk in self._iter_feature_sources(res_sym):
             latest = tensor_blk[0, :, -1].cpu().numpy()
             for i, fname in enumerate(names):
                 val = float(latest[i]) if i < len(latest) else np.nan
                 if (not np.isfinite(val)) and ftype == 'slow_1m':
-                    hist_df = self.history_1min.get(sym)
+                    hist_df = target_history_map.get(sym)
                     if hist_df is not None and fname in hist_df.columns:
                         prev_series = pd.to_numeric(hist_df[fname], errors='coerce').dropna()
                         if not prev_series.empty:
@@ -691,10 +804,14 @@ class FeatureComputeService:
                     raw_vec[self.feat_name_to_idx[fname]] = val
                     if is_new_minute:
                         ts_logi = pd.Timestamp(alpha_label_ts, unit='s', tz=NY_TZ)
+                        target_history_map[sym].loc[ts_logi, fname] = val
                         self.history_1min[sym].loc[ts_logi, fname] = val
 
     def _finalize_1min_bar(self, sym, dt, cleanup=True):
         return self.persistence_handler.finalize_1min_bar(sym, dt, cleanup=cleanup)
+
+    def commit_ready_minutes(self, target_minute_dt):
+        return self.persistence_handler.commit_ready_minutes(target_minute_dt)
 
     def finalization_barrier(self):
         return self.persistence_handler.finalization_barrier()
@@ -861,9 +978,11 @@ class FeatureComputeService:
         if need_full_recompute:
             # 🚀 [致命修复] 严防未来数据污染！
             # 必须使用被严格对齐在上一分钟末秒的 frozen_snapshot 作为 BSM 计算基底！
-            source_snap = getattr(self, 'frozen_option_snapshot', self.option_snapshot) if is_new_minute else self.option_snapshot
+            history_1min_source = self.committed_history_1min if is_new_minute else self.history_1min
+            history_5min_source = self.committed_history_5min if is_new_minute else getattr(self, 'history_5min', {})
+            source_snap = getattr(self, 'committed_option_snapshot', self.option_snapshot) if is_new_minute else self.option_snapshot
             source_snap_5m = getattr(self, 'frozen_option_snapshot_5m', getattr(self, 'option_snapshot_5m', {})) if is_new_minute else getattr(self, 'option_snapshot_5m', {})
-            source_contracts = getattr(self, 'frozen_latest_opt_contracts', self.latest_opt_contracts) if is_new_minute else self.latest_opt_contracts
+            source_contracts = getattr(self, 'committed_option_contracts', self.latest_opt_contracts) if is_new_minute else self.latest_opt_contracts
             
             sliced_snaps = {s: snap[:, :12].copy() for s, snap in source_snap.items()}
             sliced_snaps_5m = {s: (snap[:, :12].copy() if isinstance(snap, np.ndarray) else np.zeros((6,12))) for s, snap in source_snap_5m.items()}
@@ -874,7 +993,7 @@ class FeatureComputeService:
                 for s in self.symbols:
                     if s not in sliced_snaps:
                         continue
-                    df_s = self.history_1min.get(s)
+                    df_s = history_1min_source.get(s)
                     if df_s is None or df_s.empty:
                         continue
                     try:
@@ -892,7 +1011,7 @@ class FeatureComputeService:
 
             try:
                 results_map = self.engine_adapter.compute_all_inputs(
-                    history_1min=self.history_1min, history_5min=getattr(self, 'history_5min', {}),
+                    history_1min=history_1min_source, history_5min=history_5min_source,
                     fast_feats=self.fast_feat_names, slow_feats=self.slow_feat_names,
                     option_snapshots=sliced_snaps,  
                     option_contracts=source_contracts,  # 🚀 传入严格冻结版的合约，确保 100% 对齐
@@ -936,7 +1055,7 @@ class FeatureComputeService:
                     if enriched is not None:
                         self.latest_opt_buckets[sym] = enriched
                         if self.runtime_payload_audit_enabled:
-                            df_s = self.history_1min.get(sym)
+                            df_s = history_1min_source.get(sym)
                             if df_s is not None and not df_s.empty:
                                 try:
                                     stock_price_input = float(df_s.iloc[-1]['close'])
@@ -956,6 +1075,8 @@ class FeatureComputeService:
                             self.frozen_latest_opt_buckets[sym] = enriched
                         if is_new_minute and hasattr(self, 'frozen_option_snapshot'):
                             self.frozen_option_snapshot[sym] = np.asarray(enriched, dtype=np.float32).copy()
+                        if is_new_minute and hasattr(self, 'committed_latest_opt_buckets'):
+                            self.committed_latest_opt_buckets[sym] = np.asarray(enriched, dtype=np.float32).copy()
 
 
                         try:
@@ -984,19 +1105,18 @@ class FeatureComputeService:
 
                 if is_new_minute and (is_valid or dry_mode):
                     row_ts = pd.Timestamp(alpha_label_ts, unit='s', tz=NY_TZ)
-                    if row_ts in self.history_1min[sym].index:
+                    if row_ts in self.committed_history_1min[sym].index:
                         for fname in self.slow_feat_names:
-                            if 'options_' in fname: self.history_1min[sym].at[row_ts, fname] = raw_vec[self.feat_name_to_idx[fname]]
+                            if 'options_' in fname:
+                                self.committed_history_1min[sym].at[row_ts, fname] = raw_vec[self.feat_name_to_idx[fname]]
+                                self.history_1min[sym].at[row_ts, fname] = raw_vec[self.feat_name_to_idx[fname]]
 
                 self._inject_temporal_derivatives(sym, raw_vec, is_new_minute=is_new_minute)
                 batch_raw.append(raw_vec); valid_mask.append(is_valid)
 
             self.cached_results_map, self.cached_batch_raw, self.cached_valid_mask = results_map, batch_raw, valid_mask
             
-            # 🚀 [SDS 2.0 结算屏障修复] 确保所有标的的 latest_opt_buckets 都已通过上面的循环完成补全，
-            # 此时再触发结算，才能保证 _finalize_1min_bar 拿到的是包含 Greeks 的最新矩阵。
             if is_new_minute:
-                self.finalization_barrier()
                 self._publish_option_gate_metrics(alpha_label_ts, gate_audit)
         else:
             results_map, batch_raw, valid_mask = self.cached_results_map, self.cached_batch_raw, self.cached_valid_mask
@@ -1056,8 +1176,9 @@ class FeatureComputeService:
 
         # 🚀 [Greeks 写盘修复] payload 必须优先使用补算后的 latest_opt_buckets，
         # 否则会把 raw snapshot（Greeks 常为 0）写到 option_snapshots_1m。
-        source_opt_buckets = self.latest_opt_buckets
-        source_snap_for_payload = self.option_snapshot
+        source_opt_buckets = getattr(self, 'committed_latest_opt_buckets', self.latest_opt_buckets) if is_new_minute else self.latest_opt_buckets
+        source_snap_for_payload = getattr(self, 'committed_option_snapshot', self.option_snapshot) if is_new_minute else self.option_snapshot
+        history_1min_source = self.committed_history_1min if is_new_minute else self.history_1min
 
         run_mode = os.environ.get("RUN_MODE", "").strip().upper()
         dry_mode = (run_mode == "REALTIME_DRY")
@@ -1082,8 +1203,8 @@ class FeatureComputeService:
             if is_new_minute:
                 try: 
                     target_time = dt_ny_payload.replace(second=0, microsecond=0)
-                    p_close = self.history_1min[sym].at[target_time, 'close']
-                    p_vol = self.history_1min[sym].at[target_time, 'volume']
+                    p_close = history_1min_source[sym].at[target_time, 'close']
+                    p_vol = history_1min_source[sym].at[target_time, 'volume']
                 except: 
                     p_close = self.latest_prices.get(sym, 0.0)
                     p_vol = 0.0
@@ -1147,7 +1268,7 @@ class FeatureComputeService:
         live_options_5m = {} 
  
         source_snap_5m_for_payload = getattr(self, 'frozen_option_snapshot_5m', getattr(self, 'option_snapshot_5m', {})) if is_new_minute else getattr(self, 'option_snapshot_5m', {})
-        source_contracts = getattr(self, 'frozen_latest_opt_contracts', self.latest_opt_contracts) if is_new_minute else self.latest_opt_contracts # 🚀
+        source_contracts = getattr(self, 'committed_option_contracts', self.latest_opt_contracts) if is_new_minute else self.latest_opt_contracts # 🚀
 
         for sym in batch_symbols:
             # live_options：将 raw 分钟快照与 Greeks 补算结果融合后再下发
@@ -1182,7 +1303,7 @@ class FeatureComputeService:
         hist_lens = []
         total_hist_lens = []
         for s in batch_symbols:
-            df_hist = self.history_1min.get(s, pd.DataFrame())
+            df_hist = history_1min_source.get(s, pd.DataFrame())
             if df_hist is None or df_hist.empty:
                 hist_lens.append(0)
                 total_hist_lens.append(0)
@@ -1532,6 +1653,40 @@ class FeatureComputeService:
                                         if p_min:
                                             try:
                                                 ts_val = compute_payload.get('ts')
+                                                self._log_minute_write_audit(
+                                                    stage="debug_slow:prepare",
+                                                    label_ts=float(ts_val or 0.0),
+                                                    data_ts=float(compute_payload.get('log_ts', current_batch_ts) or current_batch_ts or 0.0),
+                                                    wall_ts=time.time(),
+                                                    symbols=compute_payload.get('symbols', []),
+                                                    extra={
+                                                        'ready_symbols': len(compute_payload.get('symbols', [])),
+                                                        'is_warmed_up': bool(compute_payload.get('is_warmed_up', False)),
+                                                    },
+                                                )
+                                                run_mode = os.environ.get("RUN_MODE", "").strip().upper()
+                                                commit_grace_sec = float(getattr(self, "minute_commit_grace_sec", 1.0) or 0.0)
+                                                if run_mode in {"REALTIME", "REALTIME_DRY"}:
+                                                    max_committable_label_ts = int((time.time() - commit_grace_sec) // 60) * 60 - 60
+                                                    if int(float(ts_val or 0.0)) > max_committable_label_ts:
+                                                        self._log_minute_write_audit(
+                                                            stage="debug_slow:reject_early",
+                                                            label_ts=float(ts_val or 0.0),
+                                                            data_ts=float(compute_payload.get('log_ts', current_batch_ts) or current_batch_ts or 0.0),
+                                                            wall_ts=time.time(),
+                                                            symbols=compute_payload.get('symbols', []),
+                                                            extra={
+                                                                'ready_symbols': len(compute_payload.get('symbols', [])),
+                                                                'is_warmed_up': bool(compute_payload.get('is_warmed_up', False)),
+                                                            },
+                                                            level="error",
+                                                            force=True,
+                                                        )
+                                                        logger.error(
+                                                            f"🛑 [DebugSlow-Guard] skip early debug_slow write | ts={int(float(ts_val or 0.0))} "
+                                                            f"> max_committable={max_committable_label_ts}"
+                                                        )
+                                                        continue
                                                 date_str = datetime.fromtimestamp(ts_val, NY_TZ).strftime('%Y%m%d')
                                                 
                                                 # 准备 slow_data_list
@@ -1553,7 +1708,13 @@ class FeatureComputeService:
                                                 if slow_data_list:
                                                     sample_sym, sample_vals = slow_data_list[0]
                                                     logger.info(f"📊 [Persistence-Prep] ts={ts_val} | Symbols={len(slow_data_list)} | Sample={sample_sym} | First 3 Feats={sample_vals[:3]}")
-                                                    self._write_debug_batch(ts_val, date_str, fast_data_list=[], slow_data_list=slow_data_list)
+                                                    self._write_debug_batch(
+                                                        ts_val,
+                                                        date_str,
+                                                        fast_data_list=[],
+                                                        slow_data_list=slow_data_list,
+                                                        source_ts=float(compute_payload.get('log_ts', current_batch_ts) or current_batch_ts or ts_val),
+                                                    )
                                                 else:
                                                     logger.warning(f"⚠️ [Persistence-Skip] slow_data_list is empty for ts={ts_val}")
                                             except Exception as pe:
@@ -1607,6 +1768,7 @@ class FeatureComputeService:
             df = pd.DataFrame(data_list)
             df.set_index('timestamp', inplace=True)
             self.history_1min[symbol] = df
+            self.committed_history_1min[symbol] = df.copy()
         except Exception as e:
             logger.error(f"❌ [Redis Back-Read] Failed to sync {symbol} from Redis: {e}")
 
@@ -1624,10 +1786,13 @@ class FeatureComputeService:
             buckets = p.get('buckets', [])
             self.latest_opt_buckets[symbol] = buckets
             self.latest_opt_contracts[symbol] = p.get('contracts', [])
+            self.committed_latest_opt_buckets[symbol] = np.array(buckets, dtype=np.float32) if buckets else np.zeros((6, 12), dtype=np.float32)
+            self.committed_option_contracts[symbol] = list(p.get('contracts', []))
             
             # 🚀 [真相重构] 物理映射回推断引擎使用的 NumPy 快照
             if buckets:
                 self._reconstruct_option_snapshot(symbol, buckets)
+                self.committed_option_snapshot[symbol] = self.option_snapshot[symbol].copy()
                 
         except Exception as e:
             logger.error(f"❌ [Redis Opt-Back-Read] Failed to sync {symbol} option from Redis: {e}")

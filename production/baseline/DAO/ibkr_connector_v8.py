@@ -107,12 +107,36 @@ class IBKRConnectorFinal:
             logger.info(f"⚡ Tick-driven publish enabled | debounce={self._publish_debounce_sec * 1000:.0f}ms")
         else:
             logger.info("🕔 Tick-driven publish disabled; using 5s bar trigger.")
+        self._publish_connector_status("INIT", note="connector created")
+
+    def _publish_connector_status(self, state: str, error: str = "", note: str = ""):
+        """
+        将 IBKR Connector 连接状态同步到 Redis，供 Dashboard 直观展示。
+        """
+        try:
+            payload = {
+                "ts": time.time(),
+                "state": str(state),
+                "host": self.host,
+                "port": int(self.port),
+                "client_id": int(self.client_id),
+                "connected": bool(self.ib.isConnected()),
+                "active_stocks": int(len(self.active_stocks)),
+                "locked_symbols": int(len(self.locked_contracts)),
+                "last_error": str(error or ""),
+                "note": str(note or ""),
+                "trading_enabled": bool(TRADING_ENABLED),
+            }
+            self.redis.hset("live_ibkr_connector", "status", ser.pack(payload))
+        except Exception:
+            pass
 
     async def connect(self):
         """保持连接活跃"""
         while not self.ib.isConnected():
             try:
                 logger.info(f"🔌 Connecting to IBKR ({self.host}:{self.port})...")
+                self._publish_connector_status("CONNECTING", note="connectAsync start")
                 await self.ib.connectAsync(self.host, self.port, self.client_id)
                 self.ib.reqMarketDataType(1) # 1=Live
                 
@@ -123,8 +147,10 @@ class IBKRConnectorFinal:
                     self.ib.reqAccountUpdates() # Default account
                     
                 logger.info("✅ IBKR Connected & Subscribed to Account Updates.")
+                self._publish_connector_status("CONNECTED", note="account updates subscribed")
             except Exception as e:
                 logger.error(f"Connection failed: {e}. Retrying in 5s...")
+                self._publish_connector_status("CONNECT_FAILED", error=str(e))
                 await asyncio.sleep(5)
                 
     async def get_account_balance(self):
@@ -431,6 +457,7 @@ class IBKRConnectorFinal:
         if errorCode == 10197:
             logger.warning(f"⛔ IBKR DATA PAUSED (10197): Real account is active elsewhere.")
             logger.warning(f"   Msg: {decoded_msg}")
+            self._publish_connector_status("DATA_DELAYED", error=f"10197:{decoded_msg}", note="switched to delayed data")
             
             # [Auto-Fix] 自动切换到延迟数据 (Type 3) 以绕过锁
             logger.warning(f"⚠️ AUTOMATICALLY SWITCHING TO DELAYED DATA (Type 3) TO BYPASS LOCK.")
@@ -439,6 +466,7 @@ class IBKRConnectorFinal:
             return
 
         logger.error(f"⚠️ IBKR Error {errorCode} (reqId {reqId}): {decoded_msg}")
+        self._publish_connector_status("ERROR", error=f"{errorCode}:{decoded_msg}")
 
     # ================= 订阅逻辑 =================
     async def start_stock_stream(self, symbols: List[str]):
@@ -1136,8 +1164,10 @@ class IBKRConnectorFinal:
                 # 尝试发送请求以探测连接
                 await self.ib.reqCurrentTimeAsync()
                 logger.info("❤️ IBKR Heartbeat OK")
+                self._publish_connector_status("HEARTBEAT_OK")
             except Exception as e:
                 logger.error(f"💔 Heartbeat Failed: {e}. Reconnecting...")
+                self._publish_connector_status("HEARTBEAT_FAIL", error=str(e))
                 # 断开旧连接，重新连接
                 try: self.ib.disconnect()
                 except: pass
@@ -1149,6 +1179,7 @@ class IBKRConnectorFinal:
                     # 提取当前活跃的 symbol 列表 (original keys)
                     symbols = list(self.active_stocks.keys())
                     await self.start_stock_stream(symbols)
+                    self._publish_connector_status("RECONNECTED", note="re-subscribed market data")
 
             await asyncio.sleep(interval)
 
@@ -1157,6 +1188,7 @@ class IBKRConnectorFinal:
         logger.info("📡 Data Stream Loop (Hash) Started.")
         last_log = 0
         last_acct_update = 0
+        last_status_push = 0
         while True:
             # [NEW] 每5秒向 Redis 推送最新的账户资金总额
             if time.time() - last_acct_update > 5.0 and self.ib.isConnected():
@@ -1198,6 +1230,9 @@ class IBKRConnectorFinal:
                 if has_data: 
                     try: pipe.execute()
                     except: pass
+            if time.time() - last_status_push > 2.0:
+                self._publish_connector_status("STREAMING")
+                last_status_push = time.time()
             await asyncio.sleep(interval)
 
     # --- 下单接口 ---
@@ -1270,7 +1305,11 @@ class IBKRConnectorFinal:
             logger.info("🚀 IBKR V8 Connector Running...")
             self.ib.run()
         except KeyboardInterrupt:
+            self._publish_connector_status("STOPPED", note="keyboard interrupt")
             self.ib.disconnect()
+        except Exception as e:
+            self._publish_connector_status("CRASHED", error=str(e))
+            raise
 
 if __name__ == '__main__':
     # [Fix] 从 config.py 加载统一标的

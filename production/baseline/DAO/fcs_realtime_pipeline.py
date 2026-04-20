@@ -79,7 +79,18 @@ class FCSRealtimePipeline:
                 dt_utc = datetime.fromtimestamp(ts, timezone.utc)
                 dt_ny = dt_utc.astimezone(NY_TZ)
                 curr_minute = dt_ny.replace(second=0, microsecond=0)
+                commit_grace_sec = float(getattr(svc, "minute_commit_grace_sec", 1.0) or 0.0)
+                watermark_ts = max(float(ts) - commit_grace_sec, 0.0)
+                watermark_minute = datetime.fromtimestamp(watermark_ts, timezone.utc).astimezone(NY_TZ).replace(second=0, microsecond=0)
+                run_mode = os.environ.get("RUN_MODE", "").strip().upper()
+                allow_live_preagg = os.environ.get("FCS_ALLOW_PREAGG_REALTIME", "0").strip().lower() in {"1", "true", "yes", "on"}
                 is_preaggregated_1m = bool(payload.get('bar_preaggregated_1m', False))
+                if is_preaggregated_1m and run_mode in {"REALTIME", "REALTIME_DRY"} and not allow_live_preagg:
+                    warn_key = "_preagg_ignored_live_warned"
+                    if not getattr(svc, warn_key, False):
+                        logger.warning("⚠️ [FCS-Preagg-Ignore] preaggregated_1m flag received in live mode; ignored unless FCS_ALLOW_PREAGG_REALTIME=1")
+                        setattr(svc, warn_key, True)
+                    is_preaggregated_1m = False
                 if is_preaggregated_1m:
                     svc.preaggregated_1m_mode = True
                     if not svc._preagg_mode_logged:
@@ -93,30 +104,6 @@ class FCSRealtimePipeline:
 
                 if sym in svc.symbols:
                     svc._update_option_frame_state(sym, payload, ts)
-
-                if not is_preaggregated_1m:
-                    if not hasattr(svc, 'global_last_minute'):
-                        svc.global_last_minute = curr_minute
-                    if curr_minute > svc.global_last_minute:
-                        while svc.global_last_minute < curr_minute:
-                            for s in svc.symbols:
-                                if not hasattr(svc, 'frozen_option_snapshot'):
-                                    svc.frozen_option_snapshot = {}
-                                    svc.frozen_option_snapshot_5m = {}
-                                    svc.frozen_latest_opt_buckets = {}
-                                    svc.frozen_latest_opt_contracts = {}
-                                agg_snap, agg_contracts, agg_update_ts = svc.option_minute_agg.finalize(s, svc.global_last_minute)
-                                current_snap = agg_snap if agg_snap is not None else svc.option_snapshot.get(s)
-                                svc.frozen_option_snapshot[s] = current_snap.copy() if current_snap is not None else np.zeros((6, 12), dtype=np.float32)
-                                if USE_5M_OPTION_DATA:
-                                    current_snap_5m = getattr(svc, 'option_snapshot_5m', {}).get(s, current_snap)
-                                    svc.frozen_option_snapshot_5m[s] = current_snap_5m.copy() if current_snap_5m is not None else np.zeros((6, 12), dtype=np.float32)
-                                svc.frozen_latest_opt_buckets[s] = current_snap.copy() if current_snap is not None else svc.latest_opt_buckets.get(s, [])
-                                svc.frozen_latest_opt_contracts[s] = agg_contracts if agg_contracts else svc.latest_opt_contracts.get(s, [])
-                                if agg_update_ts is not None:
-                                    svc.last_option_update_ts[s] = float(agg_update_ts)
-                                svc.pending_finalization[s] = svc.global_last_minute
-                            svc.global_last_minute += timedelta(minutes=1)
 
                 b_raw = payload.get('buckets', payload.get('option_buckets'))
                 b_data = b_raw.get('buckets', []) if isinstance(b_raw, dict) else b_raw
@@ -242,9 +229,8 @@ class FCSRealtimePipeline:
 
                 stock_close = float(stock.get('close', stock.get('c', 0.0))) if stock else 0.0
                 if (not is_preaggregated_1m) and stock_close > 0:
-                    svc.current_bars_5s[sym].append(stock)
-                if (not is_preaggregated_1m) and dt_ny.second >= 55:
-                    svc._finalize_1min_bar(sym, curr_minute, cleanup=False)
+                    # Working set 只做 minute-local 聚合缓存，不提前 finalize 当前分钟。
+                    svc.current_bars_5s[sym].append({'stock': dict(stock), 'ts': float(ts)})
 
         except Exception as e:
             logger.error(f"Process Error: {e}", exc_info=True)
@@ -254,6 +240,7 @@ class FCSRealtimePipeline:
         current_replay_ts = ts_from_payload if ts_from_payload else svc.r.get("replay:current_ts")
         sync_ts = float(current_replay_ts) if current_replay_ts else time.time()
         run_mode = os.environ.get("RUN_MODE", "").strip().upper()
+        allow_live_preagg = os.environ.get("FCS_ALLOW_PREAGG_REALTIME", "0").strip().lower() in {"1", "true", "yes", "on"}
         if ts_from_payload is not None and run_mode in {"REALTIME", "REALTIME_DRY"}:
             wall_ts = time.time()
             max_lead = float(os.environ.get("FCS_MAX_TS_LEAD_SEC", "1.5"))
@@ -269,46 +256,33 @@ class FCSRealtimePipeline:
                 )
                 sync_ts = wall_ts
         target_time = datetime.fromtimestamp(sync_ts, NY_TZ)
-        current_minute_ts = int(sync_ts // 60) * 60
-        curr_minute_dt = target_time.replace(second=0, microsecond=0)
+        commit_grace_sec = float(getattr(svc, "minute_commit_grace_sec", 1.0) or 0.0)
+        watermark_ts = max(float(sync_ts) - commit_grace_sec, 0.0)
+        watermark_time = datetime.fromtimestamp(watermark_ts, NY_TZ)
+        current_minute_ts = int(watermark_ts // 60) * 60
+        curr_minute_dt = watermark_time.replace(second=0, microsecond=0)
 
+        committed_minutes = []
         if not bool(getattr(svc, 'preaggregated_1m_mode', False)):
-            if not hasattr(svc, 'global_last_minute'):
-                svc.global_last_minute = curr_minute_dt
-            if svc.global_last_minute < curr_minute_dt:
-                while svc.global_last_minute < curr_minute_dt:
-                    for s in svc.symbols:
-                        if not hasattr(svc, 'frozen_option_snapshot'):
-                            svc.frozen_option_snapshot = {}
-                            svc.frozen_option_snapshot_5m = {}
-                            svc.frozen_latest_opt_buckets = {}
-                            svc.frozen_latest_opt_contracts = {}
-                        current_snap = svc.option_snapshot.get(s)
-                        svc.frozen_option_snapshot[s] = current_snap.copy() if current_snap is not None else np.zeros((6, 12), dtype=np.float32)
-                        if USE_5M_OPTION_DATA:
-                            current_snap_5m = getattr(svc, 'option_snapshot_5m', {}).get(s, current_snap)
-                            svc.frozen_option_snapshot_5m[s] = current_snap_5m.copy() if current_snap_5m is not None else np.zeros((6, 12), dtype=np.float32)
-                        svc.frozen_latest_opt_buckets[s] = svc.latest_opt_buckets.get(s, [])
-                        svc.frozen_latest_opt_contracts[s] = svc.latest_opt_contracts.get(s, [])
-                        svc.pending_finalization[s] = svc.global_last_minute
-                    svc.global_last_minute += timedelta(minutes=1)
+            committed_minutes = svc.commit_ready_minutes(curr_minute_dt)
         else:
             svc.global_last_minute = curr_minute_dt
 
-        ready_symbols = [s for s in svc.symbols if not svc.history_1min.get(s, pd.DataFrame()).empty]
+        ready_symbols = [s for s in svc.symbols if not svc.committed_history_1min.get(s, pd.DataFrame()).empty]
         if not ready_symbols:
             svc._set_feature_sync_ack(sync_ts, frame_id=str(int(sync_ts)))
             return None
         sample_s = ready_symbols[0]
-        if len(svc.history_1min[sample_s]) < 1:
+        if len(svc.committed_history_1min[sample_s]) < 1:
             svc._set_feature_sync_ack(sync_ts, frame_id=str(int(sync_ts)))
             return None
 
         data_ts = float(current_replay_ts) if current_replay_ts else target_time.timestamp()
         last_minute_ts = getattr(svc, 'last_model_minute_ts', 0)
         preagg_mode = bool(getattr(svc, 'preaggregated_1m_mode', False))
+        effective_preagg_mode = bool(preagg_mode and (run_mode not in {"REALTIME", "REALTIME_DRY"} or allow_live_preagg))
         is_new_minute = False
-        if preagg_mode:
+        if effective_preagg_mode:
             if last_minute_ts == 0:
                 # 首帧仅建锚点，避免 preagg 模式冷启动时把“当前分钟”提前写入标签。
                 svc.last_model_minute_ts = current_minute_ts
@@ -318,15 +292,18 @@ class FCSRealtimePipeline:
                 is_new_minute = True
                 svc.last_model_minute_ts = current_minute_ts
         else:
-            if last_minute_ts == 0:
-                svc.last_model_minute_ts = current_minute_ts
+            latest_committed_ts = int(committed_minutes[-1].timestamp()) if committed_minutes else int(getattr(svc, "last_model_minute_ts", 0) or 0)
+            if latest_committed_ts <= 0:
                 svc._set_feature_sync_ack(data_ts, frame_id=str(int(data_ts)))
                 return None
-            if current_minute_ts > last_minute_ts:
+            if last_minute_ts == 0:
                 is_new_minute = True
-                svc.last_model_minute_ts = current_minute_ts
+                svc.last_model_minute_ts = latest_committed_ts
+            elif latest_committed_ts > last_minute_ts:
+                is_new_minute = True
+                svc.last_model_minute_ts = latest_committed_ts
 
-        alpha_label_ts = float(current_minute_ts) if preagg_mode and is_new_minute else ((float(current_minute_ts) - 60.0) if is_new_minute else data_ts)
+        alpha_label_ts = float(current_minute_ts) if effective_preagg_mode and is_new_minute else (float(svc.last_model_minute_ts) if is_new_minute else data_ts)
         step_res = svc._step_engine_compute(data_ts=data_ts, is_new_minute=is_new_minute, alpha_label_ts=alpha_label_ts)
         if not step_res:
             svc._set_feature_sync_ack(data_ts, frame_id=str(int(data_ts)))
@@ -344,6 +321,49 @@ class FCSRealtimePipeline:
         if not payload:
             svc._set_feature_sync_ack(data_ts, frame_id=str(int(data_ts)))
             return None
+
+        if bool(payload.get('is_new_minute')):
+            svc._log_minute_write_audit(
+                stage="run_compute_cycle:assembled",
+                label_ts=float(payload.get('ts', 0.0) or 0.0),
+                data_ts=data_ts,
+                wall_ts=time.time(),
+                symbols=payload.get('symbols', []),
+                extra={
+                    'sync_ts': float(sync_ts),
+                    'watermark_ts': float(watermark_ts),
+                    'preagg_mode': bool(preagg_mode),
+                    'effective_preagg_mode': bool(effective_preagg_mode),
+                },
+            )
+
+        # Live 模式硬保险：分钟标签绝不能超过当前可提交的最大标签。
+        if run_mode in {"REALTIME", "REALTIME_DRY"} and bool(payload.get('is_new_minute')):
+            max_committable_label_ts = int((time.time() - commit_grace_sec) // 60) * 60 - 60
+            payload_ts = int(float(payload.get('ts', 0.0) or 0.0))
+            if payload_ts > max_committable_label_ts:
+                svc._log_minute_write_audit(
+                    stage="run_compute_cycle:drop_early_payload",
+                    label_ts=payload_ts,
+                    data_ts=data_ts,
+                    wall_ts=time.time(),
+                    symbols=payload.get('symbols', []),
+                    extra={
+                        'sync_ts': float(sync_ts),
+                        'watermark_ts': float(watermark_ts),
+                        'preagg_mode': bool(preagg_mode),
+                        'effective_preagg_mode': bool(effective_preagg_mode),
+                    },
+                    level="error",
+                    force=True,
+                )
+                logger.error(
+                    f"🛑 [FCS-EarlyMinute-Guard] drop early minute payload | payload_ts={payload_ts} "
+                    f"> max_committable={max_committable_label_ts} | sync_ts={sync_ts:.3f} "
+                    f"| preagg={preagg_mode} effective_preagg={effective_preagg_mode}"
+                )
+                svc._set_feature_sync_ack(data_ts, frame_id=str(int(data_ts)))
+                return None
 
         if payload.get('is_new_minute') and (not bool(payload.get('is_warmed_up', False))):
             if getattr(svc, '_warmup_diag_log_count', 0) < 20:

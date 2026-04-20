@@ -25,8 +25,10 @@ except ImportError:
 class StrategyCoreV1:
     def __init__(self, config: StrategyConfig = None):
         self.cfg = config if config else StrategyConfig()
+        self._last_reject_reason = None
 
     def decide_entry(self, ctx: dict) -> dict:
+        self._last_reject_reason = None
         # 🧪 [Parity Fix] 在严格对齐模式下，禁用 cs_alpha_z (截面缩放)，只看原始 Alpha
         if getattr(self.cfg, 'PARITY_STRICT_MODE', False):
             alpha_z = ctx.get('alpha_z', 0.0)
@@ -37,10 +39,17 @@ class StrategyCoreV1:
         # Select Channel
         if abs(alpha_z) >= self.cfg.ALPHA_ENTRY_STRICT:
             sig = self._check_channel_a_momentum(ctx)
+        else:
+            self._last_reject_reason = f'alpha_below_strict({abs(alpha_z):.2f}<{self.cfg.ALPHA_ENTRY_STRICT})'
         
-        if not sig: return None
+        if not sig:
+            if not self._last_reject_reason:
+                self._last_reject_reason = 'channel_a_none'
+            return None
         if self.cfg.ENTRY_LIQUIDITY_GUARD_ENABLED:
-            if not self._check_entry_liquidity_guard(ctx): return None
+            if not self._check_entry_liquidity_guard(ctx):
+                self._last_reject_reason = 'liquidity_guard'
+                return None
         return sig
 
     def _check_entry_pre_conditions(self, ctx: dict) -> bool:
@@ -117,7 +126,9 @@ class StrategyCoreV1:
         # 🧪 [Parity Fix] 如果开启了严格对齐模式，强制使用 Plan A 的门槛逻辑
         if getattr(self.cfg, 'PARITY_STRICT_MODE', False):
             # Plan A 逻辑: 1. 必须 prob >= 0.7  2. 必须 abs(alpha) >= ALPHA_ENTRY_STRICT
-            if prob < self.cfg.EVENT_PROB_THRESHOLD: return None
+            if prob < self.cfg.EVENT_PROB_THRESHOLD:
+                self._last_reject_reason = f'parity_event_prob_low({prob:.2f}<{self.cfg.EVENT_PROB_THRESHOLD})'
+                return None
             final_threshold = self.cfg.ALPHA_ENTRY_STRICT
             action = 1 if alpha > 0 else -1
             is_event_hot = True # 默认置为 True 以兼容后缀
@@ -125,23 +136,35 @@ class StrategyCoreV1:
             # S4 高保真模式: 允许 prob=0 的冷启动，并配备动态阈值
             is_event_hot = prob > self.cfg.EVENT_PROB_THRESHOLD or prob == 0
             if is_event_hot:
-                if vol_z > self.cfg.VOL_MAX_Z: return None
+                if vol_z > self.cfg.VOL_MAX_Z:
+                    self._last_reject_reason = f'hot_vol_z_too_high({vol_z:.2f}>{self.cfg.VOL_MAX_Z})'
+                    return None
                 final_threshold = 0.5 
                 action = 1 if alpha > 0 else -1
             else:
-                if not (self.cfg.VOL_MIN_Z < vol_z < self.cfg.VOL_MAX_Z): return None
+                if not (self.cfg.VOL_MIN_Z < vol_z < self.cfg.VOL_MAX_Z):
+                    self._last_reject_reason = f'vol_z_out_of_band({vol_z:.2f}!∈({self.cfg.VOL_MIN_Z},{self.cfg.VOL_MAX_Z}))'
+                    return None
                 base_threshold = self.cfg.ALPHA_ENTRY_THRESHOLD
                 dynamic_threshold = self._calculate_dynamic_alpha_threshold(ctx.get('symbol', 'UNK'), vol_z)
                 final_threshold = max(base_threshold, dynamic_threshold)
                 action = 1 if alpha > 0 else -1
 
-        if abs(alpha_val) < final_threshold: return None
+        if abs(alpha_val) < final_threshold:
+            self._last_reject_reason = f'alpha_below_final_th({abs(alpha_val):.2f}<{final_threshold:.2f})'
+            return None
         if self.cfg.ENTRY_MOMENTUM_GUARD_ENABLED:
-            if not self._check_stock_momentum_guard(ctx, action): return None
+            if not self._check_stock_momentum_guard(ctx, action):
+                self._last_reject_reason = 'stock_momentum_guard'
+                return None
         if self.cfg.INDEX_GUARD_ENABLED:
-            if not self._check_index_guard(ctx, action): return None
+            if not self._check_index_guard(ctx, action):
+                self._last_reject_reason = 'index_guard'
+                return None
         if self.cfg.MACD_HIST_CONFIRM_ENABLED:
-            if not self._check_macd_confirm(ctx, action): return None
+            if not self._check_macd_confirm(ctx, action):
+                self._last_reject_reason = 'macd_confirm'
+                return None
         
         prefix = "[EVENT_HOT]" if is_event_hot else "CH_A_MOM"
         reason = f"{prefix}|A:{alpha_val:.2f}|V:{vol_z:.1f}|EV:{prob:.2f}"

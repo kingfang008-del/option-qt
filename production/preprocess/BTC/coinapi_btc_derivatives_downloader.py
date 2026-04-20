@@ -425,13 +425,13 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-# export COINAPI_KEY="你的_key"
+# export COINAPI_KEY="e80d8243"
 
-# python coinapi_btc_derivatives_downloader.py \
-#   --exchange BINANCEFTS \
-#   --asset BTC \
-#   --period 1MIN \
-#   --time-start 2026-04-01T00:00:00 \
-#   --time-end   2026-04-03T00:00:00 \
-#   --top-n 3 \
-#   --outdir ./coinapi_btc_data
+python coinapi_btc_derivatives_downloader.py \
+  --exchange BINANCEFTS \
+  --asset BTC \
+  --period 1MIN \
+  --time-start 2026-04-01T00:00:00 \
+  --time-end   2026-04-03T00:00:00 \
+  --top-n 3 \
+  --outdir ./coinapi_btc_data

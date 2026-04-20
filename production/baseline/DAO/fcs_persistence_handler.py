@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import time
 from typing import Optional
 
 import numpy as np
@@ -20,6 +22,48 @@ class FCSPersistenceHandler:
     def __init__(self, service):
         self.service = service
 
+    def _prepare_minute_commit_state(self, sym, dt):
+        svc = self.service
+        if not hasattr(svc, 'frozen_option_snapshot'):
+            svc.frozen_option_snapshot = {}
+            svc.frozen_option_snapshot_5m = {}
+            svc.frozen_latest_opt_buckets = {}
+            svc.frozen_latest_opt_contracts = {}
+        agg_snap, agg_contracts, agg_update_ts = svc.option_minute_agg.finalize(sym, dt)
+        current_snap = agg_snap if agg_snap is not None else svc.option_snapshot.get(sym)
+        prev_enriched = svc.latest_opt_buckets.get(sym)
+        svc.frozen_option_snapshot[sym] = current_snap.copy() if current_snap is not None else np.zeros((6, 12), dtype=np.float32)
+        current_snap_5m = getattr(svc, 'option_snapshot_5m', {}).get(sym, current_snap)
+        svc.frozen_option_snapshot_5m[sym] = current_snap_5m.copy() if current_snap_5m is not None else np.zeros((6, 12), dtype=np.float32)
+        if isinstance(prev_enriched, np.ndarray) and prev_enriched.size > 0:
+            svc.frozen_latest_opt_buckets[sym] = prev_enriched.copy()
+        elif isinstance(prev_enriched, list) and len(prev_enriched) > 0:
+            svc.frozen_latest_opt_buckets[sym] = list(prev_enriched)
+        else:
+            svc.frozen_latest_opt_buckets[sym] = current_snap.copy() if current_snap is not None else []
+        svc.frozen_latest_opt_contracts[sym] = agg_contracts if agg_contracts else svc.latest_opt_contracts.get(sym, [])
+        if agg_update_ts is not None:
+            svc.last_option_update_ts[sym] = float(agg_update_ts)
+
+    def commit_ready_minutes(self, target_minute_dt):
+        svc = self.service
+        committed_minutes = []
+        if target_minute_dt is None:
+            return committed_minutes
+        if getattr(svc, 'global_last_minute', None) is None:
+            svc.global_last_minute = target_minute_dt
+            return committed_minutes
+        while svc.global_last_minute < target_minute_dt:
+            commit_dt = svc.global_last_minute
+            for sym in svc.symbols:
+                self._prepare_minute_commit_state(sym, commit_dt)
+            for sym in svc.symbols:
+                self.finalize_1min_bar(sym, commit_dt, cleanup=True)
+            committed_minutes.append(commit_dt)
+            svc.committed_last_minute = commit_dt
+            svc.global_last_minute += pd.Timedelta(minutes=1)
+        return committed_minutes
+
     def finalize_1min_bar(self, sym, dt, cleanup=True):
         svc = self.service
         bars = svc.current_bars_5s.get(sym, [])
@@ -28,8 +72,18 @@ class FCSPersistenceHandler:
             s_data = b.get('stock', b)
             return float(s_data.get(k, s_data.get(alt, default)))
 
-        valid_ticks = [b for b in bars if gvx(b, 'close', 'c') > 0]
+        def ev_ts(b):
+            try:
+                return float(b.get('ts', 0.0))
+            except Exception:
+                return 0.0
+
         bar_time = dt.replace(second=0, microsecond=0)
+        minute_start_ts = float(bar_time.timestamp())
+        minute_end_ts = minute_start_ts + 60.0
+        # 仅消费目标 minute 的 working 事件；未来分钟的 tick 必须保留。
+        minute_bars = [b for b in bars if minute_start_ts <= ev_ts(b) < minute_end_ts]
+        valid_ticks = [b for b in minute_bars if gvx(b, 'close', 'c') > 0]
 
         if not valid_ticks:
             c_raw = svc.last_tick_price.get(sym, 0.0)
@@ -72,6 +126,10 @@ class FCSPersistenceHandler:
             o_contracts = o_contracts.tolist()
 
         snap_arr = merged_buckets if isinstance(merged_buckets, np.ndarray) else np.array(merged_buckets, dtype=np.float32)
+        if isinstance(snap_arr, np.ndarray) and snap_arr.ndim == 2 and snap_arr.size > 0:
+            svc.committed_option_snapshot[sym] = snap_arr.copy()
+            svc.committed_option_contracts[sym] = list(o_contracts) if o_contracts else []
+            svc.committed_latest_opt_buckets[sym] = snap_arr.copy()
         if isinstance(snap_arr, np.ndarray) and snap_arr.shape == (6, 12):
             has_price_content = np.sum(np.abs(snap_arr[:, [0, 5]])) > 1e-6
             if has_price_content:
@@ -86,7 +144,22 @@ class FCSPersistenceHandler:
                             f"ATM_P_K: {p_row[5]:.2f} | P_Price: {p_row[0]:.4f} | Delta: {p_row[1]:.4f} | IV: {p_row[7]:.4f}"
                         )
                 else:
-                    logger.warning(f"⚠️ [Greeks-Check] {sym} snapshot has DATA but ZERO Greeks. Calculation failed?")
+                    try:
+                        raw_arr = raw_buckets if isinstance(raw_buckets, np.ndarray) else np.array(raw_buckets, dtype=np.float32)
+                    except Exception:
+                        raw_arr = None
+                    try:
+                        enriched_arr = enriched_buckets if isinstance(enriched_buckets, np.ndarray) else np.array(enriched_buckets, dtype=np.float32)
+                    except Exception:
+                        enriched_arr = None
+                    raw_g_sum = float(np.sum(np.abs(raw_arr[:, 1:5]))) if isinstance(raw_arr, np.ndarray) and raw_arr.ndim == 2 and raw_arr.shape[1] >= 5 else -1.0
+                    enriched_g_sum = float(np.sum(np.abs(enriched_arr[:, 1:5]))) if isinstance(enriched_arr, np.ndarray) and enriched_arr.ndim == 2 and enriched_arr.shape[1] >= 5 else -1.0
+                    valid_ba = int(np.sum((snap_arr[:, 8] > 0.0) & (snap_arr[:, 9] >= snap_arr[:, 8]))) if snap_arr.shape[1] > 9 else -1
+                    logger.warning(
+                        f"⚠️ [Greeks-Check] {sym} snapshot has DATA but ZERO Greeks | "
+                        f"raw_g_sum={raw_g_sum:.6f} enriched_g_sum={enriched_g_sum:.6f} "
+                        f"valid_bidask_rows={valid_ba} contracts={len(o_contracts) if o_contracts is not None else 0}"
+                    )
 
         bar_payload = {'open': float(o), 'high': float(h), 'low': float(l), 'close': float(c_raw), 'volume': float(v), 'vwap': float(vwap)}
         opt_payload = {'buckets': o_buckets, 'contracts': o_contracts, 'atm_c_iv': atm_c_iv, 'atm_p_iv': atm_p_iv}
@@ -99,9 +172,9 @@ class FCSPersistenceHandler:
         except Exception:
             pass
 
-        should_full_sync = not success or svc.history_1min.get(sym, pd.DataFrame()).empty
+        should_full_sync = not success or svc.committed_history_1min.get(sym, pd.DataFrame()).empty
         if not should_full_sync:
-            last_ts_loc = svc.history_1min[sym].index[-1].timestamp()
+            last_ts_loc = svc.committed_history_1min[sym].index[-1].timestamp()
             if ts_key - last_ts_loc > 65:
                 should_full_sync = True
 
@@ -111,11 +184,12 @@ class FCSPersistenceHandler:
         else:
             new_ts = pd.Timestamp(ts_key, unit='s', tz=NY_TZ)
             for k, val in bar_payload.items():
-                svc.history_1min[sym].loc[new_ts, k] = val
-            if len(svc.history_1min[sym]) > 500:
-                svc.history_1min[sym] = svc.history_1min[sym].iloc[-500:]
+                svc.committed_history_1min[sym].loc[new_ts, k] = val
+            if len(svc.committed_history_1min[sym]) > 500:
+                svc.committed_history_1min[sym] = svc.committed_history_1min[sym].iloc[-500:]
+            svc.history_1min[sym] = svc.committed_history_1min[sym].copy()
 
-        df_1m = svc.history_1min[sym]
+        df_1m = svc.committed_history_1min[sym]
         if not df_1m.empty:
             df_5m = df_1m.resample('5min', closed='left', label='left').agg({
                 'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
@@ -127,10 +201,11 @@ class FCSPersistenceHandler:
             else:
                 df_5m['vwap'] = df_5m['close']
             df_5m = df_5m.dropna(subset=['open', 'close'])
-            svc.history_5min[sym] = df_5m.iloc[-100:]
+            svc.committed_history_5min[sym] = df_5m.iloc[-100:]
+            svc.history_5min[sym] = svc.committed_history_5min[sym].copy()
             if not df_5m.empty:
-                last_5m = df_5m.iloc[-1]
-                ts_5m_key = int(df_5m.index[-1].timestamp())
+                last_5m = svc.committed_history_5min[sym].iloc[-1]
+                ts_5m_key = int(svc.committed_history_5min[sym].index[-1].timestamp())
                 bar_5m_payload = {
                     'open': float(last_5m['open']), 'high': float(last_5m['high']),
                     'low': float(last_5m['low']), 'close': float(last_5m['close']),
@@ -142,7 +217,8 @@ class FCSPersistenceHandler:
                     pass
 
         if cleanup:
-            svc.current_bars_5s[sym] = []
+            # 仅移除已经提交完成的 minute；保留未来分钟 working set。
+            svc.current_bars_5s[sym] = [b for b in bars if ev_ts(b) >= minute_end_ts]
         return True
 
     def finalization_barrier(self):
@@ -158,6 +234,44 @@ class FCSPersistenceHandler:
         svc = self.service
         try:
             ts_val = float(payload.get('ts', 0.0))
+            run_mode = os.environ.get("RUN_MODE", "").strip().upper()
+            commit_grace_sec = float(getattr(svc, "minute_commit_grace_sec", 1.0) or 0.0)
+            if bool(payload.get('is_new_minute')):
+                svc._log_minute_write_audit(
+                    stage="atomic_commit:before",
+                    label_ts=ts_val,
+                    data_ts=float(payload.get('log_ts', ts_val) or ts_val),
+                    wall_ts=time.time(),
+                    symbols=payload.get('symbols', []),
+                    extra={
+                        'frame_id': payload.get('frame_id'),
+                        'frame_seq': payload.get('frame_seq'),
+                        'run_mode': run_mode,
+                    },
+                )
+            if run_mode in {"REALTIME", "REALTIME_DRY"}:
+                max_committable_label_ts = int((time.time() - commit_grace_sec) // 60) * 60 - 60
+                if int(ts_val) > max_committable_label_ts:
+                    svc._log_minute_write_audit(
+                        stage="atomic_commit:reject_early",
+                        label_ts=ts_val,
+                        data_ts=float(payload.get('log_ts', ts_val) or ts_val),
+                        wall_ts=time.time(),
+                        symbols=payload.get('symbols', []),
+                        extra={
+                            'frame_id': payload.get('frame_id'),
+                            'frame_seq': payload.get('frame_seq'),
+                            'run_mode': run_mode,
+                        },
+                        level="error",
+                        force=True,
+                    )
+                    logger.error(
+                        f"🛑 [AtomicCommit-Guard] refuse early minute commit | ts={int(ts_val)} "
+                        f"> max_committable={max_committable_label_ts}"
+                    )
+                    self.set_feature_sync_ack(float(payload.get('log_ts', ts_val) or ts_val), frame_id=str(payload.get('frame_id') or str(int(ts_val))))
+                    return False
             frame_id = str(payload.get('frame_id') or str(int(ts_val)))
             svc.publish_frame_seq = int(svc.publish_frame_seq) + 1
             frame_seq = int(payload.get('frame_seq') or svc.publish_frame_seq)

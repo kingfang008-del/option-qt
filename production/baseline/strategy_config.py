@@ -82,7 +82,7 @@ class StrategyConfig:
     SLIPPAGE_PCT: float = 0.001
     LIMIT_BUFFER_ENTRY: float = 1.03
     LIMIT_BUFFER_EXIT: float = 0.97
-    ORDER_TIMEOUT_SECONDS: int = 30
+    ORDER_TIMEOUT_SECONDS: int = 5
     ORDER_MAX_RETRIES: int = 3
 
     # ================= 11. Profit Guards (Universal Ladder) =================

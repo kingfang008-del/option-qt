@@ -183,16 +183,22 @@ class FCSSupportHandler:
                 c.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table_name}'")
                 return [r[0] for r in c.fetchall()]
 
-            c.execute("""CREATE TABLE IF NOT EXISTS debug_fast (ts DOUBLE PRECISION, symbol TEXT, created_at TEXT, PRIMARY KEY (ts, symbol)) PARTITION BY RANGE (ts);""")
+            c.execute("""CREATE TABLE IF NOT EXISTS debug_fast (ts DOUBLE PRECISION, symbol TEXT, created_at TEXT, write_wall_ts DOUBLE PRECISION, write_wall_at TEXT, source_ts DOUBLE PRECISION, PRIMARY KEY (ts, symbol)) PARTITION BY RANGE (ts);""")
             existing_cols_fast = get_existing_cols("debug_fast")
+            for fixed_col, fixed_type in [("write_wall_ts", "DOUBLE PRECISION"), ("write_wall_at", "TEXT"), ("source_ts", "DOUBLE PRECISION")]:
+                if fixed_col not in existing_cols_fast:
+                    c.execute(f'ALTER TABLE debug_fast ADD COLUMN "{fixed_col}" {fixed_type}')
             for name in svc.fast_feat_names:
                 if name not in existing_cols_fast:
                     c.execute(f'ALTER TABLE debug_fast ADD COLUMN "{name}" DOUBLE PRECISION')
             part_fast = f"debug_fast_{date_str}"
             c.execute(f"CREATE TABLE IF NOT EXISTS {part_fast} PARTITION OF debug_fast FOR VALUES FROM ({start_ts}) TO ({end_ts});")
 
-            c.execute("""CREATE TABLE IF NOT EXISTS debug_slow (ts DOUBLE PRECISION, symbol TEXT, created_at TEXT, PRIMARY KEY (ts, symbol)) PARTITION BY RANGE (ts);""")
+            c.execute("""CREATE TABLE IF NOT EXISTS debug_slow (ts DOUBLE PRECISION, symbol TEXT, created_at TEXT, write_wall_ts DOUBLE PRECISION, write_wall_at TEXT, source_ts DOUBLE PRECISION, PRIMARY KEY (ts, symbol)) PARTITION BY RANGE (ts);""")
             existing_cols_slow = get_existing_cols("debug_slow")
+            for fixed_col, fixed_type in [("write_wall_ts", "DOUBLE PRECISION"), ("write_wall_at", "TEXT"), ("source_ts", "DOUBLE PRECISION")]:
+                if fixed_col not in existing_cols_slow:
+                    c.execute(f'ALTER TABLE debug_slow ADD COLUMN "{fixed_col}" {fixed_type}')
             for name in svc.slow_feat_names:
                 if name not in existing_cols_slow:
                     c.execute(f'ALTER TABLE debug_slow ADD COLUMN "{name}" DOUBLE PRECISION')
@@ -201,6 +207,13 @@ class FCSSupportHandler:
 
             for part_name, feat_names in [(part_fast, svc.fast_feat_names), (part_slow, svc.slow_feat_names)]:
                 existing_partition_cols = get_existing_cols(part_name)
+                for fixed_col, fixed_type in [("write_wall_ts", "DOUBLE PRECISION"), ("write_wall_at", "TEXT"), ("source_ts", "DOUBLE PRECISION")]:
+                    if fixed_col not in existing_partition_cols:
+                        try:
+                            c.execute(f'ALTER TABLE {part_name} ADD COLUMN "{fixed_col}" {fixed_type}')
+                            logger.info(f"➕ [Schema Sync] Added fixed column '{fixed_col}' to partition {part_name}")
+                        except Exception as ae:
+                            logger.warning(f"Failed to add fixed column {fixed_col} to {part_name}: {ae}")
                 for name in feat_names:
                     if name not in existing_partition_cols:
                         try:
@@ -215,7 +228,7 @@ class FCSSupportHandler:
             if conn:
                 conn.close()
 
-    def write_debug_batch(self, ts, date_str, fast_data_list, slow_data_list):
+    def write_debug_batch(self, ts, date_str, fast_data_list, slow_data_list, source_ts=None):
         if not fast_data_list and not slow_data_list:
             return
         import psycopg2
@@ -225,31 +238,72 @@ class FCSSupportHandler:
             conn = psycopg2.connect(PG_DB_URL)
             conn.autocommit = True
             c = conn.cursor()
-            dt_ny = datetime.fromtimestamp(ts, NY_TZ)
-            created_at = dt_ny.strftime("%Y-%m-%d %H:%M:%S")
+            wall_ts = time.time()
+            wall_dt_ny = datetime.fromtimestamp(wall_ts, NY_TZ)
+            # created_at = 真实写入墙钟（NY 时区字符串）。label 时间随时可由 ts 字段反算。
+            created_at = wall_dt_ny.strftime("%Y-%m-%d %H:%M:%S")
+            write_wall_at = created_at
+            source_ts = float(source_ts) if source_ts is not None else float(ts)
+            label_ny = datetime.fromtimestamp(ts, NY_TZ).strftime("%Y-%m-%d %H:%M:%S")
+            earliest_commit_wall_ts = float(ts) + 60.0 + float(getattr(svc, "minute_commit_grace_sec", 1.0) or 0.0)
+            if slow_data_list:
+                svc._log_minute_write_audit(
+                    stage="debug_write:execute",
+                    label_ts=float(ts),
+                    data_ts=float(ts),
+                    wall_ts=wall_ts,
+                    symbols=[sym for sym, _ in slow_data_list],
+                    extra={
+                        'rows': len(slow_data_list),
+                        'date_str': date_str,
+                        'label_ny': label_ny,
+                        'created_at_wall_ny': created_at,
+                    },
+                    level="error" if wall_ts + 1e-9 < earliest_commit_wall_ts else "info",
+                    force=bool(wall_ts + 1e-9 < earliest_commit_wall_ts),
+                )
+                if wall_ts + 1e-9 < earliest_commit_wall_ts:
+                    logger.error(
+                        "🛑 [Debug-Write-WallClock] debug_slow actual write wall-clock is earlier than allowed commit time "
+                        f"| wall_ts={wall_ts:.3f} earliest={earliest_commit_wall_ts:.3f} label_ts={float(ts):.3f}"
+                    )
 
             if fast_data_list:
                 table_name = f"debug_fast_{date_str}"
-                cols_str = "ts, symbol, created_at, " + ", ".join([f'"{name}"' for name in svc.fast_feat_names])
-                placeholders = ",".join(["%s"] * (3 + len(svc.fast_feat_names)))
+                fixed_cols = ["ts", "symbol", "created_at", "write_wall_ts", "write_wall_at", "source_ts"]
+                cols_str = ", ".join(fixed_cols + [f'"{name}"' for name in svc.fast_feat_names])
+                placeholders = ",".join(["%s"] * (len(fixed_cols) + len(svc.fast_feat_names)))
                 rows_fast = []
                 for sym, vals in fast_data_list:
                     clean_vals = [None if not np.isfinite(v) else float(v) for v in vals]
-                    rows_fast.append([ts, sym, created_at] + clean_vals)
+                    rows_fast.append([ts, sym, created_at, wall_ts, write_wall_at, source_ts] + clean_vals)
                 if rows_fast:
-                    c.executemany(f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders}) ON CONFLICT (ts, symbol) DO NOTHING", rows_fast)
+                    update_cols = ["created_at", "write_wall_ts", "write_wall_at", "source_ts"] + [f'"{name}"' for name in svc.fast_feat_names]
+                    update_sql = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_cols])
+                    c.executemany(
+                        f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders}) "
+                        f"ON CONFLICT (ts, symbol) DO UPDATE SET {update_sql}",
+                        rows_fast
+                    )
 
             if slow_data_list:
                 table_name = f"debug_slow_{date_str}"
-                cols_str = "ts, symbol, created_at, " + ", ".join([f'"{name}"' for name in svc.slow_feat_names])
-                placeholders = ",".join(["%s"] * (3 + len(svc.slow_feat_names)))
+                fixed_cols = ["ts", "symbol", "created_at", "write_wall_ts", "write_wall_at", "source_ts"]
+                cols_str = ", ".join(fixed_cols + [f'"{name}"' for name in svc.slow_feat_names])
+                placeholders = ",".join(["%s"] * (len(fixed_cols) + len(svc.slow_feat_names)))
                 rows_slow = []
                 for sym, vals in slow_data_list:
                     clean_vals = [None if not np.isfinite(v) else float(v) for v in vals]
-                    rows_slow.append([ts, sym, created_at] + clean_vals)
+                    rows_slow.append([ts, sym, created_at, wall_ts, write_wall_at, source_ts] + clean_vals)
                 if rows_slow:
                     logger.info(f"📁 [Debug-Write] Writing {len(rows_slow)} symbols to {table_name} at ts={ts}")
-                    c.executemany(f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders}) ON CONFLICT (ts, symbol) DO NOTHING", rows_slow)
+                    update_cols = ["created_at", "write_wall_ts", "write_wall_at", "source_ts"] + [f'"{name}"' for name in svc.slow_feat_names]
+                    update_sql = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_cols])
+                    c.executemany(
+                        f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders}) "
+                        f"ON CONFLICT (ts, symbol) DO UPDATE SET {update_sql}",
+                        rows_slow
+                    )
                     logger.info(f"✅ [Debug-Write] Success for {table_name}")
             c.close()
         except Exception as e:

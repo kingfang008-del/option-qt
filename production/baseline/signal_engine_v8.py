@@ -415,6 +415,13 @@ class SignalEngineV8:
         
         self.last_save_time = 0
 
+        # [Entry-Reject-Stats] 开仓拒绝原因周期汇总，不改动任何策略逻辑，仅观测
+        from collections import defaultdict as _dd_reject
+        self._entry_reject_counts = _dd_reject(int)
+        self._entry_reject_samples = {}
+        self._entry_attempt_count = 0
+        self._entry_pass_count = 0
+
         # [新增] 逆势交易统计 (Counter-trend tracking)
         self.stats_counter_trend_long_count = 0
         self.stats_counter_trend_long_win_count = 0
@@ -1329,29 +1336,44 @@ class SignalEngineV8:
             return None
 
         # 4. 开仓决策
-        if not should_update_full: return None  # 🚀 [核心门控] 高频增量帧仅允许平仓，坚决禁止开仓检查
+        if not should_update_full:
+            return None  # 🚀 [核心门控] 高频增量帧仅允许平仓，坚决禁止开仓检查（信息性，不计为拒绝）
+
+        self._entry_attempt_count += 1
 
         if not ctx['is_ready']:
+            self._bump_entry_reject('warmup_incomplete', sym, {'alpha_hist': len(self.states[sym].alpha_history)})
             if getattr(self, '_warmup_log_count', 0) < 5:
                 logger.info(f"⏳ [SE-Gate] {sym} not ready (Warmup: {len(self.states[sym].alpha_history)})")
                 self._warmup_log_count = getattr(self, '_warmup_log_count', 0) + 1
             return None
         
         if curr_ts < self.global_cooldown_until:
+            self._bump_entry_reject('global_cooldown', sym, {'until': self.global_cooldown_until})
             logger.info(f"🛡️ [SE-Gate] Global Cooldown active until {self.global_cooldown_until}")
             return None
             
         if is_zombie_market:
-            # logger.info(f"🧟 [SE-Gate] Zombie Market detected")
+            self._bump_entry_reject('zombie_market', sym)
             return None
         
         no_entry_h = self.strategy.cfg.NO_ENTRY_HOUR
         no_entry_m = self.strategy.cfg.NO_ENTRY_MINUTE
-        if ny_now.time() >= dt_time(no_entry_h, no_entry_m): return None
+        if ny_now.time() >= dt_time(no_entry_h, no_entry_m):
+            self._bump_entry_reject('no_entry_window', sym, {'ny': ny_now.strftime('%H:%M:%S')})
+            return None
         
         entry_sig = self.strategy.decide_entry(ctx)
         if not entry_sig:
-            # logger.info(f"⚪ [SE-Gate] {sym} strategy rejected entry")
+            sub = getattr(self.strategy, '_last_reject_reason', 'strategy_unspecified') or 'strategy_unspecified'
+            self._bump_entry_reject(f'strategy:{sub}', sym, {
+                'alpha': ctx.get('alpha_z', 0.0),
+                'cs_alpha_z': ctx.get('cs_alpha_z', 0.0),
+                'vol_z': ctx.get('vol_z', 0.0),
+                'event_prob': ctx.get('event_prob', 0.0),
+                'macd_hist': ctx.get('macd_hist', 0.0),
+                'spy_roc': ctx.get('spy_roc', 0.0),
+            })
             return None
 
         # [严格守卫]：策略决定好方向后，精准提取对应方向的真实参数提交订单！
@@ -1374,16 +1396,20 @@ class SignalEngineV8:
 
             fair_p = self._get_fair_market_price(t_price, t_bid, t_ask)
             if fair_p < 0.05:
+                self._bump_entry_reject('opt_fair_price_low', sym, {'fair_p': fair_p, 'bid': t_bid, 'ask': t_ask})
                 logger.info(f"🚫 [SE-Gate] {sym} Fair Price {fair_p:.4f} too low")
                 return None
             if not t_id:
+                self._bump_entry_reject('opt_missing_contract_id', sym, {'strike': t_k})
                 logger.info(f"🚫 [SE-Gate] {sym} missing Option ID")
                 return None
             
             strike_valid = (t_k > 1.0 and abs(t_k - price) / max(price, 1.0) < 0.80)
             if strike_valid:
                 intrinsic = max(0.0, price - t_k) if is_call else max(0.0, t_k - price)
-                if fair_p < intrinsic * 0.9: return None
+                if fair_p < intrinsic * 0.9:
+                    self._bump_entry_reject('opt_below_intrinsic', sym, {'fair_p': fair_p, 'intrinsic': intrinsic, 'strike': t_k, 'stock': price})
+                    return None
             
             entry_sig.update({
                 'price': fair_p, 'contract_id': t_id,
@@ -1396,7 +1422,9 @@ class SignalEngineV8:
                     'alpha_available_ts': metrics.get('alpha_available_ts', curr_ts),
                 }
             })
+            self._entry_pass_count += 1
             return entry_sig
+        self._bump_entry_reject('no_option_feed', sym)
         return None
 
     async def _evaluate_symbol_signals_back(self, i, sym, metrics, opt_data, ny_now, curr_ts, spy_roc, qqq_roc, is_zombie_market, index_trend=0):
@@ -2522,6 +2550,46 @@ class SignalEngineV8:
                 sig = {'action': 'SELL', 'reason': reason, 'dir': -st.position, 'price': 0.1}
                 await self._emit_trade_signal('SELL', sym, sig, 0.1, custom_ts, -1)
 
+    # === Entry Reject Stats (diagnostic only, no logic change) ===
+    def _bump_entry_reject(self, reason, sym=None, extra=None):
+        try:
+            self._entry_reject_counts[reason] = self._entry_reject_counts.get(reason, 0) + 1
+            if sym and reason not in self._entry_reject_samples:
+                snap = {'sym': sym}
+                if isinstance(extra, dict):
+                    for k, v in list(extra.items())[:6]:
+                        try:
+                            snap[k] = float(v) if isinstance(v, (int, float)) else str(v)[:40]
+                        except Exception:
+                            pass
+                self._entry_reject_samples[reason] = snap
+        except Exception:
+            pass
+
+    def _emit_entry_reject_stats(self):
+        try:
+            if not self._entry_reject_counts and self._entry_attempt_count == 0:
+                return
+            total_rejects = sum(self._entry_reject_counts.values())
+            top = sorted(self._entry_reject_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+            top_str = " | ".join([f"{k}={v}" for k, v in top])
+            logger.info(
+                f"🛂 [Entry-Reject-Stats] 60s attempts={self._entry_attempt_count} passes={self._entry_pass_count} "
+                f"rejects={total_rejects} | {top_str}"
+            )
+            # 每 5 分钟额外输出一次典型样本，便于直接定位
+            if int(time.time()) // 300 != getattr(self, '_entry_reject_sample_bucket', -1):
+                self._entry_reject_sample_bucket = int(time.time()) // 300
+                if self._entry_reject_samples:
+                    for reason, snap in list(self._entry_reject_samples.items())[:6]:
+                        logger.info(f"🔎 [Entry-Reject-Sample] {reason}: {snap}")
+            self._entry_reject_counts.clear()
+            self._entry_reject_samples.clear()
+            self._entry_attempt_count = 0
+            self._entry_pass_count = 0
+        except Exception as e:
+            logger.warning(f"[Entry-Reject-Stats] emit failed: {e}")
+
     # === Accounting Logic ===
     def _emit_trade_log(self, payload):
         """复用 Accounting 模块的日志发送逻辑，确保 Cash 和 Mode 标记一致"""
@@ -2661,6 +2729,7 @@ class SignalEngineV8:
                     logger.info(
                         f"📊 [SE-Stats] 60s msgs={stats['msgs']} payloads={stats['payloads']} sync_calls={stats['sync_calls']}"
                     )
+                    self._emit_entry_reject_stats()
                     stats = {'msgs': 0, 'payloads': 0, 'sync_calls': 0}
                     last_stats_log = time.time()
 
