@@ -2,6 +2,7 @@ import asyncio
 import logging
 import json
 import time
+import os
 from config import TRADING_ENABLED
 
 logger = logging.getLogger("V8_Orchestrator.Reconciler")
@@ -10,6 +11,10 @@ class OrchestratorReconciler:
     def __init__(self, orchestrator):
         self.orch = orchestrator
         self.reconcile_interval = 10  # 每 10 秒对账一次 (避免把 IBKR 接口打爆)
+        self.cash_warn_threshold = float(os.environ.get("CASH_RECON_WARN_USD", "1500"))
+        self.cash_pause_threshold = float(os.environ.get("CASH_RECON_PAUSE_USD", "5000"))
+        self._last_cash_warn_ts = 0.0
+        self._last_cash_pause_ts = 0.0
 
     async def run_reconciliation_loop(self):
         """
@@ -73,6 +78,74 @@ class OrchestratorReconciler:
                 
                 # 执行自愈逻辑 (Auto-Healing)
                 await self._auto_heal_divergence(sym, st, local_qty, broker_qty)
+
+        await self._perform_cash_reconciliation()
+
+    async def _perform_cash_reconciliation(self):
+        """Cash guard: reconcile local mock_cash against broker available funds."""
+        if not hasattr(self.orch, 'ibkr') or not hasattr(self.orch.ibkr, 'get_account_balance'):
+            return
+        try:
+            broker_cash = float(await self.orch.ibkr.get_account_balance() or 0.0)
+        except Exception:
+            return
+        if broker_cash <= 0:
+            return
+
+        local_cash = float(getattr(self.orch, 'mock_cash', 0.0) or 0.0)
+        locked_cash = 0.0
+        pending_cnt = 0
+        for st in getattr(self.orch, 'states', {}).values():
+            try:
+                locked_cash += max(0.0, float(getattr(st, 'locked_cash', 0.0) or 0.0))
+            except Exception:
+                pass
+            if bool(getattr(st, 'is_pending', False)):
+                pending_cnt += 1
+        local_total = local_cash + locked_cash
+        diff_cash = broker_cash - local_cash
+        diff_total = broker_cash - local_total
+        abs_diff = abs(diff_cash)
+        now = time.time()
+
+        if abs_diff >= self.cash_warn_threshold and (now - self._last_cash_warn_ts) >= 30:
+            self._last_cash_warn_ts = now
+            logger.warning(
+                f"⚠️ [Cash-Reconcile] broker=${broker_cash:,.2f} local_cash=${local_cash:,.2f} "
+                f"locked=${locked_cash:,.2f} local_total=${local_total:,.2f} "
+                f"diff_cash={diff_cash:+,.2f} diff_total={diff_total:+,.2f} pending={pending_cnt}"
+            )
+
+        # Hard guard: large divergence without pending orders means local cash is likely corrupted.
+        if abs_diff >= self.cash_pause_threshold and pending_cnt == 0:
+            if (now - self._last_cash_pause_ts) >= 60:
+                self._last_cash_pause_ts = now
+                self.orch.trading_paused = True
+                logger.critical(
+                    f"🛑 [Cash-Reconcile-HardGuard] Trading paused: broker=${broker_cash:,.2f}, "
+                    f"local_cash=${local_cash:,.2f}, diff={diff_cash:+,.2f} (threshold={self.cash_pause_threshold:.2f})"
+                )
+                try:
+                    self.orch.accounting._emit_trade_log({
+                        'ts': now,
+                        'symbol': 'SYSTEM',
+                        'action': 'CASH_DIVERGENCE',
+                        'side': 'SYS_GUARD',
+                        'qty': 0,
+                        'price': 0.0,
+                        'stock_price': 0.0,
+                        'strategy_note': json.dumps({
+                            'reason': 'CASH_RECONCILE_HARD_GUARD',
+                            'broker_cash': broker_cash,
+                            'local_cash': local_cash,
+                            'locked_cash': locked_cash,
+                            'diff_cash': diff_cash,
+                            'diff_total': diff_total,
+                        }),
+                        'mode': 'REALTIME'
+                    })
+                except Exception:
+                    pass
 
     async def _auto_heal_divergence(self, sym, st, local_qty, broker_qty):
         """

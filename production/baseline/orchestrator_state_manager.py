@@ -10,9 +10,56 @@ from pytz import timezone
 import psycopg2
 import sqlite3
 import numpy as np
-from config import PG_DB_URL, IS_SIMULATED, IS_BACKTEST, ROLLING_WINDOW, TARGET_SYMBOLS, DB_DIR, REDIS_CFG, NY_TZ
+from config import (
+    PG_DB_URL,
+    IS_SIMULATED,
+    IS_BACKTEST,
+    IS_REALTIME_DRY,
+    RUN_MODE,
+    INITIAL_ACCOUNT,
+    ROLLING_WINDOW,
+    TARGET_SYMBOLS,
+    DB_DIR,
+    REDIS_CFG,
+    NY_TZ,
+)
 
 logger = logging.getLogger("V8_Orchestrator.StateManager")
+
+
+def sanitize_restored_mock_cash(
+    restored_cash,
+    *,
+    initial_cash=INITIAL_ACCOUNT,
+    is_realtime_dry=IS_REALTIME_DRY,
+    max_multiplier=None,
+):
+    """Validate restored mock cash before it can become OMS truth.
+
+    REALTIME_DRY is a paper ledger. If a legacy/corrupted _GLOBAL_STATE_ says
+    the paper cash is 10x the configured initial cash, restarting OMS should not
+    rebroadcast that amount as the authoritative Redis ledger.
+    """
+    try:
+        cash = float(restored_cash)
+        initial = float(initial_cash)
+    except Exception:
+        return float(initial_cash), "non_numeric"
+
+    if not is_realtime_dry:
+        return cash, None
+
+    if max_multiplier is None:
+        try:
+            max_multiplier = float(os.environ.get("OMS_DRY_CASH_RESTORE_MAX_MULTIPLIER", "3.0"))
+        except Exception:
+            max_multiplier = 3.0
+    max_cash = max(initial, 1.0) * max(float(max_multiplier), 1.0)
+    if cash <= 0:
+        return initial, "non_positive"
+    if cash > max_cash:
+        return initial, f"above_dry_restore_cap:{cash:.2f}>{max_cash:.2f}"
+    return cash, None
 
 class OrchestratorStateManager:
     def __init__(self, orchestrator):
@@ -93,22 +140,53 @@ class OrchestratorStateManager:
             ny_tz = timezone('America/New_York')
             now_ny = datetime.now(ny_tz).date()
             
+            # [🛡️ 跨天丢弃] 所有状态记录（包括 _GLOBAL_STATE_）只在同一交易日内沿用
+            # 之前的 bug：_GLOBAL_STATE_ 不受跨天约束，导致 mock_cash 隔夜漂移
+            # 现在统一按 updated_at 的 NY 日期判定
             dropped_count = 0
+            dropped_global = False
             for sym, data_str, updated_at in rows:
                 try:
                     ts_dt = datetime.fromtimestamp(updated_at, ny_tz).date()
-                    if ts_dt != now_ny and sym != '_GLOBAL_STATE_':
+                    if ts_dt != now_ny:
                         dropped_count += 1
+                        if sym == '_GLOBAL_STATE_':
+                            dropped_global = True
                         continue
                     restored[sym] = json.loads(data_str)
                 except: pass
-                
-            # [新增] 恢复全局资金状态
+
+            # [新增] 恢复全局资金状态（仅当天有效）
             if '_GLOBAL_STATE_' in restored:
                 global_data = restored['_GLOBAL_STATE_']
                 if 'mock_cash' in global_data:
-                    self.orch.mock_cash = float(global_data['mock_cash'])
-                    logger.info(f"💰 Restored mock_cash from DB: ${self.orch.mock_cash:,.2f}")
+                    state_mode = str(global_data.get('mode') or '').upper()
+                    if state_mode and state_mode != RUN_MODE:
+                        logger.warning(
+                            f"🚫 Ignore _GLOBAL_STATE_ cash from mode={state_mode}; "
+                            f"current RUN_MODE={RUN_MODE}, keep mock_cash=${self.orch.mock_cash:,.2f}"
+                        )
+                    else:
+                        restored_cash, reject_reason = sanitize_restored_mock_cash(
+                            global_data['mock_cash'],
+                            initial_cash=getattr(self.orch.cfg, 'INITIAL_ACCOUNT', INITIAL_ACCOUNT),
+                            is_realtime_dry=IS_REALTIME_DRY,
+                        )
+                        if reject_reason:
+                            self.orch.mock_cash = restored_cash
+                            logger.warning(
+                                f"🚫 Reject restored _GLOBAL_STATE_ mock_cash={global_data['mock_cash']} "
+                                f"reason={reject_reason}; reset to ${self.orch.mock_cash:,.2f}"
+                            )
+                        else:
+                            self.orch.mock_cash = restored_cash
+                            legacy_tag = " legacy-no-mode" if not state_mode else ""
+                            logger.info(
+                                f"💰 Restored mock_cash from DB (same-day{legacy_tag}): "
+                                f"${self.orch.mock_cash:,.2f}"
+                            )
+            elif dropped_global:
+                logger.info("🧹 _GLOBAL_STATE_ from previous day dropped; mock_cash keeps default (fresh start).")
 
             if dropped_count > 0:
                 logger.info(f"🧹 Ignored {dropped_count} state records from previous days.")
@@ -117,20 +195,21 @@ class OrchestratorStateManager:
             logger.error(f"❌ DB Load Error: {e}")
             return {}
 
-    def _save_state_to_db(self, state_data):
+    def _save_state_to_db(self, state_data, snapshot_ts=None):
         """[修改] 异步备份状态到 PG，彻底剥离 I/O 阻塞"""
         def _write_task(data):
             try:
                 self._init_state_db() # 确保表存在
                 conn = self._get_pg_conn()
                 c = conn.cursor()
-                ts = time.time()
+                ts = float(snapshot_ts if snapshot_ts is not None else time.time())
                 data_list = [(sym, json.dumps(d), ts) for sym, d in data.items()]
                 import psycopg2.extras
                 psycopg2.extras.execute_batch(c, """
                     INSERT INTO symbol_state (symbol, data, updated_at) VALUES (%s, %s, %s)
                     ON CONFLICT (symbol) DO UPDATE 
                     SET data=EXCLUDED.data, updated_at=EXCLUDED.updated_at
+                    WHERE symbol_state.updated_at IS NULL OR symbol_state.updated_at <= EXCLUDED.updated_at
                 """, data_list)
                 conn.commit()
                 conn.close()
@@ -154,11 +233,13 @@ class OrchestratorStateManager:
             # [新增] 注入全局资金状态
             state_data['_GLOBAL_STATE_'] = {
                 'mock_cash': self.orch.mock_cash,
-                'updated_at': time.time()
+                'updated_at': time.time(),
+                'mode': RUN_MODE,
+                'engine_mode': str(getattr(self.orch, 'mode', '') or '').upper(),
             }
 
             # Write to PostgreSQL
-            self._save_state_to_db(state_data)
+            self._save_state_to_db(state_data, snapshot_ts=time.time())
             
             # Remove JSON file if exists to avoid confusion
             json_path = Path("positions_ignore_v8.json")

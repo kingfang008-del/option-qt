@@ -34,7 +34,7 @@ class StrategyConfig:
     # V0 逻辑: VOL_MIN 为 -1 (更宽松)，ALPHA_ENTRY 为 0.85
     VOL_MIN_Z: float = -1          
     VOL_MAX_Z: float = 4.0           
-    ALPHA_ENTRY_THRESHOLD: float = 0.8
+    ALPHA_ENTRY_THRESHOLD: float = 0.7
     ALPHA_ENTRY_STRICT: float = 1.2
     MIN_CS_ALPHA_Z: float = 0.5           
     
@@ -183,8 +183,13 @@ class StrategyConfig:
     EXIT_COND_STOP_ENABLED: bool = True
     EXIT_SMALL_GAIN_ENABLED: bool = True
 
-    # ================= 18. 1s 高频平仓确认 =================
-    # 仅用于秒级回测/高频执行路径，避免被秒级盘口噪声过早打出场
+    # ================= 18. Exit Frequency Control =================
+    # 分钟级平仓信号模式:
+    # True  -> 仅分钟级策略链路产生平仓信号; 秒级只做执行层成交推进
+    # False -> 允许秒级风控链路(_process_exits/_process_fast_fused_tick)直接触发平仓
+    EXIT_SIGNAL_MINUTE_ONLY: bool = True
+
+    # 仅在启用秒级平仓判定时生效: 高频确认阈值，避免秒级盘口噪声过早打出场
     EXIT_CONFIRM_SECONDS_1S: int = 8
     EXIT_CONFIRM_REASON_PREFIXES: Tuple[str, ...] = (
         "HARD_STOP",

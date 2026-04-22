@@ -1241,21 +1241,46 @@ class IBKRConnectorFinal:
         """
         下单并自动附加云端止损 (Server-Side Stop Loss) 
         :param stop_loss_pct: 止损百分比 (默认 0.05 = 5%, 与 V3 策略 STOP_LOSS 同步)。设为 0 则不带止损。
+
+        返回值语义:
+            Trade 对象 : 已提交订单 (TRADING_ENABLED 且连接正常).
+            None       : 未下单. 两种原因:
+                          (a) TRADING_ENABLED=False (DRY RUN) → 上游可安全走"模拟成交".
+                          (b) IBKR 未连接 / 本次 placeOrder 抛异常 → 上游不得模拟成交,
+                              只能跳过本次并等待重连.
+                         两种情况在日志 tag 上做区分 ([DRY RUN] vs [NOT CONNECTED]).
         """
- 
 
         # ==========================================================
         # 🚨🚨🚨 核按钮：DRY RUN 模式强制开启 🚨🚨🚨
         # ==========================================================
-        # [NEW] 彻底实现“一行代码开关”：只需在 config.py 开启 TRADING_ENABLED，此处不再硬编码阻拦
+        # [NEW] 彻底实现"一行代码开关"：只需在 config.py 开启 TRADING_ENABLED，此处不再硬编码阻拦
         if not TRADING_ENABLED:
             logger.warning(f"🛑 [DRY RUN 空跑拦截] config.TRADING_ENABLED=False: {action} {qty}手 {contract.localSymbol} @ {order_type} | 限价: {lmt_price}")
             return None  # 强行返回，绝对不向交易所发任何单！
-        
-        # [Safety Check] 全局交易开关
-        if not TRADING_ENABLED:
-            logger.warning(f"🚫 TRADING DISABLED in config. Order BLOCKED: {action} {qty} {contract.localSymbol}")
-            return
+
+        # [🛡️ Connection Guard] IBKR 未连接时不要让 ib_insync 抛 ConnectionError,
+        # 否则每秒数条退出信号都会各自产生一条 traceback, 同时 _smart_exit_order 里的
+        # `if not trade` 兜底会把仓位按"模拟成交"清算, 造成账实不符.
+        # 这里做一次性节流日志 + 返回 None; 调用方需通过 self.last_not_connected_ts
+        # 判断是连接问题还是 DRY RUN, 从而决定是否跳过"模拟成交".
+        try:
+            is_conn = bool(self.ib.isConnected())
+        except Exception:
+            is_conn = False
+        if not is_conn:
+            now = time.time()
+            last_logged = getattr(self, '_last_disconnect_log_ts', 0.0)
+            # 标记给上游用 (毫秒级时间戳, >0 表示最近一次下单时检测到断连)
+            self.last_not_connected_ts = now
+            if now - last_logged > 60.0:
+                logger.error(
+                    f"🔌 [IBKR NOT CONNECTED] 跳过下单 | {action} {qty} {getattr(contract, 'localSymbol', contract)} "
+                    f"@ {order_type} lmt={lmt_price} reason={reason} "
+                    f"| 将由 connect()/maintenance_loop 触发重连, 下游请勿做模拟成交."
+                )
+                self._last_disconnect_log_ts = now
+            return None
 
         # 1. 构建主订单 (Parent)
         parent = Order()
@@ -1287,7 +1312,22 @@ class IBKRConnectorFinal:
         
         logger.info(f"🛒 Order: {action} {qty} {contract.localSymbol} @ {order_type} (Managed by Orchestrator)")
         parent.transmit = True
-        trade_parent = self.ib.placeOrder(contract, parent)
+        # [🛡️ Last Resort] 即便上面检测时已连接, 下发瞬间仍可能断链; 再包一层 try 保底,
+        # 任何异常都转为返回 None + 记录断连时间, 而不是让 traceback 向上冒泡把整个
+        # tick 的账务逻辑打断.
+        try:
+            trade_parent = self.ib.placeOrder(contract, parent)
+        except Exception as e:
+            self.last_not_connected_ts = time.time()
+            now = time.time()
+            last_logged = getattr(self, '_last_disconnect_log_ts', 0.0)
+            if now - last_logged > 60.0:
+                logger.error(
+                    f"🔌 [IBKR placeOrder FAILED] {e} | {action} {qty} {contract.localSymbol} @ {order_type} lmt={lmt_price}",
+                    exc_info=True,
+                )
+                self._last_disconnect_log_ts = now
+            return None
         return trade_parent
 
 

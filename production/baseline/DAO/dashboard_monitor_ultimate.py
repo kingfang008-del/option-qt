@@ -38,7 +38,13 @@ from config import (
     HASH_OPTION_SNAPSHOT, STREAM_FUSED_MARKET, STREAM_INFERENCE,
     STREAM_TRADE_LOG, BUCKET_SPECS, TAG_TO_INDEX, IBKR_PORT, PG_DB_URL,
     AUTO_TRADING_CAPITAL_RATIO, MANUAL_TRADING_CAPITAL_RATIO, MANUAL_ORDER_ALLOC_RATIO,
-    COMMISSION_PER_CONTRACT
+    COMMISSION_PER_CONTRACT,
+    STREAM_ORCH_SIGNAL, GROUP_OMS, GROUP_ORCH, RUN_MODE,
+)
+from dashboard_cash_utils import (
+    parse_oms_ledger_hash,
+    parse_oms_live_cash_payload,
+    select_remaining_cash,
 )
 
 # [Fix 1] 补全 Dashboard 所需的 Redis Key 映射
@@ -83,14 +89,64 @@ def fetch_latest_mock_cash():
     try:
         conn = psycopg2.connect(PG_DB_URL)
         c = conn.cursor()
-        c.execute("SELECT data FROM symbol_state WHERE symbol = '_GLOBAL_STATE_'")
+        c.execute("SELECT data, updated_at FROM symbol_state WHERE symbol = '_GLOBAL_STATE_'")
         row = c.fetchone()
         conn.close()
         if row:
             data = json.loads(row[0])
+            updated_at = row[1]
+            try:
+                # 仅接受 NY 当日快照，避免旧 _GLOBAL_STATE_ 污染 Dashboard 显示
+                ts_ny = datetime.fromtimestamp(float(updated_at), NY_TZ).date()
+                if ts_ny != datetime.now(NY_TZ).date():
+                    return None
+            except Exception:
+                return None
             return float(data.get('mock_cash', 0.0))
     except: pass
     return None
+
+
+def fetch_live_oms_cash(
+    max_age_sec: float = 120.0,
+    allow_stale: bool = False,
+    return_source: bool = False,
+    expected_modes=None,
+):
+    """优先读取 OMS 广播现金 (oms:live_positions.____SYSTEM_CASH____).
+
+    Remaining Cash 的核心口径应该是 OMS 当前现金；若仅因心跳短暂过期就回退到
+    Trade Log/PG，会造成页面在两种口径间抖动，表现为“无交易也忽大忽小”。
+    """
+    try:
+        r = redis.Redis(**{k: v for k, v in REDIS_CFG.items() if k in ['host', 'port', 'db']}, decode_responses=False)
+        # 1) 首选：OMS 账本投影（单一口径，避免 trade_log/PG 推导抖动）
+        try:
+            ledger = r.hgetall("meta:oms_ledger") or {}
+            cash, source = parse_oms_ledger_hash(
+                ledger,
+                max_age_sec=max_age_sec,
+                allow_stale=allow_stale,
+                expected_modes=expected_modes,
+            )
+            if cash is not None:
+                return (cash, source) if return_source else cash
+        except Exception:
+            pass
+
+        # 2) 兼容旧口径：oms:live_positions 里的系统现金心跳
+        raw = r.hget("oms:live_positions", "____SYSTEM_CASH____")
+        cash, source = parse_oms_live_cash_payload(
+            raw,
+            max_age_sec=max_age_sec,
+            allow_stale=allow_stale,
+            expected_modes=expected_modes,
+        )
+        if cash is not None:
+            return (cash, source) if return_source else cash
+        return (None, None) if return_source else None
+    except Exception:
+        return (None, None) if return_source else None
 
 _FEAT_JSON_DIR = SCRIPT_DIR  # daily_backtest/
 FAST_FEAT_NAMES = _load_feat_names(_FEAT_JSON_DIR / "fast_feature.json")
@@ -1820,7 +1876,7 @@ if c4.button(f"🔍 Orch: {status.warmup['Orch']}%", help="Click to view Alpha L
 st.divider()
 
 # --- Main: Tabs ---
-tab1, tab10, tab2, tab11, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+tab1, tab10, tab2, tab11, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab_sh, tab_gates = st.tabs([
     "📈 Market Feed", 
     "🏦 Positions",
     "📜 History & Replay", 
@@ -1831,7 +1887,9 @@ tab1, tab10, tab2, tab11, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "🐞 Feature Debug",
     "💾 Warmup Audit" ,
     "🧪 Norm Health",
-    "🔄 Live -> Backtest"
+    "🔄 Live -> Backtest",
+    "🩺 Stream Health",
+    "🧬 策略门禁",
 ])
 
 # === Tab 1: 市场透视 ===
@@ -2687,8 +2745,38 @@ with tab5:
             f5.metric("Full Fills", f"{funnel['full_fills']}", delta=f"Partial {funnel['partial_fills']}")
             f6.metric("CLOSE Total", f"{funnel['close_total']}", delta=f"Signaled {funnel['symbol_signaled']} syms")
             
-            sql = f"SELECT * FROM {target_table} WHERE ts >= {target_start_ts} AND ts < {target_end_ts} ORDER BY ts ASC"
-            df_all = pd.read_sql(sql, conn)
+            # [🛡️ 双表兜底]
+            # 重启/模式切换边界下，少量 OPEN/CLOSE 可能被路由到另一张表。
+            # 这里主表优先 + 副表兜底，避免 Recent Trade Logs 出现“只有平仓没有开仓”。
+            secondary_table = 'trade_logs_backtest' if target_table == 'trade_logs' else 'trade_logs'
+            sql_primary = f"SELECT * FROM {target_table} WHERE ts >= {target_start_ts} AND ts < {target_end_ts}"
+            sql_secondary = f"SELECT * FROM {secondary_table} WHERE ts >= {target_start_ts} AND ts < {target_end_ts}"
+            try:
+                df_primary = pd.read_sql(sql_primary, conn)
+            except Exception:
+                df_primary = pd.DataFrame()
+            try:
+                df_secondary = pd.read_sql(sql_secondary, conn)
+            except Exception:
+                df_secondary = pd.DataFrame()
+            if not df_primary.empty:
+                df_primary['source_table'] = target_table
+            if not df_secondary.empty:
+                df_secondary['source_table'] = secondary_table
+            if df_primary.empty and df_secondary.empty:
+                df_all = pd.DataFrame()
+            elif df_secondary.empty:
+                df_all = df_primary
+            elif df_primary.empty:
+                df_all = df_secondary
+            else:
+                df_all = pd.concat([df_primary, df_secondary], ignore_index=True)
+                # 防止双写情况下重复展示同一条记录
+                df_all = df_all.drop_duplicates(
+                    subset=['ts', 'symbol', 'action', 'qty', 'price'],
+                    keep='last'
+                )
+            df_all = df_all.sort_values(by='ts', ascending=True) if not df_all.empty else df_all
             conn.close()
             
             if df_all.empty:
@@ -2913,8 +3001,31 @@ with tab5:
                     c3.metric("Total Market Value", f"${total_market_value:,.0f}")
                     
                     # 显示剩余现金
-                    display_cash = latest_cash if latest_cash is not None else (df_all['account_cash'].iloc[-1] if not df_all.empty else 0.0)
+                    # 实时/空跑模式下，OMS Redis 账本是唯一权威现金源；Trade Log 只做审计展示，
+                    # 不能作为实时现金兜底，否则旧回放/旧空跑日志会把 Remaining Cash 顶高。
+                    live_cash, live_cash_source = fetch_live_oms_cash(
+                        max_age_sec=120.0,
+                        allow_stale=False,
+                        return_source=True,
+                        expected_modes=[RUN_MODE],
+                    )
+                    log_cash = None
+                    try:
+                        if not df_all.empty and 'account_cash' in df_all.columns:
+                            _cash_series = pd.to_numeric(df_all['account_cash'], errors='coerce').dropna()
+                            if not _cash_series.empty:
+                                log_cash = float(_cash_series.iloc[-1])
+                    except Exception:
+                        log_cash = None
+                    display_cash, cash_source = select_remaining_cash(
+                        live_cash=live_cash,
+                        live_cash_source=live_cash_source,
+                        log_cash=log_cash,
+                        latest_cash=latest_cash,
+                        run_mode=RUN_MODE,
+                    )
                     c4.metric("Remaining Cash", f"${display_cash:,.2f}")
+                    c4.caption(f"source: {cash_source}")
                     
                     win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
                     c5.metric("Win Rate", f"{win_rate:.1f}%", f"{wins}W / {losses}L")
@@ -3472,6 +3583,631 @@ with tab9:
                 c2.warning(f"Extra in Live (False Positive): {extra_in_live}")
             else:
                 c2.success("No Phantom Trades")
+
+# ============================================================
+# 🩺 Stream Health —— 消费状态/积压/PG 残留 可视化诊断
+# ============================================================
+_STREAM_HEALTH_TARGETS = [
+    (STREAM_ORCH_SIGNAL,  GROUP_OMS),   # SE → OMS
+    (STREAM_FUSED_MARKET, GROUP_OMS),   # IBKR → OMS (exits)
+    (STREAM_FUSED_MARKET, GROUP_ORCH),  # IBKR → SE (features)
+    (STREAM_INFERENCE,    GROUP_ORCH),  # FCS → SE
+]
+
+
+def _sh_decode(v):
+    if isinstance(v, bytes):
+        return v.decode('utf-8', errors='ignore')
+    return v
+
+
+@st.cache_data(ttl=3)
+def _sh_inspect_redis_groups():
+    """拉取每个 (stream, group) 的消费健康度。返回 list[dict]。"""
+    rds = get_redis_client()
+    rows = []
+    if rds is None:
+        return rows, "Redis 连接失败"
+    for stream, group in _STREAM_HEALTH_TARGETS:
+        row = {
+            'stream': stream, 'group': group,
+            'stream_exists': False, 'group_exists': False,
+            'last_delivered_id': None, 'pending': None, 'lag': None,
+            'stream_last_id': None, 'stream_len': None,
+        }
+        try:
+            s_info = rds.xinfo_stream(stream)
+            row['stream_exists']   = True
+            row['stream_last_id']  = _sh_decode(s_info.get(b'last-generated-id') or s_info.get('last-generated-id'))
+            row['stream_len']      = s_info.get(b'length') or s_info.get('length')
+        except Exception:
+            rows.append(row)
+            continue
+        try:
+            for g in rds.xinfo_groups(stream):
+                name = _sh_decode(g.get(b'name') or g.get('name'))
+                if name != group:
+                    continue
+                row['group_exists']       = True
+                row['last_delivered_id']  = _sh_decode(g.get(b'last-delivered-id') or g.get('last-delivered-id'))
+                row['pending']            = g.get(b'pending') or g.get('pending')
+                row['lag']                = g.get(b'lag')     or g.get('lag')
+                break
+        except Exception:
+            pass
+        rows.append(row)
+    return rows, None
+
+
+@st.cache_data(ttl=5)
+def _sh_inspect_pg_state():
+    """查看 PG symbol_state 的跨天残留 / GLOBAL_STATE。"""
+    summary = {
+        'table_exists': False, 'total_rows': 0,
+        'today_symbol_rows': 0, 'stale_symbol_rows': [],
+        'global_state_row': None, 'connected': False, 'error': None,
+    }
+    try:
+        conn = psycopg2.connect(PG_DB_URL)
+        c = conn.cursor()
+        summary['connected'] = True
+    except Exception as e:
+        summary['error'] = str(e)
+        return summary
+    try:
+        c.execute("SELECT to_regclass('public.symbol_state')")
+        if c.fetchone()[0] is None:
+            conn.close()
+            return summary
+        summary['table_exists'] = True
+        c.execute("SELECT COUNT(*) FROM symbol_state")
+        summary['total_rows'] = c.fetchone()[0]
+        now_ny_date = datetime.now(NY_TZ).date()
+        c.execute("SELECT symbol, updated_at FROM symbol_state ORDER BY updated_at DESC")
+        for sym, updated_at in c.fetchall():
+            try:
+                ts_dt = datetime.fromtimestamp(float(updated_at), NY_TZ).date()
+            except Exception:
+                ts_dt = None
+            is_today = (ts_dt == now_ny_date)
+            if sym == '_GLOBAL_STATE_':
+                summary['global_state_row'] = {
+                    'updated_at': updated_at, 'ts_ny': str(ts_dt), 'is_today': is_today,
+                }
+            else:
+                if is_today:
+                    summary['today_symbol_rows'] += 1
+                else:
+                    summary['stale_symbol_rows'].append((sym, str(ts_dt)))
+        conn.close()
+    except Exception as e:
+        summary['error'] = str(e)
+        try: conn.close()
+        except Exception: pass
+    return summary
+
+
+@st.cache_data(ttl=5)
+def _sh_inspect_fcs_state():
+    """查看 fcs_state_snapshot 各 namespace 的健康度。"""
+    summary = {
+        'connected': False, 'table_exists': False,
+        'namespaces': [], 'error': None,
+    }
+    try:
+        conn = psycopg2.connect(PG_DB_URL); c = conn.cursor()
+        summary['connected'] = True
+    except Exception as e:
+        summary['error'] = str(e)
+        return summary
+    try:
+        c.execute("SELECT to_regclass('public.fcs_state_snapshot')")
+        if c.fetchone()[0] is None:
+            conn.close()
+            return summary
+        summary['table_exists'] = True
+        c.execute("""
+            SELECT namespace,
+                   COUNT(*)                       AS rows,
+                   COUNT(*) FILTER (WHERE symbol <> '_META_') AS symbol_count,
+                   MAX(schema_version)            AS schema_version,
+                   MAX(updated_at)                AS latest_saved
+            FROM fcs_state_snapshot
+            GROUP BY namespace
+            ORDER BY MAX(updated_at) DESC
+        """)
+        ns_rows = c.fetchall()
+
+        now_ny_date = datetime.now(NY_TZ).date()
+        for ns, rows, syms, ver, latest in ns_rows:
+            is_today = False
+            try:
+                if latest is not None:
+                    is_today = (datetime.fromtimestamp(float(latest), NY_TZ).date() == now_ny_date)
+            except Exception: pass
+            meta_row = None
+            try:
+                c.execute(
+                    "SELECT payload FROM fcs_state_snapshot WHERE namespace=%s AND symbol='_META_'",
+                    (ns,),
+                )
+                row = c.fetchone()
+                if row and row[0] is not None:
+                    import zlib as _zlib, pickle as _pk
+                    meta_row = _pk.loads(_zlib.decompress(bytes(row[0])))
+            except Exception:
+                pass
+            summary['namespaces'].append({
+                'namespace':      ns,
+                'rows':           int(rows or 0),
+                'symbol_count':   int(syms or 0),
+                'schema_version': int(ver) if ver is not None else None,
+                'latest_saved':   latest,
+                'is_today':       is_today,
+                'meta_row':       meta_row,
+            })
+        conn.close()
+    except Exception as e:
+        summary['error'] = str(e)
+        try: conn.close()
+        except Exception: pass
+    return summary
+
+
+def _sh_group_status(row):
+    """返回 (level, msg) — level ∈ {'ok','warn','err','gray'}"""
+    if not row['stream_exists']:
+        return 'gray', 'stream 不存在'
+    if not row['group_exists']:
+        return 'warn', '组未创建'
+    ldi = row.get('last_delivered_id') or ''
+    if ldi.startswith('0-0'):
+        return 'err', '从未消费 (重启将全量回放!)'
+    try:
+        lag = int(row.get('lag') or 0)
+    except Exception:
+        lag = 0
+    if lag >= 500:
+        return 'err', f'严重积压 lag={lag}'
+    if lag >= 50:
+        return 'warn', f'积压 lag={lag}'
+    return 'ok', 'healthy'
+
+
+def _sh_run_action(action: str):
+    """直接在 Dashboard 里执行清理，对应脚本里的三个开关。"""
+    rds = get_redis_client()
+    msgs = []
+    if action in ('drop', 'all') and rds is not None:
+        for stream, group in _STREAM_HEALTH_TARGETS:
+            try:
+                # 只对存在的组做 SETID；不存在就跳过
+                exists = False
+                try:
+                    for g in rds.xinfo_groups(stream):
+                        if _sh_decode(g.get(b'name') or g.get('name')) == group:
+                            exists = True; break
+                except Exception: pass
+                if not exists:
+                    msgs.append(f"⏭ {stream}/{group} 组不存在，跳过")
+                    continue
+                rds.xgroup_setid(stream, group, '$')
+                msgs.append(f"✅ XGROUP SETID {stream} {group} $")
+            except Exception as e:
+                msgs.append(f"❌ {stream}/{group} SETID 失败: {e}")
+    if action in ('reset_gs', 'all'):
+        try:
+            conn = psycopg2.connect(PG_DB_URL); c = conn.cursor()
+            c.execute("SELECT to_regclass('public.symbol_state')")
+            if c.fetchone()[0] is not None:
+                c.execute("DELETE FROM symbol_state WHERE symbol = %s", ('_GLOBAL_STATE_',))
+                conn.commit()
+                msgs.append(f"✅ 已删除 _GLOBAL_STATE_ ({c.rowcount} 行)")
+            else:
+                msgs.append("⏭ symbol_state 表不存在，跳过")
+            conn.close()
+        except Exception as e:
+            msgs.append(f"❌ 删除 _GLOBAL_STATE_ 失败: {e}")
+    if action in ('purge', 'all'):
+        try:
+            conn = psycopg2.connect(PG_DB_URL); c = conn.cursor()
+            c.execute("SELECT to_regclass('public.symbol_state')")
+            if c.fetchone()[0] is not None:
+                now_ny_date = datetime.now(NY_TZ).date()
+                start_of_day = NY_TZ.localize(datetime.combine(now_ny_date, dt_time.min)).timestamp()
+                c.execute(
+                    "DELETE FROM symbol_state WHERE symbol <> %s AND updated_at < %s",
+                    ('_GLOBAL_STATE_', start_of_day),
+                )
+                conn.commit()
+                msgs.append(f"✅ 已清除跨天 symbol_state ({c.rowcount} 行)")
+            else:
+                msgs.append("⏭ symbol_state 表不存在，跳过")
+            conn.close()
+        except Exception as e:
+            msgs.append(f"❌ 清除跨天 symbol_state 失败: {e}")
+    # 清缓存让下一次渲染读到真实状态
+    try:
+        _sh_inspect_redis_groups.clear()
+        _sh_inspect_pg_state.clear()
+    except Exception:
+        pass
+    return msgs
+
+
+with tab_sh:
+    st.header("🩺 Stream Health — 数据消费诊断")
+    st.caption(
+        "本页展示 OMS / SE 当前的 Redis Stream 消费状态 & PG 状态残留，"
+        "可用于盘前体检 / 进程重启后快速确认是否需要清理积压。"
+        "此面板缓存 3 秒，可能与 CLI 有短暂滞后。"
+    )
+
+    # --- 1. 拉数据 ---
+    redis_rows, redis_err = _sh_inspect_redis_groups()
+    pg_summary = _sh_inspect_pg_state()
+
+    if redis_err:
+        st.error(redis_err)
+
+    # --- 2. 汇总指标 ---
+    total_lag = 0
+    critical_rows = 0
+    for row in redis_rows:
+        level, _ = _sh_group_status(row)
+        try:
+            total_lag += int(row.get('lag') or 0)
+        except Exception: pass
+        if level == 'err':
+            critical_rows += 1
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("总积压 lag", f"{total_lag}", delta=("严重" if critical_rows else None), delta_color="inverse" if critical_rows else "off")
+    c2.metric("危险分组", f"{critical_rows}/{len(redis_rows)}")
+    stale_n = len(pg_summary.get('stale_symbol_rows') or [])
+    c3.metric("PG 跨天残留", stale_n, delta=("需清理" if stale_n else None), delta_color="inverse" if stale_n else "off")
+    gs_row = pg_summary.get('global_state_row')
+    if gs_row is None:
+        c4.metric("_GLOBAL_STATE_", "无", delta="fresh", delta_color="off")
+    elif gs_row.get('is_today'):
+        c4.metric("_GLOBAL_STATE_", "当日有效", delta_color="off")
+    else:
+        c4.metric("_GLOBAL_STATE_", "跨天残留", delta="需清理", delta_color="inverse")
+
+    # --- 3. Redis group 详表 ---
+    st.subheader("🔗 Redis Consumer Groups")
+    color_map = {'ok': '🟢', 'warn': '🟡', 'err': '🔴', 'gray': '⚪'}
+    rows_view = []
+    for row in redis_rows:
+        level, msg = _sh_group_status(row)
+        rows_view.append({
+            '状态': f"{color_map.get(level, '⚪')} {msg}",
+            'Stream': row['stream'],
+            'Group':  row['group'],
+            'last-delivered-id': row['last_delivered_id'] or '-',
+            'pending': row['pending'] if row['pending'] is not None else '-',
+            'lag': row['lag'] if row['lag'] is not None else '-',
+            'stream last-id': row['stream_last_id'] or '-',
+            'stream length': row['stream_len'] if row['stream_len'] is not None else '-',
+        })
+    df_redis = pd.DataFrame(rows_view)
+    st.dataframe(df_redis, use_container_width=True, hide_index=True)
+
+    # --- 4. PG 详情 ---
+    st.subheader("🐘 PostgreSQL `symbol_state`")
+    if not pg_summary.get('connected'):
+        st.error(f"PG 连接失败: {pg_summary.get('error')}")
+    elif not pg_summary.get('table_exists'):
+        st.info("symbol_state 表尚未创建 (首次启动即自动创建)")
+    else:
+        cc1, cc2, cc3 = st.columns(3)
+        cc1.metric("总行数",    pg_summary['total_rows'])
+        cc2.metric("当日 symbol 行", pg_summary['today_symbol_rows'])
+        cc3.metric("跨天残留 symbol 行", stale_n)
+        if gs_row:
+            if gs_row['is_today']:
+                st.success(f"_GLOBAL_STATE_ 当日有效, ts_ny={gs_row['ts_ny']} updated_at={gs_row['updated_at']}")
+            else:
+                st.error(f"⚠️ _GLOBAL_STATE_ 是跨天残留, ts_ny={gs_row['ts_ny']} — 建议清理，否则会污染 mock_cash")
+        else:
+            st.info("_GLOBAL_STATE_ 不存在 (fresh start)")
+        if stale_n:
+            with st.expander(f"跨天残留 symbol 预览 ({stale_n} 条)"):
+                st.dataframe(
+                    pd.DataFrame(pg_summary['stale_symbol_rows'], columns=['symbol', 'ts_ny']),
+                    use_container_width=True, hide_index=True,
+                )
+
+    # --- 4.5 FCS Snapshot Health (L2 PG-backed) ---
+    st.subheader("📦 FCS State Snapshot (`fcs_state_snapshot`)")
+    fcs_summary = _sh_inspect_fcs_state()
+    if not fcs_summary.get('connected'):
+        st.error(f"PG 连接失败: {fcs_summary.get('error')}")
+    elif not fcs_summary.get('table_exists'):
+        st.info("fcs_state_snapshot 表尚未创建 (FCS 首次启动时自动创建)")
+    elif not fcs_summary.get('namespaces'):
+        st.info("FCS 暂无快照 (冷启动 / Deep Warmup 中)")
+    else:
+        rows_view = []
+        for ns_row in fcs_summary['namespaces']:
+            saved = ns_row.get('latest_saved')
+            age_h = None
+            try:
+                if saved is not None:
+                    age_h = (time.time() - float(saved)) / 3600.0
+            except Exception: pass
+            saved_str = "-"
+            if saved is not None:
+                try:
+                    saved_str = datetime.fromtimestamp(float(saved), NY_TZ).strftime('%Y-%m-%d %H:%M:%S')
+                except Exception: pass
+            rows_view.append({
+                'Namespace':    ns_row['namespace'],
+                'Rows':         ns_row['rows'],
+                'Symbols':      ns_row['symbol_count'],
+                'Schema':       ns_row['schema_version'] if ns_row['schema_version'] is not None else '-',
+                'Latest save':  saved_str,
+                'Age (h)':      f"{age_h:.2f}" if age_h is not None else '-',
+                'Same day':     "✅" if ns_row.get('is_today') else "🕰",
+            })
+        st.dataframe(pd.DataFrame(rows_view), use_container_width=True, hide_index=True)
+        with st.expander("原始 _META_ 行 (逐 namespace)"):
+            for ns_row in fcs_summary['namespaces']:
+                st.write(f"**{ns_row['namespace']}**: {ns_row.get('meta_row') or '(无)'}")
+
+    # --- 5. 清理操作 (二次确认) ---
+    st.markdown("---")
+    st.subheader("🛠 清理操作 (Danger Zone)")
+    st.caption(
+        "和命令行脚本 `production/scripts/oms_state_recovery.py` 等价，"
+        "建议盘前/重启后执行。每个按钮需勾选下方确认框才会生效。"
+    )
+    confirm = st.checkbox("我已确认要修改 Redis 和 PostgreSQL", key='sh_confirm')
+    ab1, ab2, ab3, ab4 = st.columns(4)
+    if ab1.button("🧹 Drop Backlog", disabled=not confirm, use_container_width=True, key='sh_drop'):
+        for m in _sh_run_action('drop'):
+            st.write(m)
+        st.rerun()
+    if ab2.button("🗑 Reset _GLOBAL_STATE_", disabled=not confirm, use_container_width=True, key='sh_reset_gs'):
+        for m in _sh_run_action('reset_gs'):
+            st.write(m)
+        st.rerun()
+    if ab3.button("🧽 Purge Stale", disabled=not confirm, use_container_width=True, key='sh_purge'):
+        for m in _sh_run_action('purge'):
+            st.write(m)
+        st.rerun()
+    if ab4.button("🚀 Run All", disabled=not confirm, use_container_width=True, key='sh_all'):
+        for m in _sh_run_action('all'):
+            st.write(m)
+        st.rerun()
+
+    st.markdown("**等价 CLI**")
+    st.code("python production/scripts/oms_state_recovery.py --all --yes", language='bash')
+
+
+# ======================================================================
+# === Tab 🧬 策略门禁 (Strategy Gates) ===
+# 数据源 (全部只读, 不会 touch 任何业务状态):
+#   meta:global_gates        - SE 每 5s 刷新的全局门禁聚合快照 (session/CB/positions/exposure)
+#   meta:circuit_breaker     - OMS 写的熔断状态 (streak / cb_until)
+#   meta:symbol_cooldowns    - OMS 写的 per-symbol cooldown_until
+#   meta:gate_trace:{sym}    - SE 每次 decide_entry/check_exit 后写的决策链 (节流)
+#   meta:gate_counter:{YYYYMMDD} - SE 拦截累计计数, 按 NY 日
+#   meta:strategy_config     - SE 启动广播的 strategy_config0 参数快照
+# ======================================================================
+with tab_gates:
+    st.header("🧬 策略门禁 (V0) — 规则 & 实时命中状态")
+    st.caption(
+        "每条规则对应 `strategy_core_v0._check_*` 里的一个 early-return。"
+        "绿色=放行 / 红色=拦截 / 灰色=未评估或已禁用。"
+        "所有数据经 SE 节流写入 Redis, Dashboard 只读, 不会影响策略进程。"
+    )
+
+    # ---------- A. 全局门禁横条 ----------
+    try:
+        gg = r.hgetall("meta:global_gates") or {}
+        def _g(k, d=''):
+            v = gg.get(k.encode() if isinstance(k, str) else k) or gg.get(k)
+            if isinstance(v, bytes):
+                v = v.decode('utf-8', errors='ignore')
+            return v or d
+    except Exception as _e:
+        gg = {}
+        _g = lambda k, d='': d
+        st.warning(f"meta:global_gates 读取失败: {_e}")
+
+    gcols = st.columns(5)
+    session = _g('session', 'unknown')
+    session_emoji = {
+        'pre_open': '🌙 未开盘',
+        'entry_open': '🟢 可开仓',
+        'no_entry': '🟡 禁入',
+        'close_forced': '🔴 强平时段',
+    }.get(session, f"❓ {session}")
+    gcols[0].metric(
+        "交易时段",
+        session_emoji,
+        f"开={_g('session_open_at')} 禁={_g('session_no_entry_at')} 平={_g('session_close_at')}"
+    )
+    cb_active = _g('cb_active', '0') == '1'
+    streak = _g('consecutive_losses', '0')
+    cb_th = _g('cb_threshold', '3')
+    cb_badge = "🔥 熔断 ON" if cb_active else "✅ 熔断 OFF"
+    gcols[1].metric("G1 熔断 (CB)", cb_badge, f"连败 {streak}/{cb_th}")
+    gcols[2].metric(
+        "G2 持仓占用",
+        f"{_g('positions_used', '0')} / {_g('positions_limit', '-')}"
+    )
+    try:
+        exp_used = float(_g('exposure_used', '0') or 0)
+        exp_limit = float(_g('exposure_limit', '0') or 0)
+        gcols[3].metric(
+            "G5 敞口",
+            f"{exp_used:.1%}",
+            f"limit={exp_limit:.0%}"
+        )
+    except Exception:
+        gcols[3].metric("G5 敞口", "-", "")
+    gcols[4].metric("数据时间", _g('now_ny', '-'), f"upd={_g('updated_at', '')[:10]}")
+
+    # per-symbol cooldown 标签条
+    try:
+        cd_map = r.hgetall("meta:symbol_cooldowns") or {}
+        cd_items = []
+        _now = time.time()
+        for k, v in cd_map.items():
+            sym = k.decode('utf-8') if isinstance(k, bytes) else str(k)
+            try:
+                cd_ts = float(v.decode('utf-8') if isinstance(v, bytes) else v)
+            except Exception:
+                continue
+            if cd_ts > _now:
+                cd_items.append(f"`{sym}` ({(cd_ts - _now) / 60:.0f}m)")
+        if cd_items:
+            st.markdown("⏳ **单标的冷却中**: " + " · ".join(cd_items))
+        else:
+            st.markdown("⏳ **单标的冷却**: 无")
+    except Exception:
+        pass
+
+    st.divider()
+
+    # ---------- B. Per-Symbol Gate Trace 矩阵 ----------
+    st.subheader("🎯 每标的决策链")
+    # 读取所有 gate_trace:{sym}
+    try:
+        trace_keys = list(r.scan_iter(match="meta:gate_trace:*", count=200))
+    except Exception as _e:
+        trace_keys = []
+        st.error(f"scan gate_trace 失败: {_e}")
+
+    if not trace_keys:
+        st.info("暂无决策链快照。等待 SE 推送下一 tick...")
+    else:
+        # 排序稳定
+        parsed_rows = []
+        for key in trace_keys:
+            sym = (key.decode('utf-8') if isinstance(key, bytes) else key).split(':')[-1]
+            try:
+                h = r.hgetall(key) or {}
+                def _hget(k):
+                    v = h.get(k.encode() if isinstance(k, str) else k) or h.get(k)
+                    if isinstance(v, bytes):
+                        v = v.decode('utf-8', errors='ignore')
+                    return v or ''
+                kind = _hget('kind') or 'entry'
+                result = _hget('result') or '-'
+                last_block = _hget('last_block') or ''
+                import json as _json
+                trace_list = []
+                try:
+                    trace_list = _json.loads(_hget('trace_json') or '[]')
+                except Exception:
+                    trace_list = []
+                ts = _hget('ts') or ''
+                parsed_rows.append({
+                    'sym': sym, 'kind': kind, 'result': result,
+                    'last_block': last_block, 'trace': trace_list, 'ts': ts,
+                })
+            except Exception:
+                continue
+        parsed_rows.sort(key=lambda x: (x['kind'], x['sym']))
+
+        # 两列并排展示, 信息密度更高
+        cols_per_row = 2
+        for row_idx in range(0, len(parsed_rows), cols_per_row):
+            row_slice = parsed_rows[row_idx:row_idx + cols_per_row]
+            cols = st.columns(cols_per_row)
+            for c_idx, row in enumerate(row_slice):
+                with cols[c_idx]:
+                    kind_tag = "🎯 ENTRY" if row['kind'] == 'entry' else "🚪 EXIT"
+                    result = row['result']
+                    if result == 'BUY':
+                        color = "green"
+                        verdict = "✅ BUY"
+                    elif result.startswith('SELL'):
+                        color = "orange"
+                        verdict = f"🚪 {result}"
+                    elif result.startswith('REJECT'):
+                        color = "red"
+                        verdict = f"❌ {result}"
+                    else:
+                        color = "gray"
+                        verdict = result
+                    st.markdown(f"#### `{row['sym']}` · {kind_tag} · :{color}[{verdict}]")
+                    # trace 逐条渲染
+                    icons = {'pass': '✅', 'block': '❌', 'skip': '⏸️'}
+                    lines = []
+                    for g in row['trace']:
+                        gate = g.get('gate', '?')
+                        status = g.get('status', '?')
+                        detail = g.get('detail', '')
+                        icon = icons.get(status, '•')
+                        # 拦截那条加粗, 其它小字
+                        if status == 'block':
+                            lines.append(f"**{icon} `{gate}` — {detail}**")
+                        elif status == 'skip':
+                            lines.append(f"<span style='color:#888'>{icon} `{gate}` — {detail}</span>")
+                        else:
+                            lines.append(f"{icon} `{gate}` — <span style='color:#666'>{detail}</span>")
+                    st.markdown("<br/>".join(lines), unsafe_allow_html=True)
+
+    st.divider()
+
+    # ---------- C. Top-N 拒单计数器 ----------
+    st.subheader("🏆 今日拦截 TOP 15")
+    try:
+        import datetime as _dt, pytz as _pytz
+        ny_date = _dt.datetime.now(_pytz.timezone('America/New_York')).strftime('%Y%m%d')
+        cnt_map = r.hgetall(f"meta:gate_counter:{ny_date}") or {}
+        rows = []
+        for k, v in cnt_map.items():
+            gk = k.decode('utf-8') if isinstance(k, bytes) else str(k)
+            try:
+                cnt = int(v.decode('utf-8') if isinstance(v, bytes) else v)
+            except Exception:
+                cnt = 0
+            rows.append((gk, cnt))
+        rows.sort(key=lambda x: -x[1])
+        if not rows:
+            st.info(f"{ny_date} 今日暂无拦截记录。")
+        else:
+            import pandas as _pd
+            df = _pd.DataFrame(rows[:15], columns=['Gate', 'Blocked'])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+    except Exception as _e:
+        st.error(f"读 gate_counter 失败: {_e}")
+
+    st.divider()
+
+    # ---------- D. 策略参数快照 ----------
+    with st.expander("📋 strategy_config0 参数快照 (SE 启动时广播)", expanded=False):
+        try:
+            cfg_map = r.hgetall("meta:strategy_config") or {}
+            if not cfg_map:
+                st.info("meta:strategy_config 为空, 请确认 SE 已启动且成功广播。")
+            else:
+                rows = []
+                meta_cols = {}
+                for k, v in cfg_map.items():
+                    kk = k.decode('utf-8') if isinstance(k, bytes) else str(k)
+                    vv = v.decode('utf-8') if isinstance(v, bytes) else str(v)
+                    if kk.startswith('__') and kk.endswith('__'):
+                        meta_cols[kk] = vv
+                    else:
+                        rows.append((kk, vv))
+                if meta_cols:
+                    info_parts = []
+                    for k in ('__core_version__', '__version__', '__loaded_at__'):
+                        if k in meta_cols:
+                            info_parts.append(f"**{k}** = `{meta_cols[k]}`")
+                    st.markdown(" · ".join(info_parts))
+                import pandas as _pd
+                df = _pd.DataFrame(sorted(rows, key=lambda x: x[0]), columns=['Param', 'Value'])
+                st.dataframe(df, use_container_width=True, hide_index=True, height=420)
+        except Exception as _e:
+            st.error(f"读 strategy_config 失败: {_e}")
+
 
 # 自动刷新逻辑
 if auto_refresh:

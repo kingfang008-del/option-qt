@@ -62,6 +62,7 @@ get_pid() {
 start_task() {
     local alias=$1
     local script_name=$2
+    local extra_env=$3
     local log_file="${alias}.log"
     local full_log_path="$LOG_DIR/$log_file"
     local full_script_path=$(get_script_path "$script_name")
@@ -86,7 +87,11 @@ start_task() {
         nohup streamlit run "$full_script_path" --server.port 8501 > "$full_log_path" 2>&1 &
     else
         # -u: 禁用缓存，实时写日志
-        nohup python -u "$full_script_path" > "$full_log_path" 2>&1 &
+        if [ -n "$extra_env" ]; then
+            nohup env $extra_env python -u "$full_script_path" > "$full_log_path" 2>&1 &
+        else
+            nohup python -u "$full_script_path" > "$full_log_path" 2>&1 &
+        fi
     fi
     
     local new_pid=$!
@@ -152,9 +157,10 @@ do_start() {
             sleep 1
             start_task "Engine"      "$FILE_ENG"
             sleep 1
-            start_task "SignalEngine" "$FILE_SIGNAL"
-            sleep 1
             start_task "ExecutionEngine" "$FILE_EXEC"
+            sleep 1
+            # 协调启动时，SE 不应因 OMS 心跳短暂缺失触发激进启动清理
+            start_task "SignalEngine" "$FILE_SIGNAL" "SKIP_STARTUP_CLEANUP=1"
             sleep 1
             start_task "Dashboard"   "$FILE_DASH"
             ;;
@@ -171,9 +177,10 @@ do_start() {
         db)    start_task "Persistence" "$FILE_DB" ;;
         ib)    start_task "Connector"   "$FILE_IB" ;;
         calc)  start_task "Engine"      "$FILE_ENG" ;;
-        brain) start_task "SignalEngine" "$FILE_SIGNAL"
+        brain) start_task "ExecutionEngine" "$FILE_EXEC"
             sleep 1
-            start_task "ExecutionEngine" "$FILE_EXEC" ;;
+            # 协调重启 brain 时，SE 跳过启动清理，避免误删同日状态
+            start_task "SignalEngine" "$FILE_SIGNAL" "SKIP_STARTUP_CLEANUP=1" ;;
         dash)  start_task "Dashboard"   "$FILE_DASH" ;;
         *)     echo -e "${RED}Unknown service: $target${NC}"; show_help ;;
     esac

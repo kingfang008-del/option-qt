@@ -160,8 +160,11 @@ class MockIBKRHistorical:
             
         import bisect
         times = [x[0] for x in self.market_history]
-        idx = bisect.bisect_left(times, ts)
-        
+        # Use latest snapshot at-or-before ts to avoid look-ahead bias when
+        # there are sparse/missing 1s bars.
+        idx = bisect.bisect_right(times, ts) - 1
+        if idx < 0:
+            return None
         if idx >= len(self.market_history):
             idx = len(self.market_history) - 1
             
@@ -206,8 +209,10 @@ class MockIBKRHistorical:
             
         import bisect
         times = [x[0] for x in self.market_history]
-        idx = bisect.bisect_left(times, ts)
-        
+        # Anchor at-or-before ts first, then apply bar offset.
+        idx = bisect.bisect_right(times, ts) - 1
+        if idx < 0:
+            return None
         target_idx = idx + bar_offset
         if target_idx >= len(self.market_history):
             target_idx = len(self.market_history) - 1
@@ -312,6 +317,61 @@ class MockIBKRHistorical:
 
         return trades, open_positions
 
+    def _build_logical_trade_view(self, df_trades: pd.DataFrame) -> pd.DataFrame:
+        """把拆单成交行聚合为逻辑交易视图，避免 Iceberg chunk 在报表中看似“重叠开仓”。
+
+        说明:
+        - 同一 symbol/方向/原因/合约，并且 entry/exit 落在同一秒的行视为同一逻辑交易；
+        - 价格按 qty 加权，PnL 直接求和；
+        - roi 按聚合后的成本口径重算，便于和单行口径对齐。
+        """
+        if df_trades is None or df_trades.empty:
+            return pd.DataFrame()
+
+        df = df_trades.copy()
+        df['entry_ts_key'] = df['entry_ts'].round(0).astype('int64')
+        df['exit_ts_key'] = df['exit_ts'].round(0).astype('int64')
+
+        group_cols = [
+            'date', 'symbol', 'opt_dir', 'reason', 'contract',
+            'entry_ts_key', 'exit_ts_key',
+        ]
+
+        agg = (
+            df.groupby(group_cols, as_index=False)
+              .apply(lambda g: pd.Series({
+                  'entry_ts': float(g['entry_ts'].min()),
+                  'exit_ts': float(g['exit_ts'].max()),
+                  'entry_time': g.sort_values('entry_ts').iloc[0]['entry_time'],
+                  'exit_time': g.sort_values('exit_ts').iloc[-1]['exit_time'],
+                  'qty': int(g['qty'].sum()),
+                  'entry_price': float(np.average(g['entry_price'], weights=g['qty'])),
+                  'exit_price': float(np.average(g['exit_price'], weights=g['qty'])),
+                  'entry_stock': float(np.average(g['entry_stock'], weights=g['qty'])),
+                  'exit_stock': float(np.average(g['exit_stock'], weights=g['qty'])),
+                  'pnl': float(g['pnl'].sum()),
+                  'duration': float((g['exit_ts'].max() - g['entry_ts'].min()) / 60.0),
+                  'liq_chunks': int(g['liq_chunks'].max()),
+                  'liq_reason': str(g.iloc[0].get('liq_reason', 'N/A')),
+                  'chunk_rows': int(len(g)),
+              }))
+              .reset_index(drop=True)
+        )
+
+        # 聚合后 ROI 统一按聚合成本重算 (包含双边手续费)
+        entry_comm = agg['qty'] * COMMISSION_PER_CONTRACT
+        agg_cost = (agg['entry_price'] * agg['qty'] * 100.0) + entry_comm
+        agg['roi'] = np.where(agg_cost > 0.0, agg['pnl'] / agg_cost, 0.0)
+
+        # 对齐原始 CSV 常见列顺序
+        ordered_cols = [
+            'date', 'symbol', 'entry_time', 'exit_time', 'pnl', 'roi', 'qty',
+            'entry_price', 'exit_price', 'reason', 'duration',
+            'entry_ts', 'exit_ts', 'contract', 'opt_dir',
+            'entry_stock', 'exit_stock', 'liq_chunks', 'liq_reason', 'chunk_rows',
+        ]
+        return agg[ordered_cols].sort_values('exit_ts').reset_index(drop=True)
+
     def save_trades(self, filename="replay_trades_v8_1s.csv"):
         if not self.orders:
             print("\n⚠️ NO TRADES EXECUTED.")
@@ -335,6 +395,17 @@ class MockIBKRHistorical:
         target_path = log_dir / filename
         df_trades.to_csv(target_path, index=False)
         print(f"\n💾 Trades saved to {target_path}")
+
+        # 额外导出逻辑交易视图 (聚合拆单)
+        logical_df = self._build_logical_trade_view(df_trades)
+        if not logical_df.empty:
+            logical_name = f"{target_path.stem}_logical{target_path.suffix}"
+            logical_path = target_path.with_name(logical_name)
+            logical_df.to_csv(logical_path, index=False)
+            print(
+                f"💾 Logical trades saved to {logical_path} "
+                f"(raw_rows={len(df_trades)} -> logical_rows={len(logical_df)})"
+            )
         
         self._print_daily_report(df_trades)
         self._print_summary_report(df_trades, open_pos)

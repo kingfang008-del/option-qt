@@ -110,6 +110,17 @@ def _truncate_pg_mirror_day(date_str: str, *, include_alpha: bool = True, includ
         if conn:
             conn.close()
 
+
+def _drop_sqlite_alpha_logs(db_path: Path):
+    """Drop stale alpha_logs before the replay writer recreates it."""
+    if not db_path.exists():
+        return
+
+    with sqlite3.connect(f"file:{db_path}?mode=rw", uri=True, timeout=60.0) as conn:
+        conn.execute("DROP TABLE IF EXISTS alpha_logs")
+        conn.commit()
+    logger.info(f"🧹 [SQLite Clean] Dropped alpha_logs in {db_path.name}")
+
 class BatchSQLiteDriver1s:
     """1秒级全量连续流发球机"""
     def __init__(self, target_dbs: list, run_id: str, parity_mode: bool = False):
@@ -744,16 +755,18 @@ class BatchSQLiteDriver1s:
                     if pg_persist_svc:
                         pg_persist_svc.flush()
                     
-                    # 🚀 [新功能] 实时审计：确保上一分钟的数据已成功入账
-                    check_ts = int(ts_val - 60)
+                    # 🚀 [新功能] 实时审计：FCS 带 1s commit grace，分钟 bar 会延后一轮完成写入。
+                    # 因此校验已经稳定提交的前两分钟，避免在 finalize 前误报 DATA_LOSS。
+                    check_ts = int(ts_val - 120)
                     sample_sym = 'NVDA'
-                    if self.r.hexists(f"BAR:1M:{sample_sym}", str(check_ts)):
-                        if count % 60 == 0: # 降低日志频率
-                            logger.info(f"🛡️ [Write-Verify] Minute {check_ts} for {sample_sym} confirmed in Redis.")
-                    else:
-                        # 如果数据库里有但 Redis 里没有，说明聚合层漏单了
-                        logger.error(f"❌ [DATA_LOSS_ALERT] Redis MISSING bar for {sample_sym} at {check_ts}!")
-                        # 随机抛出一个标的进行补全校验 (可选)
+                    if check_ts >= first_full_min:
+                        if self.r.hexists(f"BAR:1M:{sample_sym}", str(check_ts)):
+                            if count % 60 == 0: # 降低日志频率
+                                logger.info(f"🛡️ [Write-Verify] Minute {check_ts} for {sample_sym} confirmed in Redis.")
+                        else:
+                            # 如果延迟两轮后仍缺失，才认为聚合层可能漏单。
+                            logger.error(f"❌ [DATA_LOSS_ALERT] Redis MISSING committed bar for {sample_sym} at {check_ts}!")
+                            # 随机抛出一个标的进行补全校验 (可选)
 
             # 跑完全天后，强制刷入最后残留的数据
             logger.info("💾 Triggering final flush to SQLite...")
@@ -967,6 +980,8 @@ async def main():
         def robust_init_db(self):
             for attempt in range(5):
                 try:
+                    base_dir = self.forced_db_dir if self.forced_db_dir else data_persistence_service_v8_sqlite.DB_DIR
+                    _drop_sqlite_alpha_logs(Path(base_dir) / f"market_{self.current_date}.db")
                     orig_init_db(self)
                     return
                 except sqlite3.OperationalError as e:

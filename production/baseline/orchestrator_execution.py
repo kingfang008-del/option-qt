@@ -13,6 +13,7 @@ from config import (
     GLOBAL_EXPOSURE_LIMIT, SLIPPAGE_ENTRY_PCT, SLIPPAGE_EXIT_PCT, 
     EXIT_ORDER_TYPE, TRADING_ENABLED, IS_LIVEREPLAY,
     DISABLE_ICEBERG, SYNC_EXECUTION, BACKTEST_1S_DISABLE_ICEBERG,
+    BACKTEST_1S_STRICT_EXECUTION,
     ENTRY_MAX_REQUOTE_SLIPPAGE_PCT, ENTRY_REQUOTE_STEP_CAP_PCT, AUTO_TRADING_CAPITAL_RATIO
 )
 from liquidity_rules import LiquidityRiskManager
@@ -23,6 +24,79 @@ PURE_ALPHA_REPLAY = os.environ.get('PURE_ALPHA_REPLAY') == '1'
 class OrchestratorExecution:
     def __init__(self, orchestrator):
         self.orch = orchestrator
+        self._refund_once_keys = {}
+
+    def _cash_set(self, value: float, reason: str, sym: str = ""):
+        before = float(getattr(self.orch, 'mock_cash', 0.0) or 0.0)
+        try:
+            after = float(value)
+        except Exception:
+            after = before
+        self.orch.mock_cash = after
+        logger.warning(
+            f"💳 [CashAudit] {reason} {sym} | before={before:.2f} | after={after:.2f}"
+        )
+
+    def _cash_add(self, delta: float, reason: str, sym: str = ""):
+        try:
+            d = float(delta or 0.0)
+        except Exception:
+            d = 0.0
+        before = float(getattr(self.orch, 'mock_cash', 0.0) or 0.0)
+        after = before + d
+        self.orch.mock_cash = after
+        logger.info(
+            f"💳 [CashAudit] {reason} {sym} | delta={d:+.2f} | before={before:.2f} | after={after:.2f}"
+        )
+        if abs(d) >= 10000:
+            logger.warning(
+                f"🚨 [CashAudit Spike] {reason} {sym} | delta={d:+.2f} | before={before:.2f} | after={after:.2f}"
+            )
+
+    def _refund_locked_cash_once(self, st, amount: float, reason: str, sym: str, refund_key: str):
+        """Refund guard: idempotent + capped by current locked cash."""
+        now = time.time()
+        # prune old keys
+        if len(self._refund_once_keys) > 20000:
+            cutoff = now - 24 * 3600
+            self._refund_once_keys = {k: v for k, v in self._refund_once_keys.items() if v >= cutoff}
+        if refund_key in self._refund_once_keys:
+            logger.warning(f"🛡️ [RefundGuard] duplicate refund ignored | key={refund_key} | {sym} {reason}")
+            return 0.0
+
+        try:
+            req = float(amount or 0.0)
+        except Exception:
+            req = 0.0
+        locked = max(0.0, float(getattr(st, 'locked_cash', 0.0) or 0.0))
+        refund = min(max(0.0, req), locked)
+        if refund <= 0:
+            logger.warning(
+                f"🛡️ [RefundGuard] no refundable locked cash | key={refund_key} | "
+                f"{sym} {reason} | requested={req:.2f} locked={locked:.2f}"
+            )
+            return 0.0
+        if refund + 1e-6 < req:
+            logger.warning(
+                f"🛡️ [RefundGuard] capped refund by locked cash | key={refund_key} | "
+                f"{sym} {reason} | requested={req:.2f} refund={refund:.2f} locked={locked:.2f}"
+            )
+
+        self._cash_add(refund, reason, sym)
+        st.locked_cash = max(0.0, locked - refund)
+        self._refund_once_keys[refund_key] = now
+        return refund
+
+    def _count_active_slots(self, include_pending: bool = True, exclude_sym: str = "") -> int:
+        cnt = 0
+        for s, s_state in self.orch.states.items():
+            if exclude_sym and s == exclude_sym:
+                continue
+            pos = int(getattr(s_state, 'position', 0) or 0)
+            pending = bool(getattr(s_state, 'is_pending', False))
+            if pos != 0 or (include_pending and pending):
+                cnt += 1
+        return cnt
 
     @staticmethod
     def _fmt_ny_time(ts: float) -> str:
@@ -38,6 +112,68 @@ class OrchestratorExecution:
         if cfg is None:
             return default
         return getattr(cfg, key, default)
+
+    def _effective_slippage_pct(self, side: str = 'entry') -> float:
+        """[REALTIME_DRY 友好] 返回当前运行模式下实际生效的滑点比例.
+
+        - REALTIME_DRY: 默认 0.0, 便于干净地评估 alpha 链路真实收益.
+          若要复刻实盘体验, 设 REALTIME_DRY_APPLY_SLIPPAGE=1 即可恢复配置值.
+        - 其他模式 (REALTIME / BACKTEST / LIVEREPLAY): 维持原优先级,
+          SLIPPAGE_PCT → SLIPPAGE_{ENTRY|EXIT}_PCT → config 默认值.
+        """
+        try:
+            from config import IS_REALTIME_DRY
+        except Exception:
+            IS_REALTIME_DRY = False
+
+        if IS_REALTIME_DRY:
+            apply_flag = os.environ.get('REALTIME_DRY_APPLY_SLIPPAGE', '').strip().lower()
+            if apply_flag not in ('1', 'true', 'yes'):
+                return 0.0
+
+        if side == 'entry':
+            fallback_key, default_val = 'SLIPPAGE_ENTRY_PCT', SLIPPAGE_ENTRY_PCT
+        else:
+            fallback_key, default_val = 'SLIPPAGE_EXIT_PCT', SLIPPAGE_EXIT_PCT
+        return float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value(fallback_key, default_val)))
+
+    # ------------------------------------------------------------------
+    # [🛡️ IBKR Connection Guard]
+    # 统一的 IBKR 连接态判断入口, 供 entry / exit 路径在下单前预检.
+    # 目的: 一旦 IBKR 掉线, 不要让 ib_insync 抛 ConnectionError 把每一个
+    # SELL / BUY 信号都炸成一条 traceback; 也不要走 "not trade → 模拟成交"
+    # 的 DRY RUN 兜底, 否则账本会把实际仍持有的仓位清零, 造成账实不符.
+    # ------------------------------------------------------------------
+    def _ibkr_is_connected(self) -> bool:
+        """True 表示 self.ib 当前已连接; 任何异常一律视为未连接."""
+        ibkr = getattr(self.orch, "ibkr", None)
+        ib = getattr(ibkr, "ib", None) if ibkr is not None else None
+        if ib is None:
+            return False
+        try:
+            return bool(ib.isConnected())
+        except Exception:
+            return False
+
+    def _ibkr_recently_failed(self, window_sec: float = 5.0) -> bool:
+        """最近 `window_sec` 秒内 place_option_order 记录过连接失败? 用于区分
+        "DRY RUN 预期 None" vs "实盘连接断开 None"."""
+        ibkr = getattr(self.orch, "ibkr", None)
+        if ibkr is None:
+            return True
+        last = float(getattr(ibkr, 'last_not_connected_ts', 0.0) or 0.0)
+        return last > 0.0 and (time.time() - last) < float(window_sec)
+
+    def _log_ibkr_disconnect_throttled(self, sym: str, reason: str):
+        """节流打印 IBKR 断连告警, 避免每秒刷屏 60 条 traceback."""
+        now = time.time()
+        last = float(getattr(self, '_ibkr_disconnect_warn_ts', 0.0) or 0.0)
+        if now - last > 30.0:
+            logger.warning(
+                f"🔌 [IBKR Down] 跳过下单请求 | sym={sym} reason={reason} "
+                f"| 等待 connect()/maintenance_loop 恢复连接后重新处理."
+            )
+            self._ibkr_disconnect_warn_ts = now
 
     def _entry_requote_cap_price(self, reference_price: float) -> float:
         ref = float(reference_price or 0.0)
@@ -154,7 +290,11 @@ class OrchestratorExecution:
         if self.orch.mode != 'backtest':
             return False
         ibkr_mod = getattr(getattr(self.orch, 'ibkr', None), '__module__', '') or ''
-        return BACKTEST_1S_DISABLE_ICEBERG and 'mock_ibkr_historical_1s' in ibkr_mod
+        if 'mock_ibkr_historical_1s' not in ibkr_mod:
+            return False
+        # strict/gentle 任一开启都强制单块执行，避免拆单在 1s 回测中制造
+        # 虚假的“重叠成交/高容量”收益。
+        return bool(BACKTEST_1S_DISABLE_ICEBERG or BACKTEST_1S_STRICT_EXECUTION)
 
     def _get_entry_limit_price(self, sig, base_price, attempt_no=0):
         bid = float(sig.get('meta', {}).get('bid', 0.0) or 0.0)
@@ -194,6 +334,25 @@ class OrchestratorExecution:
         total_discount = base_discount + requote_discount
         return round(max(base_price * (1 - total_discount), 0.01), 2)
 
+    def _release_entry_pending(self, st):
+        """[🛡️ Ghost Pending Fix]
+        入场流程早退 (return) 前统一调用，把 SE 在 shared_mem+LIVEREPLAY 下给的
+        `is_pending=True, pending_action='BUY'` 标记清掉。
+        不这样做的话，`_execute_entry` 里任何一个 early return (资金不足/价格不合规/
+        IV 过低 等) 都会留下幽灵 pending BUY，在 SE 的 `current_active` 统计里
+        常驻，很快把 MAX_POSITIONS 的名额堆满，所有新候选都被 Batch-Limit 砍掉。
+        """
+        try:
+            st.is_pending = False
+            if hasattr(st, 'pending_action'):
+                st.pending_action = ''
+            if hasattr(st, 'pending_side'):
+                st.pending_side = None
+            if hasattr(st, '_pending_frames'):
+                st._pending_frames = 0
+        except Exception:
+            pass
+
     async def _execute_entry(self, sym, sig, stock_price, curr_ts, batch_idx):
         st = self.orch.states[sym]
         
@@ -206,6 +365,8 @@ class OrchestratorExecution:
             st.locked_cash = 0.0 # 初始化锁定金额，防止 NaN
             
         if st.position != 0:
+            # 已有持仓，理论上 SE 不应派发 BUY；出现即视为幽灵，强制清锁后返回。
+            self._release_entry_pending(st)
             return
 
         # =================================================================
@@ -229,6 +390,15 @@ class OrchestratorExecution:
                     locked_cash_by_bot += (getattr(s_state, 'qty', 0) * getattr(s_state, 'entry_price', 0.0) * 100)
         
         max_positions = max(1, int(self._cfg_value('MAX_POSITIONS', MAX_POSITIONS)))
+        # Hard gate: regardless of upstream candidate sorting, OMS must never
+        # admit an entry when slots are already full (excluding current symbol).
+        hard_slots_before = self._count_active_slots(include_pending=True, exclude_sym=sym)
+        if hard_slots_before >= max_positions:
+            logger.warning(
+                f"🚫 [HardCap] {sym} blocked before entry | active_slots={hard_slots_before} >= max={max_positions}"
+            )
+            self._release_entry_pending(st)
+            return
         parity_bypass = (
             os.environ.get('PARITY_MODE') == 'PLAN_A'
             and self.orch.mode == 'backtest'
@@ -244,12 +414,13 @@ class OrchestratorExecution:
                     f"✋ [风控拒单 - {sym}] 当前已有 {active_count} 个持仓或挂单，"
                     f"达到上限 ({max_positions})，拒绝开仓！"
                 )
+                self._release_entry_pending(st)
                 return
 
         if math.isnan(self.orch.mock_cash):
             logger.error("🛑 [Fatal] mock_cash is NaN! Emergency fallback to INITIAL_ACCOUNT.")
             from config import INITIAL_ACCOUNT
-            self.orch.mock_cash = float(INITIAL_ACCOUNT)
+            self._cash_set(float(INITIAL_ACCOUNT), "NAN_FALLBACK_INITIAL_ACCOUNT", sym)
 
         position_ratio = max(0.0, min(1.0, float(self._cfg_value('POSITION_RATIO', POSITION_RATIO))))
         global_exposure_limit = max(0.0, min(1.0, float(self._cfg_value('GLOBAL_EXPOSURE_LIMIT', GLOBAL_EXPOSURE_LIMIT))))
@@ -259,9 +430,11 @@ class OrchestratorExecution:
         auto_cap_ratio = max(0.0, min(1.0, auto_cap_ratio))
         if auto_cap_ratio <= 0.0:
             logger.warning(f"✋ [风控拒单 - {sym}] AUTO_TRADING_CAPITAL_RATIO=0，自动交易资金池已关闭。")
+            self._release_entry_pending(st)
             return
         if position_ratio <= 0.0:
             logger.warning(f"✋ [风控拒单 - {sym}] POSITION_RATIO=0，单标的仓位分配为 0。")
+            self._release_entry_pending(st)
             return
 
         bot_total_capital = self.orch.mock_cash + locked_cash_by_bot
@@ -272,7 +445,9 @@ class OrchestratorExecution:
         remaining_quota = max(0.0, max_exposure - locked_cash_by_bot)
         final_alloc = min(raw_alloc, remaining_quota, self.orch.mock_cash, max_trade_cap)
         
-        if final_alloc < 200: return
+        if final_alloc < 200:
+            self._release_entry_pending(st)
+            return
         
         new_iv = sig.get('meta', {}).get('iv', 0.0)
         if not PURE_ALPHA_REPLAY and new_iv < 0.01 and st.last_valid_iv > 0.01:
@@ -282,15 +457,40 @@ class OrchestratorExecution:
         price = sig.get('price', 0.0)
         if price <= 0 or price < self.orch.MIN_OPTION_PRICE or math.isnan(price):
             logger.info(f"✋ [风控拒单 - {sym}] 期权价格 {price:.2f} 低于最低限制 {self.orch.MIN_OPTION_PRICE}")
+            self._release_entry_pending(st)
             return
 
-        if curr_ts < self.orch.global_cooldown_until: return
+        if curr_ts < self.orch.global_cooldown_until:
+            # [Layer 3 - Cross-Process Observability]
+            # 历史 bug: 这里静默 return, SE 感知不到 OMS 已进入熔断, 继续 emit BUY;
+            # 外观上就是"熔断消失了"。现在配合 Layer 1/2 的 Redis 广播, 这里再打一条
+            # 节流日志 (每 sym 至多 30s 一条), 让运维能直接看到拒单链路。
+            try:
+                last_map = getattr(self.orch, '_cb_reject_last_log_ts', None)
+                if not isinstance(last_map, dict):
+                    last_map = {}
+                    self.orch._cb_reject_last_log_ts = last_map
+                last_ts = float(last_map.get(sym, 0.0))
+                if (curr_ts - last_ts) >= 30.0:
+                    ny_cool = datetime.fromtimestamp(self.orch.global_cooldown_until, tz=timezone('America/New_York'))
+                    logger.warning(
+                        f"🛡️ [OMS-Gate] {sym} BUY 被连败熔断拒单, 暂停至 {ny_cool.strftime('%H:%M:%S')} NY"
+                    )
+                    last_map[sym] = curr_ts
+            except Exception:
+                pass
+            self._release_entry_pending(st)
+            return
         
         effective_iv = new_iv if new_iv > 0.01 else st.last_valid_iv
         if not PURE_ALPHA_REPLAY and effective_iv < 0.01:
+            self._release_entry_pending(st)
             return
 
-        final_alloc = min(final_alloc, 150000.0)
+        # [Cleanup] 原本这里硬编码 `final_alloc = min(final_alloc, 150000.0)`，
+        # 既与 config.MAX_TRADE_CAP (默认 100000) 不一致, 又与上方 L359 已经做过的
+        # `min(raw_alloc, remaining_quota, mock_cash, max_trade_cap)` 重复且更宽松。
+        # 删除该硬编码, 统一走 `max_trade_cap` 配置。
         ask_size = sig.get('meta', {}).get('ask_size', 0.0)
         
         liq_eval = LiquidityRiskManager.evaluate_order(sym, final_alloc, price, mode=self.orch.mode, ask_size=ask_size)
@@ -300,7 +500,9 @@ class OrchestratorExecution:
             chunks = 1
         logger.info(f"💧 [流动性拆单评估] {sym} 最终核准额度: ${final_alloc:,.0f} | 拆分笔数: {chunks} | 理由: {liq_eval['reason']}")
         
-        if final_alloc <= 0 or chunks < 1: return
+        if final_alloc <= 0 or chunks < 1:
+            self._release_entry_pending(st)
+            return
 
         logger.info(f"🚀 [交易柜台 - 真正发单] {sym} 通过所有风控检查！准备买入 {sig['tag']} @ {price}")
         
@@ -311,7 +513,9 @@ class OrchestratorExecution:
         cost_per_contract = (fill_price * 100) + commission_per_contract
         target_qty = int(final_alloc // cost_per_contract)
         
-        if target_qty < 1: return
+        if target_qty < 1:
+            self._release_entry_pending(st)
+            return
         
         total_est_cost = target_qty * fill_price * 100
         total_est_comm = target_qty * commission_per_contract
@@ -325,10 +529,11 @@ class OrchestratorExecution:
                 f"> max_exposure=${max_exposure:,.2f} | current_locked=${locked_cash_by_bot:,.2f} "
                 f"| new_locked=${total_new_locked:,.2f}"
             )
+            self._release_entry_pending(st)
             return
         
         # 扣款
-        self.orch.mock_cash -= total_new_locked
+        self._cash_add(-total_new_locked, "ENTRY_LOCK_DEBIT", sym)
         st.locked_cash = total_new_locked
         
         # =========== 冰山发单分流 [Ghost A: 冰山保护] ===========
@@ -343,6 +548,20 @@ class OrchestratorExecution:
         st.qty = target_qty
         st.entry_stock = stock_price
         st.entry_price = fill_price
+
+        # Final invariant check: never allow > MAX_POSITIONS to persist.
+        hard_slots_after = self._count_active_slots(include_pending=True, exclude_sym="")
+        if hard_slots_after > max_positions:
+            logger.critical(
+                f"🚨 [HardCap-Breach] {sym} would exceed max positions | after={hard_slots_after} > max={max_positions}. Rolling back this entry."
+            )
+            self._refund_locked_cash_once(
+                st, total_new_locked, "ENTRY_POST_CAP_ROLLBACK", sym,
+                refund_key=f"ENTRY_POST_CAP_ROLLBACK:{sym}:{int(curr_ts)}"
+            )
+            self._reset_failed_entry_state(st)
+            self._release_entry_pending(st)
+            return
         
         if 'meta' in sig:
             st.strike_price = sig['meta']['strike']
@@ -358,10 +577,22 @@ class OrchestratorExecution:
 
         st.opt_type = 'call' if st.position == 1 else 'put'
         st.entry_ts = curr_ts
-        st.entry_spy_roc = sig.get('meta', {}).get('spy_roc', 0.0)
-        st.entry_index_trend = sig.get('meta', {}).get('index_trend', 0)
-        st.entry_alpha_z = sig.get('meta', {}).get('alpha_z', 0.0)
-        st.entry_iv = sig.get('meta', {}).get('iv', st.last_valid_iv)
+        # [🛡️ Defensive] 赋值即强转, 防止 sig.meta 里混入 dict/非数字 (历史曾出现)
+        # 污染 st.entry_spy_roc → 进而触发 strategy.check_exit 的 TypeError 把整批
+        # SE tick 的 alpha 陪葬.
+        _meta = sig.get('meta', {}) or {}
+        def _mf(v, d=0.0):
+            if isinstance(v, dict): return d
+            try: return float(v)
+            except (TypeError, ValueError): return d
+        def _mi(v, d=0):
+            if isinstance(v, dict): return d
+            try: return int(v)
+            except (TypeError, ValueError): return d
+        st.entry_spy_roc = _mf(_meta.get('spy_roc', 0.0))
+        st.entry_index_trend = _mi(_meta.get('index_trend', 0))
+        st.entry_alpha_z = _mf(_meta.get('alpha_z', 0.0))
+        st.entry_iv = _mf(_meta.get('iv', st.last_valid_iv))
         st.max_roi = 0.0
 
         alpha_label_ts = sig.get('meta', {}).get('alpha_label_ts', 0.0)
@@ -379,8 +610,8 @@ class OrchestratorExecution:
             fill_ts = float(st.entry_ts)
             timing_fields = self._build_timing_fields(alpha_label_ts, alpha_available_ts, order_submit_ts, fill_ts)
             
-            # 🚀 [架构对齐 2] 统一计算包含滑点的最终成交价
-            slippage_entry_pct = float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value('SLIPPAGE_ENTRY_PCT', SLIPPAGE_ENTRY_PCT)))
+            # 🚀 [架构对齐 2] 统一计算包含滑点的最终成交价 (REALTIME_DRY 下默认 0)
+            slippage_entry_pct = self._effective_slippage_pct('entry')
             simulated_fill_price = round(fill_price * (1 + slippage_entry_pct), 2)
             
             contract = type('MockContract', (), {'symbol': sym, 'localSymbol': st.contract_id, 'tag': sig['tag'], 'secType': 'OPT'})()
@@ -388,10 +619,17 @@ class OrchestratorExecution:
             liq_chunks = liq_eval.get('chunks', 1)
             liq_reason = liq_eval.get('reason', 'N/A')
             
+            # [🛡️ Live Disconnect Guard]
+            # LIVEREPLAY 场景下 self.orch.ibkr 可能是真 IBKRConnectorV8。
+            # 前一轮 IBKR 断线修复后，place_option_order 在未连接时会返回 None。
+            # 如果 TRADING_ENABLED=True 且任一子单返回 None，说明实盘链路断了，
+            # 此时绝不可以在本地虚构成交并记账 (否则账本与 IB 端完全分叉)。
+            from config import TRADING_ENABLED as _TRADE_ON
+            live_disconnect_abort = False
             if hasattr(self.orch.ibkr, 'place_option_order'):
                 chunk_qtys = self._split_qty_into_chunks(st.qty, liq_chunks)
                 for chunk_idx, chunk_qty in enumerate(chunk_qtys):
-                    self.orch.ibkr.place_option_order(
+                    _ret = self.orch.ibkr.place_option_order(
                         contract,
                         'BUY',
                         chunk_qty,
@@ -403,6 +641,28 @@ class OrchestratorExecution:
                         chunks=liq_chunks,
                         liq_reason=liq_reason
                     )
+                    if _TRADE_ON and _ret is None:
+                        live_disconnect_abort = True
+                        break
+
+            if live_disconnect_abort:
+                logger.warning(
+                    f"🛑 [Live Disconnect] {sym} 开仓终止：IBKR 未连接，回退 ${total_new_locked:,.2f} 资金并放弃模拟记账。"
+                )
+                self._refund_locked_cash_once(
+                    st, total_new_locked, "ENTRY_ABORT_REFUND", sym,
+                    refund_key=f"ENTRY_ABORT_REFUND:{sym}:{int(curr_ts)}"
+                )
+                # 关键字段复位，避免 st.position=sig['dir'] 残留进状态落盘 → 后续误判为持仓
+                st.position = 0
+                st.qty = 0
+                st.entry_price = 0.0
+                st.entry_stock = 0.0
+                st.entry_ts = 0.0
+                st.max_roi = -1.0
+                self._release_entry_pending(st)
+                return
+
             self.orch.accounting._process_open_accounting(
                 sym,
                 st,
@@ -424,6 +684,12 @@ class OrchestratorExecution:
             try:    
                 limit_price = self._get_entry_limit_price(sig, fill_price, attempt_no=0)
                 if limit_price < 0.05:
+                    # 这里已经扣过 mock_cash (total_new_locked)，退回后再清锁。
+                    self._refund_locked_cash_once(
+                        st, total_new_locked, "ENTRY_LIMIT_TOO_LOW_REFUND", sym,
+                        refund_key=f"ENTRY_LIMIT_TOO_LOW_REFUND:{sym}:{int(curr_ts)}"
+                    )
+                    self._release_entry_pending(st)
                     return
                 entry_ref_price = float(sig.get('price', fill_price) or fill_price or 0.0)
                 cap_price = self._entry_requote_cap_price(entry_ref_price)
@@ -431,6 +697,11 @@ class OrchestratorExecution:
                     logger.warning(
                         f"🛑 [Entry Cap] {sym} 初始限价 {limit_price:.4f} 超过追价上限 {cap_price:.4f}，中止开仓。"
                     )
+                    self._refund_locked_cash_once(
+                        st, total_new_locked, "ENTRY_CAP_REJECT_REFUND", sym,
+                        refund_key=f"ENTRY_CAP_REJECT_REFUND:{sym}:{int(curr_ts)}"
+                    )
+                    self._release_entry_pending(st)
                     return
                 
                 # Removing redundant limit_price override as fairness is now standard
@@ -474,9 +745,20 @@ class OrchestratorExecution:
                     from config import TRADING_ENABLED, IS_LIVEREPLAY
                     if not TRADING_ENABLED:
                         logger.info(f"ℹ️ {sym} 开仓被拦截 (DRY RUN 极速结算)。")
-                        slippage_entry_pct = float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value('SLIPPAGE_ENTRY_PCT', SLIPPAGE_ENTRY_PCT)))
-                        simulated_fill_price = round(limit_price * (1 + slippage_entry_pct), 2)
-                        st.entry_price = simulated_fill_price  
+                        # [REALTIME_DRY 无人为滑点]
+                        # REALTIME_DRY 目标是尽量贴近“信号评估价(fair/mid)”做链路验证，
+                        # 不再使用偏向成交保护的 limit_price(靠近 ask) 作为干跑成交价，
+                        # 以避免开仓瞬间因点差出现 -1%~-2% 的人为浮亏观感。
+                        try:
+                            from config import IS_REALTIME_DRY
+                        except Exception:
+                            IS_REALTIME_DRY = False
+                        if IS_REALTIME_DRY:
+                            simulated_fill_price = float(fill_price or limit_price or 0.0)
+                        else:
+                            slippage_entry_pct = self._effective_slippage_pct('entry')
+                            simulated_fill_price = float(limit_price * (1 + slippage_entry_pct))
+                        st.entry_price = simulated_fill_price
                         
                         log_ts = curr_ts if IS_LIVEREPLAY else time.time()
                         timing_fields = self._build_timing_fields(alpha_label_ts, alpha_available_ts, start_time, log_ts)
@@ -495,12 +777,15 @@ class OrchestratorExecution:
                         )
                     else:
                         logger.error(f"❌ [实盘异常] {sym} 订单被拒！回退资金。")
-                        self.orch.mock_cash += (total_est_cost + total_est_comm)
+                        self._refund_locked_cash_once(
+                            st, (total_est_cost + total_est_comm), "ENTRY_ORDER_REJECT_REFUND", sym,
+                            refund_key=f"ENTRY_ORDER_REJECT_REFUND:{sym}:{int(curr_ts)}"
+                        )
                         self._reset_failed_entry_state(st)
             finally:
-                # 只有在非监控模式下才在这里释放
+                # 只有在非监控模式下才在这里释放 (异步监控由 _monitor_realtime_order 负责解锁)
                 if not (self.orch.mode == 'realtime' and trade is not None):
-                    st.is_pending = False
+                    self._release_entry_pending(st)
                     
         self.orch.state_manager.save_state()
 
@@ -546,7 +831,7 @@ class OrchestratorExecution:
             if is_simulated_env or SYNC_EXECUTION:
                 # 在同步比对模式下，必须假设无限流动性，否则状态机必分叉！
                 actual_fill_qty = exit_qty 
-                slippage_exit_pct = float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value('SLIPPAGE_EXIT_PCT', SLIPPAGE_EXIT_PCT)))
+                slippage_exit_pct = self._effective_slippage_pct('exit')
                 final_price = round(raw_price * (1 - slippage_exit_pct), 2)
                 final_price = max(final_price, 0.01)
                 
@@ -583,7 +868,7 @@ class OrchestratorExecution:
                     actual_fill_qty = min(exit_qty, int(available_size))
                     if actual_fill_qty <= 0: return 
                     
-                    slippage_exit_pct = float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value('SLIPPAGE_EXIT_PCT', SLIPPAGE_EXIT_PCT)))
+                    slippage_exit_pct = self._effective_slippage_pct('exit')
                     simulated_exit_price = max(round(raw_price * (1 - slippage_exit_pct), 2), 0.01)
                     self.orch.accounting._process_exit_accounting(sym, st, actual_fill_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0, original_position=original_position)
                 else:
@@ -671,7 +956,10 @@ class OrchestratorExecution:
                     await asyncio.sleep(0.5) # 降低间隔，加速成交
 
             unspent_cash = (total_est_cost + total_est_comm) - (total_actual_cost + total_actual_comm)
-            self.orch.mock_cash += unspent_cash
+            self._refund_locked_cash_once(
+                st, unspent_cash, "ICEBERG_UNSPENT_REFUND", sym,
+                refund_key=f"ICEBERG_UNSPENT_REFUND:{sym}:{int(curr_ts)}"
+            )
             
             if total_qty_filled > 0:
                 st.position = sig['dir']
@@ -680,12 +968,22 @@ class OrchestratorExecution:
                 st.entry_price = (total_actual_cost / total_qty_filled) / 100.0
                 st.opt_type = 'call' if st.position == 1 else 'put'
                 st.entry_ts = curr_ts
-                st.entry_spy_roc = sig.get('meta', {}).get('spy_roc', 0.0)
-                st.entry_index_trend = sig.get('meta', {}).get('index_trend', 0)
-                st.entry_alpha_z = sig.get('meta', {}).get('alpha_z', 0.0)
-                st.entry_iv = sig.get('meta', {}).get('iv', st.last_valid_iv)
+                # [🛡️ Defensive] 同上方 _execute_entry 的保护: 赋值即强转, 拒绝 dict.
+                _meta2 = sig.get('meta', {}) or {}
+                def _mf2(v, d=0.0):
+                    if isinstance(v, dict): return d
+                    try: return float(v)
+                    except (TypeError, ValueError): return d
+                def _mi2(v, d=0):
+                    if isinstance(v, dict): return d
+                    try: return int(v)
+                    except (TypeError, ValueError): return d
+                st.entry_spy_roc = _mf2(_meta2.get('spy_roc', 0.0))
+                st.entry_index_trend = _mi2(_meta2.get('index_trend', 0))
+                st.entry_alpha_z = _mf2(_meta2.get('alpha_z', 0.0))
+                st.entry_iv = _mf2(_meta2.get('iv', st.last_valid_iv))
                 st.max_roi = 0.0
-                st.contract_id = sig.get('meta', {}).get('contract_id', '')
+                st.contract_id = _meta2.get('contract_id', '') or ''
                 
                 fill_ts = time.time()
                 self.orch.accounting._process_open_accounting(
@@ -782,7 +1080,10 @@ class OrchestratorExecution:
 
             actual_commission = total_filled_qty * commission_per_contract
             refund = (cost + commission) - (total_actual_cost + actual_commission)
-            self.orch.mock_cash += refund
+            self._refund_locked_cash_once(
+                st, refund, "REALTIME_REQUOTE_REFUND", sym,
+                refund_key=f"REALTIME_REQUOTE_REFUND:{sym}:{int(start_time)}"
+            )
             
             if total_filled_qty > 0:
                 avg_fill_price = (total_actual_cost / total_filled_qty) / 100.0
@@ -817,19 +1118,39 @@ class OrchestratorExecution:
         """实盘防滑点平仓订单执行器"""
         st = self.orch.states.get(sym)
         if not st: return
-        start_time = time.time() 
-        
+        start_time = time.time()
+
+        # [🛡️ Connection Guard] 实盘路径下, 若 IBKR 断连则直接跳过本次 exit:
+        #   - 不调用 place_option_order (避免 ib_insync 抛 ConnectionError 刷屏);
+        #   - 不走 "not trade → 模拟成交" 兜底 (那条路径是 DRY RUN 语义, 实盘用会
+        #     让账本清掉实际仍持有的仓位, 严重账实不符);
+        #   - is_pending 重置为 False, 让下一个 exit 信号到达时能重新尝试.
+        if TRADING_ENABLED and not self._ibkr_is_connected():
+            self._log_ibkr_disconnect_throttled(sym, reason)
+            try:
+                st.is_pending = False
+            except Exception:
+                pass
+            return
+
         try:
-            slippage_exit_pct = float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value('SLIPPAGE_EXIT_PCT', SLIPPAGE_EXIT_PCT)))
+            slippage_exit_pct = self._effective_slippage_pct('exit')
             configured_exit_order_type = str(self._cfg_value('EXIT_ORDER_TYPE', EXIT_ORDER_TYPE)).upper()
             max_attempts = max(1, int(self._cfg_value('ORDER_MAX_RETRIES', config.ORDER_MAX_RETRIES)))
             order_timeout_seconds = max(1, int(self._cfg_value('ORDER_TIMEOUT_SECONDS', config.ORDER_TIMEOUT_SECONDS)))
 
             if configured_exit_order_type == 'MKT':
                 trade = self.orch.ibkr.place_option_order(real_contract, 'SELL', total_qty, 'MKT', base_price, custom_time=curr_ts, reason=reason)
-                if not trade: 
-                    simulated_exit_price = max(round(base_price * (1 - slippage_exit_pct), 2), 0.01)
-                    self.orch.accounting._process_exit_accounting(sym, st, total_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0)
+                if not trade:
+                    # [🛡️ Safe Fallback] place_option_order 返回 None 有两种语义:
+                    #   (a) DRY RUN / TRADING_ENABLED=False → 应该用模拟价清算账本;
+                    #   (b) 实盘但 IBKR 断连 → 绝不能模拟清算 (会让账本和持仓不一致).
+                    # 用 last_not_connected_ts 窗口 + TRADING_ENABLED 联合判断.
+                    if TRADING_ENABLED and self._ibkr_recently_failed():
+                        self._log_ibkr_disconnect_throttled(sym, reason)
+                    else:
+                        simulated_exit_price = max(round(base_price * (1 - slippage_exit_pct), 2), 0.01)
+                        self.orch.accounting._process_exit_accounting(sym, st, total_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0)
                 return
                 
             is_urgent = is_force or any(keyword in reason for keyword in ["STOP", "FLIP", "EOD", "FORCE"])
@@ -841,9 +1162,14 @@ class OrchestratorExecution:
             limit_sell_price = self._get_exit_limit_price(base_price, bid=bid, ask=ask, is_urgent=is_urgent, attempt_no=0)
             current_trade = self.orch.ibkr.place_option_order(real_contract, 'SELL', remaining_qty, 'LMT', lmt_price=limit_sell_price, custom_time=curr_ts, reason=reason)
             if not current_trade:
-                 simulated_exit_price = max(round(limit_sell_price * (1 - slippage_exit_pct), 2), 0.01)
-                 self.orch.accounting._process_exit_accounting(sym, st, total_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0)
-                 return
+                # [🛡️ Safe Fallback] 同上 MKT 分支: 区分 DRY RUN (模拟成交) 与
+                # 实盘连接断开 (跳过, 等待重连后由下一个 exit 信号重试).
+                if TRADING_ENABLED and self._ibkr_recently_failed():
+                    self._log_ibkr_disconnect_throttled(sym, reason)
+                    return
+                simulated_exit_price = max(round(limit_sell_price * (1 - slippage_exit_pct), 2), 0.01)
+                self.orch.accounting._process_exit_accounting(sym, st, total_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0)
+                return
 
             for attempt_no in range(max_attempts):
                 for _ in range(wait_per_attempt):
@@ -962,7 +1288,7 @@ class OrchestratorExecution:
                         if raw_price < 0.05:
                             raw_price = st.entry_price if st.entry_price > 0 else 0.01
 
-                    slippage_exit_pct = float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value('SLIPPAGE_EXIT_PCT', SLIPPAGE_EXIT_PCT)))
+                    slippage_exit_pct = self._effective_slippage_pct('exit')
                     final_p = max(round(raw_price * (1 - slippage_exit_pct), 2), 0.01)
                     self.orch.accounting._process_exit_accounting(sym, st, st.qty, final_p, curr_stock, custom_ts, f"FORCE_{reason}", 0.0, 1.0)
                     if hasattr(self.orch.ibkr, 'place_option_order'):
@@ -971,7 +1297,7 @@ class OrchestratorExecution:
                 else:
                     st.is_pending = True 
                     if not TRADING_ENABLED:
-                        slippage_exit_pct = float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value('SLIPPAGE_EXIT_PCT', SLIPPAGE_EXIT_PCT)))
+                        slippage_exit_pct = self._effective_slippage_pct('exit')
                         sim_exit = max(round(raw_price * (1 - slippage_exit_pct), 2), 0.01)
                         self.orch.accounting._process_exit_accounting(sym, st, st.qty, sim_exit, curr_stock, custom_ts, f"FORCE_{reason}", 0.0, 1.0)
                         st.is_pending = False

@@ -315,20 +315,146 @@ class FCSSupportHandler:
             if conn:
                 conn.close()
 
+    # ------------------------------------------------------------------
+    # 状态持久化 (L2: PostgreSQL 主存 + 本地 pkl 二级缓存)
+    # ------------------------------------------------------------------
+    #
+    # 后端选择由环境变量 FCS_STATE_BACKEND 控制:
+    #   - "pg"   : 仅 PG (推荐, 最干净)
+    #   - "pkl"  : 仅本地 pkl (旧行为, 回退用)
+    #   - "both" : 双写 PG + pkl, 读优先 PG, 失败降级 pkl (默认, 最安全的过渡)
+    # ------------------------------------------------------------------
+    def _state_backend(self) -> str:
+        val = (os.environ.get("FCS_STATE_BACKEND") or "both").strip().lower()
+        return val if val in ("pg", "pkl", "both") else "both"
+
+    # ---------- Save ----------
     def save_service_state(self):
         svc = self.service
-        try:
-            state = {'ts': time.time(), 'normalizers': {s: norm.get_state() for s, norm in svc.normalizers.items()}}
-            temp_file = svc.state_file.with_suffix('.tmp')
-            with open(temp_file, 'wb') as f:
-                f.write(ser.pack(state))
-            if svc.state_file.exists():
-                os.remove(svc.state_file)
-            os.rename(temp_file, svc.state_file)
-        except Exception as e:
-            logger.error(f"Save State Error: {e}")
+        backend = self._state_backend()
 
+        # 1) PG
+        if backend in ("pg", "both"):
+            store = getattr(svc, "state_store", None)
+            if store is not None:
+                try:
+                    store.save(svc)   # 内部后台线程, 不阻塞
+                except Exception as e:
+                    logger.error(f"[StateStore] save_service_state PG failed: {e}")
+
+        # 2) pkl (保留 normalizer 轻量兜底; 主 state 已在 PG)
+        if backend in ("pkl", "both"):
+            try:
+                state = {
+                    'ts': time.time(),
+                    'normalizers': {s: norm.get_state() for s, norm in svc.normalizers.items()},
+                }
+                temp_file = svc.state_file.with_suffix('.tmp')
+                with open(temp_file, 'wb') as f:
+                    f.write(ser.pack(state))
+                if svc.state_file.exists():
+                    os.remove(svc.state_file)
+                os.rename(temp_file, svc.state_file)
+            except Exception as e:
+                logger.error(f"Save State (pkl) Error: {e}")
+
+    # ---------- Load ----------
     def load_service_state(self):
+        svc = self.service
+        backend = self._state_backend()
+
+        # 优先尝试 PG
+        if backend in ("pg", "both"):
+            store = getattr(svc, "state_store", None)
+            if store is not None:
+                if self._load_from_pg(store):
+                    return  # PG 已成功恢复
+
+        # 回退到 pkl
+        if backend in ("pkl", "both"):
+            self._load_from_pkl()
+            return
+
+        # 都禁用 → 冷启动
+        if ENABLE_DEEP_WARMUP:
+            logger.info("ℹ️ No state backend enabled; Deep Warmup.")
+            svc._warmup_from_history(replay_features=True)
+        else:
+            logger.info("⏭️ [Warmup] All backends disabled & Deep Warmup OFF. Starting cold.")
+
+    # ---------- PG Load ----------
+    def _load_from_pg(self, store) -> bool:
+        """尝试从 PG 恢复. 返回 True 表示已处理 (成功/降级无需再走 pkl)."""
+        svc = self.service
+        try:
+            result = store.load(svc)
+        except Exception as e:
+            logger.error(f"[StateStore] PG load raised: {e}")
+            return False
+
+        if not result.found:
+            logger.info(f"ℹ️ [StateStore] PG namespace={store.namespace} empty; fallback to pkl/deep-warmup.")
+            return False
+
+        if not result.schema_match:
+            logger.warning(f"⚠️ [StateStore] PG schema mismatch ({result.note}); ignoring PG.")
+            return False
+        if not result.feature_match:
+            logger.warning(f"⚠️ [StateStore] PG feature_names hash mismatch; ignoring PG.")
+            return False
+        if not result.symbols_match:
+            logger.warning(f"⚠️ [StateStore] PG symbols hash mismatch; ignoring PG.")
+            return False
+
+        # 跨天策略: 与原 pkl 逻辑保持一致
+        age_h = result.age_hours or 0.0
+        saved_at = result.saved_at or 0.0
+        state_date = datetime.fromtimestamp(saved_at, NY_TZ).date() if saved_at else None
+        now_ny_date = datetime.now(NY_TZ).date()
+        cross_day = state_date is not None and state_date != now_ny_date
+
+        if cross_day:
+            if age_h <= float(FCS_RECENT_STATE_MAX_HOURS):
+                logger.warning(
+                    f"♻️ [StateStore] Reusing recent cross-day PG state "
+                    f"(age={age_h:.1f}h <= {float(FCS_RECENT_STATE_MAX_HOURS):.1f}h, saved={state_date})."
+                )
+            else:
+                if not ENABLE_DEEP_WARMUP:
+                    logger.info(
+                        f"⏭️ [StateStore] PG state is stale ({age_h:.1f}h) and Deep Warmup DISABLED. "
+                        "Starting cold (PG not applied)."
+                    )
+                    return True  # 已处理
+                logger.warning(
+                    f"⚠️ [StateStore] PG state is stale ({age_h:.1f}h > {float(FCS_RECENT_STATE_MAX_HOURS):.1f}h); "
+                    "dropping and running Deep Warmup."
+                )
+                svc._warmup_from_history(replay_features=True)
+                return True
+
+        if not result.fully_warmed:
+            if not ENABLE_DEEP_WARMUP:
+                logger.info(
+                    f"⏭️ [StateStore] PG state incomplete ({result.note}) & Deep Warmup OFF. Starting cold with PG partial."
+                )
+                return True
+            logger.warning(f"⚠️ [StateStore] PG state INCOMPLETE ({result.note}); forcing Deep Warmup.")
+            svc._warmup_from_history(replay_features=True)
+            return True
+
+        # 完整恢复成功
+        logger.info(
+            f"♻️ [StateStore] PG state restored: ns={store.namespace} "
+            f"saved_at={datetime.fromtimestamp(saved_at, NY_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"age={age_h:.2f}h syms={result.symbol_count}. "
+            "Running light warmup (replay_features=False)..."
+        )
+        svc._warmup_from_history(replay_features=False)
+        return True
+
+    # ---------- pkl Load (原逻辑) ----------
+    def _load_from_pkl(self):
         svc = self.service
         if not svc.state_file.exists():
             if not ENABLE_DEEP_WARMUP:
@@ -347,18 +473,18 @@ class FCSSupportHandler:
                 can_reuse_recent = age_hours <= float(FCS_RECENT_STATE_MAX_HOURS)
                 if can_reuse_recent:
                     logger.warning(
-                        f"♻️ [Warmup] Reusing recent cross-day FCS state from {state_time.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+                        f"♻️ [Warmup] Reusing recent cross-day FCS pkl state from {state_time.strftime('%Y-%m-%d %H:%M:%S %Z')} "
                         f"(age={age_hours:.1f}h <= {float(FCS_RECENT_STATE_MAX_HOURS):.1f}h)."
                     )
                 else:
                     if not ENABLE_DEEP_WARMUP:
                         logger.info(
-                            f"⏭️ [Warmup] State is stale ({age_hours:.1f}h > {float(FCS_RECENT_STATE_MAX_HOURS):.1f}h) "
+                            f"⏭️ [Warmup] pkl State is stale ({age_hours:.1f}h > {float(FCS_RECENT_STATE_MAX_HOURS):.1f}h) "
                             "and Deep Warmup is DISABLED. Starting cold."
                         )
                         return
                     logger.warning(
-                        f"⚠️ State file is from previous day ({state_time.date()}) and exceeds recent window "
+                        f"⚠️ pkl State file is from previous day ({state_time.date()}) and exceeds recent window "
                         f"({age_hours:.1f}h > {float(FCS_RECENT_STATE_MAX_HOURS):.1f}h), starting fresh (Deep Warmup)."
                     )
                     svc._warmup_from_history(replay_features=True)
@@ -371,15 +497,15 @@ class FCSSupportHandler:
                         is_fully_warmed = False
             if not is_fully_warmed:
                 if not ENABLE_DEEP_WARMUP:
-                    logger.info("⏭️ [Warmup] State incomplete but Deep Warmup is DISABLED via config. Starting cold.")
+                    logger.info("⏭️ [Warmup] pkl state incomplete but Deep Warmup is DISABLED via config. Starting cold.")
                     return
-                logger.warning("⚠️ State file is from today but INCOMPLETE (count < 500). Forcing Deep Warmup!")
+                logger.warning("⚠️ pkl State file is from today but INCOMPLETE (count < 500). Forcing Deep Warmup!")
                 svc._warmup_from_history(replay_features=True)
             else:
-                logger.info(f"♻️ Service State Restored from disk: {svc.state_file.name} (Fully Warmed). Loading base history...")
+                logger.info(f"♻️ Service State Restored from pkl: {svc.state_file.name} (Fully Warmed). Loading base history...")
                 svc._warmup_from_history(replay_features=False)
         except Exception as e:
-            logger.error(f"❌ State Load Error: {e}")
+            logger.error(f"❌ State Load Error (pkl): {e}")
             svc._warmup_from_history(replay_features=True)
 
     def get_dynamic_atm_iv(self, snap, price):

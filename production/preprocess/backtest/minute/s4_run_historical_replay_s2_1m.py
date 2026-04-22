@@ -63,7 +63,7 @@ def resolve_db_path(args):
     CURRENT_DIR = Path(__file__).resolve().parent
     # 🚀 既然确定了是在 history_sqlite_1m 下，我们直接锁定这个路径，不做任何模糊搜索
     #HIST_DIR = CURRENT_DIR.parent / "preprocess" / "backtest" / "history_sqlite_1m"
-    HIST_DIR = Path("/home/kingfang007/quant_project/data/history_sqlite_1m")
+    HIST_DIR = Path("/home/kingfang007/quant_project/data/history_sqlite_1s")
     if args.date:
         db_name = f"market_{args.date}.db"
         p = HIST_DIR / db_name
@@ -111,6 +111,12 @@ async def main():
         config_paths=config_paths,
         model_paths={}
     )
+    logger.info(
+        "🧭 [AlphaEngine Audit] cfg=%s INDEX_GUARD_ENABLED=%s INDEX_REVERSAL_EXIT_ENABLED=%s",
+        signal_engine.cfg.__class__.__module__,
+        getattr(signal_engine.cfg, 'INDEX_GUARD_ENABLED', None),
+        getattr(signal_engine.cfg, 'INDEX_REVERSAL_EXIT_ENABLED', None),
+    )
     shared_signal_queue = asyncio.Queue()
     signal_engine.signal_queue = shared_signal_queue
     signal_engine.use_shared_mem = True
@@ -118,12 +124,15 @@ async def main():
     exec_engine = ExecutionEngineV8(
         symbols=symbols,
         mode='backtest',
-        shared_states=signal_engine.states,
         signal_queue=shared_signal_queue
     )
-    exec_engine.strategy.cfg = signal_engine.strategy.cfg
-    exec_engine.cfg = signal_engine.strategy.cfg
-    exec_engine.use_shared_mem = True
+    logger.info(
+        "🧭 [OMS Strategy Audit] core=%s cfg=%s INDEX_GUARD_ENABLED=%s INDEX_REVERSAL_EXIT_ENABLED=%s",
+        exec_engine.strategy.__class__.__name__,
+        exec_engine.cfg.__class__.__module__,
+        getattr(exec_engine.cfg, 'INDEX_GUARD_ENABLED', None),
+        getattr(exec_engine.cfg, 'INDEX_REVERSAL_EXIT_ENABLED', None),
+    )
     
     logger.info(f"🔌 Injecting Mock IBKR...")
     mock_ibkr = MockIBKRHistorical()

@@ -315,16 +315,25 @@ class SymbolState:
 
     def from_dict(self, data):
         """从字典恢复状态 (含 Buffer)"""
-        self.position = data.get('position', 0)
-        self.qty = data.get('qty', 0)
-        self.entry_price = data.get('entry_price', 0.0)
-        self.entry_stock = data.get('entry_stock', 0.0)
-        self.last_opt_price = data.get('last_opt_price', 0.0)
-        self.entry_ts = data.get('entry_ts', 0.0)
-        self.entry_spy_roc = data.get('entry_spy_roc', 0.0)
-        self.entry_index_trend = data.get('entry_index_trend', 0)  # <--- [新增] 安全恢复，老数据默认给 0
-        self.entry_alpha_z = data.get('entry_alpha_z', 0.0)       # 🚨 [修复]
-        self.entry_iv = data.get('entry_iv', 0.0)                 # 🚨 [修复]
+        # [🛡️ Defensive Coerce] 与 SE/OMS 的 from_dict 对齐, 统一拦截 dict/非法类型.
+        def _coerce_float(v, default=0.0):
+            if isinstance(v, dict): return default
+            try: return float(v)
+            except (TypeError, ValueError): return default
+        def _coerce_int(v, default=0):
+            if isinstance(v, dict): return default
+            try: return int(v)
+            except (TypeError, ValueError): return default
+        self.position = _coerce_int(data.get('position', 0))
+        self.qty = _coerce_int(data.get('qty', 0))
+        self.entry_price = _coerce_float(data.get('entry_price', 0.0))
+        self.entry_stock = _coerce_float(data.get('entry_stock', 0.0))
+        self.last_opt_price = _coerce_float(data.get('last_opt_price', 0.0))
+        self.entry_ts = _coerce_float(data.get('entry_ts', 0.0))
+        self.entry_spy_roc = _coerce_float(data.get('entry_spy_roc', 0.0))
+        self.entry_index_trend = _coerce_int(data.get('entry_index_trend', 0))
+        self.entry_alpha_z = _coerce_float(data.get('entry_alpha_z', 0.0))
+        self.entry_iv = _coerce_float(data.get('entry_iv', 0.0))
         self.max_roi = data.get('max_roi', -1.0)
         self.cooldown_until = data.get('cooldown_until', 0.0)
         self.contract_id = data.get('contract_id')
@@ -1446,6 +1455,12 @@ class V8Orchestrator:
             self.consecutive_stop_losses = 0
 
             self.global_cooldown_until = 0
+            # [Layer 4] 跨日重置连带清理 Redis 熔断广播 hash, 避免 SE/下游进程读到昨日残值
+            try:
+                if getattr(self, 'r', None) is not None:
+                    self.r.delete("meta:circuit_breaker")
+            except Exception as _cb_del_e:
+                logger.warning(f"⚠️ [CB Sync] day-boundary DEL meta:circuit_breaker failed: {_cb_del_e}")
             self.index_opening_prices = {} # [NEW] 跨日重置开盘价缓存
             self._generate_daily_analysis_report(report_date_str=self.last_date.strftime('%Y%m%d'))
             

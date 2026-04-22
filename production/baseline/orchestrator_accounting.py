@@ -18,6 +18,35 @@ class OrchestratorAccounting:
     def __init__(self, orchestrator):
         self.orch = orchestrator
 
+    def _cash_add(self, delta: float, reason: str, sym: str = ""):
+        """Unified cash mutation path with audit log."""
+        try:
+            d = float(delta or 0.0)
+        except Exception:
+            d = 0.0
+        before = float(getattr(self.orch, 'mock_cash', 0.0) or 0.0)
+        after = before + d
+        self.orch.mock_cash = after
+        logger.info(
+            f"💳 [CashAudit] {reason} {sym} | delta={d:+.2f} | before={before:.2f} | after={after:.2f}"
+        )
+        if abs(d) >= 10000:
+            logger.warning(
+                f"🚨 [CashAudit Spike] {reason} {sym} | delta={d:+.2f} | before={before:.2f} | after={after:.2f}"
+            )
+
+    def _schedule_live_state_broadcast(self):
+        """Best-effort: push latest cash/positions to Redis right after accounting."""
+        try:
+            fn = getattr(self.orch, '_broadcast_state_to_redis', None)
+            if fn is None:
+                return
+            loop = asyncio.get_running_loop()
+            loop.create_task(fn())
+        except Exception:
+            # Non-blocking path; dashboard can still fall back to logs/state table.
+            pass
+
     @staticmethod
     def _resolve_mode_label(mode_override=None):
         if mode_override:
@@ -119,6 +148,49 @@ class OrchestratorAccounting:
             'mode': mode_override or self.orch.mode.upper(),
         })
 
+        # [🛡️ Atomic State Snapshot] 账务变化后立即触发一次持久化，
+        # 确保 positions / mock_cash 与交易日志原子对齐，避免崩溃或
+        # 异常分支导致下次重启时状态漂移。save_state 内部是后台线程写，非阻塞。
+        try:
+            sm = getattr(self.orch, 'state_manager', None)
+            if sm is not None:
+                sm.save_state()
+        except Exception as e:
+            logger.debug(f"[Accounting] post-open save_state skipped: {e}")
+        self._schedule_live_state_broadcast()
+
+    def _broadcast_circuit_breaker(self, safe_now_ts, trigger_reason=None, tripped=False):
+        """[Cross-Process Sync] 将熔断状态广播到 Redis, 让独立进程的 Signal Engine 能感知。
+
+        - 用于 REALTIME / LIVEREPLAY / REALTIME_DRY 等 SE/OMS 分进程架构下, 解决
+          `global_cooldown_until` 只驻留在 OMS 内存, SE 永远看不到的历史 bug。
+        - 单进程 shared-mem 模式下 SE 直接读 `self.orch.global_cooldown_until`, 不依赖此通道,
+          但多写一份 Redis 也无副作用。
+        - 仅写入元数据, 不承担任何业务决策 (决策仍在各进程本地完成)。
+        """
+        try:
+            r = getattr(self.orch, 'r', None)
+            if r is None:
+                return
+            cb_until = float(getattr(self.orch, 'global_cooldown_until', 0.0) or 0.0)
+            streak = int(getattr(self.orch, 'consecutive_stop_losses', 0) or 0)
+            mapping = {
+                'global_cooldown_until': f"{cb_until:.3f}",
+                'consecutive_stop_losses': str(streak),
+                'updated_at': f"{float(safe_now_ts):.3f}",
+            }
+            if tripped:
+                mapping['last_trip_at'] = f"{float(safe_now_ts):.3f}"
+                mapping['last_trip_reason'] = str(trigger_reason or '')
+            r.hset("meta:circuit_breaker", mapping=mapping)
+            # 6h 兜底 TTL, 防止过期值跨交易日残留
+            try:
+                r.expire("meta:circuit_breaker", 6 * 3600)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"⚠️ [Circuit Breaker Broadcast] failed: {e}")
+
     def _process_exit_accounting(self, sym, st, filled_qty, fill_price, stock_price, curr_ts, reason, duration, ratio, original_position=None):
         """[核心新增] 统一财务清算中心：只有发生物理成交才碰钱、算盈亏、写日志"""
         if filled_qty <= 0: return
@@ -128,7 +200,7 @@ class OrchestratorAccounting:
         
         commission = filled_qty * COMMISSION_PER_CONTRACT
         proceeds = fill_price * filled_qty * 100 - commission
-        self.orch.mock_cash += proceeds
+        self._cash_add(proceeds, "EXIT_PROCEEDS", sym)
         
         # [Fix] PnL 必须扣除建仓时产生的对应部分手续费，否则 Realized PnL 总是比账户真实回款多！
         open_commission = filled_qty * COMMISSION_PER_CONTRACT
@@ -167,13 +239,24 @@ class OrchestratorAccounting:
              st.cooldown_until = safe_now_ts + (COOLDOWN_MINUTES * 60)
         if 'HARD_STOP' in reason or 'COND_STOP' in reason or 'STOCK_STOP' in reason:
             self.orch.consecutive_stop_losses += 1
+            # [Layer A] 每次 streak 递增都打一条可见 warning (无论是否真正熔断),
+            # 避免历史 bug: 用户只在达到阈值时才看到日志, 无法观察"离熔断还差几次"
+            logger.warning(
+                f"🛑 [Streak] {sym} {reason} | consecutive_stop_losses="
+                f"{self.orch.consecutive_stop_losses}/{self.orch.CIRCUIT_BREAKER_THRESHOLD} "
+                f"| ROI={roi:.1%}"
+            )
             if self.orch.consecutive_stop_losses >= self.orch.CIRCUIT_BREAKER_THRESHOLD:
                 self.orch.global_cooldown_until = safe_now_ts + (self.orch.CIRCUIT_BREAKER_MINUTES * 60)
                 ny_cool = datetime.fromtimestamp(self.orch.global_cooldown_until, tz=timezone('America/New_York'))
                 logger.warning(f"🔥 连败熔断触发! 暂停至 {ny_cool.strftime('%H:%M')}")
                 self.orch.consecutive_stop_losses = 0
+                self._broadcast_circuit_breaker(safe_now_ts, trigger_reason=reason, tripped=True)
+            else:
+                self._broadcast_circuit_breaker(safe_now_ts, trigger_reason=reason, tripped=False)
         elif roi >= 0:
             self.orch.consecutive_stop_losses = 0
+            self._broadcast_circuit_breaker(safe_now_ts, trigger_reason=None, tripped=False)
             
         # 写日志
         self._emit_trade_log({
@@ -222,6 +305,16 @@ class OrchestratorAccounting:
             st.entry_price = 0.0
             st.entry_ts = 0.0
             st.max_roi = 0.0
+
+        # [🛡️ Atomic State Snapshot] 平仓后强制快照，避免 mock_cash 更新
+        # 与下次重启状态不一致。save_state 内部是后台线程写，非阻塞。
+        try:
+            sm = getattr(self.orch, 'state_manager', None)
+            if sm is not None:
+                sm.save_state()
+        except Exception as e:
+            logger.debug(f"[Accounting] post-exit save_state skipped: {e}")
+        self._schedule_live_state_broadcast()
 
     def _generate_daily_analysis_report(self, report_date_str: str = None):
         """盘后诊断报告"""

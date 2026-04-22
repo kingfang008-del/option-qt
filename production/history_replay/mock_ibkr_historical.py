@@ -162,8 +162,11 @@ class MockIBKRHistorical:
             
         import bisect
         times = [x[0] for x in self.market_history]
-        idx = bisect.bisect_left(times, ts)
-        
+        # Use latest snapshot at-or-before ts to avoid look-ahead bias when
+        # there are sparse/missing bars.
+        idx = bisect.bisect_right(times, ts) - 1
+        if idx < 0:
+            return None
         if idx >= len(self.market_history):
             idx = len(self.market_history) - 1
             
@@ -208,8 +211,10 @@ class MockIBKRHistorical:
             
         import bisect
         times = [x[0] for x in self.market_history]
-        idx = bisect.bisect_left(times, ts)
-        
+        # Anchor at-or-before ts first, then apply bar offset.
+        idx = bisect.bisect_right(times, ts) - 1
+        if idx < 0:
+            return None
         target_idx = idx + bar_offset
         if target_idx >= len(self.market_history):
             target_idx = len(self.market_history) - 1

@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 import argparse
 import sys
+import shutil
 import pandas as pd
 import sqlite3
 import json
@@ -21,14 +22,14 @@ from datetime import datetime
 import pytz
 from tqdm import tqdm
 
-MY_DIR = Path(__file__).resolve().parent
-ROOT_DIR = MY_DIR.parent.parent
-sys.path.insert(0, str(ROOT_DIR / "production" / "baseline"))
-sys.path.insert(0, str(ROOT_DIR / "production" / "history_replay"))
-sys.path.insert(0, str(ROOT_DIR / "production" / "model"))
+# MY_DIR = Path(__file__).resolve().parent
+# PRODUCTION_DIR = MY_DIR.parents[2]
+# sys.path.insert(0, str(PRODUCTION_DIR / "baseline"))
+# sys.path.insert(0, str(PRODUCTION_DIR / "history_replay"))
+# sys.path.insert(0, str(PRODUCTION_DIR / "model"))
 
 from signal_engine_v8 import SignalEngineV8
-from execution_engine_v8 import ExecutionEngineV8
+from execution_engine_v8 import ExecutionEngineV8, ExecutionWindow
 import mock_ibkr_historical_1s
 from mock_ibkr_historical_1s import MockIBKRHistorical
 print(f"🔍 [Import Trace] Using MockIBKR from: {mock_ibkr_historical_1s.__file__}")
@@ -121,11 +122,61 @@ def build_option_arrays(group):
     }
 
 
+def build_replay_packet(group, ts_val, is_new_minute=False):
+    """Build one 1s quote packet; callers decide whether it is also the minute signal packet."""
+    symbols_list = group['symbol'].tolist()
+    opt = build_option_arrays(group)
+    return {
+        'symbols': symbols_list,
+        'ts': float(ts_val),
+        'stock_price': group['close'].values.astype(np.float32),
+        'fast_vol': safe_col(group, 'fast_vol', 0.0),
+        'precalc_alpha': safe_col(group, 'alpha_score', 0.0),
+        'alpha_label_ts': safe_col(group, 'alpha_label_ts', 0.0, dtype=np.float64),
+        'alpha_available_ts': np.full(len(group), float(ts_val), dtype=np.float64),
+        'spy_roc_5min': safe_col(group, 'spy_roc_5min', 0.0),
+        'qqq_roc_5min': safe_col(group, 'qqq_roc_5min', 0.0),
+        'is_new_minute': bool(is_new_minute),
+        'symbols_with_data': opt['symbols_with_data'],
+        'feed_put_price': opt['put_prices'],
+        'feed_call_price': opt['call_prices'],
+        'feed_put_k': opt['put_ks'],
+        'feed_call_k': opt['call_ks'],
+        'feed_put_iv': opt['put_ivs'],
+        'feed_call_iv': opt['call_ivs'],
+        'feed_put_bid': opt['put_bids'],
+        'feed_put_ask': opt['put_asks'],
+        'feed_call_bid': opt['call_bids'],
+        'feed_call_ask': opt['call_asks'],
+        'feed_put_vol': np.ones(len(group), dtype=np.float32),
+        'feed_call_vol': np.ones(len(group), dtype=np.float32),
+        'feed_call_bid_size': np.full(len(group), 100.0, dtype=np.float32),
+        'feed_call_ask_size': np.full(len(group), 100.0, dtype=np.float32),
+        'feed_put_bid_size': np.full(len(group), 100.0, dtype=np.float32),
+        'feed_put_ask_size': np.full(len(group), 100.0, dtype=np.float32),
+        'slow_1m': np.zeros((len(symbols_list), 30, 1), dtype=np.float32),
+        'feed_put_id': [""] * len(group),
+        'feed_call_id': [""] * len(group),
+    }
+
+
+async def drain_signal_queue(shared_signal_queue, exec_engine):
+    """Synchronously drain SE→OMS queue before advancing the replay clock."""
+    # 与 ExecutionEngineV8.signal_queue 为同一 asyncio.Queue 时,
+    # 等价于 exec_engine.drain_trade_signal_queue()。
+    await exec_engine.drain_trade_signal_queue()
+
+
 async def main():
     print(f"!!! EXECUTING S2 1S REPLAY SCRIPT: {__file__} !!!")
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", type=str, default="20260102")
     parser.add_argument("--symbol", type=str, default=None)
+    parser.add_argument(
+        "--legacy-per-second-strategy",
+        action="store_true",
+        help="Debug only: run the old per-second process_batch loop. Default is synchronized minute-window mode.",
+    )
     args = parser.parse_args()
 
     db_path = resolve_db_path(args)
@@ -151,11 +202,10 @@ async def main():
         model_paths={}
     )
     logger.info(
-        "🧭 [Strategy Audit] core=%s cfg=%s INDEX_GUARD_ENABLED=%s INDEX_REVERSAL_EXIT_ENABLED=%s",
-        signal_engine.strategy.__class__.__name__,
-        signal_engine.strategy.cfg.__class__.__module__,
-        getattr(signal_engine.strategy.cfg, 'INDEX_GUARD_ENABLED', None),
-        getattr(signal_engine.strategy.cfg, 'INDEX_REVERSAL_EXIT_ENABLED', None),
+        "🧭 [AlphaEngine Audit] cfg=%s INDEX_GUARD_ENABLED=%s INDEX_REVERSAL_EXIT_ENABLED=%s",
+        signal_engine.cfg.__class__.__module__,
+        getattr(signal_engine.cfg, 'INDEX_GUARD_ENABLED', None),
+        getattr(signal_engine.cfg, 'INDEX_REVERSAL_EXIT_ENABLED', None),
     )
     shared_signal_queue = asyncio.Queue()
     signal_engine.signal_queue = shared_signal_queue
@@ -164,12 +214,15 @@ async def main():
     exec_engine = ExecutionEngineV8(
         symbols=symbols,
         mode='backtest',
-        shared_states=signal_engine.states,
         signal_queue=shared_signal_queue
     )
-    exec_engine.strategy.cfg = signal_engine.strategy.cfg
-    exec_engine.cfg = signal_engine.strategy.cfg
-    exec_engine.use_shared_mem = True
+    logger.info(
+        "🧭 [OMS Strategy Audit] core=%s cfg=%s INDEX_GUARD_ENABLED=%s INDEX_REVERSAL_EXIT_ENABLED=%s",
+        exec_engine.strategy.__class__.__name__,
+        exec_engine.cfg.__class__.__module__,
+        getattr(exec_engine.cfg, 'INDEX_GUARD_ENABLED', None),
+        getattr(exec_engine.cfg, 'INDEX_REVERSAL_EXIT_ENABLED', None),
+    )
 
     logger.info("🔌 Injecting Mock IBKR 1s...")
     mock_ibkr = MockIBKRHistorical()
@@ -246,135 +299,133 @@ async def main():
     start_time = time.time()
 
     ny_tz = pytz.timezone('America/New_York')
-    last_minute = -1
-    minute_diag = None
 
-    for ts_val, group in tqdm(grouped, desc="Replaying", total=unique_groups):
+    minute_windows = {}
+    ordered_minute_ts = []
+
+    for ts_val, group in tqdm(grouped, desc="Preparing minute windows", total=unique_groups):
         dt_ny = datetime.fromtimestamp(ts_val, tz=pytz.utc).astimezone(ny_tz)
         curr_time_str = dt_ny.strftime('%H:%M:%S')
         if curr_time_str < "09:35:00" or curr_time_str > "16:00:00":
             continue
 
-        current_minute = int(ts_val // 60)
-        is_new_minute = (last_minute != current_minute)
-        last_minute = current_minute
+        minute_ts = int(ts_val // 60) * 60
+        packet = build_replay_packet(group, ts_val, is_new_minute=False)
+        packet['minute_ts'] = float(minute_ts)
 
-        symbols_list = group['symbol'].tolist()
-        opt = build_option_arrays(group)
-        packet = {
-            'symbols': symbols_list,
-            'ts': float(ts_val),
-            'stock_price': group['close'].values.astype(np.float32),
-            'fast_vol': safe_col(group, 'fast_vol', 0.0),
-            'precalc_alpha': safe_col(group, 'alpha_score', 0.0),
-            'alpha_label_ts': safe_col(group, 'alpha_label_ts', 0.0, dtype=np.float64),
-            'alpha_available_ts': np.full(len(group), float(ts_val), dtype=np.float64),
-            'spy_roc_5min': safe_col(group, 'spy_roc_5min', 0.0),
-            'qqq_roc_5min': safe_col(group, 'qqq_roc_5min', 0.0),
-            'is_new_minute': is_new_minute,
-            'symbols_with_data': opt['symbols_with_data'],
-            'feed_put_price': opt['put_prices'],
-            'feed_call_price': opt['call_prices'],
-            'feed_put_k': opt['put_ks'],
-            'feed_call_k': opt['call_ks'],
-            'feed_put_iv': opt['put_ivs'],
-            'feed_call_iv': opt['call_ivs'],
-            'feed_put_bid': opt['put_bids'],
-            'feed_put_ask': opt['put_asks'],
-            'feed_call_bid': opt['call_bids'],
-            'feed_call_ask': opt['call_asks'],
-            'feed_put_vol': np.ones(len(group), dtype=np.float32),
-            'feed_call_vol': np.ones(len(group), dtype=np.float32),
-            'feed_call_bid_size': np.full(len(group), 100.0, dtype=np.float32),
-            'feed_call_ask_size': np.full(len(group), 100.0, dtype=np.float32),
-            'feed_put_bid_size': np.full(len(group), 100.0, dtype=np.float32),
-            'feed_put_ask_size': np.full(len(group), 100.0, dtype=np.float32),
-            'slow_1m': np.zeros((len(symbols_list), 30, 1), dtype=np.float32),
-            'feed_put_id': [""] * len(group),
-            'feed_call_id': [""] * len(group),
-        }
-
-        active_now = int((packet['precalc_alpha'] != 0).sum())
-        symbol_rows_now = len(symbols_list)
-
-        if minute_diag is None or minute_diag['minute'] != current_minute:
-            if minute_diag is not None and minute_diag['active_counts']:
-                ac = minute_diag['active_counts']
-                sc = minute_diag['symbol_rows']
-                logger.info(
-                    "📊 [REPLAY_S2_1S-DIAG] Minute %d | Active(min/avg/max)=%d/%.2f/%d | "
-                    "ticks=%d | symbol_rows(min/max)=%d/%d | missing_symbol_ticks=%d | zero_alpha_ticks=%d | boundary_window_ticks=%d",
-                    int(minute_diag['minute']),
-                    int(min(ac)),
-                    float(sum(ac) / len(ac)),
-                    int(max(ac)),
-                    int(len(ac)),
-                    int(min(sc)),
-                    int(max(sc)),
-                    int(minute_diag['missing_symbol_ticks']),
-                    int(minute_diag['zero_alpha_ticks']),
-                    int(minute_diag['boundary_window_ticks']),
-                )
-            minute_diag = {
-                'minute': current_minute,
+        if minute_ts not in minute_windows:
+            minute_windows[minute_ts] = {
+                'minute_ts': float(minute_ts),
+                'alpha_label_ts': float(minute_ts - ALPHA_AVAILABLE_DELAY_SECONDS),
+                'alpha_available_ts': float(minute_ts),
+                'signal_packet': None,
+                'quotes': [],
                 'active_counts': [],
                 'symbol_rows': [],
                 'missing_symbol_ticks': 0,
                 'zero_alpha_ticks': 0,
-                'boundary_window_ticks': 0,
             }
+            ordered_minute_ts.append(minute_ts)
 
-        minute_diag['active_counts'].append(active_now)
-        minute_diag['symbol_rows'].append(symbol_rows_now)
+        window = minute_windows[minute_ts]
+        window['quotes'].append(packet)
+        active_now = int((packet['precalc_alpha'] != 0).sum())
+        symbol_rows_now = len(packet['symbols'])
+        window['active_counts'].append(active_now)
+        window['symbol_rows'].append(symbol_rows_now)
         if symbol_rows_now < expected_symbol_count:
-            minute_diag['missing_symbol_ticks'] += 1
+            window['missing_symbol_ticks'] += 1
         if active_now == 0:
-            minute_diag['zero_alpha_ticks'] += 1
-        if is_new_minute:
-            minute_diag['boundary_window_ticks'] += 1
+            window['zero_alpha_ticks'] += 1
+        if window['signal_packet'] is None:
+            # The minute signal is available at minute_ts and is evaluated once.
+            # The remaining packets in this window are execution quotes only.
+            sig_packet = dict(packet)
+            sig_packet['ts'] = float(minute_ts)
+            sig_packet['is_new_minute'] = True
+            sig_packet['alpha_available_ts'] = np.full(len(packet['symbols']), float(minute_ts), dtype=np.float64)
+            window['signal_packet'] = sig_packet
 
-        if is_new_minute:
-            sig_count = active_now
-            if sig_count > 0:
-                logger.info(f"📡 [REPLAY_S2_1S] Minute {current_minute} | Active Signals: {sig_count}")
+    logger.info(
+        "🚀 Starting synchronized 1s execution windows (%d minutes, %d ticks)...",
+        len(ordered_minute_ts),
+        unique_groups,
+    )
 
-        await signal_engine.process_batch(packet)
-        mock_ibkr.record_market_data(packet, alphas=packet['precalc_alpha'])
+    for minute_ts in tqdm(ordered_minute_ts, desc="Replaying minute windows", total=len(ordered_minute_ts)):
+        window = minute_windows[minute_ts]
+        quotes = window['quotes']
+        if not quotes:
+            continue
 
-        while not shared_signal_queue.empty():
-            try:
-                sig_payload = shared_signal_queue.get_nowait()
-                await exec_engine.process_trade_signal(sig_payload)
-                shared_signal_queue.task_done()
-            except Exception:
-                break
-
-        await exec_engine.process_trade_signal({'action': 'SYNC', 'ts': float(ts_val), 'payload': {}})
-        signal_engine.mock_cash = exec_engine.mock_cash
-
-    if minute_diag is not None and minute_diag['active_counts']:
-        ac = minute_diag['active_counts']
-        sc = minute_diag['symbol_rows']
+        ac = window['active_counts']
+        sc = window['symbol_rows']
         logger.info(
-            "📊 [REPLAY_S2_1S-DIAG] Minute %d | Active(min/avg/max)=%d/%.2f/%d | "
-            "ticks=%d | symbol_rows(min/max)=%d/%d | missing_symbol_ticks=%d | zero_alpha_ticks=%d | boundary_window_ticks=%d",
-            int(minute_diag['minute']),
-            int(min(ac)),
-            float(sum(ac) / len(ac)),
-            int(max(ac)),
-            int(len(ac)),
-            int(min(sc)),
-            int(max(sc)),
-            int(minute_diag['missing_symbol_ticks']),
-            int(minute_diag['zero_alpha_ticks']),
-            int(minute_diag['boundary_window_ticks']),
+            "📊 [REPLAY_S2_1S-WINDOW] Minute %d | Active(min/avg/max)=%d/%.2f/%d | "
+            "ticks=%d | symbol_rows(min/max)=%d/%d | missing_symbol_ticks=%d | zero_alpha_ticks=%d",
+            int(minute_ts // 60),
+            int(min(ac)) if ac else 0,
+            float(sum(ac) / len(ac)) if ac else 0.0,
+            int(max(ac)) if ac else 0,
+            int(len(quotes)),
+            int(min(sc)) if sc else 0,
+            int(max(sc)) if sc else 0,
+            int(window['missing_symbol_ticks']),
+            int(window['zero_alpha_ticks']),
         )
+
+        if args.legacy_per_second_strategy:
+            # Debug-only compatibility path: old behavior, one process_batch per second.
+            for quote_packet in quotes:
+                quote_packet['is_new_minute'] = (float(quote_packet['ts']) == float(quotes[0]['ts']))
+                await signal_engine.process_batch(quote_packet)
+                exec_engine._cache_execution_market_packet(quote_packet)
+                mock_ibkr.record_market_data(quote_packet, alphas=quote_packet['precalc_alpha'])
+                await drain_signal_queue(shared_signal_queue, exec_engine)
+                await exec_engine.process_trade_signal({'action': 'SYNC', 'ts': float(quote_packet['ts']), 'payload': {}})
+                signal_engine.mock_cash = exec_engine.mock_cash
+            continue
+
+        signal_packet = window['signal_packet']
+        if signal_packet is None:
+            continue
+
+        # [Step A] 用 ExecutionWindow 把 alpha_frame + 60 秒 quotes 打包成一等契约,
+        # OMS 通过 execute_window() 单入口编排 "分钟边界一次 + 秒级循环"。
+        # 行为应 bit-identical 于之前三行散调用 (cache_minute + execute_phase).
+        exec_window = ExecutionWindow.from_packets(
+            minute_ts=int(minute_ts),
+            alpha_frame=signal_packet,
+            quotes_1s=quotes,
+        )
+
+        # SE: 仅 alpha 推理 (分钟级), 产物进 signal_queue / ALPHA_FRAME
+        await signal_engine.process_batch(exec_window.alpha_frame)
+        # OMS: 分钟边界 cache/drain + 秒级 ingest/SYNC
+        await exec_engine.execute_window(exec_window)
+        signal_engine.mock_cash = exec_engine.mock_cash
 
     elapsed = time.time() - start_time
     print(f"\n✅ S2 1S Replay Finished in {elapsed:.1f}s.")
     await exec_engine.force_close_all()
     await asyncio.sleep(0.5)
     mock_ibkr.save_trades(filename="replay_trades_s2_1s.csv")
+    # 结果镜像到脚本目录，避免误读旧文件（常见：只看 second/ 下历史 CSV）。
+    try:
+        log_dir = Path.home() / "quant_project" / "logs"
+        src_raw = log_dir / "replay_trades_s2_1s.csv"
+        src_logical = log_dir / "replay_trades_s2_1s_logical.csv"
+        dst_dir = Path(__file__).resolve().parent
+        if src_raw.exists():
+            dst_raw = dst_dir / src_raw.name
+            shutil.copy2(src_raw, dst_raw)
+            print(f"💾 [Mirror] raw trades copied to: {dst_raw}")
+        if src_logical.exists():
+            dst_logical = dst_dir / src_logical.name
+            shutil.copy2(src_logical, dst_logical)
+            print(f"💾 [Mirror] logical trades copied to: {dst_logical}")
+    except Exception as e:
+        print(f"⚠️ [Mirror] copy replay trades failed: {e}")
 
     print("\n" + "=" * 50)
     print("📊 FINAL BACKTEST PERFORMANCE SUMMARY (S2 1S DUAL)")

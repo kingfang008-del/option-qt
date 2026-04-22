@@ -421,6 +421,17 @@ class FeatureComputeService:
         self.last_wait_log_time = 0
         self.state_file = Path(get_feature_service_state_file())
 
+        # [L2] 状态持久化后端: PG 主存 + pkl 二级缓存 (由 FCS_STATE_BACKEND 控制)
+        try:
+            from fcs_state_store import FCSStateStore
+            ns = self.state_file.stem.replace("feature_service_state_", "") or "default"
+            self.state_store = FCSStateStore(namespace=ns, pg_url=PG_DB_URL)
+            self.state_store.ensure_table()
+            logger.info(f"📦 [StateStore] initialised (PG ns={ns}, pkl={self.state_file.name})")
+        except Exception as e:
+            self.state_store = None
+            logger.error(f"[StateStore] init failed, falling back to pkl-only: {e}")
+
         self.latest_opt_buckets = {s: np.zeros((6, 12), dtype=np.float32) for s in self.symbols}
         self.latest_opt_contracts = {s: [] for s in self.symbols}
         self.option_minute_agg = OptionMinuteAggregator()
