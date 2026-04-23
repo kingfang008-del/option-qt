@@ -72,13 +72,26 @@ def test_realtime_dry_never_uses_trade_log_cash_fallback():
     assert source == "No fresh OMS cash"
 
 
-def test_non_realtime_can_use_trade_log_cash_fallback():
+def test_realtime_dry_never_uses_pg_cash_fallback():
+    cash, source = select_remaining_cash(
+        live_cash=None,
+        live_cash_source=None,
+        log_cash=None,
+        latest_cash=500000.0,
+        run_mode="REALTIME_DRY",
+    )
+
+    assert cash == 0.0
+    assert source == "No fresh OMS cash"
+
+
+def test_backtest_can_use_trade_log_cash_fallback():
     cash, source = select_remaining_cash(
         live_cash=None,
         live_cash_source=None,
         log_cash=123456.0,
         latest_cash=None,
-        run_mode="LIVEREPLAY",
+        run_mode="BACKTEST",
     )
 
     assert cash == 123456.0

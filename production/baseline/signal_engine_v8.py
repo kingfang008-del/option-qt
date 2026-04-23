@@ -79,7 +79,6 @@ from config import (
     NON_TRADABLE_SYMBOLS,
     ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS,
     INDEX_TREND_SYMBOLS,
-    IS_LIVEREPLAY,
     IS_BACKTEST,
     IS_SIMULATED
 )
@@ -444,7 +443,7 @@ class SignalEngineV8:
         self.dynamic_vol_std = 0.1106
 
         # 👇 零干扰优化：初始化缓存与高频识别
-        self.is_high_freq = (self.mode == 'realtime' or os.environ.get('RUN_MODE') == 'LIVEREPLAY')
+        self.is_high_freq = (self.mode == 'realtime')
         self.cached_alphas = {}
         self.cached_event_probs = {} # [NEW] 存储事件爆发概率
         self.cached_vol_z = {}
@@ -851,9 +850,8 @@ class SignalEngineV8:
             res['put_iv']  = _safe_f(batch.get('feed_put_iv', batch.get('cheat_put_iv', [0]*len(batch['symbols'])))[i])
 
         else:
-            # 👇 [🔥 致命漏洞修复防弹装甲]
-            # 如果 batch 里根本没有期权数组，说明外壳脚本传错了模式 (把 LIVEREPLAY 传成了 backtest)
-            # 我们直接在此处动态拦截，强行转去读取 Redis 的实时快照！
+            # 如果 batch 里根本没有期权数组，说明外壳脚本传错了模式。
+            # 这里直接转去读取 Redis 的实时快照作为兜底。
             return self._get_opt_data_realtime(sym, st, None, None)
             # 👆 修复结束
             #
@@ -1153,11 +1151,11 @@ class SignalEngineV8:
 
     async def process_batch(self, batch: dict):
         # 🚀 [零干扰引擎] 自动识别数据模式
-        # 如果是实盘/回放模式，或者环境变量强制开启了高频模式，则进入“升频执行，降频推理”
+        # 如果是实盘模式，或者环境变量强制开启了高频模式，则进入“升频执行，降频推理”
         parity_mode_1s = os.environ.get('REPLAY_1S_PARITY_MODE') == '1'
         is_high_freq = (
             not parity_mode_1s and
-            (self.mode == 'realtime' or os.environ.get('RUN_MODE') == 'LIVEREPLAY' or os.environ.get('FORCE_HIGH_FREQ') == '1')
+            (self.mode == 'realtime' or os.environ.get('FORCE_HIGH_FREQ') == '1')
         )
         # is_new_minute = batch.get('is_new_minute', True) # [REMOVED - Re-defined below with safe fallback]
         symbols = batch.get('symbols', [])
@@ -1190,8 +1188,8 @@ class SignalEngineV8:
         is_new_min_crossing = (int(curr_ts / 60) > int(last_t / 60)) or (last_t == 0)
         self.last_process_ts_for_gating = curr_ts
 
-        # 分钟级回测模式：每一帧都是 should_update_full，确保计算不被缓存拦截
-        # 秒级模式 (LIVEREPLAY)：只有在 is_new_minute 为 True 时才是 should_update_full (由特征服务结算驱动)
+        # 分钟级回测模式：每一帧都是 should_update_full，确保计算不被缓存拦截。
+        # 高频实盘模式：只有在 is_new_minute 为 True 时才是 should_update_full。
         # 🚀 [Parity Fix] 如果 batch 里没有传 is_new_minute (Standalone Pitcher)，则安全回退到 ts 跨越逻辑
         is_new_minute = batch.get('is_new_minute', is_new_min_crossing)
 
@@ -1464,7 +1462,7 @@ class SignalEngineV8:
                 st = self.states[sym] = SymbolState(sym)
 
             if st:
-                if self.mode == 'realtime' or os.environ.get('RUN_MODE') == 'LIVEREPLAY':
+                if self.mode == 'realtime':
                     opt_data = self._get_opt_data_realtime(sym, st, ny_now, stock_prices[i], batch)
                 else:
                     opt_data = self._get_opt_data_backtest(batch, i, sym, st)
@@ -1556,15 +1554,20 @@ class SignalEngineV8:
         await self._oms_sync(curr_ts, frame_id=frame_id)
 
     async def _oms_sync(self, curr_ts: float, frame_id: str = None):
-        """[Consolidated] 统一处理 OMS 状态同步与卡位控制"""
-        if not curr_ts: return
+        """Send an execution barrier only; do not synchronize trading state.
 
-        latest_prices = {sym: getattr(st, 'last_opt_price', 0.0)
-                         for sym, st in self.states.items()
-                         if st.position != 0 and hasattr(st, 'last_opt_price')}
+        Redis-mode SE is Alpha Engine only. It must not infer active OMS
+        positions or push position-derived prices back to OMS. Shared-memory
+        replay may still pass latest prices because both sides share one state
+        object and there is no Redis state authority involved.
+        """
+        if not curr_ts: return
 
         # 1. 共享内存模式 (s4 Deterministic Bus)
         if getattr(self, 'use_shared_mem', False):
+            latest_prices = {sym: getattr(st, 'last_opt_price', 0.0)
+                             for sym, st in self.states.items()
+                             if st.position != 0 and hasattr(st, 'last_opt_price')}
             sync_payload = {'action': 'SYNC', 'ts': curr_ts, 'prices': latest_prices}
             await self.signal_queue.put(sync_payload)
             # await self.signal_queue.join() # ❌ [BUG FIX] S4 driver consumes queue sequentially *after* process_tick returns. Calling join() here causes an infinite deadlock.
@@ -1576,7 +1579,7 @@ class SignalEngineV8:
         # 2. Redis 模式 (s2 / Realtime)
         if hasattr(self, 'r'):
             from utils import serialization_utils as ser
-            payload = {'action': 'SYNC', 'ts': curr_ts, 'prices': latest_prices, 'frame_id': frame_id}
+            payload = {'action': 'SYNC', 'ts': curr_ts, 'prices': {}, 'frame_id': frame_id}
             self.r.xadd('orch_trade_signals', {'data': ser.pack(payload)}, maxlen=5000)
             # 屏障由 OMS 在处理 SYNC 后回写，SE 不再提前 ACK。
             # 仅在 only_log_alpha 场景下保留 SE 兜底 ACK。
@@ -1692,8 +1695,8 @@ class SignalEngineV8:
             except Exception: pass
 
         logger.info(f"🔥 V8 Engine Started (Mode: {self.mode}, DB: {target_db})")
-        from config import RUN_MODE, IS_SIMULATED, IS_LIVEREPLAY, IS_BACKTEST
-        logger.info(f"🔍 DEBUG: RUN_MODE={RUN_MODE}, IS_SIMULATED={IS_SIMULATED}, IS_LIVEREPLAY={IS_LIVEREPLAY}, IS_BACKTEST={IS_BACKTEST}")
+        from config import RUN_MODE, IS_SIMULATED, IS_BACKTEST
+        logger.info(f"🔍 DEBUG: RUN_MODE={RUN_MODE}, IS_SIMULATED={IS_SIMULATED}, IS_BACKTEST={IS_BACKTEST}")
 
         # [Config Snapshot] strategy_config0 快照由 OMS (ExecutionEngineV8.run) 负责广播,
         # 它才持有真正生效的 self.strategy.cfg 实例; SE 不再参与.
@@ -1705,9 +1708,6 @@ class SignalEngineV8:
             # 实盘模式下从 PG 恢复
             self._recover_warmup_from_pg()
 
-
-        elif IS_LIVEREPLAY:
-             logger.info(f"🎞️ Live Replay Mode: Skipping IBKR connection.")
         self._ensure_consumer_group()
 
         # [新增] 心跳计时器
@@ -1718,7 +1718,6 @@ class SignalEngineV8:
         HEARTBEAT_TIMEOUT = 120
 
         # 🚀 [🔥 核心新增] 启动内存盈亏监视器，作为数据库之外的第二真相源
-        # 在 LIVEREPLAY 模式下由 process_batch 同步驱动，不在后台扫描以保证确定性
 
 
         # 🛡️ [🔥 硬核新增] 启动防掉单真实对账器
@@ -1751,7 +1750,7 @@ class SignalEngineV8:
                     last_heartbeat = time.time()
 
                 streams_to_read = {REDIS_CFG['input_stream']: '>'}
-                if self.mode != 'backtest' or os.environ.get('RUN_MODE') == 'LIVEREPLAY':
+                if self.mode != 'backtest':
                     streams_to_read[STREAM_FUSED_MARKET] = '>'
 
                 resp = self.r.xreadgroup(REDIS_CFG.get('orch_group'), 'worker_v8', streams_to_read, count=50, block=100)

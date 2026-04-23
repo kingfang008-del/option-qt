@@ -315,6 +315,51 @@ class FCSSupportHandler:
             if conn:
                 conn.close()
 
+    def ensure_option_gate_metrics_partition(self, cursor, minute_ts: float) -> None:
+        """Ensure option_gate_metrics has a daily partition for minute_ts."""
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS option_gate_metrics (
+                ts DOUBLE PRECISION PRIMARY KEY,
+                dt TEXT,
+                total_symbols INT,
+                snapshot_ok_count INT,
+                frame_ok_count INT,
+                ready_count INT,
+                allow_count INT,
+                pass_rate DOUBLE PRECISION,
+                ready_symbols TEXT,
+                allow_symbols TEXT,
+                failed_symbols TEXT
+            ) PARTITION BY RANGE (ts)
+        """)
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_partitioned_table pt
+                JOIN pg_class c ON c.oid = pt.partrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public' AND c.relname = 'option_gate_metrics'
+            )
+        """)
+        is_partitioned = bool(cursor.fetchone()[0])
+        if not is_partitioned:
+            return
+
+        day_date = datetime.fromtimestamp(float(minute_ts), NY_TZ).date()
+        # DST-safe local day boundaries: localize each midnight independently.
+        # Adding timedelta to a pytz-aware datetime can overlap/skip ranges
+        # across the March/November DST transition.
+        day = NY_TZ.localize(datetime.combine(day_date, datetime.min.time()))
+        next_day = NY_TZ.localize(datetime.combine(day_date + timedelta(days=1), datetime.min.time()))
+        date_str = day_date.strftime("%Y%m%d")
+        part_name = f"option_gate_metrics_{date_str}"
+        start_ts = float(day.timestamp())
+        end_ts = float(next_day.timestamp())
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS {part_name} "
+            f"PARTITION OF option_gate_metrics FOR VALUES FROM ({start_ts}) TO ({end_ts})"
+        )
+
     # ------------------------------------------------------------------
     # 状态持久化 (L2: PostgreSQL 主存 + 本地 pkl 二级缓存)
     # ------------------------------------------------------------------
@@ -434,6 +479,8 @@ class FCSSupportHandler:
                 return True
 
         if not result.fully_warmed:
+            if hasattr(svc, '_rebuild_deriv_history_from_history'):
+                svc._rebuild_deriv_history_from_history()
             if not ENABLE_DEEP_WARMUP:
                 logger.info(
                     f"⏭️ [StateStore] PG state incomplete ({result.note}) & Deep Warmup OFF. Starting cold with PG partial."
@@ -444,6 +491,8 @@ class FCSSupportHandler:
             return True
 
         # 完整恢复成功
+        if hasattr(svc, '_rebuild_deriv_history_from_history'):
+            svc._rebuild_deriv_history_from_history()
         logger.info(
             f"♻️ [StateStore] PG state restored: ns={store.namespace} "
             f"saved_at={datetime.fromtimestamp(saved_at, NY_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')} "
@@ -768,21 +817,7 @@ class FCSSupportHandler:
             try:
                 conn = svc._get_pg_conn()
                 c = conn.cursor()
-                c.execute("""
-                    CREATE TABLE IF NOT EXISTS option_gate_metrics (
-                        ts DOUBLE PRECISION PRIMARY KEY,
-                        dt TEXT,
-                        total_symbols INT,
-                        snapshot_ok_count INT,
-                        frame_ok_count INT,
-                        ready_count INT,
-                        allow_count INT,
-                        pass_rate DOUBLE PRECISION,
-                        ready_symbols TEXT,
-                        allow_symbols TEXT,
-                        failed_symbols TEXT
-                    )
-                """)
+                self.ensure_option_gate_metrics_partition(c, minute_ts)
                 c.execute("""
                     INSERT INTO option_gate_metrics
                     (ts, dt, total_symbols, snapshot_ok_count, frame_ok_count, ready_count, allow_count, pass_rate, ready_symbols, allow_symbols, failed_symbols)

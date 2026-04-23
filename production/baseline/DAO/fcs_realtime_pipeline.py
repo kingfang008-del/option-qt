@@ -140,16 +140,96 @@ class FCSRealtimePipeline:
                 if profile is not None and not profile.accept_realtime_tick(dt_ny):
                     continue
                 if profile is not None and profile.should_flush_premarket(dt_ny, getattr(svc, '_premarket_flushed_date', None)):
-                        for s in svc.symbols:
-                            df = svc.history_1min.get(s, pd.DataFrame())
-                            if not df.empty:
-                                idx = df.index
-                                if getattr(idx, "tz", None) is None:
-                                    idx = idx.tz_localize(NY_TZ)
-                                mask = profile.history_keep_mask(idx, dt_ny)
-                                svc.history_1min[s] = df[mask].sort_index()
-                        svc._premarket_flushed_date = dt_ny.date()
-                        logger.info("🧹 Session pre-open cleanup completed.")
+                    zero_opt = np.zeros((6, 12), dtype=np.float32)
+
+                    def _trim_history_map(history_map):
+                        for sym in svc.symbols:
+                            df = history_map.get(sym, pd.DataFrame())
+                            if df is None or df.empty:
+                                history_map[sym] = pd.DataFrame() if df is None else df
+                                continue
+                            idx = df.index
+                            if getattr(idx, "tz", None) is None:
+                                idx = idx.tz_localize(NY_TZ)
+                            mask = profile.history_keep_mask(idx, dt_ny)
+                            history_map[sym] = df[mask].sort_index()
+
+                    _trim_history_map(getattr(svc, 'history_1min', {}))
+                    _trim_history_map(getattr(svc, 'committed_history_1min', {}))
+                    _trim_history_map(getattr(svc, 'history_5min', {}))
+                    _trim_history_map(getattr(svc, 'committed_history_5min', {}))
+
+                    for s in svc.symbols:
+                        # 跨日热启动时，上一交易日尾盘的 option snapshot 不能带入新会话，
+                        # 否则 09:30 之后会用 stale Greeks/IV 连续生成伪分钟快照。
+                        svc.option_snapshot[s] = zero_opt.copy()
+                        if hasattr(svc, 'option_snapshot_5m'):
+                            svc.option_snapshot_5m[s] = zero_opt.copy()
+                        svc.committed_option_snapshot[s] = zero_opt.copy()
+                        svc.committed_latest_opt_buckets[s] = zero_opt.copy()
+                        svc.committed_option_contracts[s] = []
+                        svc.latest_opt_buckets[s] = zero_opt.copy()
+                        svc.latest_opt_contracts[s] = []
+                        svc.last_option_update_ts[s] = None
+                        if hasattr(svc, 'frozen_option_snapshot'):
+                            svc.frozen_option_snapshot[s] = zero_opt.copy()
+                        if hasattr(svc, 'frozen_option_snapshot_5m'):
+                            svc.frozen_option_snapshot_5m[s] = zero_opt.copy()
+                        if hasattr(svc, 'frozen_latest_opt_buckets'):
+                            svc.frozen_latest_opt_buckets[s] = zero_opt.copy()
+                        if hasattr(svc, 'frozen_latest_opt_contracts'):
+                            svc.frozen_latest_opt_contracts[s] = []
+                        if hasattr(svc, 'current_bars_5s'):
+                            svc.current_bars_5s[s] = []
+
+                    if hasattr(svc, 'option_minute_agg'):
+                        svc.option_minute_agg.reset()
+
+                    curr_minute = dt_ny.replace(second=0, microsecond=0)
+                    rth_anchor_minute = curr_minute.replace(
+                        hour=profile.rth_start_time.hour,
+                        minute=profile.rth_start_time.minute,
+                        second=0,
+                        microsecond=0,
+                    ) - pd.Timedelta(minutes=1)
+
+                    prev_global_last_minute = getattr(svc, 'global_last_minute', None)
+                    prev_committed_last_minute = getattr(svc, 'committed_last_minute', None)
+
+                    def _normalize_minute_ts(ts_val):
+                        if ts_val is None:
+                            return None
+                        ts_obj = ts_val if isinstance(ts_val, pd.Timestamp) else pd.Timestamp(ts_val)
+                        if getattr(ts_obj, "tz", None) is None:
+                            ts_obj = ts_obj.tz_localize(NY_TZ)
+                        else:
+                            ts_obj = ts_obj.tz_convert(NY_TZ)
+                        return ts_obj.replace(second=0, microsecond=0)
+
+                    prev_global_last_minute = _normalize_minute_ts(prev_global_last_minute)
+                    prev_committed_last_minute = _normalize_minute_ts(prev_committed_last_minute)
+                    preserve_same_day_watermark = (
+                        prev_global_last_minute is not None
+                        and prev_global_last_minute.date() == dt_ny.date()
+                    )
+
+                    if preserve_same_day_watermark:
+                        svc.global_last_minute = rth_anchor_minute
+                        if (
+                            prev_committed_last_minute is not None
+                            and prev_committed_last_minute.date() == dt_ny.date()
+                        ):
+                            svc.committed_last_minute = min(prev_committed_last_minute, rth_anchor_minute)
+                        else:
+                            svc.committed_last_minute = None
+                    else:
+                        svc.global_last_minute = curr_minute
+                        svc.committed_last_minute = curr_minute
+                    svc._premarket_flushed_date = dt_ny.date()
+                    logger.info(
+                        "🧹 Session pre-open cleanup completed. "
+                        "Trimmed committed histories, cleared stale cross-day option cache, and re-anchored minute watermark."
+                    )
 
                 stock = payload.get('stock', {})
                 if stock:
@@ -273,7 +353,7 @@ class FCSRealtimePipeline:
             svc._set_feature_sync_ack(sync_ts, frame_id=str(int(sync_ts)))
             return None
         sample_s = ready_symbols[0]
-        if len(svc.committed_history_1min[sample_s]) < 1:
+        if len(svc.committed_history_1min.get(sample_s, pd.DataFrame())) < 1:
             svc._set_feature_sync_ack(sync_ts, frame_id=str(int(sync_ts)))
             return None
 

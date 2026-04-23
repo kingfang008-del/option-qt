@@ -89,6 +89,27 @@ REDIS_CFG = {
     'consumer': 'worker_v8_prod',
 }
 
+
+def inject_calendar_features_into_raw_vec(raw_vec, feat_name_to_idx, alpha_label_ts, ny_tz=NY_TZ):
+    """Calendar categorical features must be derived from the NY label time."""
+    try:
+        dt_ny = datetime.fromtimestamp(float(alpha_label_ts), ny_tz)
+    except Exception:
+        return {}
+
+    expected = {}
+    for name, value in {
+        "hour": float(dt_ny.hour),
+        "day_of_week": float(dt_ny.weekday()),
+        "minute": float(dt_ny.minute),
+    }.items():
+        expected[name] = value
+        idx = feat_name_to_idx.get(name) if isinstance(feat_name_to_idx, dict) else None
+        if idx is not None and 0 <= int(idx) < len(raw_vec):
+            raw_vec[int(idx)] = value
+    return expected
+
+
 class RollingWindowNormalizer:
     def __init__(self, feature_names: List[str], config_dicts: Dict[str, dict], window=2000, use_tanh=True):
         self.window = window
@@ -101,6 +122,10 @@ class RollingWindowNormalizer:
         n = len(feature_names)
         self.last_mean = np.zeros(n, dtype=np.float32)
         self.last_std = np.ones(n, dtype=np.float32)
+        # 默认口径：count>=100 后每 5 帧刷新一次统计量。
+        # 语义上仍属于低频台阶式更新；如需更快或更慢刷新，可通过
+        # 环境变量 FCS_NORMALIZER_STATS_UPDATE_INTERVAL 覆盖。
+        self.stats_update_interval = max(1, int(os.environ.get("FCS_NORMALIZER_STATS_UPDATE_INTERVAL", "5")))
         
         # 排除归一化的特征名单
         self.bounded_features = {
@@ -126,8 +151,17 @@ class RollingWindowNormalizer:
         # [对齐离线训练]：定义必须预先压制肥尾分布的特征名单
         self.FAT_TAIL_FEATURES = {'options_iv_momentum', 'options_gamma_accel', 'options_iv_divergence'}
         self.fat_tail_mask = np.array([name in self.FAT_TAIL_FEATURES for name in feature_names], dtype=bool)
+        self._enforce_categorical_identity_stats()
 
     # --- 状态存取 ---
+    def _enforce_categorical_identity_stats(self) -> None:
+        """Categorical/raw features pass through as raw values, even after restore."""
+        try:
+            self.last_mean[self.categorical_mask] = 0.0
+            self.last_std[self.categorical_mask] = 1.0
+        except Exception:
+            pass
+
     def normalize_only(self, x_raw_1d: np.ndarray) -> np.ndarray:
         """
         [新增] 仅归一化，不更新 Buffer 和统计量 (用于盘前/盘后数据)
@@ -135,6 +169,7 @@ class RollingWindowNormalizer:
         if not np.isfinite(x_raw_1d).all():
             x_raw_1d = np.nan_to_num(x_raw_1d, nan=0.0, posinf=0.0, neginf=0.0)
 
+        self._enforce_categorical_identity_stats()
         # 直接使用现有统计量
         x_norm = (x_raw_1d - self.last_mean) / (self.last_std + 1e-6)
         x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=10.0, neginf=-10.0)
@@ -161,6 +196,7 @@ class RollingWindowNormalizer:
         self.last_mean = state.get('mean', self.last_mean)
         self.last_std = state.get('std', self.last_std)
         self.count = state.get('count', 0)
+        self._enforce_categorical_identity_stats()
 
     def process_frame(self, x_raw_1d: np.ndarray) -> np.ndarray:
         if not np.isfinite(x_raw_1d).all():
@@ -175,8 +211,9 @@ class RollingWindowNormalizer:
         self.raw_buffer.append(x_raw_1d)
         self.count += 1
         
-        # 定期更新统计量
-        if self.count < 100 or self.count % 10 == 0:
+        # 每个 committed minute 都刷新统计量；如需压低回放成本，可通过
+        # FCS_NORMALIZER_STATS_UPDATE_INTERVAL 显式调大，但实时默认必须为 1。
+        if self.count < 100 or self.count % self.stats_update_interval == 0:
             if len(self.raw_buffer) >= 2:
                 raw_block = np.vstack(list(self.raw_buffer))
                 self.last_mean = np.mean(raw_block, axis=0).astype(np.float32)
@@ -186,6 +223,7 @@ class RollingWindowNormalizer:
                 self.last_mean[self.categorical_mask] = 0.0
                 self.last_std[self.categorical_mask] = 1.0
 
+        self._enforce_categorical_identity_stats()
         # [对齐离线训练]：Z-Score (epsilon=1e-6) + Tanh(/3) 压缩
         x_norm = (x_raw_1d - self.last_mean) / (self.last_std + 1e-6)
         x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=10.0, neginf=-10.0)
@@ -208,6 +246,7 @@ class RollingWindowNormalizer:
         else: 
             data = full_data
             
+        self._enforce_categorical_identity_stats()
         x_norm = (data - self.last_mean) / (self.last_std + 1e-9)
         x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=10.0, neginf=-10.0)
         
@@ -479,8 +518,6 @@ class FeatureComputeService:
                 f"🧭 Minute write audit enabled | grace={self.minute_commit_grace_sec:.3f}s "
                 f"| sample_symbols={self.minute_write_audit_symbol_limit}"
             )
-
-
         # 尝试加载状态
         self._load_service_state()
 
@@ -658,6 +695,23 @@ class FeatureComputeService:
      
     def _write_debug_batch(self, ts, date_str, fast_data_list, slow_data_list, source_ts=None):
         return self.support_handler.write_debug_batch(ts, date_str, fast_data_list, slow_data_list, source_ts=source_ts)
+
+    def _build_slow_data_list_from_payload(self, compute_payload: Optional[dict]):
+        if not compute_payload:
+            return []
+        batch_syms = compute_payload.get('symbols', []) or []
+        feats_dict = compute_payload.get('features_dict', {}) or {}
+        slow_data_list = []
+        for i, sym in enumerate(batch_syms):
+            vals = []
+            for fn in self.slow_feat_names:
+                f_tensor = feats_dict.get(fn)
+                if f_tensor is not None and i < f_tensor.shape[0]:
+                    vals.append(float(f_tensor[i, -1]))
+                else:
+                    vals.append(0.0)
+            slow_data_list.append((sym, vals))
+        return slow_data_list
 
     # --- 持久化方法 ---
     def _save_service_state(self):
@@ -904,6 +958,47 @@ class FeatureComputeService:
                         df = df.iloc[-self.HISTORY_LEN:]
                     self.history_1min[s] = df
 
+    def _rebuild_deriv_history_from_history(self, symbol: Optional[str] = None):
+        """
+        从已落好的 1min 历史重建导数特征的 lookback 队列。
+
+        这条链路在 warmup / PG 恢复后尤其重要：
+        `options_iv_momentum / options_gamma_accel / options_iv_divergence`
+        本身虽然是 FCS 侧在线计算，但它们依赖最近几分钟的
+        `options_vw_iv / options_vw_gamma / close`。
+        如果重启后 deriv_history 为空，会导致前几分钟重新从 0 开始。
+        """
+        symbols = [symbol] if symbol is not None else list(self.symbols)
+        min_iv = float(getattr(self, 'option_gate_min_iv', 0.01) or 0.01)
+        for sym in symbols:
+            hist_df = self.history_1min.get(sym)
+            dq = deque(maxlen=10)
+            if hist_df is None or hist_df.empty:
+                self.deriv_history[sym] = dq
+                continue
+
+            cols = ['options_vw_iv', 'options_vw_gamma', 'close']
+            if any(col not in hist_df.columns for col in cols):
+                self.deriv_history[sym] = dq
+                continue
+
+            snap_df = hist_df[cols].copy()
+            for col in cols:
+                snap_df[col] = pd.to_numeric(snap_df[col], errors='coerce')
+            snap_df = snap_df.replace([np.inf, -np.inf], np.nan).dropna(subset=cols)
+            snap_df = snap_df[snap_df['close'] > 0.0]
+            snap_df = snap_df[snap_df['options_vw_iv'] >= min_iv]
+            if len(snap_df) > dq.maxlen:
+                snap_df = snap_df.iloc[-dq.maxlen:]
+
+            for _, row in snap_df.iterrows():
+                dq.append({
+                    'iv': float(row['options_vw_iv']),
+                    'gamma': float(row['options_vw_gamma']),
+                    'price': float(row['close']),
+                })
+            self.deriv_history[sym] = dq
+
     def _inject_temporal_derivatives(self, sym: str, raw_vec: np.ndarray, is_new_minute: bool = False):
         """
         [极速截胡] 计算并注入时序导数特征 (期权动量/加速度/量价背离)
@@ -914,6 +1009,10 @@ class FeatureComputeService:
         curr_iv = raw_vec[idx_iv] if idx_iv is not None else 0.0
         curr_gamma = raw_vec[idx_gamma] if idx_gamma is not None else 0.0
         curr_price = self.latest_prices.get(sym, 1.0)
+        if not np.isfinite(curr_iv) or not np.isfinite(curr_gamma) or not np.isfinite(curr_price):
+            return
+        if curr_price <= 0.0 or curr_iv < float(getattr(self, 'option_gate_min_iv', 0.01) or 0.01):
+            return
         
         # 🚀 [致命时序坍缩修复]：只有物理时间跨越了 1 分钟，才往队列里 append
         # 这样保证队列的长度代表了真正的“物理分钟数”，而不是“计算触发次数”！
@@ -1113,16 +1212,32 @@ class FeatureComputeService:
                             alpha_label_ts=alpha_label_ts,
                             is_new_minute=is_new_minute,
                         )
+                        self._inject_temporal_derivatives(sym, raw_vec, is_new_minute=is_new_minute)
 
+                pre_calendar_vals = {}
+                for _cal_name in ("hour", "day_of_week", "minute"):
+                    _cal_idx = self.feat_name_to_idx.get(_cal_name)
+                    if _cal_idx is not None and 0 <= int(_cal_idx) < len(raw_vec):
+                        pre_calendar_vals[_cal_name] = float(raw_vec[int(_cal_idx)])
+                expected_calendar_vals = inject_calendar_features_into_raw_vec(raw_vec, self.feat_name_to_idx, alpha_label_ts, NY_TZ)
+                mismatched_calendar = {
+                    k: (pre_calendar_vals.get(k), v)
+                    for k, v in expected_calendar_vals.items()
+                    if k in pre_calendar_vals and abs(float(pre_calendar_vals.get(k, 0.0)) - float(v)) > 1e-6
+                }
+                if mismatched_calendar and getattr(self, "_calendar_repair_log_count", 0) < 20:
+                    logger.warning(
+                        f"⚠️ [FCS-Calendar-Repair] {sym} calendar feature mismatch before injection "
+                        f"| ts={int(alpha_label_ts)} | mismatch={mismatched_calendar}"
+                    )
+                    self._calendar_repair_log_count = getattr(self, "_calendar_repair_log_count", 0) + 1
                 if is_new_minute and (is_valid or dry_mode):
                     row_ts = pd.Timestamp(alpha_label_ts, unit='s', tz=NY_TZ)
                     if row_ts in self.committed_history_1min[sym].index:
                         for fname in self.slow_feat_names:
-                            if 'options_' in fname:
+                            if 'options_' in fname or fname in {'hour', 'day_of_week', 'minute'}:
                                 self.committed_history_1min[sym].at[row_ts, fname] = raw_vec[self.feat_name_to_idx[fname]]
                                 self.history_1min[sym].at[row_ts, fname] = raw_vec[self.feat_name_to_idx[fname]]
-
-                self._inject_temporal_derivatives(sym, raw_vec, is_new_minute=is_new_minute)
                 batch_raw.append(raw_vec); valid_mask.append(is_valid)
 
             self.cached_results_map, self.cached_batch_raw, self.cached_valid_mask = results_map, batch_raw, valid_mask
@@ -1700,22 +1815,7 @@ class FeatureComputeService:
                                                         continue
                                                 date_str = datetime.fromtimestamp(ts_val, NY_TZ).strftime('%Y%m%d')
                                                 
-                                                # 准备 slow_data_list
-                                                batch_syms = compute_payload.get('symbols', [])
-                                                feats_dict = compute_payload.get('features_dict', {})
-                                                
-                                                slow_data_list = []
-                                                for i, sym in enumerate(batch_syms):
-                                                    # 提取该 symbol 在当前分钟 (索引 -1) 的所有 slow 特征值
-                                                    vals = []
-                                                    for fn in self.slow_feat_names:
-                                                        f_tensor = feats_dict.get(fn)
-                                                        if f_tensor is not None and i < f_tensor.shape[0]:
-                                                            vals.append(float(f_tensor[i, -1]))
-                                                        else:
-                                                            vals.append(0.0)
-                                                    slow_data_list.append((sym, vals))
-                                                
+                                                slow_data_list = self._build_slow_data_list_from_payload(compute_payload)
                                                 if slow_data_list:
                                                     sample_sym, sample_vals = slow_data_list[0]
                                                     logger.info(f"📊 [Persistence-Prep] ts={ts_val} | Symbols={len(slow_data_list)} | Sample={sample_sym} | First 3 Feats={sample_vals[:3]}")

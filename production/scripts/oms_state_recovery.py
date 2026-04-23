@@ -64,6 +64,7 @@ try:
         PG_DB_URL,
         NY_TZ,
         RUN_MODE,
+        OMS_STATE_NAMESPACE,
     )
 except Exception as e:
     print(f"[FATAL] 无法导入 production/baseline/config.py: {e}")
@@ -332,6 +333,7 @@ def inspect_pg() -> dict:
         'global_state_row':    None,
         'stale_symbol_rows':   [],
         'today_symbol_rows':   0,
+        'namespace':           OMS_STATE_NAMESPACE,
     }
     try:
         conn = _pg_conn()
@@ -348,12 +350,24 @@ def inspect_pg() -> dict:
             return result
         result['table_exists'] = True
 
-        c.execute("SELECT COUNT(*) FROM symbol_state")
+        c.execute("""
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='symbol_state' AND column_name='namespace'
+        """)
+        has_namespace = c.fetchone() is not None
+        ns_filter = "WHERE namespace = %s" if has_namespace else ""
+        ns_params = (OMS_STATE_NAMESPACE,) if has_namespace else ()
+
+        c.execute(f"SELECT COUNT(*) FROM symbol_state {ns_filter}", ns_params)
         result['total_rows'] = c.fetchone()[0]
 
         now_ny_date = datetime.now(NY_TZ).date()
 
-        c.execute("SELECT symbol, updated_at FROM symbol_state ORDER BY updated_at DESC")
+        c.execute(
+            f"SELECT symbol, updated_at FROM symbol_state {ns_filter} ORDER BY updated_at DESC",
+            ns_params,
+        )
         rows = c.fetchall()
 
         for sym, updated_at in rows:
@@ -375,7 +389,8 @@ def inspect_pg() -> dict:
                 else:
                     result['stale_symbol_rows'].append((sym, ts_dt))
 
-        print(f"  📦 总行数: {result['total_rows']}")
+        ns_note = f"namespace={OMS_STATE_NAMESPACE}" if has_namespace else "legacy-no-namespace"
+        print(f"  📦 总行数: {result['total_rows']} ({ns_note})")
         print(f"  📅 当日 (NY={now_ny_date}) symbol 状态行: {result['today_symbol_rows']}")
         print(f"  🕰  跨天残留 symbol 状态行: {len(result['stale_symbol_rows'])}")
         if result['global_state_row']:
@@ -421,7 +436,19 @@ def reset_global_state(pg_report: dict, yes: bool) -> None:
     try:
         conn = _pg_conn()
         c = conn.cursor()
-        c.execute("DELETE FROM symbol_state WHERE symbol = %s", ('_GLOBAL_STATE_',))
+        c.execute("""
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='symbol_state' AND column_name='namespace'
+        """)
+        has_namespace = c.fetchone() is not None
+        if has_namespace:
+            c.execute(
+                "DELETE FROM symbol_state WHERE namespace = %s AND symbol = %s",
+                (OMS_STATE_NAMESPACE, '_GLOBAL_STATE_'),
+            )
+        else:
+            c.execute("DELETE FROM symbol_state WHERE symbol = %s", ('_GLOBAL_STATE_',))
         conn.commit()
         print(f"  ✅ 已删除 _GLOBAL_STATE_ ({c.rowcount} 行)")
         conn.close()
@@ -453,10 +480,22 @@ def purge_stale(pg_report: dict, yes: bool) -> None:
         now_ny_date = datetime.now(NY_TZ).date()
         # 取当天 NY 00:00 的 epoch, 删除 updated_at 小于它且 symbol != _GLOBAL_STATE_ 的行
         start_of_day = NY_TZ.localize(datetime.combine(now_ny_date, datetime.min.time())).timestamp()
-        c.execute(
-            "DELETE FROM symbol_state WHERE symbol <> %s AND updated_at < %s",
-            ('_GLOBAL_STATE_', start_of_day),
-        )
+        c.execute("""
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='symbol_state' AND column_name='namespace'
+        """)
+        has_namespace = c.fetchone() is not None
+        if has_namespace:
+            c.execute(
+                "DELETE FROM symbol_state WHERE namespace = %s AND symbol <> %s AND updated_at < %s",
+                (OMS_STATE_NAMESPACE, '_GLOBAL_STATE_', start_of_day),
+            )
+        else:
+            c.execute(
+                "DELETE FROM symbol_state WHERE symbol <> %s AND updated_at < %s",
+                ('_GLOBAL_STATE_', start_of_day),
+            )
         conn.commit()
         print(f"  ✅ 已删除跨天 symbol_state {c.rowcount} 行")
         conn.close()

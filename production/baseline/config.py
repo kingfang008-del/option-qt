@@ -35,20 +35,24 @@ FEATURE_SERVICE_STATE_FILE = CACHE_DIR / "feature_service_state.pkl"
 
 # ================= 系统运行模式 (单一事实来源) =================
 # 模式枚举:
-# - 'REALTIME'      : 实盘链路 + 可下单 (默认)
+# - 'REALTIME'      : 实盘链路 + 可下单
 # - 'REALTIME_DRY'  : 实盘链路 + 禁止下单 (Dry Run)
-# - 'LIVEREPLAY'    : 流式回放 (模拟)
 # - 'BACKTEST'      : 极速回测 (模拟)
 # 通过环境变量隔离，确保所有子进程对当前环境的认知绝对一致
-RUN_MODE = os.environ.get("RUN_MODE", "REALTIME").upper()
+# 默认使用 REALTIME_DRY，防止未显式设置 RUN_MODE 时误入可成交路径。
+RUN_MODE = os.environ.get("RUN_MODE", "REALTIME_DRY").upper()
+_LEGACY_STREAM_REPLAY_MODE = "LIVE" + "REPLAY"
+if RUN_MODE == _LEGACY_STREAM_REPLAY_MODE:
+    RUN_MODE = "BACKTEST"
+if RUN_MODE not in {"REALTIME", "REALTIME_DRY", "BACKTEST"}:
+    raise ValueError(f"Unsupported RUN_MODE={RUN_MODE!r}; expected REALTIME, REALTIME_DRY, or BACKTEST")
 
-IS_LIVEREPLAY = (RUN_MODE == 'LIVEREPLAY')
 IS_BACKTEST   = (RUN_MODE == 'BACKTEST')
 IS_REALTIME_DRY = (RUN_MODE == 'REALTIME_DRY')
-IS_SIMULATED  = (RUN_MODE in ['BACKTEST', 'LIVEREPLAY'])
+IS_SIMULATED  = IS_BACKTEST
 
 # 全局交易开关:
-# - 仿真模式 (BACKTEST/LIVEREPLAY): 强制 False
+# - 仿真模式 (BACKTEST): 强制 False
 # - 实盘 Dry 模式 (REALTIME_DRY): 强制 False
 # - REALTIME: 默认 True，可通过环境变量 TRADING_ENABLED 显式关闭
 TRADING_ENABLED = (
@@ -125,6 +129,26 @@ IBKR_HOST       = '127.0.0.1'
 IBKR_PORT       = 4001          # 🚨 4002=Paper (模拟盘), 4001=Real (实盘)
 IBKR_CLIENT_ID  = 102
 IBKR_ACCOUNT_ID = "DUK363545"
+
+
+def get_oms_state_namespace() -> str:
+    """
+    为 OMS PostgreSQL 状态表生成隔离 namespace。
+
+    symbol_state 是账本/持仓恢复的权威快照，必须按运行模式、账号口径、Redis DB
+    隔离，避免 REALTIME_DRY / REALTIME / 回放之间互相污染。
+    """
+    namespace = os.environ.get("OMS_STATE_NAMESPACE", "").strip()
+    if namespace:
+        return namespace
+    mode_label = RUN_MODE.lower()
+    if RUN_MODE.startswith("REALTIME"):
+        acct_label = "paper" if int(IBKR_PORT) == 4002 else "live"
+        return f"oms_{mode_label}_{acct_label}_db{get_redis_db()}"
+    return f"oms_{mode_label}_db{get_redis_db()}"
+
+
+OMS_STATE_NAMESPACE = get_oms_state_namespace()
 
 # ================= Redis 配置 =================
 # 🚩 [核心流定义]
@@ -234,6 +258,15 @@ AUTO_TRADING_CAPITAL_RATIO = min(
     max(0.0, float(os.environ.get("AUTO_TRADING_CAPITAL_RATIO", "1.0")))
 )
 MANUAL_TRADING_CAPITAL_RATIO = max(0.0, 1.0 - AUTO_TRADING_CAPITAL_RATIO)
+
+# 实盘总资金上限（美元）：
+# - 仅在 RUN_MODE=REALTIME 时生效
+# - 0 表示关闭，沿用 OMS 当前账本/恢复资金
+# - 典型用法：实盘账户很大，但只想先拿 $5,000 做真实验证
+LIVE_TRADING_CAPITAL_LIMIT = max(
+    0.0,
+    float(os.environ.get("LIVE_TRADING_CAPITAL_LIMIT", "5000"))
+)
 
 # 手动触发单笔默认占用手动资金池比例（Dashboard 使用）
 MANUAL_ORDER_ALLOC_RATIO = min(

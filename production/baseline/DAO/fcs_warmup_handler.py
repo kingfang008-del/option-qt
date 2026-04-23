@@ -184,6 +184,8 @@ class FCSWarmupHandler:
         except Exception as e:
             logger.error(f"Backfill Error: {e}", exc_info=True)
 
+        if hasattr(svc, '_rebuild_deriv_history_from_history'):
+            svc._rebuild_deriv_history_from_history()
         logger.info(f"✅ Deep Warmup Complete for {warmup_count} symbols (Dual Resolution).")
         self.publish_warmup_status()
 
@@ -262,6 +264,8 @@ class FCSWarmupHandler:
         except Exception as e:
             logger.error(f"Backfill Error: {e}")
 
+        if hasattr(svc, '_rebuild_deriv_history_from_history'):
+            svc._rebuild_deriv_history_from_history()
         logger.info(f"✅ Deep Warmup (Window=2000) Complete for {warmup_count} symbols.")
         self.publish_warmup_status()
 

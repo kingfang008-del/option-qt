@@ -30,6 +30,7 @@ import psycopg2
 from config import PG_DB_URL
 import threading
 import os
+import uuid
 from pathlib import Path
 from datetime import datetime, time as dt_time, timedelta
 from collections import deque
@@ -78,7 +79,6 @@ from config import (
     SLIPPAGE_EXIT_PCT,          # [Fix] Added to imports
     OMS_SIGNAL_DELAY_BARS,
     OMS_SIGNAL_DELAY_ACTIONS,
-    IS_LIVEREPLAY,
     IS_BACKTEST,
     IS_SIMULATED,
     IS_REALTIME_DRY,
@@ -87,8 +87,11 @@ from config import (
     OMS_MAX_QUOTE_WALL_STALE_SEC,
     OMS_BLOCK_ENTRY_ON_STALE,
     OMS_BLOCK_EXIT_ON_STALE,
-    OMS_ALLOW_EOD_EXIT_ON_STALE
+    OMS_ALLOW_EOD_EXIT_ON_STALE,
+    OMS_STATE_NAMESPACE,
+    LIVE_TRADING_CAPITAL_LIMIT,
 )
+from runtime_trading_controls import get_runtime_live_trading_capital_limit
 
 
 #from train_fast_channel_microstructure import FastMicrostructureModel
@@ -248,6 +251,10 @@ class SymbolState:
         self.pending_side = None
         self.pending_action = None # [幽灵 C] 记录当前锁定的动作
         self.pending_ts = 0.0      # [幽灵 C] 记录加锁时间戳
+        # Independent OMS slot reservation. Pending flags are transient and may
+        # be cleared by async order lifecycles; this one represents capacity.
+        self.entry_slot_reserved = False
+        self.open_fill_confirmed = False
 
         self.prev_macd_hist = 0.0
         
@@ -320,6 +327,8 @@ class SymbolState:
             'correction_mode': self.correction_mode, # 🚨 [修复]
             'prev_macd_hist': self.prev_macd_hist,   # 🚨 [修复]
             'last_spread_pct': self.last_spread_pct, # 🚨 [修复]
+            'entry_slot_reserved': bool(self.entry_slot_reserved),
+            'open_fill_confirmed': bool(self.open_fill_confirmed),
 
             # [新增] 历史数据 Buffer 持久化
             'prices': list(self.prices),
@@ -369,6 +378,14 @@ class SymbolState:
         self.correction_mode = data.get('correction_mode', 'NORMAL') # 🚨 [修复]
         self.prev_macd_hist = data.get('prev_macd_hist', 0.0)        # 🚨 [修复]
         self.last_spread_pct = data.get('last_spread_pct', 0.0)      # 🚨 [修复]
+        self.entry_slot_reserved = bool(data.get('entry_slot_reserved', self.position != 0))
+        explicit_open_fill = data.get('open_fill_confirmed')
+        if explicit_open_fill is None:
+            self.open_fill_confirmed = bool(
+                self.position != 0 and self.qty > 0 and self.entry_price > 0 and self.entry_ts > 0
+            )
+        else:
+            self.open_fill_confirmed = bool(explicit_open_fill)
         
         # [新增] 恢复 Buffer
         if 'prices' in data: self.prices = deque(data['prices'], maxlen=self.prices.maxlen)
@@ -413,7 +430,7 @@ class ExecutionEngineV8:
         
         # IBKR backend selection:
         # - REALTIME / REALTIME_DRY: real connector
-        # - BACKTEST / LIVEREPLAY: mock connector
+        # - BACKTEST: mock connector
         try:
             if self.mode == 'realtime' and not IS_SIMULATED:
                 self.ibkr = IBKRConnectorFinal(client_id=999)
@@ -440,6 +457,7 @@ class ExecutionEngineV8:
         
         self.last_date = None
         self.mock_cash = self.cfg.INITIAL_ACCOUNT
+        self._apply_live_trading_capital_limit("init_default")
         self.index_opening_prices = {}
         self.consecutive_stop_losses = 0
         self.global_cooldown_until = 0
@@ -505,6 +523,11 @@ class ExecutionEngineV8:
         self.win_count = 0               # 盈利笔数
         self.loss_count = 0              # 亏损笔数
         self._ledger_seq = 0             # OMS 本地账本序号（随广播递增）
+        self._boot_id = uuid.uuid4().hex[:12]
+        self._oms_writer_lock_key = f"lock:oms_writer:{RUN_MODE}:db{get_redis_db()}"
+        self._oms_writer_lock_value = f"{self._boot_id}:{os.getpid()}"
+        self._oms_writer_lock_acquired = False
+        self._last_writer_lock_refresh_ts = 0.0
 
         # [NEW] 每日交易数据池 (用于盘后分析)
         self.daily_trades = []
@@ -528,6 +551,149 @@ class ExecutionEngineV8:
                 for k, v in data.items()
             }
         return data
+
+    @staticmethod
+    def _parse_oms_writer_lock_owner(value):
+        """Return (owner_text, pid) from the Redis single-writer lock value."""
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="ignore")
+        owner = str(value or "")
+        try:
+            pid = int(owner.rsplit(":", 1)[-1])
+        except Exception:
+            pid = None
+        return owner, pid
+
+    @staticmethod
+    def _is_local_pid_alive(pid) -> bool:
+        """Best-effort local process liveness check for stale lock recovery."""
+        try:
+            pid = int(pid)
+        except Exception:
+            return False
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
+    def _delete_oms_writer_lock_if_value_matches(self, expected_owner: str) -> bool:
+        """Delete the writer lock only if it still belongs to expected_owner."""
+        script = """
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+            return redis.call('DEL', KEYS[1])
+        end
+        return 0
+        """
+        try:
+            deleted = self.r.eval(script, 1, self._oms_writer_lock_key, str(expected_owner))
+            return int(deleted or 0) == 1
+        except Exception as e:
+            logger.warning(f"⚠️ [OMS Writer Lock] compare-delete failed: {e}")
+            return False
+
+    def _acquire_oms_writer_lock(self, ttl_sec: int = 60) -> bool:
+        """Ensure only one OMS process can publish the realtime cash ledger."""
+        if getattr(self, 'use_shared_mem', False) or self.mode == 'backtest':
+            return True
+        if os.environ.get("ALLOW_MULTIPLE_OMS", "").strip().lower() in ("1", "true", "yes"):
+            logger.warning("⚠️ [OMS Writer Lock] ALLOW_MULTIPLE_OMS enabled; ledger single-writer guard bypassed.")
+            return True
+        try:
+            ok = self.r.set(
+                self._oms_writer_lock_key,
+                self._oms_writer_lock_value,
+                nx=True,
+                ex=int(ttl_sec),
+            )
+            if ok:
+                self._oms_writer_lock_acquired = True
+                self._last_writer_lock_refresh_ts = time.time()
+                logger.info(
+                    f"🔐 [OMS Writer Lock] acquired key={self._oms_writer_lock_key} "
+                    f"value={self._oms_writer_lock_value}"
+                )
+                return True
+            existing = self.r.get(self._oms_writer_lock_key)
+            if isinstance(existing, bytes):
+                existing = existing.decode("utf-8", errors="ignore")
+            if existing == self._oms_writer_lock_value:
+                self._oms_writer_lock_acquired = True
+                self._last_writer_lock_refresh_ts = time.time()
+                self.r.expire(self._oms_writer_lock_key, int(ttl_sec))
+                return True
+
+            owner_text, owner_pid = self._parse_oms_writer_lock_owner(existing)
+            try:
+                lock_ttl = int(self.r.ttl(self._oms_writer_lock_key))
+            except Exception:
+                lock_ttl = None
+            owner_alive = self._is_local_pid_alive(owner_pid) if owner_pid is not None else None
+            if owner_pid is not None and owner_alive is False:
+                logger.warning(
+                    f"🧹 [OMS Writer Lock] stale owner detected for {self._oms_writer_lock_key}: "
+                    f"{owner_text} | ttl={lock_ttl}. Reclaiming lock."
+                )
+                if self._delete_oms_writer_lock_if_value_matches(owner_text):
+                    ok = self.r.set(
+                        self._oms_writer_lock_key,
+                        self._oms_writer_lock_value,
+                        nx=True,
+                        ex=int(ttl_sec),
+                    )
+                    if ok:
+                        self._oms_writer_lock_acquired = True
+                        self._last_writer_lock_refresh_ts = time.time()
+                        logger.info(
+                            f"🔐 [OMS Writer Lock] reclaimed key={self._oms_writer_lock_key} "
+                            f"value={self._oms_writer_lock_value}"
+                        )
+                        return True
+                logger.critical(
+                    f"🚨 [OMS Writer Lock] stale owner reclaim raced/lost for {self._oms_writer_lock_key}: "
+                    f"old={owner_text} current={self._oms_writer_lock_value}"
+                )
+                return False
+
+            logger.critical(
+                f"🚨 [OMS Writer Lock] another OMS is active for {self._oms_writer_lock_key}: "
+                f"{owner_text}. Current={self._oms_writer_lock_value}. ttl={lock_ttl} "
+                f"owner_pid={owner_pid} owner_alive={owner_alive}. Refusing to publish/trade."
+            )
+            return False
+        except Exception as e:
+            logger.error(f"🚨 [OMS Writer Lock] acquire failed: {e}")
+            return False
+
+    def _refresh_oms_writer_lock(self, ttl_sec: int = 60, min_interval_sec: float = 15.0) -> bool:
+        if not getattr(self, '_oms_writer_lock_acquired', False):
+            return True
+        now = time.time()
+        if now - float(getattr(self, '_last_writer_lock_refresh_ts', 0.0) or 0.0) < min_interval_sec:
+            return True
+        try:
+            existing = self.r.get(self._oms_writer_lock_key)
+            if isinstance(existing, bytes):
+                existing = existing.decode("utf-8", errors="ignore")
+            if existing != self._oms_writer_lock_value:
+                logger.critical(
+                    f"🚨 [OMS Writer Lock] lost ownership key={self._oms_writer_lock_key} "
+                    f"existing={existing} current={self._oms_writer_lock_value}. Stop ledger publish."
+                )
+                self._oms_writer_lock_acquired = False
+                return False
+            self.r.expire(self._oms_writer_lock_key, int(ttl_sec))
+            self._last_writer_lock_refresh_ts = now
+            return True
+        except Exception as e:
+            logger.error(f"🚨 [OMS Writer Lock] refresh failed: {e}")
+            return False
 
     def _reconstruct_market_packet(self, payload_list):
         """[Parity] 将 Pitcher 发来的分品种 Payload 列表重组为 S4 模拟器所需的 Batch 格式"""
@@ -892,6 +1058,45 @@ class ExecutionEngineV8:
                     market_price = prev_price
 
         return market_price
+
+    @staticmethod
+    def _state_uses_entry_slot(st) -> bool:
+        if int(getattr(st, 'position', 0) or 0) != 0:
+            return True
+        if bool(getattr(st, 'entry_slot_reserved', False)):
+            return True
+        if bool(getattr(st, 'is_pending', False)):
+            side = str(getattr(st, 'pending_action', None) or getattr(st, 'pending_side', '') or '').upper()
+            return side == 'BUY'
+        return False
+
+    def _count_entry_slots(self) -> int:
+        return sum(1 for st in self.states.values() if self._state_uses_entry_slot(st))
+
+    def _apply_live_trading_capital_limit(self, reason: str = "") -> None:
+        """Clamp OMS cash ledger to the configured live trading cap.
+
+        This is a deliberate risk budget control for RUN_MODE=REALTIME only.
+        It does not affect BACKTEST / REALTIME_DRY, and it does not try to
+        mirror the broker's true account size.
+        """
+        if self.mode != 'realtime' or IS_REALTIME_DRY:
+            return
+        cap = float(get_runtime_live_trading_capital_limit(default_value=LIVE_TRADING_CAPITAL_LIMIT, r=getattr(self, "r", None)) or 0.0)
+        if cap <= 0.0:
+            return
+        try:
+            before = float(self.mock_cash or 0.0)
+        except Exception:
+            before = 0.0
+        after = min(before, cap) if before > 0.0 else cap
+        if abs(after - before) <= 1e-9:
+            return
+        self.mock_cash = after
+        logger.warning(
+            f"🧮 [Live Capital Cap] {reason or 'apply'} | cash capped from ${before:,.2f} to ${after:,.2f} "
+            f"| LIVE_TRADING_CAPITAL_LIMIT=${cap:,.2f}"
+        )
 
     def _should_delay_signal(self, action: str) -> bool:
         return OMS_SIGNAL_DELAY_BARS > 0 and str(action).upper() in OMS_SIGNAL_DELAY_ACTIONS
@@ -1401,14 +1606,30 @@ class ExecutionEngineV8:
         )
         return bool(is_fresh), float(lag), float(wall_lag), q
 
-    def _should_block_strategy_on_stale_quote(self, sym: str, curr_ts: float, action: str, reason: str = "") -> bool:
-        """Block strategy-side BUY/SELL when quote is stale during realtime modes."""
+    def _should_block_strategy_on_stale_quote(
+        self,
+        sym: str,
+        curr_ts: float,
+        action: str,
+        reason: str = "",
+        frame_has_quote: bool = False,
+    ) -> bool:
+        """Block strategy-side BUY/SELL when quote is stale during realtime modes.
+
+        For strategy exits, the minute ALPHA_FRAME may already carry a fresh,
+        symbol-local option quote in ``opt_data`` even when the independent
+        execution-quote cache is stale or briefly missing. In that case we
+        should trust the frame and allow StrategyCore risk exits (especially
+        EOD_CLEAR) to proceed instead of requiring a second cache to refresh.
+        """
         if self.mode != 'realtime' or not OMS_GUARD_STALE_QUOTES:
             return False
         action = str(action or '').upper()
         if action == 'BUY' and not OMS_BLOCK_ENTRY_ON_STALE:
             return False
         if action == 'SELL' and not OMS_BLOCK_EXIT_ON_STALE:
+            return False
+        if action == 'SELL' and frame_has_quote:
             return False
 
         is_fresh, lag, wall_lag, _ = self._execution_quote_freshness(sym, curr_ts)
@@ -1618,8 +1839,18 @@ class ExecutionEngineV8:
                 exit_sig = self.strategy.check_exit(ctx)
                 self._publish_gate_trace(sym, 'exit', exit_sig, event_ts=curr_ts)
                 if exit_sig:
+                    frame_has_quote = bool(
+                        opt_data.get('has_feed')
+                        and ctx_curr_price > 0.01
+                        and ctx_bid > 0.0
+                        and ctx_ask > 0.0
+                    )
                     if self._should_block_strategy_on_stale_quote(
-                        sym, curr_ts, 'SELL', str(exit_sig.get('reason', ''))
+                        sym,
+                        curr_ts,
+                        'SELL',
+                        str(exit_sig.get('reason', '')),
+                        frame_has_quote=frame_has_quote,
                     ):
                         continue
                     exit_sig['price'] = ctx_curr_price
@@ -1722,14 +1953,11 @@ class ExecutionEngineV8:
                 'alpha_strength': raw_rank * mom_multiplier,
             })
 
-        min_symbols = 1 if (IS_BACKTEST or IS_SIMULATED or os.environ.get('RUN_MODE') == 'LIVEREPLAY') else 10
+        min_symbols = 1 if (IS_BACKTEST or IS_SIMULATED) else 10
         if entry_candidates and len(items) >= min_symbols:
             entry_candidates.sort(key=lambda x: x['alpha_strength'], reverse=True)
             max_entries = 3
-            active_slots_now = sum(
-                1 for st in self.states.values()
-                if int(getattr(st, 'position', 0) or 0) != 0 or bool(getattr(st, 'is_pending', False))
-            )
+            active_slots_now = self._count_entry_slots()
             max_slots = int(getattr(self.cfg, 'MAX_POSITIONS', 0) or 0)
             remaining_slots = max(0, max_slots - active_slots_now)
             if remaining_slots <= 0:
@@ -1741,10 +1969,7 @@ class ExecutionEngineV8:
             allowed_entries = min(max_entries, remaining_slots)
 
             for cand in entry_candidates[:allowed_entries]:
-                active_count = sum(
-                    1 for st in self.states.values()
-                    if int(getattr(st, 'position', 0) or 0) != 0 or bool(getattr(st, 'is_pending', False))
-                )
+                active_count = self._count_entry_slots()
                 if active_count >= int(getattr(self.cfg, 'MAX_POSITIONS', 0)):
                     logger.info(
                         f"🚫 [OMS Batch-Limit] {cand['sym']} blocked | "
@@ -1769,9 +1994,15 @@ class ExecutionEngineV8:
         return
 
     async def _broadcast_state_to_redis(self):
-        """将当前 OMS 的真实持仓快照发布到 Redis，供 Signal Engine 对齐"""
+        """Publish a read-only OMS projection for dashboard/diagnostics only.
+
+        Trading state authority stays in OMS memory and PG state snapshots.
+        Signal Engine must not consume this hash to drive strategy decisions.
+        """
         if getattr(self, 'use_shared_mem', False):
             return # 🚀 共享内存模式下，对象修改瞬间双端可见，禁止网络广播！
+        if not self._refresh_oms_writer_lock():
+            return
         import json
         active_states = {}
         
@@ -1780,9 +2011,10 @@ class ExecutionEngineV8:
             if isinstance(sym, bytes):
                 sym = sym.decode('utf-8')
                 
-            # 只要 OMS 确认持仓，或者正在处理订单，就广播出去
-            if st.position != 0 or st.is_pending:
+            # 只要 OMS 确认持仓，或者正在处理订单，就发布只读投影。
+            if self._state_uses_entry_slot(st) or st.is_pending:
                 active_states[sym] = json.dumps({
+                    'projection_only': True,
                     'pos': st.position,
                     'qty': getattr(st, 'qty', 0),
                     'price': st.entry_price,
@@ -1790,17 +2022,18 @@ class ExecutionEngineV8:
                     'ts': st.entry_ts,
                     'max_roi': getattr(st, 'max_roi', 0.0),
                     'is_pending': st.is_pending,
-                    # 👇 [核心修复] 必须补齐 SE 退出评估依赖的策略元数据
+                    # 仅供 Dashboard/诊断展示，不能作为 SE 策略状态输入。
                     'entry_spy_roc': getattr(st, 'entry_spy_roc', 0.0),
                     'entry_index_trend': getattr(st, 'entry_index_trend', 0),
                     'entry_alpha_z': getattr(st, 'entry_alpha_z', 0.0),
                     'entry_iv': getattr(st, 'entry_iv', getattr(st, 'last_valid_iv', 0.0))
                 })
         
-        # 👑 同时同步资金池状态
+        # 👑 同时发布资金池只读投影
         ledger_run_mode = str(RUN_MODE or '').upper()
         ledger_engine_mode = str(getattr(self, 'mode', '') or '').upper()
         active_states['____SYSTEM_CASH____'] = json.dumps({
+            'projection_only': True,
             'cash': self.mock_cash,
             'ts': time.time(),
             'mode': ledger_run_mode,
@@ -1828,16 +2061,19 @@ class ExecutionEngineV8:
             'updated_at': f"{time.time():.3f}",
             'mode': ledger_run_mode,
             'engine_mode': ledger_engine_mode,
+            'projection_only': '1',
+            'writer_pid': str(os.getpid()),
+            'boot_id': str(getattr(self, '_boot_id', '')),
+            'writer_lock': str(getattr(self, '_oms_writer_lock_key', '')),
+            'state_namespace': OMS_STATE_NAMESPACE,
+            'open_positions': str(self._count_entry_slots()),
         })
         pipe.expire("meta:oms_ledger", 24 * 3600)
         pipe.execute()
 
-        # [Cross-Process Sync] 广播 per-symbol cooldown_until 到 Redis。
-        # 历史 bug: 止损/反转后 OMS 在 _process_exit_accounting 里写
-        # st.cooldown_until = now + 60min, 但该字段没被放进 oms:live_positions,
-        # SE 进程因此永远读不到, 策略 _check_entry_pre_conditions 里的
-        # `ctx['cooldown_until']` 永远是 0 → 同标的止损后下一 tick 立刻又能 BUY.
-        # 独立 hash 方便原子刷新, 不污染持仓账本语义; 6h TTL 兜底跨日清理。
+        # [Observability Projection] per-symbol cooldown_until.
+        # 只给 Dashboard/诊断展示，策略冷却由 OMS 本地 StrategyCore 状态裁决。
+        # 禁止 SE 或其他进程把该 Redis hash 当交易状态同步源。
         try:
             now_ts = time.time()
             cooldown_mapping = {}
@@ -1870,8 +2106,7 @@ class ExecutionEngineV8:
                     cb_tag = f"🔥 CB ON {(cb_until - now_hb) / 60:.0f}m"
                 else:
                     cb_tag = "CB OFF"
-                pos_cnt = sum(1 for st in self.states.values()
-                              if int(getattr(st, 'position', 0) or 0) != 0 or bool(getattr(st, 'is_pending', False)))
+                pos_cnt = self._count_entry_slots()
                 max_pos = int(getattr(self.cfg, 'MAX_POSITIONS', 0))
                 cd_list = []
                 for sym, st in self.states.items():
@@ -2012,9 +2247,12 @@ class ExecutionEngineV8:
                 logger.error(f"❌ [OMS] Error executing {action} for {sym}: {e}")
             finally:
                 # 🛡️ 最终防线：无论成交与否，只要完成了本轮逻辑，必须释放标志位
-                st.is_pending = False
-                st.pending_action = None
-                st.pending_side = None
+                # 冰山开仓会在后台继续成交；此时必须保持 pending，
+                # 否则同一 AlphaFrame 的后续候选会忽略这笔锁定资金/名额。
+                if not bool(getattr(st, '_async_entry_order_active', False)):
+                    st.is_pending = False
+                    st.pending_action = None
+                    st.pending_side = None
         
         # 👑 处理完毕后 (仅限交易信号)，全网广播最新的真实持仓状态！
         await self._broadcast_state_to_redis()
@@ -2025,9 +2263,9 @@ class ExecutionEngineV8:
     async def run(self):
         """
         [V8 终极执行引擎主循环]
-        采用非阻塞异步 Redis 流消费，完美兼容 LiveReplay 发球机架构与实盘。
+        采用非阻塞异步 Redis 流消费，兼容实盘与回测信号流。
         """
-        from config import REDIS_CFG, STREAM_ORCH_SIGNAL, STREAM_FUSED_MARKET, IS_LIVEREPLAY, SYNC_EXECUTION, TRADING_ENABLED
+        from config import REDIS_CFG, STREAM_ORCH_SIGNAL, STREAM_FUSED_MARKET, SYNC_EXECUTION, TRADING_ENABLED
         import os
         import traceback
         import asyncio
@@ -2035,6 +2273,9 @@ class ExecutionEngineV8:
         from utils import serialization_utils as ser
         
         logger.info(f"🔥 Execution Engine (OMS) Started (DB: {self.r.connection_pool.connection_kwargs.get('db')})")
+
+        if not self._acquire_oms_writer_lock():
+            return
         
         # 1. 确保消费组存在
         self._ensure_consumer_group()
@@ -2042,7 +2283,7 @@ class ExecutionEngineV8:
         # 1.1 [Startup Init] 双引擎 OMS 必须自行完成:
         #       (A) 连接 IBKR (REALTIME/REALTIME_DRY, 非 SIMULATED);
         #       (B) 从 PG 恢复当日 mock_cash + 同日持仓 (_load_state);
-        #       (C) 从 IBKR 读真实账户净资产, 按 TRADING_ENABLED/real_bal 优先级覆盖 mock_cash。
+        #       (C) 从 IBKR 读真实账户净资产只做观测日志, 不覆盖 OMS cash ledger。
         #     之前这段逻辑只存在于 single-process system_orchestrator_v8, 双引擎架构下
         #     OMS 从未 connect / get_balance / _load_state → mock_cash 永远 50000,
         #     REALTIME 甚至下不出单。
@@ -2053,6 +2294,7 @@ class ExecutionEngineV8:
                     sm = getattr(self, 'state_manager', None)
                     if sm is not None:
                         sm._load_state()
+                        self._apply_live_trading_capital_limit("post_load_state")
                         restored_open_positions = sum(
                             1 for _st in self.states.values()
                             if int(getattr(_st, 'position', 0) or 0) != 0
@@ -2080,28 +2322,12 @@ class ExecutionEngineV8:
                         except Exception as e:
                             real_bal = None
                             logger.warning(f"⚠️ [OMS-Init] get_account_balance 异常: {e}")
-                        if TRADING_ENABLED and real_bal is not None and real_bal > 0:
-                            # [🛡️ Cash Source Guard]
-                            # 若已从 state 恢复到未平仓仓位, 不要在启动时用券商余额覆盖 mock_cash。
-                            # 否则当 real_bal 口径包含仓位价值时, 会与本地已恢复仓位形成双计,
-                            # 表现为 Dashboard Remaining Cash 异常跳高/翻倍。
-                            if restored_open_positions > 0:
-                                logger.warning(
-                                    f"⚠️ [OMS-Init] restored_open_positions={restored_open_positions} > 0; "
-                                    f"skip broker balance override (real_bal=${float(real_bal):,.2f}), "
-                                    f"keep restored mock_cash=${self.mock_cash:,.2f}."
-                                )
-                            else:
-                                self.mock_cash = float(real_bal)
-                                logger.info(f"💰 [OMS-Init] REAL ACCOUNT BALANCE LOADED: ${self.mock_cash:,.2f}")
-                        else:
-                            # REALTIME_DRY / TRADING_ENABLED=False: 保留 _load_state 恢复出来的值;
-                            # 若 PG 也没有, 就保持 INITIAL_ACCOUNT 兜底。
-                            tag = "DRY RUN" if IS_REALTIME_DRY else "TRADING_OFF"
-                            logger.info(
-                                f"⚠️ [OMS-Init] {tag} | 真实账户余额={real_bal} | "
-                                f"继续使用本地 mock_cash=${self.mock_cash:,.2f}"
-                            )
+                        logger.info(
+                            f"💰 [OMS-Init] Broker balance observed={real_bal} | "
+                            f"OMS cash ledger kept=${self.mock_cash:,.2f} | "
+                            f"restored_open_positions={restored_open_positions} | "
+                            f"TRADING_ENABLED={TRADING_ENABLED} | IS_REALTIME_DRY={IS_REALTIME_DRY}"
+                        )
                 else:
                     logger.info(
                         f"🧪 [OMS-Init] mode={self.mode}/ibkr={type(self.ibkr).__name__ if self.ibkr else None} "
@@ -2110,10 +2336,9 @@ class ExecutionEngineV8:
         except Exception as e:
             logger.error(f"❌ [OMS-Init] 启动期初始化异常: {e}")
 
-        # [Startup Broadcast Barrier]
-        # 历史问题: OMS 启动后虽已从 PG 恢复到真实持仓/资金, 但在收到首条交易信号前不会主动
-        # 广播 oms:live_positions。SE 在这段窗口读取空快照会误判为空仓并重复发 BUY/SELL。
-        # 修复: 启动完成后立即广播一次当前账本, 让 SE 与 Dashboard 拿到一致的初始真相。
+        # [Startup Projection]
+        # OMS 启动后发布一次只读账本投影，供 Dashboard/诊断看到当前状态。
+        # SE 不读取该投影，策略交易状态只由 OMS 内存/PG 快照管理。
         try:
             await self._broadcast_state_to_redis()
             logger.info("📡 [OMS-Init] Startup state broadcast completed.")
@@ -2145,8 +2370,8 @@ class ExecutionEngineV8:
         except Exception as e:
             logger.warning(f"⚠️ [OMS-Init] Alpha barrier publish failed: {e}")
 
-        # 2. 启动后台监控任务 (非回放模式或启用同步时)
-        if not IS_LIVEREPLAY and not SYNC_EXECUTION:
+        # 2. 启动后台监控任务 (同步回测时不启动后台扫描，保持确定性)
+        if not SYNC_EXECUTION:
             asyncio.create_task(self._pnl_monitor_loop())
             if TRADING_ENABLED:
                 asyncio.create_task(self.reconciler.run_reconciliation_loop())
@@ -2154,7 +2379,7 @@ class ExecutionEngineV8:
         target_group = getattr(self, '_oms_group', REDIS_CFG.get('oms_group') or REDIS_CFG.get('orch_group') or GROUP_OMS)
         consumer_name = f"oms_consumer_{os.getpid()}"
         
-        # 我们需要同时监听信号流(指令)和行情流(兜底/状态同步)
+        # 同时监听信号流(指令/ALPHA_FRAME)和行情流(只做执行报价缓存兜底)
         streams = {STREAM_ORCH_SIGNAL: '>', STREAM_FUSED_MARKET: '>'}
         last_stats_log = time.time()
         stats = {'msgs': 0, 'signal': 0, 'fused': 0, 'acks': 0}
@@ -2184,6 +2409,8 @@ class ExecutionEngineV8:
         
         while True:
             try:
+                if not self._refresh_oms_writer_lock():
+                    return
                 now = time.time()
                 if now - last_health_check_ts >= health_check_interval_sec:
                     last_health_check_ts = now
@@ -2257,16 +2484,8 @@ class ExecutionEngineV8:
                             try:
                                 self.r.xack(stream_str, target_group, msg_id)
                                 stats['acks'] += 1
-                                
-                                # [Parity Barrier] 如果开启了回放模式，处理完后报备锁
-                                ts_val = payload.get('ts') if isinstance(payload, dict) else None
-                                if IS_LIVEREPLAY and ts_val:
-                                    logger.info(f"🔓 [OMS] Releasing barrier for ts={ts_val}")
-                                    self._mark_exec_done(ts_val)
-                                elif IS_LIVEREPLAY:
-                                    logger.warning(f"⚠️ [OMS] IS_LIVEREPLAY active but ts missing in payload from {stream_str}")
                             except Exception as ack_err:
-                                logger.error(f"ACK/Sync Error: {ack_err}")
+                                logger.error(f"ACK Error: {ack_err}")
                                 
                         except Exception as msg_err:
                             logger.error(f"OMS Error processing msg_id {msg_id}: {msg_err}")

@@ -51,10 +51,8 @@ async def main():
     logger.info(f"🧭 Runtime Mode: RUN_MODE={RUN_MODE} | IS_SIMULATED={IS_SIMULATED} | TRADING_ENABLED={TRADING_ENABLED}")
 
     # [🧹 Startup State Hygiene]
-    # OMS 启动前无条件清掉 Redis oms:live_positions 里的上一轮残留快照。
-    # 本进程随后会通过 _broadcast_state_to_redis 在自己就绪后重新 publish 真实账本，
-    # 所以这里删除是安全的；好处是 SE 侧在 OMS 尚未 broadcast 完成前不会读到
-    # 陈旧仓位快照。仿真模式 (IS_SIMULATED) 及 SKIP_STARTUP_CLEANUP=1 时自动跳过。
+    # OMS 启动前只清 Redis dashboard projection；交易状态只从 OMS 内存/PG 快照恢复，
+    # 不再允许 Redis 仓位投影参与策略或交易同步。
     try:
         from startup_state_hygiene import run_startup_cleanup
         _dry = os.environ.get("STARTUP_CLEANUP_DRY_RUN", "").strip().lower() in ("1", "true", "yes")

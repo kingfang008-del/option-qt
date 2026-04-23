@@ -51,6 +51,7 @@ class _State:
         self.pending_action = ""
         self.last_opt_price = 2.0
         self.cooldown_until = 0.0
+        self.entry_slot_reserved = False
 
 
 class _DummyRedis:
@@ -71,9 +72,11 @@ class _DummyIBKR:
 
 class _DummyAccounting:
     def __init__(self) -> None:
+        self.open_calls = []
         self.exit_calls = []
 
     def _process_open_accounting(self, *args, **kwargs):
+        self.open_calls.append((args, kwargs))
         return None
 
     def _process_exit_accounting(self, *args, **kwargs):
@@ -146,6 +149,180 @@ def test_execute_entry_scope_guard_no_unboundlocalerror() -> None:
                 raise AssertionError(f"不应再触发 trade 作用域错误: {e}") from e
             else:  # pragma: no cover
                 raise AssertionError("预期应抛出 RuntimeError(limit calc failed)")
+
+
+def test_realtime_iceberg_entry_keeps_pending_until_background_task_finishes() -> None:
+    _bootstrap_imports()
+    import orchestrator_execution as oe  # noqa: E402
+
+    orch = _build_orch(mode="realtime")
+    orch.cfg.LIMIT_BUFFER_ENTRY = 1.0
+    ex = oe.OrchestratorExecution(orch)
+    st = orch.states["NVDA"]
+
+    sig = {
+        "tag": "CALL_ATM",
+        "dir": 1,
+        "reason": "UNIT_ICEBERG",
+        "price": 2.0,
+        "meta": {"iv": 0.3, "contract_id": "NVDA260313C00180000", "strike": 180.0, "ask_size": 1},
+    }
+    captured_coros = []
+
+    def _capture_task(coro):
+        captured_coros.append(coro)
+        coro.close()
+        return SimpleNamespace(cancel=lambda: None)
+
+    with patch.object(oe.LiquidityRiskManager, "evaluate_order", return_value={"final_alloc": 3000.0, "chunks": 2, "reason": "unit"}):
+        with patch.object(oe, "DISABLE_ICEBERG", False), patch.object(oe, "SYNC_EXECUTION", False):
+            with patch("asyncio.create_task", side_effect=_capture_task):
+                asyncio.run(ex._execute_entry("NVDA", sig, stock_price=100.0, curr_ts=1_777_777_777.0, batch_idx=0))
+
+    assert captured_coros, "chunks>1 的 realtime 开仓应启动后台冰山任务"
+    assert st.is_pending is True
+    assert getattr(st, "_async_entry_order_active", False) is True
+    assert st.locked_cash > 0
+    assert orch.mock_cash == 50000.0, "冰山单开始执行但未成交前不应改变 Remaining Cash"
+
+
+def test_entry_allows_fourth_slot_but_blocks_fifth() -> None:
+    _bootstrap_imports()
+    import orchestrator_execution as oe  # noqa: E402
+
+    orch = _build_orch(mode="realtime")
+    orch.cfg.LIMIT_BUFFER_ENTRY = 1.0
+    for sym in ["AAPL", "MSFT", "AMZN"]:
+        st = _State()
+        st.symbol = sym
+        st.position = 1
+        st.qty = 1
+        st.entry_price = 2.0
+        st.entry_slot_reserved = True
+        orch.states[sym] = st
+
+    ex = oe.OrchestratorExecution(orch)
+    sig = {
+        "tag": "CALL_ATM",
+        "dir": 1,
+        "reason": "UNIT_FOURTH",
+        "price": 2.0,
+        "meta": {"iv": 0.3, "contract_id": "NVDA260313C00180000", "strike": 180.0},
+    }
+
+    with patch.object(oe.LiquidityRiskManager, "evaluate_order", return_value={"final_alloc": 1000.0, "chunks": 1, "reason": "unit"}):
+        with patch.object(oe, "TRADING_ENABLED", False):
+            asyncio.run(ex._execute_entry("NVDA", sig, stock_price=100.0, curr_ts=1_777_777_777.0, batch_idx=0))
+
+    assert orch.states["NVDA"].position != 0, "已有 3 个持仓时，第 4 个应允许开仓"
+    assert getattr(orch.states["NVDA"], "entry_slot_reserved", False) is True
+
+    fifth = _State()
+    fifth.symbol = "TSLA"
+    orch.states["TSLA"] = fifth
+    sig2 = {
+        "tag": "CALL_ATM",
+        "dir": 1,
+        "reason": "UNIT_FIFTH",
+        "price": 2.0,
+        "meta": {"iv": 0.3, "contract_id": "TSLA260313C00180000", "strike": 180.0},
+    }
+
+    with patch.object(oe.LiquidityRiskManager, "evaluate_order", return_value={"final_alloc": 1000.0, "chunks": 1, "reason": "unit"}):
+        with patch.object(oe, "TRADING_ENABLED", False):
+            asyncio.run(ex._execute_entry("TSLA", sig2, stock_price=100.0, curr_ts=1_777_777_778.0, batch_idx=1))
+
+    assert fifth.position == 0, "已有 4 个 active slot 时，第 5 个必须被拒绝"
+    assert getattr(fifth, "entry_slot_reserved", False) is False
+
+
+def test_live_capital_limit_caps_realtime_entry_allocation() -> None:
+    _bootstrap_imports()
+    import orchestrator_execution as oe  # noqa: E402
+
+    orch = _build_orch(mode="realtime")
+    ex = oe.OrchestratorExecution(orch)
+
+    sig = {
+        "tag": "CALL_ATM",
+        "dir": 1,
+        "reason": "UNIT_LIVE_CAP",
+        "price": 2.0,
+        "meta": {"iv": 0.3, "contract_id": "NVDA260313C00180000", "strike": 180.0},
+    }
+    seen = {}
+
+    def _fake_liq_eval(_sym, alloc, _price, **_kwargs):
+        seen["alloc"] = float(alloc)
+        return {"final_alloc": float(alloc), "chunks": 1, "reason": "unit"}
+
+    with patch.object(oe.LiquidityRiskManager, "evaluate_order", side_effect=_fake_liq_eval):
+        with patch.object(oe, "LIVE_TRADING_CAPITAL_LIMIT", 5000.0), \
+             patch.object(oe, "IS_REALTIME_DRY", False), \
+             patch.object(oe, "TRADING_ENABLED", False), \
+             patch.object(oe, "SYNC_EXECUTION", True):
+            asyncio.run(ex._execute_entry("NVDA", sig, stock_price=100.0, curr_ts=1_777_777_777.0, batch_idx=0))
+
+    assert round(seen["alloc"], 2) == 2500.0, "测试夹具 POSITION_RATIO=50%，实盘总资金上限=5000 时单笔应为 2500 美元"
+
+
+def test_runtime_live_capital_limit_override_beats_config_default() -> None:
+    _bootstrap_imports()
+    import orchestrator_execution as oe  # noqa: E402
+
+    orch = _build_orch(mode="realtime")
+    ex = oe.OrchestratorExecution(orch)
+
+    sig = {
+        "tag": "CALL_ATM",
+        "dir": 1,
+        "reason": "UNIT_RUNTIME_CAP",
+        "price": 2.0,
+        "meta": {"iv": 0.3, "contract_id": "NVDA260313C00180000", "strike": 180.0},
+    }
+
+    seen = {}
+
+    def _capture(_sym, final_alloc, _price, **_kwargs):
+        seen["alloc"] = final_alloc
+        return {"final_alloc": final_alloc, "chunks": 1, "reason": "unit"}
+
+    with patch.object(oe, "LIVE_TRADING_CAPITAL_LIMIT", 5000.0), \
+         patch.object(oe, "IS_REALTIME_DRY", False), \
+         patch.object(oe, "TRADING_ENABLED", False), \
+         patch.object(oe, "SYNC_EXECUTION", True), \
+         patch.object(oe, "get_runtime_live_trading_capital_limit", return_value=4000.0), \
+         patch.object(oe.LiquidityRiskManager, "evaluate_order", side_effect=_capture):
+        asyncio.run(ex._execute_entry("NVDA", sig, stock_price=100.0, curr_ts=1_777_777_777.0, batch_idx=0))
+
+    assert round(seen["alloc"], 2) == 2000.0, "Redis runtime cap=4000 时，应覆盖 config 默认 5000，单笔分配为 2000 美元"
+
+
+def test_runtime_trading_disable_switches_realtime_entry_to_dry_path() -> None:
+    _bootstrap_imports()
+    import orchestrator_execution as oe  # noqa: E402
+
+    orch = _build_orch(mode="realtime")
+    ex = oe.OrchestratorExecution(orch)
+
+    sig = {
+        "tag": "CALL_ATM",
+        "dir": 1,
+        "reason": "UNIT_RUNTIME_DISARM",
+        "price": 2.0,
+        "meta": {"iv": 0.3, "contract_id": "NVDA260313C00180000", "strike": 180.0},
+    }
+
+    with patch.object(oe, "LIVE_TRADING_CAPITAL_LIMIT", 5000.0), \
+         patch.object(oe, "IS_REALTIME_DRY", False), \
+         patch.object(oe, "TRADING_ENABLED", True), \
+         patch.object(oe, "SYNC_EXECUTION", False), \
+         patch.object(oe, "get_runtime_trading_enabled", return_value=False), \
+         patch.object(oe.OrchestratorExecution, "_get_entry_limit_price", return_value=2.0), \
+         patch.object(oe.LiquidityRiskManager, "evaluate_order", return_value={"final_alloc": 2000.0, "chunks": 1, "reason": "unit"}):
+        asyncio.run(ex._execute_entry("NVDA", sig, stock_price=100.0, curr_ts=1_777_777_777.0, batch_idx=0))
+
+    assert orch.accounting.open_calls, "Runtime disarm 后，realtime 开仓应走 dry accounting 路径而不是真实下单"
 
 
 def test_execute_exit_put_uses_bid_size_in_dry_mode() -> None:
@@ -254,6 +431,8 @@ def test_entry_requote_cap_blocks_over_2pct() -> None:
 
 def main() -> None:
     test_execute_entry_scope_guard_no_unboundlocalerror()
+    test_realtime_iceberg_entry_keeps_pending_until_background_task_finishes()
+    test_entry_allows_fourth_slot_but_blocks_fifth()
     test_execute_exit_put_uses_bid_size_in_dry_mode()
     test_execution_cfg_override_limit_buffers()
     test_entry_requote_cap_blocks_over_2pct()
@@ -262,4 +441,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

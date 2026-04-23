@@ -34,8 +34,7 @@ class DataPersistenceServicePG:
                 self.r.xgroup_create(stream, REDIS_CFG['pg_group'], mkstream=True, id='0')
             except redis.exceptions.ResponseError as e:
                 if "BUSYGROUP" in str(e):
-                    # 🚀 [CRITICAL] Force reset to '0' to catch up missed history
-                    self.r.xgroup_setid(stream, REDIS_CFG['pg_group'], id='0')
+                    logger.info(f"Consumer group already exists for {stream}; keeping current offset.")
                 else: 
                     logger.error(f"Group Error ({stream}): {e}")
 
@@ -56,6 +55,7 @@ class DataPersistenceServicePG:
         self.last_synthesized = {} # {symbol: last_5m_ts}
         
         self.trade_buffer = []
+        self.trade_pending_acks = []
         self.alpha_buffer = []
         self.last_flush = time.time()
         # 默认分钟表质量优先：只落 Greeks 已就绪的 option snapshot
@@ -514,11 +514,84 @@ class DataPersistenceServicePG:
         except Exception as e:
             logger.error(f"❌ [Market Process Error] Symbol: {symbol}, TS: {ts}, Error: {e}", exc_info=True)
 
+    def flush_trade_logs(self):
+        """Persist trade audit rows synchronously, then ACK Redis.
+
+        Trade logs are the audit trail for OPEN/CLOSE pairing. They must not be
+        acknowledged before PostgreSQL commit, otherwise a persistence restart
+        can leave a valid OMS position with a missing OPEN row.
+        """
+        if not self.trade_buffer:
+            return True
+
+        snapshot = list(self.trade_buffer)
+        ack_snapshot = list(self.trade_pending_acks)
+        try:
+            conn = self._get_pg_conn()
+            c = conn.cursor()
+            realtime_logs = []
+            backtest_logs = []
+            from config import NY_TZ
+
+            for item in snapshot:
+                ts = item[0]
+                dt_ny = datetime.fromtimestamp(ts, NY_TZ).strftime('%Y-%m-%d %H:%M:%S')
+                row = (ts, dt_ny, item[1], item[2], item[3], item[4], item[5])
+                mode = str(item[6] or 'REALTIME').upper()
+                if mode in ['BACKTEST', 'SHADOW', 'REALTIME_DRY']:
+                    backtest_logs.append(row)
+                else:
+                    realtime_logs.append(row)
+
+            if realtime_logs:
+                psycopg2.extras.execute_batch(
+                    c,
+                    "INSERT INTO trade_logs VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    realtime_logs,
+                )
+
+            if backtest_logs:
+                psycopg2.extras.execute_batch(
+                    c,
+                    "INSERT INTO trade_logs_backtest VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    backtest_logs,
+                )
+
+            conn.commit()
+            c.close()
+
+            del self.trade_buffer[:len(snapshot)]
+            del self.trade_pending_acks[:len(ack_snapshot)]
+            for stream_name, msg_id in ack_snapshot:
+                try:
+                    self.r.xack(stream_name, REDIS_CFG['pg_group'], msg_id)
+                except Exception as ack_e:
+                    logger.warning(f"Trade log ACK failed ({stream_name}, {msg_id}): {ack_e}")
+            return True
+        except Exception as e:
+            logger.error(f"Trade Flush Error: {e}")
+            try:
+                if self.conn and self.conn.closed == 0:
+                    self.conn.rollback()
+            except Exception:
+                pass
+            if 'no partition' in str(e).lower() or 'violates' in str(e).lower():
+                try:
+                    from config import NY_TZ
+                    data_dt = datetime.fromtimestamp(snapshot[0][0], NY_TZ) if snapshot else datetime.now(NY_TZ)
+                    self._create_daily_partition(data_dt)
+                except Exception as pe:
+                    logger.error(f"Trade partition creation failed: {pe}")
+            return False
+
     def flush(self):
+        if self.trade_buffer:
+            self.flush_trade_logs()
+
         if not (
             self.bar_buffer_1s or self.bar_buffer or self.bar_buffer_5m
             or self.option_buffer_1s or self.option_buffer or self.option_buffer_5m
-            or self.trade_buffer or self.alpha_buffer
+            or self.alpha_buffer
         ):
             return
         
@@ -575,30 +648,6 @@ class DataPersistenceServicePG:
                         SET buckets_json = EXCLUDED.buckets_json
                     """, rows)
                     for k in keys_to_del: del buf[k]
-
-            # 3. Trades
-            if self.trade_buffer:
-                realtime_logs = []
-                backtest_logs = []
-                
-                for item in self.trade_buffer:
-                    ts = item[0]
-                    from config import NY_TZ
-                    dt_ny = datetime.fromtimestamp(ts, NY_TZ).strftime('%Y-%m-%d %H:%M:%S')
-                    row = (ts, dt_ny, item[1], item[2], item[3], item[4], item[5]) 
-                    mode = item[6]
-                    if mode in ['BACKTEST', 'LIVEREPLAY', 'SHADOW']:
-                        backtest_logs.append(row)
-                    else:
-                        realtime_logs.append(row)
-                
-                if realtime_logs:
-                    psycopg2.extras.execute_batch(c, "INSERT INTO trade_logs VALUES (%s,%s,%s,%s,%s,%s,%s)", realtime_logs)
-                
-                if backtest_logs:
-                    psycopg2.extras.execute_batch(c, "INSERT INTO trade_logs_backtest VALUES (%s,%s,%s,%s,%s,%s,%s)", backtest_logs)
-                    
-                self.trade_buffer = []
 
             conn.commit()
             c.close()
@@ -733,6 +782,7 @@ class DataPersistenceServicePG:
                         msg_count += len(msgs)
                         for msg_id, data in msgs:
                             try:
+                                acked = False
                                 payload = None
                                 if b'batch' in data:
                                     # [New] Support for vectorized batch payloads (all streams)
@@ -776,11 +826,15 @@ class DataPersistenceServicePG:
                                                 float(payload.get('qty', 0)), float(payload.get('price', 0)),
                                                 json.dumps(payload), mode
                                             ))
+                                            self.trade_pending_acks.append((stream_name, msg_id))
+                                            self.flush_trade_logs()
+                                            acked = True
                                             
                                     elif stream_name == STREAM_INFERENCE:
                                         self.process_feature_data(payload)
                                         
-                                self.r.xack(stream_name, REDIS_CFG['pg_group'], msg_id)
+                                if not acked:
+                                    self.r.xack(stream_name, REDIS_CFG['pg_group'], msg_id)
 
                             except Exception as e:
                                 logger.error(f"Message Parse Error ({stream_name}): {e}")

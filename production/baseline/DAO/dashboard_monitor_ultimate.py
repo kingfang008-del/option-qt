@@ -39,12 +39,20 @@ from config import (
     STREAM_TRADE_LOG, BUCKET_SPECS, TAG_TO_INDEX, IBKR_PORT, PG_DB_URL,
     AUTO_TRADING_CAPITAL_RATIO, MANUAL_TRADING_CAPITAL_RATIO, MANUAL_ORDER_ALLOC_RATIO,
     COMMISSION_PER_CONTRACT,
-    STREAM_ORCH_SIGNAL, GROUP_OMS, GROUP_ORCH, RUN_MODE,
+    STREAM_ORCH_SIGNAL, GROUP_OMS, GROUP_ORCH, RUN_MODE, OMS_STATE_NAMESPACE,
+    LIVE_TRADING_CAPITAL_LIMIT, TRADING_ENABLED,
 )
 from dashboard_cash_utils import (
     parse_oms_ledger_hash,
     parse_oms_live_cash_payload,
     select_remaining_cash,
+)
+from runtime_trading_controls import (
+    clear_runtime_live_trading_capital_limit,
+    get_runtime_live_trading_capital_limit,
+    get_runtime_trading_enabled,
+    set_runtime_live_trading_capital_limit,
+    set_runtime_trading_enabled,
 )
 
 # [Fix 1] 补全 Dashboard 所需的 Redis Key 映射
@@ -77,19 +85,35 @@ def _load_feat_names(json_path, resolution=None):
     except Exception:
         return []
 
+def _load_feat_resolution_map(json_path):
+    """从 feature JSON 提取 name -> resolution，供 Debug Inspector 解释低频广播特征。"""
+    try:
+        if not json_path.exists():
+            return {}
+        with open(json_path, 'r') as f:
+            cfg = _json.load(f)
+        return {
+            feat['name']: feat.get('resolution', '1min')
+            for feat in cfg.get('features', [])
+            if isinstance(feat, dict) and feat.get('name')
+        }
+    except Exception:
+        return {}
+
 def fetch_latest_mock_cash():
     """从 PostgreSQL symbol_state 表中读取 _GLOBAL_STATE_ 里的 mock_cash"""
-    # 👇 [🔥 修复：新增回放模式拦截] 👇
-    from config import IS_LIVEREPLAY, TRADING_ENABLED
-    # 如果系统处于回放模式，或者禁止了实盘交易，绝对不能读数据库里的历史残留资金！
-    if IS_LIVEREPLAY or not TRADING_ENABLED:
+    from config import TRADING_ENABLED
+    # 如果禁止了实盘交易，绝对不能读数据库里的历史残留资金。
+    if not TRADING_ENABLED:
         return None
-    # 👆 修复结束 👆
 
     try:
         conn = psycopg2.connect(PG_DB_URL)
         c = conn.cursor()
-        c.execute("SELECT data, updated_at FROM symbol_state WHERE symbol = '_GLOBAL_STATE_'")
+        c.execute(
+            "SELECT data, updated_at FROM symbol_state WHERE namespace = %s AND symbol = '_GLOBAL_STATE_'",
+            (OMS_STATE_NAMESPACE,),
+        )
         row = c.fetchone()
         conn.close()
         if row:
@@ -148,9 +172,28 @@ def fetch_live_oms_cash(
     except Exception:
         return (None, None) if return_source else None
 
-_FEAT_JSON_DIR = SCRIPT_DIR  # daily_backtest/
+
+def fetch_live_broker_balance():
+    """Read latest broker account snapshot from Redis connector cache."""
+    try:
+        r = redis.Redis(**{k: v for k, v in REDIS_CFG.items() if k in ['host', 'port', 'db']}, decode_responses=False)
+        raw_acct = r.hget('live_account_info', 'balance')
+        if not raw_acct:
+            return None, None
+        acct_data = ser.unpack(raw_acct)
+        net_liq = float(acct_data.get('net_liquidation', 0.0) or 0.0)
+        avail = float(acct_data.get('available_funds', 0.0) or 0.0)
+        return net_liq, avail
+    except Exception:
+        return None, None
+
+_FEAT_JSON_DIR = BASE_PROJECT_DIR.parent / "CONFIG"
+if not (_FEAT_JSON_DIR / "slow_feature.json").exists():
+    _FEAT_JSON_DIR = SCRIPT_DIR  # legacy fallback: daily_backtest/
 FAST_FEAT_NAMES = _load_feat_names(_FEAT_JSON_DIR / "fast_feature.json")
 SLOW_FEAT_NAMES = _load_feat_names(_FEAT_JSON_DIR / "slow_feature.json")
+FAST_FEAT_RESOLUTIONS = _load_feat_resolution_map(_FEAT_JSON_DIR / "fast_feature.json")
+SLOW_FEAT_RESOLUTIONS = _load_feat_resolution_map(_FEAT_JSON_DIR / "slow_feature.json")
 
 # Fallback: 如果 JSON 不存在，用占位名
 if not FAST_FEAT_NAMES:
@@ -222,6 +265,71 @@ def get_redis_client():
     except Exception as e:
         st.error(f"Redis Connection Failed: {e}")
         return None
+
+
+def _apply_runtime_control_action(pending_action: dict):
+    rds = get_redis_client()
+    if not rds:
+        raise RuntimeError("Redis unavailable")
+    action = str((pending_action or {}).get("action") or "")
+    if action == "set_cap":
+        new_cap = float((pending_action or {}).get("value") or 0.0)
+        saved = set_runtime_live_trading_capital_limit(new_cap, r=rds, source="dashboard")
+        return f"Live trading cap saved: ${saved:,.2f}"
+    if action == "reset_cap":
+        clear_runtime_live_trading_capital_limit(r=rds, source="dashboard_reset")
+        return "Live trading cap reset to config default"
+    if action == "set_trading":
+        enabled = bool((pending_action or {}).get("value"))
+        saved = set_runtime_trading_enabled(enabled, r=rds, source="dashboard")
+        return "Live trading armed" if saved else "Live trading disarmed"
+    raise ValueError(f"Unsupported runtime control action: {action}")
+
+
+def _render_runtime_control_dialog():
+    pending = st.session_state.get("runtime_control_pending")
+    if not pending:
+        notice = st.session_state.pop("runtime_control_notice", "")
+        if notice:
+            st.success(notice)
+        return
+
+    def _cancel():
+        st.session_state.pop("runtime_control_pending", None)
+        st.rerun()
+
+    def _confirm():
+        notice = _apply_runtime_control_action(pending)
+        st.session_state["runtime_control_notice"] = notice
+        st.session_state.pop("runtime_control_pending", None)
+        st.rerun()
+
+    title = "Confirm Live Control Change"
+    body = str(pending.get("message") or "Please confirm this live runtime change.")
+
+    if hasattr(st, "dialog"):
+        @st.dialog(title)
+        def _dialog():
+            st.warning(body)
+            st.caption("Type `CONFIRM` to continue.")
+            token = st.text_input("Confirmation", key="runtime_control_confirm_token")
+            c1, c2 = st.columns(2)
+            if c1.button("Confirm", type="primary", use_container_width=True, disabled=(token.strip().upper() != "CONFIRM")):
+                _confirm()
+            if c2.button("Cancel", use_container_width=True):
+                _cancel()
+
+        _dialog()
+        return
+
+    with st.sidebar.expander("Confirm Live Control Change", expanded=True):
+        st.warning(body)
+        token = st.text_input("Type CONFIRM", key="runtime_control_confirm_token_fallback")
+        c1, c2 = st.columns(2)
+        if c1.button("Confirm", type="primary", use_container_width=True, disabled=(token.strip().upper() != "CONFIRM")):
+            _confirm()
+        if c2.button("Cancel", use_container_width=True):
+            _cancel()
 
 def get_ibkr_connector_status(rds):
     """读取 ibkr_connector_v8 上报的连接状态。"""
@@ -1665,7 +1773,7 @@ def render_momentum_panel():
             )
 
 def render_debug_inspector():
-    """读取每日统一 DB 并可视化 debug_slow/fast 原始特征"""
+    """读取每日统一 DB 并可视化 debug_slow/fast 模型特征。"""
     st.markdown("## 🐞 特征引擎透视 (Feature Engine Inspector)")
     
     ny_tz = timezone('America/New_York')
@@ -1679,8 +1787,10 @@ def render_debug_inspector():
         
         if "Slow" in table_source:
             base_table_name = "debug_slow"
+            feat_resolutions = SLOW_FEAT_RESOLUTIONS
         else:
             base_table_name = "debug_fast"
+            feat_resolutions = FAST_FEAT_RESOLUTIONS
             
         table_name = f"{base_table_name}_{today_str}"
     
@@ -1727,7 +1837,18 @@ def render_debug_inspector():
             cols = ['time_str', 'created_at'] + [c for c in df.columns if c not in ['time_str', 'created_at', 'ts', 'symbol']]
             df_display = df[cols].copy()
 
-            st.markdown(f"### 📊 {selected_sym} Raw Features ({table_name})")
+            st.markdown(f"### 📊 {selected_sym} Model Features ({table_name})")
+            five_min_cols = [
+                c for c in df_display.select_dtypes(include=[np.number]).columns
+                if feat_resolutions.get(c) == '5min'
+            ]
+            if five_min_cols:
+                st.caption(
+                    "这些列配置为 `resolution=5min`，FCS 会把 5min 值广播到对应的 1min 行；"
+                    "因此连续几分钟相同是预期现象: "
+                    + ", ".join(five_min_cols[:12])
+                    + (" ..." if len(five_min_cols) > 12 else "")
+                )
             
             # 动态检查全0或NaN
             numeric_cols = df_display.select_dtypes(include=[np.number]).columns
@@ -1855,14 +1976,112 @@ with st.sidebar:
     symbol = st.selectbox("Symbol", symbols, index=1)
     auto_refresh = st.checkbox("Auto Refresh (1s)", True)
     if st.button("Manual Refresh"): st.rerun()
+    if RUN_MODE == "REALTIME":
+        st.markdown("### Live Risk Controls")
+        current_trading_enabled, current_trading_meta = get_runtime_trading_enabled(
+            default_value=TRADING_ENABLED,
+            r=r,
+            return_meta=True,
+        )
+        trade_status = "ARMED" if current_trading_enabled else "DISARMED"
+        trade_color = "#EF553B" if current_trading_enabled else "#00CC96"
+        st.markdown(
+            f"**Live Trading**: <span style='color:{trade_color}'>{trade_status}</span>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"source: {current_trading_meta.get('source', 'config')} | by: {current_trading_meta.get('updated_by') or 'config'}"
+        )
+        tc1, tc2 = st.columns(2)
+        if tc1.button("Arm Trading", use_container_width=True, disabled=(not TRADING_ENABLED or current_trading_enabled)):
+            st.session_state["runtime_control_pending"] = {
+                "action": "set_trading",
+                "value": True,
+                "message": "This will allow REALTIME OMS to submit real orders. Please confirm carefully.",
+            }
+            st.rerun()
+        if tc2.button("Disarm Trading", use_container_width=True, disabled=(not current_trading_enabled)):
+            st.session_state["runtime_control_pending"] = {
+                "action": "set_trading",
+                "value": False,
+                "message": "This will stop REALTIME OMS from sending new real orders and switch execution back to dry-style accounting.",
+            }
+            st.rerun()
+        current_live_cap, current_live_cap_meta = get_runtime_live_trading_capital_limit(
+            default_value=LIVE_TRADING_CAPITAL_LIMIT,
+            r=r,
+            return_meta=True,
+        )
+        live_cap_input = st.number_input(
+            "Live Trading Cap ($)",
+            min_value=0.0,
+            value=float(current_live_cap or 0.0),
+            step=500.0,
+            key="live_trading_cap_input",
+        )
+        lc1, lc2 = st.columns(2)
+        if lc1.button("Save Cap", use_container_width=True):
+            st.session_state["runtime_control_pending"] = {
+                "action": "set_cap",
+                "value": float(live_cap_input),
+                "message": f"This will update the REALTIME live trading cap to ${float(live_cap_input):,.2f}.",
+            }
+            st.rerun()
+        if lc2.button("Reset Cap", use_container_width=True):
+            st.session_state["runtime_control_pending"] = {
+                "action": "reset_cap",
+                "message": "This will clear the Redis override and restore the config default live trading cap.",
+            }
+            st.rerun()
+        cap_source = current_live_cap_meta.get("source", "config")
+        cap_updater = current_live_cap_meta.get("updated_by") or "config"
+        st.caption(
+            f"current: ${float(current_live_cap or 0.0):,.2f} | source: {cap_source} | by: {cap_updater}"
+        )
+        st.caption(f"config default: ${float(LIVE_TRADING_CAPITAL_LIMIT or 0.0):,.2f}")
     st.divider()
     st.markdown("### Model Health Guide")
     st.info("IC > 0.05: Healthy\nIC < 0: Inverted\nIC ~ 0: Decay")
+
+_render_runtime_control_dialog()
 
 # --- Top: Topology ---
 status = SystemStatus(r, symbol)
 st.plotly_chart(draw_topology(status), use_container_width=True)
 render_momentum_panel()
+
+if RUN_MODE == "REALTIME":
+    top_live_trading_enabled, top_live_trading_meta = get_runtime_trading_enabled(
+        default_value=TRADING_ENABLED,
+        r=r,
+        return_meta=True,
+    )
+    top_live_trading_source = top_live_trading_meta.get("source", "config")
+    top_live_trading_by = top_live_trading_meta.get("updated_by") or "config"
+    if top_live_trading_enabled:
+        st.markdown(
+            f"""
+            <div style='background:#5A1E1E; border:1px solid #EF553B; color:#FFF4F2; padding:12px 16px; border-radius:10px; margin:8px 0 14px 0; font-weight:600;'>
+                REAL ORDERS ENABLED
+                <span style='font-weight:400; margin-left:10px; opacity:0.9;'>
+                    source: {top_live_trading_source} | by: {top_live_trading_by}
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f"""
+            <div style='background:#153B2E; border:1px solid #00CC96; color:#EFFFF8; padding:12px 16px; border-radius:10px; margin:8px 0 14px 0; font-weight:600;'>
+                LIVE ORDERS BLOCKED
+                <span style='font-weight:400; margin-left:10px; opacity:0.9;'>
+                    source: {top_live_trading_source} | by: {top_live_trading_by}
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 # [New] Interactive Warmup Buttons
 c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
@@ -3031,6 +3250,46 @@ with tab5:
                     c5.metric("Win Rate", f"{win_rate:.1f}%", f"{wins}W / {losses}L")
                     c6.metric("Open Positions", f"{len(open_positions)} Symbols")
 
+                    broker_net_liq, broker_avail = fetch_live_broker_balance()
+                    live_trading_enabled, live_trading_meta = get_runtime_trading_enabled(
+                        default_value=TRADING_ENABLED,
+                        r=r,
+                        return_meta=True,
+                    )
+                    live_cap, live_cap_meta = get_runtime_live_trading_capital_limit(
+                        default_value=LIVE_TRADING_CAPITAL_LIMIT,
+                        r=r,
+                        return_meta=True,
+                    )
+                    live_cap = float(live_cap or 0.0)
+                    broker_cols = st.columns(4)
+                    broker_cols[0].metric(
+                        "Broker Balance",
+                        f"${broker_net_liq:,.2f}" if broker_net_liq is not None and broker_net_liq > 0 else "N/A",
+                    )
+                    broker_cols[0].caption(
+                        f"available: ${broker_avail:,.2f}" if broker_avail is not None and broker_avail > 0 else "available: N/A"
+                    )
+                    broker_cols[1].metric(
+                        "OMS Cash Ledger",
+                        f"${live_cash:,.2f}" if live_cash is not None else f"${display_cash:,.2f}",
+                    )
+                    broker_cols[1].caption(f"source: {live_cash_source or cash_source}")
+                    broker_cols[2].metric(
+                        "Live Trading Cap",
+                        f"${live_cap:,.2f}" if live_cap > 0 else "Unlimited",
+                    )
+                    broker_cols[2].caption(
+                        f"source: {live_cap_meta.get('source', 'config')}" if live_cap > 0 else "cap disabled"
+                    )
+                    broker_cols[3].metric(
+                        "Live Trading",
+                        "ARMED" if live_trading_enabled else "DISARMED",
+                    )
+                    broker_cols[3].caption(
+                        f"source: {live_trading_meta.get('source', 'config')} | by: {live_trading_meta.get('updated_by') or 'config'}"
+                    )
+
                     if paper_details:
                         st.dataframe(
                             pd.DataFrame(paper_details).style.applymap(
@@ -3048,14 +3307,17 @@ with tab5:
                 df_trade = df_all.sort_values(by='ts', ascending=False).head(100).copy()
                 df_trade['time'] = pd.to_datetime(df_trade['ts'], unit='s', utc=True).dt.tz_convert(NY_TZ).dt.strftime('%Y-%m-%d %H:%M:%S')
                 
-                # [New] 把上方算好的纸面盈亏同步赋值给依然 OPEN 的历史日志
+                # OPEN 日志是审计事件，pnl/roi 应保持为空；当前浮盈单独展示为
+                # paper_pnl/paper_roi，避免误读成“开仓瞬间继承了上一笔涨幅”。
+                df_trade['paper_pnl'] = np.nan
+                df_trade['paper_roi'] = np.nan
                 for idx, row in df_trade.iterrows():
                     if row.get('action') == 'OPEN' and row.get('symbol') in open_positions:
                         sym = row['symbol']
-                        df_trade.at[idx, 'pnl'] = open_positions[sym].get('paper_pnl', 0.0)
-                        df_trade.at[idx, 'roi'] = open_positions[sym].get('roi_pct', 0.0) / 100.0 # 格式化要求小数
+                        df_trade.at[idx, 'paper_pnl'] = open_positions[sym].get('paper_pnl', 0.0)
+                        df_trade.at[idx, 'paper_roi'] = open_positions[sym].get('roi_pct', 0.0) / 100.0
                         
-                display_cols = ['time', 'symbol', 'action', 'qty', 'fill_duration', 'fill_ratio', 'account_cash', 'price', 'pnl', 'roi', 'stock_price', 'entry_stock', 'mode', 'alpha', 'reason']
+                display_cols = ['time', 'symbol', 'action', 'qty', 'fill_duration', 'fill_ratio', 'account_cash', 'price', 'paper_pnl', 'paper_roi', 'pnl', 'roi', 'stock_price', 'entry_stock', 'mode', 'alpha', 'reason']
                 final_cols = [c for c in display_cols if c in df_trade.columns]
                 
                 st.dataframe(
@@ -3063,7 +3325,7 @@ with tab5:
                         lambda x: 'color: #00CC96' if x == 'OPEN' else ('color: #EF553B' if x == 'CLOSE' else ''), subset=['action']
                     ).applymap(
                         lambda x: 'color: #00CC96' if pd.notna(x) and x > 0 else ('color: #EF553B' if pd.notna(x) and x < 0 else ''),
-                        subset=['pnl', 'roi'] if 'pnl' in final_cols and 'roi' in final_cols else []
+                        subset=[c for c in ['paper_pnl', 'paper_roi', 'pnl', 'roi'] if c in final_cols]
                     ),
                     use_container_width=True
                 )
@@ -3646,6 +3908,7 @@ def _sh_inspect_pg_state():
         'table_exists': False, 'total_rows': 0,
         'today_symbol_rows': 0, 'stale_symbol_rows': [],
         'global_state_row': None, 'connected': False, 'error': None,
+        'namespace': OMS_STATE_NAMESPACE,
     }
     try:
         conn = psycopg2.connect(PG_DB_URL)
@@ -3660,10 +3923,13 @@ def _sh_inspect_pg_state():
             conn.close()
             return summary
         summary['table_exists'] = True
-        c.execute("SELECT COUNT(*) FROM symbol_state")
+        c.execute("SELECT COUNT(*) FROM symbol_state WHERE namespace = %s", (OMS_STATE_NAMESPACE,))
         summary['total_rows'] = c.fetchone()[0]
         now_ny_date = datetime.now(NY_TZ).date()
-        c.execute("SELECT symbol, updated_at FROM symbol_state ORDER BY updated_at DESC")
+        c.execute(
+            "SELECT symbol, updated_at FROM symbol_state WHERE namespace = %s ORDER BY updated_at DESC",
+            (OMS_STATE_NAMESPACE,),
+        )
         for sym, updated_at in c.fetchall():
             try:
                 ts_dt = datetime.fromtimestamp(float(updated_at), NY_TZ).date()
@@ -3800,7 +4066,10 @@ def _sh_run_action(action: str):
             conn = psycopg2.connect(PG_DB_URL); c = conn.cursor()
             c.execute("SELECT to_regclass('public.symbol_state')")
             if c.fetchone()[0] is not None:
-                c.execute("DELETE FROM symbol_state WHERE symbol = %s", ('_GLOBAL_STATE_',))
+                c.execute(
+                    "DELETE FROM symbol_state WHERE namespace = %s AND symbol = %s",
+                    (OMS_STATE_NAMESPACE, '_GLOBAL_STATE_'),
+                )
                 conn.commit()
                 msgs.append(f"✅ 已删除 _GLOBAL_STATE_ ({c.rowcount} 行)")
             else:
@@ -3816,8 +4085,8 @@ def _sh_run_action(action: str):
                 now_ny_date = datetime.now(NY_TZ).date()
                 start_of_day = NY_TZ.localize(datetime.combine(now_ny_date, dt_time.min)).timestamp()
                 c.execute(
-                    "DELETE FROM symbol_state WHERE symbol <> %s AND updated_at < %s",
-                    ('_GLOBAL_STATE_', start_of_day),
+                    "DELETE FROM symbol_state WHERE namespace = %s AND symbol <> %s AND updated_at < %s",
+                    (OMS_STATE_NAMESPACE, '_GLOBAL_STATE_', start_of_day),
                 )
                 conn.commit()
                 msgs.append(f"✅ 已清除跨天 symbol_state ({c.rowcount} 行)")

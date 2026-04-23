@@ -4,6 +4,7 @@ import json
 import time
 import os
 from config import TRADING_ENABLED
+from runtime_trading_controls import get_runtime_trading_enabled
 
 logger = logging.getLogger("V8_Orchestrator.Reconciler")
 
@@ -16,6 +17,17 @@ class OrchestratorReconciler:
         self._last_cash_warn_ts = 0.0
         self._last_cash_pause_ts = 0.0
 
+    def _runtime_trading_enabled(self) -> bool:
+        try:
+            return bool(
+                get_runtime_trading_enabled(
+                    default_value=TRADING_ENABLED,
+                    r=getattr(self.orch, 'r', None),
+                )
+            )
+        except Exception:
+            return bool(TRADING_ENABLED)
+
     async def run_reconciliation_loop(self):
         """
         [防掉单对账器] 后台守护协程
@@ -26,7 +38,7 @@ class OrchestratorReconciler:
             await asyncio.sleep(self.reconcile_interval)
             
             # 仅在实盘且允许交易的模式下进行物理对账
-            if self.orch.mode != 'realtime' or not TRADING_ENABLED:
+            if self.orch.mode != 'realtime' or not self._runtime_trading_enabled():
                 continue
                 
             # 确保 IBKR 连接正常

@@ -120,6 +120,11 @@ class RealTimeFeatureEngine:
         self.time_gen = TimeFeatureGenerator(self.device)
         self.rfr_cache = {} # Cache for RFR per date
         self.epsilon = 1e-6
+        # 这些特征属于时间/类别语义，不能做 median/iqr 缩放，否则会被压成接近 0。
+        self.NO_STATS_SCALE_FEATURES = {
+            'session', 'day_of_week', 'hour', 'is_holiday',
+            'minute', 'is_expiry', 'is_fed_meeting', 'stock_id', 'timestamp', 'date', 'symbol'
+        }
         # 定义必须在 Pandas 原始分钟频率下预计算的特征
         self.PANDAS_FEATS = [
             'close_log_return', 'open_log_return', 'price_z_score','volume_ratio', 'vwap_diff',
@@ -523,6 +528,45 @@ class RealTimeFeatureEngine:
 
         return derived_history_5m, master_index_5m
 
+    @staticmethod
+    def _map_1m_targets_to_5m_buckets(target_index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+        """
+        将 1min alpha 时间轴映射到 5min slow-feature 时间轴。
+
+        默认只使用“已完成”的 5min bar：例如 10:11-10:14 的模型输入继续使用
+        10:05 这根 5min bar，直到 10:15 才切到 10:10。这样 5min 慢变量只在
+        5 分钟边界刷新一次，避免把正在形成的半根 5min K 线当作稳定慢信号。
+        """
+        bucket_index = target_index.floor('5min')
+        completed_only = os.environ.get("FCS_5M_COMPLETED_BUCKET_ONLY", "1").strip().lower()
+        if completed_only in {"0", "false", "no", "off"}:
+            return bucket_index
+
+        try:
+            lag_bars = int(os.environ.get("FCS_5M_BUCKET_LAG_BARS", "1"))
+        except (TypeError, ValueError):
+            lag_bars = 1
+        lag_bars = max(1, lag_bars)
+        return bucket_index - pd.Timedelta(minutes=5 * lag_bars)
+
+    def _postprocess_5m_feature_tensor(self, t_5m_raw: torch.Tensor, slow_feats_5m: List[str]) -> torch.Tensor:
+        """
+        5min slow-feature 广播前的可选后处理钩子。
+
+        默认实现为 no-op，保持当前逻辑不变；试验版引擎可覆写该方法，
+        对部分慢特征做额外滤波/平滑，而不污染主线 RealTimeFeatureEngine。
+        """
+        return t_5m_raw
+
+    @staticmethod
+    def _pad_option_snapshot(raw_snap: np.ndarray) -> np.ndarray:
+        raw_snap = np.asarray(raw_snap, dtype=np.float32).copy()
+        if raw_snap.shape[0] < 6:
+            raw_snap = np.vstack([raw_snap, np.zeros((6 - raw_snap.shape[0], raw_snap.shape[1]), dtype=raw_snap.dtype)])
+        if raw_snap.shape[1] < 12:
+            raw_snap = np.hstack([raw_snap, np.zeros((raw_snap.shape[0], 12 - raw_snap.shape[1]), dtype=raw_snap.dtype)])
+        return raw_snap[:, :12]
+
     # ==========================================================================
     # 核心入口：引入严格的 Pandas 时间轴对齐 (Data Alignment)
     # ==========================================================================
@@ -647,8 +691,15 @@ class RealTimeFeatureEngine:
                     derived_history_5m, ready_syns, master_index_5m, slow_feats_5m
                 )
 
-                # 5min 期权特征也使用当前 1min 冻结快照，不再维护独立 option_snapshot_5m 相位。
-                opts_bh_5m = opts_bh
+                opts_bh_5m = torch.zeros(B, 6, 12, device=self.device)
+                for i, s in enumerate(ready_syns):
+                    raw_snap_5m = None
+                    if option_snapshot_5m and s in option_snapshot_5m:
+                        raw_snap_5m = self._pad_option_snapshot(option_snapshot_5m[s])
+                    elif option_snapshots and s in option_snapshots:
+                        raw_snap_5m = self._pad_option_snapshot(option_snapshots[s])
+                    if raw_snap_5m is not None:
+                        opts_bh_5m[i] = torch.tensor(raw_snap_5m, dtype=torch.float32, device=self.device)
 
                 res_5m_raw = self.compute_batch_features(
                     prices_bh_5m, feat_idx_map_5m, ready_syns, [], slow_feats_5m,
@@ -657,13 +708,14 @@ class RealTimeFeatureEngine:
 
                 if res_5m_raw.get('slow_1m') is not None:
                     t_5m_raw = res_5m_raw['slow_1m']  # [B, N_5m, L_5m]
+                    t_5m_raw = self._postprocess_5m_feature_tensor(t_5m_raw, slow_feats_5m)
                     L_5m = t_5m_raw.shape[-1]
                     active_index_5m = master_index_5m[-L_5m:]
 
                     # 5min 特征统一广播回 1min 主时间轴：
-                    # 将每个 1min 时间点映射到它所属的 5min bucket，再做前向填充。
+                    # 默认映射到上一根已完成 5min bucket，再做前向填充。
                     target_master_index = master_index[-30:]
-                    target_bucket_index = target_master_index.floor('5min')
+                    target_bucket_index = self._map_1m_targets_to_5m_buckets(target_master_index)
                     rel_indices = active_index_5m.get_indexer(target_bucket_index, method='ffill')
                     rel_indices = np.where(rel_indices < 0, 0, rel_indices)
                     rel_idx_tensor = torch.tensor(rel_indices, dtype=torch.long, device=self.device)
@@ -842,7 +894,8 @@ class RealTimeFeatureEngine:
         if option_snapshot is not None:
              opt_feats_batch = self._calc_opt_feats_batch(option_snapshot, close[:, -1])
              for k, v in opt_feats_batch.items():
-                 if k in all_feats: res[k] = v.view(B, 1).expand(B, L)
+                 if k in all_feats:
+                     _merge_with_fallback(k, v.view(B, 1).expand(B, L))
 
         # --- 4. Extract & Scale ---
         final_results = {}
@@ -852,7 +905,7 @@ class RealTimeFeatureEngine:
             for name in feat_list:
                 col = res.get(name, torch.zeros((B, L), device=self.device))
                 
-                if name in self.stats and not skip_scaling:
+                if name in self.stats and name not in self.NO_STATS_SCALE_FEATURES and not skip_scaling:
                     s = self.stats[name]
                     median = s.get('median', 0.0)
                     iqr = max(s.get('iqr', 1.0), 1e-6)

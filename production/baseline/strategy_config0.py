@@ -40,7 +40,9 @@ class StrategyConfig:
     
     # ================= 4. Momentum & Trend =================
     STOCK_MOMENTUM_TOLERANCE: float = 0.001  
-    MIN_LAST_SNAP_ROC: float = 0.0001
+    # 慢涨优质标的（如 NVDA/MSFT）经常在 alpha 已经很强时出现 1m 微回撤；
+    # 这里允许 -3bp 的瞬时回撤，只拦明显逆向，而不是要求每分钟必须上涨。
+    MIN_LAST_SNAP_ROC: float = -0.0003
     MAX_SNAP_ROC_LIMIT: float = 0.01          # V0 为 0.01 (1%)
     
     MIN_TREND_ROC: float = 0.0001
@@ -144,7 +146,9 @@ class StrategyConfig:
     
     # ================= 14. MACD & Slow Bull =================
     MACD_HIST_CONFIRM_ENABLED: bool = True
-    MACD_HIST_THRESHOLD: float = 0.05
+    # 原 0.05 对高价慢趋势标的过严，容易把稳定爬升全部挡掉。
+    # 保留方向确认，但降到 0.015，让慢涨行情能进入 OMS 后续风控。
+    MACD_HIST_THRESHOLD: float = 0.015
     SLOW_BULL_CHANNEL_ENABLED: bool = False
     SLOW_BULL_MAX_VOL_Z: float = 0.5
     SLOW_BULL_ALPHA_THRESHOLD: float = 0.75
@@ -172,7 +176,6 @@ class StrategyConfig:
     # ================= 17. Guard Switches (V0 Context) =================
     ENTRY_MOMENTUM_GUARD_ENABLED: bool = True
     ENTRY_LIQUIDITY_GUARD_ENABLED: bool = True
-    
     EXIT_COUNTER_TREND_ENABLED: bool = True
     EXIT_INDEX_REVERSAL_ENABLED: bool = True
     EXIT_STOCK_HARD_STOP_ENABLED: bool = True

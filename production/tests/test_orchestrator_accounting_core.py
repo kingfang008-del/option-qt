@@ -130,7 +130,7 @@ def test_open_accounting_writes_state_and_open_log() -> None:
     payload = ser.unpack(payload_dict["data"])
     assert payload["action"] == "OPEN"
     assert payload["qty"] == 5
-    assert payload["mode"] == "LIVEREPLAY", "TRADING_ENABLED=False 时应路由为 LIVEREPLAY"
+    assert payload["mode"] == oa.RUN_MODE, "TRADING_ENABLED=False 时应保留当前 RUN_MODE"
 
 
 def test_exit_accounting_full_close_updates_cash_and_pnl() -> None:
@@ -216,4 +216,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

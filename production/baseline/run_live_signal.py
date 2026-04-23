@@ -59,11 +59,8 @@ async def main():
     logger.info(f"🧭 Runtime Mode: RUN_MODE={RUN_MODE} | IS_SIMULATED={IS_SIMULATED} | TRADING_ENABLED={TRADING_ENABLED}")
 
     # [🧹 Startup State Hygiene]
-    # SE 启动前检查 OMS 心跳 (oms:live_positions.____SYSTEM_CASH____.ts)。
-    # 心跳缺失/过期 → 认定账本不可信，清理 PG symbol_state 的 position != 0 幽灵行
-    # 和 Redis oms:live_positions hash，避免 SE 恢复上一轮残留仓位后对 Redis Stream
-    # 重复发送 SELL 信号，并白白占满 MAX_POSITIONS 名额阻塞真实 BUY。
-    # 仿真模式 (IS_SIMULATED) 及 SKIP_STARTUP_CLEANUP=1 时自动跳过。
+    # 新架构下 SE 只是 Alpha Engine，不再读取/清理/同步交易状态。
+    # 保留调用只用于记录边界：Redis/PG 中的持仓现金只能由 OMS 管理。
     try:
         from startup_state_hygiene import run_startup_cleanup
         _dry = os.environ.get("STARTUP_CLEANUP_DRY_RUN", "").strip().lower() in ("1", "true", "yes")

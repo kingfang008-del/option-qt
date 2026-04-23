@@ -241,12 +241,50 @@ def test_loss_reduces_next_allocation_and_position_guards_work() -> None:
     assert second_alloc < first_alloc, f"亏损后下一次分配额度应下降: first={first_alloc}, second={second_alloc}"
 
 
+def test_releasing_pending_entry_reservation_does_not_change_cash() -> None:
+    _bootstrap_imports()
+    import orchestrator_execution as oe  # noqa: E402
+
+    orch = _build_orch(mode="realtime")
+    ex = oe.OrchestratorExecution(orch)
+    st = orch.states["NVDA"]
+    st.locked_cash = 12_345.0
+    cash_before = orch.mock_cash
+
+    released = ex._refund_locked_cash_once(
+        st,
+        12_345.0,
+        "UNIT_RELEASE",
+        "NVDA",
+        "UNIT_RELEASE:NVDA",
+    )
+
+    assert released == 12_345.0
+    assert st.locked_cash == 0.0
+    assert orch.mock_cash == cash_before, "释放 pending 预占不能改变 Remaining Cash"
+
+
+def test_execution_layer_cash_mutators_are_blocked() -> None:
+    _bootstrap_imports()
+    import orchestrator_execution as oe  # noqa: E402
+
+    orch = _build_orch(mode="realtime")
+    ex = oe.OrchestratorExecution(orch)
+    cash_before = orch.mock_cash
+
+    ex._cash_add(10_000.0, "UNIT_FORBIDDEN_ADD", "NVDA")
+    ex._cash_set(999_999.0, "UNIT_FORBIDDEN_SET", "NVDA")
+
+    assert orch.mock_cash == cash_before, "执行层不能直接修改 Remaining Cash"
+
+
 def main() -> None:
     test_dry_open_close_accounting_updates_cash_and_position()
     test_loss_reduces_next_allocation_and_position_guards_work()
+    test_releasing_pending_entry_reservation_does_not_change_cash()
+    test_execution_layer_cash_mutators_are_blocked()
     print("[OK] oms accounting allocation flow passed")
 
 
 if __name__ == "__main__":
     main()
-

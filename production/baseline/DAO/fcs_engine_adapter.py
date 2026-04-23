@@ -31,6 +31,25 @@ class EquityOptionsEngineAdapter:
         return self.engine.compute_all_inputs(**kwargs)
 
 
+class EquityOptionsSlowFilterEngineAdapter:
+    """
+    试验版适配器：在默认 completed-bar 5min 逻辑上，
+    对部分背景型 slow feature 再做一层额外平滑。
+
+    默认不会启用，必须显式切换 FEATURE_ENGINE_ADAPTER。
+    """
+
+    def __init__(self, device: str):
+        try:
+            from realtime_feature_engine_slowfilter import RealTimeFeatureEngineSlowFilterV1
+        except ImportError as e:
+            raise ImportError("Missing realtime_feature_engine_slowfilter.py") from e
+        self.engine = RealTimeFeatureEngineSlowFilterV1(stats_path=None, device=device)
+
+    def compute_all_inputs(self, **kwargs) -> Dict[str, Dict]:
+        return self.engine.compute_all_inputs(**kwargs)
+
+
 class BTCOptionsEngineAdapter:
     """
     BTC 期权适配器（骨架）。
@@ -56,7 +75,8 @@ def build_feature_engine_adapter(adapter_name: Optional[str], *, device: str) ->
     name = (adapter_name or "equity_options_v1").strip().lower()
     if name in {"equity_options_v1", "equity_options", "default"}:
         return EquityOptionsEngineAdapter(device=device)
+    if name in {"equity_options_slowfilter_v1", "equity_options_sf_v1", "slowfilter_v1"}:
+        return EquityOptionsSlowFilterEngineAdapter(device=device)
     if name in {"btc_options_v1", "btc_options", "btc"}:
         return BTCOptionsEngineAdapter(device=device)
     raise ValueError(f"Unsupported feature engine adapter: {adapter_name}")
-

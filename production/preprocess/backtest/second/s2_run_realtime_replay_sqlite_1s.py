@@ -15,7 +15,10 @@ if PARITY_MODE_BOOT:
     os.environ['FORCE_HIGH_FREQ'] = '0'
     os.environ['REPLAY_1S_PARITY_MODE'] = '1'
 else:
-    os.environ['RUN_MODE'] = 'LIVEREPLAY'
+    # 旧版曾使用 legacy RUN_MODE=LIVEREPLAY。
+    # 当前主线 config 已将其视为 BACKTEST；这里直接使用 BACKTEST，
+    # 避免 FCS/审计链路读取 os.environ 时继续看到 legacy 标签。
+    os.environ['RUN_MODE'] = 'BACKTEST'
     os.environ['RECALC_GREEKS'] = '1'
     os.environ.setdefault('REPLAY_1S_PARITY_MODE', '0')
 import asyncio
@@ -62,6 +65,31 @@ DB_DIR_1S = PROJECT_ROOT / "data" / "history_sqlite_1s"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [1s_INFERENCE] - %(message)s')
 logger = logging.getLogger("1s_BatchInference")
+NY_TZ_REPLAY = pytz.timezone('America/New_York')
+
+
+def _session_bounds_ts(date_str: str, *, include_preopen_minute: bool) -> tuple[int, int]:
+    start_hhmmss = "09:29:00" if include_preopen_minute else "09:30:00"
+    start_dt = NY_TZ_REPLAY.localize(datetime.strptime(f"{date_str} {start_hhmmss}", "%Y%m%d %H:%M:%S"))
+    end_dt = NY_TZ_REPLAY.localize(datetime.strptime(f"{date_str} 16:00:00", "%Y%m%d %H:%M:%S"))
+    return int(start_dt.timestamp()), int(end_dt.timestamp())
+
+
+def _filter_df_to_session(df: pd.DataFrame, date_str: str, *, include_preopen_minute: bool, label: str) -> pd.DataFrame:
+    if df.empty or 'ts' not in df.columns:
+        return df
+    start_ts, end_ts = _session_bounds_ts(date_str, include_preopen_minute=include_preopen_minute)
+    before = len(df)
+    out = df[(df['ts'] >= start_ts) & (df['ts'] < end_ts)].copy()
+    dropped = before - len(out)
+    if dropped > 0:
+        logger.info(f"🧹 [Session Filter] {label} dropped {dropped} rows outside NY session for {date_str}.")
+    return out
+
+
+def _filter_ts_keys_to_session(ts_values, date_str: str, *, include_preopen_minute: bool):
+    start_ts, end_ts = _session_bounds_ts(date_str, include_preopen_minute=include_preopen_minute)
+    return [ts for ts in ts_values if start_ts <= int(ts) < end_ts]
 
 
 def _pg_partition_exists(cursor, table_name: str) -> bool:
@@ -195,12 +223,13 @@ class BatchSQLiteDriver1s:
                 logger.warning(f"⚠️ No 1s data in {db_path.name}, skipping.")
                 continue
 
-            if self.parity_mode:
-                rth_start_dt = pytz.timezone('America/New_York').localize(datetime.strptime(date_str + " 09:30:00", "%Y%m%d %H:%M:%S"))
-                rth_start_ts = int(rth_start_dt.timestamp())
-                df_bars_1s = df_bars_1s[df_bars_1s['ts'] >= rth_start_ts].copy()
-                df_opts_1s = df_opts_1s[df_opts_1s['ts'] >= rth_start_ts].copy()
-                logger.info(f"🎯 [Parity Mode] Trimmed pre-RTH 1s rows before {rth_start_dt}.")
+            include_preopen_minute = not self.parity_mode
+            df_bars_1s = _filter_df_to_session(df_bars_1s, date_str, include_preopen_minute=include_preopen_minute, label="market_bars_1s")
+            df_opts_1s = _filter_df_to_session(df_opts_1s, date_str, include_preopen_minute=include_preopen_minute, label="option_snapshots_1s")
+            if not df_bars_5m.empty:
+                df_bars_5m = _filter_df_to_session(df_bars_5m, date_str, include_preopen_minute=include_preopen_minute, label="market_bars_5m")
+            if not df_opts_5m.empty:
+                df_opts_5m = _filter_df_to_session(df_opts_5m, date_str, include_preopen_minute=include_preopen_minute, label="option_snapshots_5m")
 
             # =====================================================================
             # 🚀 [真 1s 高频发车]
@@ -253,6 +282,7 @@ class BatchSQLiteDriver1s:
             map_o5 = to_map(df_opts_5m, 'opts')
 
             all_ts = sorted(list(set(map_b1.keys()) | set(map_o1.keys()) | set(map_b5.keys()) | set(map_o5.keys())))
+            all_ts = _filter_ts_keys_to_session(all_ts, date_str, include_preopen_minute=include_preopen_minute)
             logger.info(f"✅ Loaded {len(all_ts)} synchronized 1s ticks. Streaming...")
 
             # 初始化所有标的的“状态缓存”，实现断流补偿
@@ -451,6 +481,12 @@ class BatchSQLiteDriver1s:
             f"WHERE ts >= {start_ts} AND ts <= {end_ts}",
             self.conn,
         )
+        df_b1 = _filter_df_to_session(
+            df_b1,
+            datetime.fromtimestamp(start_ts, NY_TZ_REPLAY).strftime('%Y%m%d'),
+            include_preopen_minute=bool(not self.parity_mode),
+            label="turbo.market_bars_1s",
+        )
         map_b1 = _build_bar_map(df_b1)
 
         # 2. 加载 1s 期权快照 ( buckets 为 JSON, 包含 buckets 和 contracts )
@@ -458,6 +494,12 @@ class BatchSQLiteDriver1s:
             f"SELECT symbol, ts, buckets_json FROM option_snapshots_1s "
             f"WHERE ts >= {start_ts} AND ts <= {end_ts}",
             self.conn,
+        )
+        df_o1 = _filter_df_to_session(
+            df_o1,
+            datetime.fromtimestamp(start_ts, NY_TZ_REPLAY).strftime('%Y%m%d'),
+            include_preopen_minute=bool(not self.parity_mode),
+            label="turbo.option_snapshots_1s",
         )
         map_o1 = _build_option_map(df_o1, audit_first=True)
 
@@ -467,12 +509,24 @@ class BatchSQLiteDriver1s:
             f"WHERE ts >= {start_ts} AND ts <= {end_ts}",
             self.conn,
         )
+        df_b5 = _filter_df_to_session(
+            df_b5,
+            datetime.fromtimestamp(start_ts, NY_TZ_REPLAY).strftime('%Y%m%d'),
+            include_preopen_minute=bool(not self.parity_mode),
+            label="turbo.market_bars_5m",
+        )
         map_b5 = _build_bar_map(df_b5)
 
         df_o5 = pd.read_sql(
             f"SELECT symbol, ts, buckets_json FROM option_snapshots_5m "
             f"WHERE ts >= {start_ts} AND ts <= {end_ts}",
             self.conn,
+        )
+        df_o5 = _filter_df_to_session(
+            df_o5,
+            datetime.fromtimestamp(start_ts, NY_TZ_REPLAY).strftime('%Y%m%d'),
+            include_preopen_minute=bool(not self.parity_mode),
+            label="turbo.option_snapshots_5m",
         )
         map_o5 = _build_option_map(df_o5)
 
@@ -641,6 +695,7 @@ class BatchSQLiteDriver1s:
             signal_svc.r.xadd = intercept_redis_xadd
 
             all_ts = sorted(list(set(map_b1.keys()) | set(map_o1.keys()) | set(map_b5.keys()) | set(map_o5.keys())))
+            all_ts = _filter_ts_keys_to_session(all_ts, date_str, include_preopen_minute=bool(not self.parity_mode))
             first_full_min = 0
             
             if all_ts:

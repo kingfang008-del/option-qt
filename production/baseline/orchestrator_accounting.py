@@ -6,11 +6,12 @@ import pickle
 import asyncio
 from datetime import datetime
 from pytz import timezone
-from config import COMMISSION_PER_CONTRACT, COOLDOWN_MINUTES, STREAM_TRADE_LOG, TRADING_ENABLED
+from config import COMMISSION_PER_CONTRACT, COOLDOWN_MINUTES, STREAM_TRADE_LOG, TRADING_ENABLED, RUN_MODE
 import sys
 # [NEW] Add project root to sys.path to import utils
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import serialization_utils as ser
+from orchestrator_state_manager import infer_open_fill_confirmed
 
 logger = logging.getLogger("V8_Orchestrator.Accounting")
 
@@ -19,7 +20,12 @@ class OrchestratorAccounting:
         self.orch = orchestrator
 
     def _cash_add(self, delta: float, reason: str, sym: str = ""):
-        """Unified cash mutation path with audit log."""
+        """Unified cash mutation path with audit log.
+
+        Cash is a fill ledger, not an order-intent ledger. In normal operation
+        this method should be called only by OPEN fill debit and CLOSE fill
+        proceeds.
+        """
         try:
             d = float(delta or 0.0)
         except Exception:
@@ -51,7 +57,7 @@ class OrchestratorAccounting:
     def _resolve_mode_label(mode_override=None):
         if mode_override:
             return mode_override
-        return "BACKTEST" if getattr(os.environ, 'get', None) and os.environ.get('RUN_MODE') == 'LIVEREPLAY' else None
+        return None
 
     def _safe_json_dumps(self, data):
         """[Fix] 移除 bytes key 导致的 JSON 序列化失败"""
@@ -72,10 +78,11 @@ class OrchestratorAccounting:
             payload['account_cash'] = round(self.orch.mock_cash, 2)
             
              
-            # [🔥 影子交易支持] 如果全局交易开关关闭，且当前处于实盘驱动模式，强行标记为 LIVEREPLAY
-            # 这样持久化服务会自动将其路由到 backtest 表，而 Dashboard 也能识别
+            # Dry/disabled trading is still a realtime runtime. Keep the real
+            # RUN_MODE label so dashboard/PG filters cannot confuse it with
+            # backtest records.
             if not TRADING_ENABLED and payload.get('mode') != 'BACKTEST':
-                payload['mode'] = 'LIVEREPLAY'
+                payload['mode'] = RUN_MODE
             
             # 必须用 ser.pack 序列化以确保全链路兼容 (Msgpack/Pickle 自动识别)
             self.orch.r.xadd(STREAM_TRADE_LOG, {'data': ser.pack(payload)}, maxlen=10000)
@@ -101,8 +108,13 @@ class OrchestratorAccounting:
         if filled_qty <= 0:
             return
 
+        commission = filled_qty * COMMISSION_PER_CONTRACT
+        cost = fill_price * filled_qty * 100 + commission
+        self._cash_add(-cost, "OPEN_FILL_DEBIT", sym)
+
         st.position = sig['dir']
         st.qty = filled_qty
+        st.entry_slot_reserved = True
         st.entry_stock = stock_price
         st.entry_price = fill_price
         st.entry_ts = entry_ts
@@ -122,6 +134,8 @@ class OrchestratorAccounting:
         st.entry_spy_roc = _get_float(st.entry_spy_roc)
         st.entry_alpha_z = _get_float(st.entry_alpha_z)
         st.entry_iv = _get_float(st.entry_iv)
+        st.locked_cash = 0.0
+        st.open_fill_confirmed = True
 
         timing_fields = timing_fields or {}
         reason = sig.get('reason', '')
@@ -160,13 +174,10 @@ class OrchestratorAccounting:
         self._schedule_live_state_broadcast()
 
     def _broadcast_circuit_breaker(self, safe_now_ts, trigger_reason=None, tripped=False):
-        """[Cross-Process Sync] 将熔断状态广播到 Redis, 让独立进程的 Signal Engine 能感知。
+        """Publish circuit-breaker status as read-only observability metadata.
 
-        - 用于 REALTIME / LIVEREPLAY / REALTIME_DRY 等 SE/OMS 分进程架构下, 解决
-          `global_cooldown_until` 只驻留在 OMS 内存, SE 永远看不到的历史 bug。
-        - 单进程 shared-mem 模式下 SE 直接读 `self.orch.global_cooldown_until`, 不依赖此通道,
-          但多写一份 Redis 也无副作用。
-        - 仅写入元数据, 不承担任何业务决策 (决策仍在各进程本地完成)。
+        OMS owns global cooldown/streak decisions locally. Redis is only for
+        Dashboard/diagnostics and must not be used as a trading-state sync bus.
         """
         try:
             r = getattr(self.orch, 'r', None)
@@ -178,6 +189,7 @@ class OrchestratorAccounting:
                 'global_cooldown_until': f"{cb_until:.3f}",
                 'consecutive_stop_losses': str(streak),
                 'updated_at': f"{float(safe_now_ts):.3f}",
+                'projection_only': '1',
             }
             if tripped:
                 mapping['last_trip_at'] = f"{float(safe_now_ts):.3f}"
@@ -194,6 +206,55 @@ class OrchestratorAccounting:
     def _process_exit_accounting(self, sym, st, filled_qty, fill_price, stock_price, curr_ts, reason, duration, ratio, original_position=None):
         """[核心新增] 统一财务清算中心：只有发生物理成交才碰钱、算盈亏、写日志"""
         if filled_qty <= 0: return
+        state_row = {
+            'position': getattr(st, 'position', 0),
+            'qty': getattr(st, 'qty', 0),
+            'entry_price': getattr(st, 'entry_price', 0.0),
+            'entry_ts': getattr(st, 'entry_ts', 0.0),
+            'open_fill_confirmed': getattr(st, 'open_fill_confirmed', None),
+        }
+        if not infer_open_fill_confirmed(state_row):
+            logger.critical(
+                f"🚫 [Ghost Exit Blocked] {sym} reason={reason} | "
+                f"qty={state_row['qty']} entry_price={state_row['entry_price']} "
+                f"entry_ts={state_row['entry_ts']} open_fill_confirmed={state_row['open_fill_confirmed']}"
+            )
+            try:
+                self._emit_trade_log({
+                    'ts': curr_ts if self.orch.mode == 'backtest' else time.time(),
+                    'symbol': sym,
+                    'action': 'GHOST_EXIT_BLOCKED',
+                    'side': 'SYS_GUARD',
+                    'qty': filled_qty,
+                    'price': fill_price,
+                    'stock_price': stock_price,
+                    'strategy_note': json.dumps({
+                        'reason': reason,
+                        'guard': 'missing_confirmed_open_fill',
+                        'entry_price': state_row['entry_price'],
+                        'entry_ts': state_row['entry_ts'],
+                    }),
+                    'fill_duration': round(duration, 1),
+                    'fill_ratio': round(ratio, 2),
+                    'mode': self.orch.mode.upper(),
+                })
+            except Exception:
+                pass
+            st.position = 0
+            st.qty = 0
+            st.entry_slot_reserved = False
+            st.entry_price = 0.0
+            st.entry_ts = 0.0
+            st.max_roi = 0.0
+            st.open_fill_confirmed = False
+            try:
+                sm = getattr(self.orch, 'state_manager', None)
+                if sm is not None:
+                    sm.save_state()
+            except Exception as e:
+                logger.debug(f"[Accounting] ghost-exit save_state skipped: {e}")
+            self._schedule_live_state_broadcast()
+            return
         
         # 🚀 [Bug2 修复] 优先使用传入的 original_position，因为共享内存下 st.position 可能已被 SE 清零
         pos_for_accounting = original_position if original_position is not None else st.position
@@ -231,7 +292,7 @@ class OrchestratorAccounting:
         roi = (fill_price - st.entry_price) / st.entry_price if st.entry_price > 0 else 0.0
 
         # 👇 [🔥 核心路由：获取安全的时间戳]
-        is_simulated = self.orch.mode == 'backtest' or os.environ.get('RUN_MODE') == 'LIVEREPLAY'
+        is_simulated = self.orch.mode == 'backtest'
         safe_now_ts = curr_ts if is_simulated else time.time()
         
         # 冷却与熔断逻辑
@@ -302,9 +363,11 @@ class OrchestratorAccounting:
         if st.qty <= 0:
             st.position = 0
             st.qty = 0
+            st.entry_slot_reserved = False
             st.entry_price = 0.0
             st.entry_ts = 0.0
             st.max_roi = 0.0
+            st.open_fill_confirmed = False
 
         # [🛡️ Atomic State Snapshot] 平仓后强制快照，避免 mock_cash 更新
         # 与下次重启状态不一致。save_state 内部是后台线程写，非阻塞。

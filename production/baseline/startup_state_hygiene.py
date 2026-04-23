@@ -6,18 +6,12 @@
 描述:
     启动期状态卫生 (Startup State Hygiene)。
 
-    解决场景:
-    - 上一轮 SE/OMS 异常退出, 留下:
-        (a) Redis Hash `oms:live_positions` 里的陈旧仓位快照;
-        (b) PG `symbol_state` 表里的 position != 0 陈旧行;
-      导致新进程启动时 SignalEngineV8 把这些"幽灵仓位"当真, 持续对
-      Redis Stream 发送 SELL 信号, 并占用 MAX_POSITIONS 名额, 阻塞
-      后续真实 BUY 开仓.
-
-    判定原则 (严格, 防止误清真仓):
-    - 通过 `oms:live_positions[____SYSTEM_CASH____].ts` 判断 OMS 是否
-      在最近 OMS_HEARTBEAT_TTL_SEC 秒内还在广播.
-    - 只有心跳过期/缺失时, 才视为"没有可信账本", 执行清理.
+    新架构原则:
+    - OMS 是唯一交易状态权威；Redis 中的 `oms:live_positions` 只允许作为
+      Dashboard/诊断的只读投影。
+    - SE 启动绝不能再根据 Redis 心跳/仓位去清理 PG `symbol_state` 或影响
+      OMS 持仓/现金状态。
+    - OMS 启动可以清理 Redis 投影，随后由 OMS 自己重新发布 fresh projection。
     - 仿真/回测模式 (IS_SIMULATED) 下彻底跳过, 避免影响回放流水线.
 
     对外接口:
@@ -114,7 +108,7 @@ def _clean_pg_phantom_rows(dry_run: bool) -> int:
     """
     try:
         import psycopg2
-        from config import PG_DB_URL
+        from config import PG_DB_URL, OMS_STATE_NAMESPACE
     except Exception as e:
         logger.error(f"[Hygiene] 无法 import psycopg2/config: {e}")
         return 0
@@ -131,10 +125,19 @@ def _clean_pg_phantom_rows(dry_run: bool) -> int:
             return 0
 
         c.execute("""
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='symbol_state' AND column_name='namespace'
+        """)
+        has_namespace = c.fetchone() is not None
+        ns_filter = "namespace = %s AND " if has_namespace else ""
+        ns_params = (OMS_STATE_NAMESPACE,) if has_namespace else ()
+
+        c.execute(f"""
             SELECT symbol, data
             FROM symbol_state
-            WHERE symbol <> '_GLOBAL_STATE_'
-        """)
+            WHERE {ns_filter}symbol <> '_GLOBAL_STATE_'
+        """, ns_params)
         rows = c.fetchall()
 
         phantom_symbols = []
@@ -163,7 +166,13 @@ def _clean_pg_phantom_rows(dry_run: bool) -> int:
         payloads = []
         ts_now = time.time()
         for sym, _pos, _ep in phantom_symbols:
-            c.execute("SELECT data FROM symbol_state WHERE symbol=%s", (sym,))
+            if has_namespace:
+                c.execute(
+                    "SELECT data FROM symbol_state WHERE namespace=%s AND symbol=%s",
+                    (OMS_STATE_NAMESPACE, sym),
+                )
+            else:
+                c.execute("SELECT data FROM symbol_state WHERE symbol=%s", (sym,))
             row = c.fetchone()
             if not row:
                 continue
@@ -180,9 +189,16 @@ def _clean_pg_phantom_rows(dry_run: bool) -> int:
             payloads.append((sym, json.dumps(d), ts_now))
 
         if payloads:
-            psycopg2.extras.execute_batch(c, """
-                UPDATE symbol_state SET data=%s, updated_at=%s WHERE symbol=%s
-            """, [(p[1], p[2], p[0]) for p in payloads])
+            if has_namespace:
+                psycopg2.extras.execute_batch(c, """
+                    UPDATE symbol_state
+                    SET data=%s, updated_at=%s
+                    WHERE namespace=%s AND symbol=%s
+                """, [(p[1], p[2], OMS_STATE_NAMESPACE, p[0]) for p in payloads])
+            else:
+                psycopg2.extras.execute_batch(c, """
+                    UPDATE symbol_state SET data=%s, updated_at=%s WHERE symbol=%s
+                """, [(p[1], p[2], p[0]) for p in payloads])
             conn.commit()
             n_affected = len(payloads)
             logger.info(f"🧹 [Hygiene] 已将 {n_affected} 个 PG 幽灵仓位置零 (保留 warmup).")
@@ -207,9 +223,8 @@ def run_startup_cleanup(role: str = "se", dry_run: bool = False) -> dict:
     """启动期幽灵仓位清理入口.
 
     参数:
-        role: 'se'  — Signal Engine 启动前调用. 心跳缺失 → 同时清 PG + Redis hash.
-              'oms' — Execution Engine 启动前调用. 无论心跳如何, 都清 Redis hash
-                     (OMS 自己会在首次 broadcast 重建); 不动 PG (OMS 不读 PG symbol_state).
+        role: 'se'  — Signal Engine 启动前调用；不读/不清交易状态。
+              'oms' — Execution Engine 启动前调用；只清 Redis projection，不动 PG。
         dry_run: True 仅预演, 不实际写入.
 
     返回: {'skipped': bool, 'reason': str, 'heartbeat_age_sec': float|None,
@@ -250,6 +265,15 @@ def run_startup_cleanup(role: str = "se", dry_run: bool = False) -> dict:
         logger.info(f"[Hygiene] 仿真模式 ({RUN_MODE}) 跳过启动期清理.")
         return result
 
+    if role == "se":
+        result["skipped"] = True
+        result["reason"] = "se_no_trading_state_cleanup"
+        logger.info(
+            "[Hygiene] SE no longer participates in trading-state cleanup; "
+            "OMS memory/PG snapshot remain the only trading-state authority."
+        )
+        return result
+
     try:
         r = _make_redis_client()
     except Exception as e:
@@ -273,35 +297,12 @@ def run_startup_cleanup(role: str = "se", dry_run: bool = False) -> dict:
     )
 
     if role == "oms":
-        # OMS 启动期: 无论心跳新旧都清, OMS 会在首次 broadcast 重建 hash.
-        # 这里只处理 Redis; OMS 不读 PG symbol_state, 故 PG 幽灵由 SE 启动期负责.
+        # OMS 启动期: 只清 Redis 只读投影，OMS 会在首次 broadcast 重建。
+        # PG symbol_state 是 OMS 自己的恢复快照，绝不能由 Redis 心跳间接清理。
         result["redis_cleared"] = _clean_redis_positions(r, dry_run=dry_run)
-        result["reason"] = "oms_fresh_start"
+        result["reason"] = "oms_projection_fresh_start"
         return result
 
-    # role == 'se'
-    fresh = (age is not None and age <= ttl)
-    if fresh:
-        result["skipped"] = True
-        result["reason"] = "oms_heartbeat_fresh"
-        logger.info(
-            f"[Hygiene] OMS 心跳在 TTL 内 (age={age:.1f}s ≤ {ttl:.0f}s), "
-            f"视为账本可信, SE 启动期清理跳过."
-        )
-        return result
-
-    # 心跳过期 / 缺失: SE 独立跑 / OMS 已死 / OMS 从未启动.
-    reason = "no_heartbeat" if age is None else f"stale_heartbeat:{age:.1f}s"
-    result["reason"] = reason
-    logger.warning(f"[Hygiene] 未检测到有效 OMS 心跳 ({reason}), 开始清理幽灵仓位...")
-    result["redis_cleared"] = _clean_redis_positions(r, dry_run=dry_run)
-    result["pg_cleared"] = _clean_pg_phantom_rows(dry_run=dry_run)
-
-    logger.info(
-        f"✅ [Hygiene] 启动期清理完成 | role={role} | "
-        f"redis_cleared={result['redis_cleared']} | pg_cleared={result['pg_cleared']} | "
-        f"dry_run={dry_run}"
-    )
     return result
 
 

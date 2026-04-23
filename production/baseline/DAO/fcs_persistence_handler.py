@@ -55,6 +55,10 @@ class FCSPersistenceHandler:
             return committed_minutes
         while svc.global_last_minute < target_minute_dt:
             commit_dt = svc.global_last_minute
+            profile = getattr(svc, "market_profile", None)
+            if profile is not None and not profile.is_rth_minute(commit_dt):
+                svc.global_last_minute += pd.Timedelta(minutes=1)
+                continue
             for sym in svc.symbols:
                 self._prepare_minute_commit_state(sym, commit_dt)
             for sym in svc.symbols:

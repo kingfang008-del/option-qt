@@ -4,10 +4,13 @@ import logging
 import os
 import threading
 import pickle
+import hashlib
+import re
 from pathlib import Path
 from datetime import datetime
 from pytz import timezone
 import psycopg2
+from psycopg2 import sql
 import sqlite3
 import numpy as np
 from config import (
@@ -16,6 +19,7 @@ from config import (
     IS_BACKTEST,
     IS_REALTIME_DRY,
     RUN_MODE,
+    OMS_STATE_NAMESPACE,
     INITIAL_ACCOUNT,
     ROLLING_WINDOW,
     TARGET_SYMBOLS,
@@ -25,6 +29,61 @@ from config import (
 )
 
 logger = logging.getLogger("V8_Orchestrator.StateManager")
+
+
+def safe_state_partition_name(namespace: str) -> str:
+    """Build a short, safe PostgreSQL partition table name for a namespace."""
+    raw = re.sub(r"[^a-zA-Z0-9_]+", "_", str(namespace or "default").lower()).strip("_")
+    raw = raw or "default"
+    digest = hashlib.md5(str(namespace or "default").encode("utf-8")).hexdigest()[:8]
+    return f"symbol_state_{raw[:38]}_{digest}"
+
+
+def tag_state_snapshot_rows(state_data, *, namespace=OMS_STATE_NAMESPACE, run_mode=RUN_MODE):
+    """Stamp every state row with mode/namespace metadata before persistence."""
+    for data in state_data.values():
+        if isinstance(data, dict):
+            data.setdefault("mode", run_mode)
+            data.setdefault("state_namespace", namespace)
+    return state_data
+
+
+def infer_open_fill_confirmed(state_row) -> bool:
+    """Best-effort detection for whether a position has a confirmed OPEN fill."""
+    if not isinstance(state_row, dict):
+        return False
+    explicit = state_row.get("open_fill_confirmed")
+    if explicit is not None:
+        return bool(explicit)
+    try:
+        pos = int(state_row.get("position", 0) or 0)
+        qty = int(state_row.get("qty", 0) or 0)
+        entry_price = float(state_row.get("entry_price", 0.0) or 0.0)
+        entry_ts = float(state_row.get("entry_ts", 0.0) or 0.0)
+    except Exception:
+        return False
+    return pos != 0 and qty > 0 and entry_price > 0 and entry_ts > 0
+
+
+def zero_position_state_row(state_row):
+    """Drop trading-state fields but keep warmup/history buffers."""
+    cleaned = dict(state_row or {})
+    cleaned.update({
+        "position": 0,
+        "qty": 0,
+        "entry_price": 0.0,
+        "entry_stock": 0.0,
+        "entry_ts": 0.0,
+        "entry_spy_roc": 0.0,
+        "entry_index_trend": 0,
+        "entry_alpha_z": 0.0,
+        "entry_iv": 0.0,
+        "max_roi": -1.0,
+        "cooldown_until": 0.0,
+        "entry_slot_reserved": False,
+        "open_fill_confirmed": False,
+    })
+    return cleaned
 
 
 def sanitize_restored_mock_cash(
@@ -64,23 +123,56 @@ def sanitize_restored_mock_cash(
 class OrchestratorStateManager:
     def __init__(self, orchestrator):
         self.orch = orchestrator
+        self.state_namespace = OMS_STATE_NAMESPACE
 
     def _get_pg_conn(self):
         return psycopg2.connect(PG_DB_URL)
 
     def _init_state_db(self):
-        """[修改] 在统一 PG 中创建状态表"""
+        """[修改] 在统一 PG 中创建 namespace 分区状态表"""
         if self.orch.mode == 'backtest': return
         try:
             conn = self._get_pg_conn()
             c = conn.cursor()
             c.execute("""
-                CREATE TABLE IF NOT EXISTS symbol_state (
-                    symbol TEXT PRIMARY KEY,
-                    data TEXT,
-                    updated_at REAL
-                )
+                SELECT c.relkind
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public' AND c.relname = 'symbol_state'
             """)
+            row = c.fetchone()
+            if row and row[0] != 'p':
+                backup_name = f"symbol_state_legacy_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                c.execute(
+                    sql.SQL("ALTER TABLE public.symbol_state RENAME TO {}")
+                    .format(sql.Identifier(backup_name))
+                )
+                logger.warning(
+                    f"🧱 symbol_state was not partitioned; renamed to {backup_name} "
+                    f"and creating namespace-partitioned symbol_state."
+                )
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS symbol_state (
+                    namespace TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    data TEXT,
+                    updated_at DOUBLE PRECISION,
+                    CONSTRAINT symbol_state_ns_pkey PRIMARY KEY (namespace, symbol)
+                ) PARTITION BY LIST (namespace)
+            """)
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_symbol_state_ns_updated_at
+                ON symbol_state (namespace, updated_at)
+            """)
+            part_name = safe_state_partition_name(self.state_namespace)
+            c.execute(
+                sql.SQL("""
+                    CREATE TABLE IF NOT EXISTS {} PARTITION OF symbol_state
+                    FOR VALUES IN (%s)
+                """).format(sql.Identifier(part_name)),
+                (self.state_namespace,),
+            )
             conn.commit()
             conn.close()
         except Exception as e:
@@ -90,7 +182,7 @@ class OrchestratorStateManager:
         """[Modified] Load state ONLY from PostgreSQL (Intraday Enforcement)"""
         # 👇 [🔥 核心修复：回放模式坚决不读旧库，强制初始化]
         if IS_SIMULATED:
-            logger.info("🔄 LIVEREPLAY 或回测模式 (SIMULATED) 启动，清空历史状态，重置为初始资金 50,000...")
+            logger.info("🔄 回测模式 (SIMULATED) 启动，清空历史状态，重置为初始资金 50,000...")
             self.orch.mock_cash = 50000.0  # 你的回放初始资金
             self.orch.locked_cash = 0.0
             self.orch.positions = {}
@@ -132,7 +224,10 @@ class OrchestratorStateManager:
                 conn.close()
                 return {}
                 
-            c.execute("SELECT symbol, data, updated_at FROM symbol_state")
+            c.execute(
+                "SELECT symbol, data, updated_at FROM symbol_state WHERE namespace = %s",
+                (self.state_namespace,),
+            )
             rows = c.fetchall()
             conn.close()
             
@@ -155,6 +250,32 @@ class OrchestratorStateManager:
                         continue
                     restored[sym] = json.loads(data_str)
                 except: pass
+
+            ghost_rows = []
+            mode_mismatch_rows = []
+            for sym, data in list(restored.items()):
+                if sym == '_GLOBAL_STATE_' or not isinstance(data, dict):
+                    continue
+                state_mode = str(data.get("mode") or "").upper()
+                if state_mode and state_mode != RUN_MODE:
+                    restored[sym] = zero_position_state_row(data)
+                    mode_mismatch_rows.append((sym, state_mode))
+                    continue
+                try:
+                    pos = int(data.get("position", 0) or 0)
+                    qty = int(data.get("qty", 0) or 0)
+                    entry_price = float(data.get("entry_price", 0.0) or 0.0)
+                    entry_ts = float(data.get("entry_ts", 0.0) or 0.0)
+                except Exception:
+                    pos, qty, entry_price, entry_ts = 0, 0, 0.0, 0.0
+                if pos != 0 and (
+                    qty <= 0
+                    or entry_price <= 0
+                    or entry_ts <= 0
+                    or not infer_open_fill_confirmed(data)
+                ):
+                    restored[sym] = zero_position_state_row(data)
+                    ghost_rows.append((sym, pos, qty, entry_price, entry_ts))
 
             # [新增] 恢复全局资金状态（仅当天有效）
             if '_GLOBAL_STATE_' in restored:
@@ -190,6 +311,19 @@ class OrchestratorStateManager:
 
             if dropped_count > 0:
                 logger.info(f"🧹 Ignored {dropped_count} state records from previous days.")
+            if mode_mismatch_rows:
+                preview = ", ".join(f"{sym}({mode})" for sym, mode in mode_mismatch_rows[:8])
+                logger.warning(
+                    f"🧹 Zeroized {len(mode_mismatch_rows)} restored rows with mode mismatch: {preview}"
+                )
+            if ghost_rows:
+                preview = ", ".join(
+                    f"{sym}(pos={pos},qty={qty},ep={entry_price:.2f},ets={entry_ts:.0f})"
+                    for sym, pos, qty, entry_price, entry_ts in ghost_rows[:8]
+                )
+                logger.warning(
+                    f"🧹 Zeroized {len(ghost_rows)} ghost restored positions without confirmed OPEN fill: {preview}"
+                )
             return restored
         except Exception as e:
             logger.error(f"❌ DB Load Error: {e}")
@@ -203,11 +337,13 @@ class OrchestratorStateManager:
                 conn = self._get_pg_conn()
                 c = conn.cursor()
                 ts = float(snapshot_ts if snapshot_ts is not None else time.time())
-                data_list = [(sym, json.dumps(d), ts) for sym, d in data.items()]
+                namespace = self.state_namespace
+                data_list = [(namespace, sym, json.dumps(d), ts) for sym, d in data.items()]
                 import psycopg2.extras
                 psycopg2.extras.execute_batch(c, """
-                    INSERT INTO symbol_state (symbol, data, updated_at) VALUES (%s, %s, %s)
-                    ON CONFLICT (symbol) DO UPDATE 
+                    INSERT INTO symbol_state (namespace, symbol, data, updated_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (namespace, symbol) DO UPDATE
                     SET data=EXCLUDED.data, updated_at=EXCLUDED.updated_at
                     WHERE symbol_state.updated_at IS NULL OR symbol_state.updated_at <= EXCLUDED.updated_at
                 """, data_list)
@@ -228,7 +364,19 @@ class OrchestratorStateManager:
 
         try:
             # Gather state for saving
-            state_data = {sym: st.to_dict() for sym, st in self.orch.states.items() if st.position != 0 or st.warmup_complete}
+            state_data = {}
+            for sym, st in self.orch.states.items():
+                if not (st.position != 0 or st.warmup_complete):
+                    continue
+                row = st.to_dict()
+                if int(row.get("position", 0) or 0) != 0 and not infer_open_fill_confirmed(row):
+                    logger.warning(
+                        f"🧹 Skip persisting unconfirmed OPEN state for {sym}: "
+                        f"qty={row.get('qty')} entry_price={row.get('entry_price')} entry_ts={row.get('entry_ts')}"
+                    )
+                    row = zero_position_state_row(row)
+                if int(row.get("position", 0) or 0) != 0 or row.get("warmup_complete"):
+                    state_data[sym] = row
             
             # [新增] 注入全局资金状态
             state_data['_GLOBAL_STATE_'] = {
@@ -237,6 +385,11 @@ class OrchestratorStateManager:
                 'mode': RUN_MODE,
                 'engine_mode': str(getattr(self.orch, 'mode', '') or '').upper(),
             }
+            state_data = tag_state_snapshot_rows(
+                state_data,
+                namespace=self.state_namespace,
+                run_mode=RUN_MODE,
+            )
 
             # Write to PostgreSQL
             self._save_state_to_db(state_data, snapshot_ts=time.time())

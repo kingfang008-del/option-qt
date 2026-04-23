@@ -113,6 +113,9 @@ def select_remaining_cash(
         return float(live_cash), live_cash_source or "OMS live"
 
     mode = str(run_mode or "").upper()
+    if mode.startswith("REALTIME"):
+        return 0.0, "No fresh OMS cash"
+
     if not mode.startswith("REALTIME") and log_cash is not None:
         return float(log_cash), "Trade Log"
 

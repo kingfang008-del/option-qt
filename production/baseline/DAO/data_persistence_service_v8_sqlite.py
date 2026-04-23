@@ -334,10 +334,10 @@ class DataPersistenceServiceSQLite:
             # 为了防止内存溢出，我们只保留最近 300 秒的 bar 在内存，旧的从 buffer 移除
             current_cutoff = time.time() - 300 # 5分钟前的数据才清理 Buffer (防止乱序)
             
-            # 🚀 [核心保护] 在重放模式 (BACKTEST/LIVEREPLAY) 下，禁止写入 market_bars 和 option_snapshots
+            # 🚀 [核心保护] 在回测模式 (BACKTEST) 下，禁止写入 market_bars 和 option_snapshots
             # 因为数据源本就来自 SQLite，回写会导致 OHLCV 精度丢失（由发球机组装导致）
             run_mode = os.environ.get('RUN_MODE', 'REALTIME')
-            is_replay = run_mode in ['BACKTEST', 'LIVEREPLAY']
+            is_replay = run_mode == 'BACKTEST'
 
             # 1. 写入 K线
             if self.bar_buffer:

@@ -1895,17 +1895,14 @@ class V8Orchestrator:
         
         if self.mode == 'realtime' and not IS_SIMULATED: 
             await self.ibkr.connect()
-            # [NEW] 尝试获取真实账户资金，根据 config 统一同步逻辑
+            # [CashInvariant] Broker balance is observability only. OMS cash is
+            # mutated exclusively by successful OPEN/CLOSE accounting events.
             if hasattr(self.ibkr, 'get_account_balance'):
                 real_bal = await self.ibkr.get_account_balance()
-
-                # 🚨 [核心修复] 只有在实盘且真实券商有钱时，才覆盖本地 mock_cash
-                if TRADING_ENABLED and real_bal is not None and real_bal > 0:
-                    self.mock_cash = float(real_bal)
-                    logger.info(f"💰 REAL ACCOUNT BALANCE LOADED: ${self.mock_cash:,.2f}")
-                else:
-                    # 在 DRY RUN 模式下，绝对不能重置！必须沿用 _load_state 从 DB 恢复出来的虚拟资金
-                    logger.info(f"⚠️ 模拟盘 (DRY RUN) 运行中，继续沿用数据库持久化的虚拟资金: ${self.mock_cash:,.2f}")
+                logger.info(
+                    f"💰 Broker balance observed={real_bal}; "
+                    f"OMS mock_cash kept=${self.mock_cash:,.2f}"
+                )
         elif IS_LIVEREPLAY:
             logger.info(f"🎞️ Live Replay Mode: Skipping IBKR connection.")
         self._ensure_consumer_group()
