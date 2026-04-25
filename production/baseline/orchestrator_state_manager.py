@@ -27,6 +27,10 @@ from config import (
     REDIS_CFG,
     NY_TZ,
 )
+try:
+    from Domain.shadow_router import get_domain_shadow_router
+except Exception:  # pragma: no cover
+    get_domain_shadow_router = None
 
 logger = logging.getLogger("V8_Orchestrator.StateManager")
 
@@ -390,6 +394,15 @@ class OrchestratorStateManager:
                 namespace=self.state_namespace,
                 run_mode=RUN_MODE,
             )
+            if get_domain_shadow_router is not None:
+                try:
+                    get_domain_shadow_router().on_state_snapshot(
+                        state_data,
+                        namespace=self.state_namespace,
+                        run_mode=RUN_MODE,
+                    )
+                except Exception as e:
+                    logger.warning(f"[DomainShadow] state_snapshot hook failed: {e}")
 
             # Write to PostgreSQL
             self._save_state_to_db(state_data, snapshot_ts=time.time())

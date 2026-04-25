@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import List, Tuple
     
 from config import TARGET_SYMBOLS
+from entry_risk_rules import evaluate_entry_liquidity
 from strategy_config0 import StrategyConfig
 
 
@@ -62,10 +63,11 @@ GATE_REGISTRY = {
     "X2.ct_timeout":          "逆势超时 (COUNTER_TREND_MAX_MINS)",
     "X3.idx_reversal":        "大盘方向反转",
     "X4.stock_hard_stop":     "正股硬止损 (Regime-Adaptive)",
-    "X5.zombie_stop":         "僵尸持仓 (ZOMBIE_EXIT_MINS)",
-    "X6.small_gain":          "小利保护 (SMALL_GAIN)",
-    "X7.time_stop":           "长期时间止损 (TIME_STOP)",
-    "X8.spread_stop":         "平仓流动性恶化",
+    "X5.no_momentum":         "5分钟无动量 (NO_MOMENTUM)",
+    "X6.zombie_stop":         "僵尸持仓 (ZOMBIE_EXIT_MINS)",
+    "X7.small_gain":          "小利保护 (SMALL_GAIN)",
+    "X8.time_stop":           "长期时间止损 (TIME_STOP)",
+    "X9.spread_stop":         "平仓流动性恶化",
     "X9a.hard_stop":          "绝对硬止损 (ABSOLUTE_STOP_LOSS)",
     "X9b.cond_stop":          "条件止损 (个股同向亏损)",
     "X10.protect_counter":    "逆势单利润保护",
@@ -123,6 +125,17 @@ class StrategyCoreV0:
         except Exception:
             return ""
 
+    def _cfg_enabled(self, key: str, default: bool = True, legacy_key: str = "") -> bool:
+        """Return a boolean config flag with optional legacy fallback."""
+        try:
+            if legacy_key:
+                legacy_default = getattr(self.cfg, legacy_key, default)
+            else:
+                legacy_default = default
+            return bool(getattr(self.cfg, key, legacy_default))
+        except Exception:
+            return bool(default)
+
     def decide_entry(self, ctx: dict) -> dict:
         """
         [开仓决策 - 核心路由入口]
@@ -154,9 +167,14 @@ class StrategyCoreV0:
             return None
 
         # 4. 流动性与点差拦截
-        if not self._check_entry_liquidity_guard(ctx):
-            self._last_reject_reason = 'liquidity_guard'
-            return None
+        if self._cfg_enabled('ENTRY_LIQUIDITY_GUARD_ENABLED', True):
+            if not self._check_entry_liquidity_guard(ctx):
+                self._last_reject_reason = 'liquidity_guard'
+                return None
+        else:
+            self._trace("E14.liquidity_bidask", "skip", "ENTRY_LIQUIDITY_GUARD_ENABLED=False")
+            self._trace("E14.liquidity_spread", "skip", "ENTRY_LIQUIDITY_GUARD_ENABLED=False")
+            self._trace("E14.liquidity_div", "skip", "ENTRY_LIQUIDITY_GUARD_ENABLED=False")
 
         return sig
 
@@ -228,40 +246,29 @@ class StrategyCoreV0:
 
     def _check_entry_liquidity_guard(self, ctx: dict) -> bool:
         """检查进场时的买卖价差与散度 (必须具备有效的 Bid/Ask)"""
-        bid = ctx.get('bid', 0.0)
-        ask = ctx.get('ask', 0.0)
-        curr_p = ctx.get('curr_price', 0.0)
-        
-        # 🚨 [终极严密] 如果没有买卖盘口，或者价格异常，绝对禁止开仓！
-        if bid <= 0.01 or ask <= 0.01 or curr_p <= 0.01:
-            self._trace("E14.liquidity_bidask", "block",
-                        f"bid={bid:.3f}/ask={ask:.3f}/p={curr_p:.3f}")
+        decision = evaluate_entry_liquidity(
+            bid=ctx.get('bid', 0.0),
+            ask=ctx.get('ask', 0.0),
+            curr_price=ctx.get('curr_price', 0.0),
+            alpha_z=ctx.get('alpha_z', 0.0),
+            spread_divergence=ctx.get('spread_divergence', 0.0),
+            cfg=self.cfg,
+        )
+
+        if decision['reason'] in ('bidask_invalid', 'min_option_price'):
+            self._trace("E14.liquidity_bidask", "block", decision['detail'])
             return False
         self._trace("E14.liquidity_bidask", "pass", "")
 
-        # 动态门槛计算
-        if curr_p <= 0.5:
-            dynamic_spread_th = 0.20
-        elif curr_p >= 5.0:
-            dynamic_spread_th = 0.10
-        else:
-            dynamic_spread_th = 0.20 - (curr_p - 0.5) * (0.10 / 4.5)
-        
-        spread_pct = (ask - bid) / curr_p
-        if spread_pct > dynamic_spread_th:
-            self._trace("E14.liquidity_spread", "block",
-                        f"spread={spread_pct:.2%} > th={dynamic_spread_th:.2%}")
+        if decision['reason'] == 'spread_too_wide':
+            self._trace("E14.liquidity_spread", "block", decision['detail'])
             return False
-        self._trace("E14.liquidity_spread", "pass",
-                    f"spread={spread_pct:.2%} ≤ {dynamic_spread_th:.2%}")
+        self._trace("E14.liquidity_spread", "pass", decision['detail'])
 
-        div = ctx.get('spread_divergence', 0.0)
-        if div > self.cfg.MAX_SPREAD_DIVERGENCE:
-            self._trace("E14.liquidity_div", "block",
-                        f"div={div:.4f} > {self.cfg.MAX_SPREAD_DIVERGENCE}")
+        if decision['reason'] == 'spread_divergence':
+            self._trace("E14.liquidity_div", "block", decision['detail'])
             return False
-        self._trace("E14.liquidity_div", "pass", f"div={div:.4f}")
-
+        self._trace("E14.liquidity_div", "pass", f"div={decision['spread_divergence']:.4f}")
         return True
 
     def _check_channel_b_slow_bull(self, ctx: dict) -> dict:
@@ -312,18 +319,22 @@ class StrategyCoreV0:
         self._trace("E7.ch_b_index", "pass", f"spy={spy_roc:.4f}/qqq={qqq_roc:.4f}")
 
         # 2. 个股慢牛顺势卫士 (Stock Positive Momentum Guard)
-        if ctx['stock_roc'] <= 0.0005:
-            self._trace("E8.ch_b_stock_momentum", "block", f"stock_roc={ctx['stock_roc']:.4f} ≤ 0.0005")
-            return None
-        self._trace("E8.ch_b_stock_momentum", "pass", f"stock_roc={ctx['stock_roc']:.4f}")
+        if not self._cfg_enabled('ENTRY_MOMENTUM_GUARD_ENABLED', True):
+            self._trace("E8.ch_b_stock_momentum", "skip", "ENTRY_MOMENTUM_GUARD_ENABLED=False")
+            self._trace("E8.ch_b_snap_roc", "skip", "ENTRY_MOMENTUM_GUARD_ENABLED=False")
+        else:
+            if ctx['stock_roc'] <= 0.0005:
+                self._trace("E8.ch_b_stock_momentum", "block", f"stock_roc={ctx['stock_roc']:.4f} ≤ 0.0005")
+                return None
+            self._trace("E8.ch_b_stock_momentum", "pass", f"stock_roc={ctx['stock_roc']:.4f}")
 
-        # [🔥 新增] 瞬时动量校验
-        snap = ctx.get('snap_roc', 0.0)
-        if snap < self.cfg.MIN_LAST_SNAP_ROC:
-            self._trace("E8.ch_b_snap_roc", "block",
-                        f"snap_roc={snap:.4f} < {self.cfg.MIN_LAST_SNAP_ROC}")
-            return None
-        self._trace("E8.ch_b_snap_roc", "pass", f"snap_roc={snap:.4f}")
+            # [🔥 新增] 瞬时动量校验
+            snap = ctx.get('snap_roc', 0.0)
+            if snap < self.cfg.MIN_LAST_SNAP_ROC:
+                self._trace("E8.ch_b_snap_roc", "block",
+                            f"snap_roc={snap:.4f} < {self.cfg.MIN_LAST_SNAP_ROC}")
+                return None
+            self._trace("E8.ch_b_snap_roc", "pass", f"snap_roc={snap:.4f}")
 
         return {
             'action': 'BUY',
@@ -360,8 +371,13 @@ class StrategyCoreV0:
                     f"|alpha|={abs(alpha_val):.2f} ≥ dyn_th={dynamic_threshold:.2f}")
 
         # 3. 个股爆发顺势校验 (Stock Momentum Guard)
-        if not self._check_stock_momentum_guard(ctx, action):
-            return None
+        if self._cfg_enabled('ENTRY_MOMENTUM_GUARD_ENABLED', True):
+            if not self._check_stock_momentum_guard(ctx, action):
+                return None
+        else:
+            self._trace("E11.ch_a_stock_rocL", "skip", "ENTRY_MOMENTUM_GUARD_ENABLED=False")
+            self._trace("E11.ch_a_snap_spike", "skip", "ENTRY_MOMENTUM_GUARD_ENABLED=False")
+            self._trace("E11.ch_a_snap_dir", "skip", "ENTRY_MOMENTUM_GUARD_ENABLED=False")
 
         # 4. 大盘实时护栏 (Index Guard)
         if not self._check_index_guard(ctx, action):
@@ -644,6 +660,10 @@ class StrategyCoreV0:
         idx_trend = ctx.get('index_trend', 0)
         is_counter_trend = (pos['dir'] == 1 and idx_trend == -1) or (pos['dir'] == -1 and idx_trend == 1)
 
+        if not self._cfg_enabled('EXIT_COUNTER_TREND_ENABLED', True):
+            self._trace("X2.ct_timeout", "skip", "EXIT_COUNTER_TREND_ENABLED=False")
+            return None
+
         if is_counter_trend and held_mins >= self.cfg.COUNTER_TREND_MAX_MINS:
             self._trace("X2.ct_timeout", "block",
                         f"dir={pos['dir']} idx_trend={idx_trend} held={held_mins:.1f}m ≥ {self.cfg.COUNTER_TREND_MAX_MINS}m")
@@ -654,8 +674,8 @@ class StrategyCoreV0:
 
     def _check_trend_reversal_guard(self, ctx: dict, pos: dict) -> dict:
         """检查大盘趋势是否发生方向性逆转"""
-        if not self.cfg.INDEX_REVERSAL_EXIT_ENABLED:
-            self._trace("X3.idx_reversal", "skip", "INDEX_REVERSAL_EXIT_ENABLED=False")
+        if not self._cfg_enabled('EXIT_INDEX_REVERSAL_ENABLED', True, legacy_key='INDEX_REVERSAL_EXIT_ENABLED'):
+            self._trace("X3.idx_reversal", "skip", "EXIT_INDEX_REVERSAL_ENABLED=False")
             return None
 
         idx_trend = ctx.get('index_trend', 0)
@@ -675,6 +695,10 @@ class StrategyCoreV0:
 
     def _check_stock_hard_stop(self, ctx: dict, pos: dict, held_mins: float, stock_roi: float) -> dict:
         """检查正股硬止损，根据 Regime 状态、Alpha 置信度和持仓时间动态调整"""
+        if not self._cfg_enabled('EXIT_STOCK_HARD_STOP_ENABLED', True):
+            self._trace("X4.stock_hard_stop", "skip", "EXIT_STOCK_HARD_STOP_ENABLED=False")
+            return None
+
         if pos['entry_stock'] <= 0 or ctx['curr_stock'] <= 0:
             self._trace("X4.stock_hard_stop", "skip", "entry_stock/curr_stock 无效")
             return None
@@ -721,48 +745,73 @@ class StrategyCoreV0:
 
     def _check_time_and_inactivity_stops(self, ctx: dict, pos: dict, held_mins: float, roi: float) -> dict:
         """检查僵尸持仓、小利保本以及长期不涨的时间止损"""
-        # 1. 僵尸持仓 (20min 毫无波动)
-        if held_mins >= self.cfg.ZOMBIE_EXIT_MINS and abs(roi) < 0.02:
-            self._trace("X5.zombie_stop", "block",
-                        f"held={held_mins:.0f}m ≥ {self.cfg.ZOMBIE_EXIT_MINS}m | |roi|={abs(roi):.2%} < 2%")
-            return {'action': 'SELL', 'reason': f"ZOMBIE_STOP:{held_mins:.0f}m"}
-        self._trace("X5.zombie_stop", "pass",
-                    f"held={held_mins:.1f}m roi={roi:.2%}")
+        # 1. 5 分钟无动量: 到达窗口时若当前收益仍未走强则直接离场
+        max_roi = float(pos.get('max_roi', 0.0) or 0.0)
+        if held_mins >= self.cfg.NO_MOMENTUM_MINS and roi < self.cfg.NO_MOMENTUM_MIN_MAX_ROI:
+            self._trace("X5.no_momentum", "block",
+                        f"held={held_mins:.1f}m >= {self.cfg.NO_MOMENTUM_MINS}m | roi={roi:.2%} < {self.cfg.NO_MOMENTUM_MIN_MAX_ROI:.2%} | max_roi={max_roi:.2%}")
+            return {'action': 'SELL', 'reason': f"NO_MOMENTUM(cur:{roi:.1%},max:{max_roi:.1%})"}
+        self._trace("X5.no_momentum", "pass",
+                    f"held={held_mins:.1f}m roi={roi:.2%} max_roi={max_roi:.2%}")
 
-        # 2. 小利保护 (曾达到 8%，若跌回 4% 则锁定利润)
-        if held_mins >= self.cfg.SMALL_GAIN_MINS and pos['max_roi'] >= self.cfg.SMALL_GAIN_THRESHOLD:
-            if roi < self.cfg.SMALL_GAIN_LOCKED_ROI:
-                self._trace("X6.small_gain", "block",
-                            f"max_roi={pos['max_roi']:.1%} ≥ {self.cfg.SMALL_GAIN_THRESHOLD:.1%} | roi={roi:.1%} < {self.cfg.SMALL_GAIN_LOCKED_ROI:.1%}")
-                return {'action': 'SELL', 'reason': f"SMALL_GAIN_P:{roi:.1%}"}
-            self._trace("X6.small_gain", "pass",
-                        f"max_roi={pos['max_roi']:.1%} roi={roi:.1%} 仍保持")
+        # 2. 僵尸持仓 (20min 毫无波动)
+        if not self._cfg_enabled('EXIT_ZOMBIE_STOP_ENABLED', True):
+            self._trace("X6.zombie_stop", "skip", "EXIT_ZOMBIE_STOP_ENABLED=False")
         else:
-            self._trace("X6.small_gain", "skip",
-                        f"held={held_mins:.1f}m / max_roi={pos['max_roi']:.1%} 未触发前置条件")
+            if held_mins >= self.cfg.ZOMBIE_EXIT_MINS and abs(roi) < 0.02:
+                self._trace("X6.zombie_stop", "block",
+                            f"held={held_mins:.0f}m ≥ {self.cfg.ZOMBIE_EXIT_MINS}m | |roi|={abs(roi):.2%} < 2%")
+                return {'action': 'SELL', 'reason': f"ZOMBIE_STOP:{held_mins:.0f}m"}
+            self._trace("X6.zombie_stop", "pass",
+                        f"held={held_mins:.1f}m roi={roi:.2%}")
 
-        # 3. 长期时间止损 (30min 未达 5% 收益)
+        # 3. 小利保护 (曾达到 8%，若跌回 4% 则锁定利润)
+        if not self._cfg_enabled('EXIT_SMALL_GAIN_ENABLED', True):
+            self._trace("X7.small_gain", "skip", "EXIT_SMALL_GAIN_ENABLED=False")
+        else:
+            if held_mins >= self.cfg.SMALL_GAIN_MINS and pos['max_roi'] >= self.cfg.SMALL_GAIN_THRESHOLD:
+                if roi < self.cfg.SMALL_GAIN_LOCKED_ROI:
+                    self._trace("X7.small_gain", "block",
+                                f"max_roi={pos['max_roi']:.1%} ≥ {self.cfg.SMALL_GAIN_THRESHOLD:.1%} | roi={roi:.1%} < {self.cfg.SMALL_GAIN_LOCKED_ROI:.1%}")
+                    return {'action': 'SELL', 'reason': f"SMALL_GAIN_P:{roi:.1%}"}
+                self._trace("X7.small_gain", "pass",
+                            f"max_roi={pos['max_roi']:.1%} roi={roi:.1%} 仍保持")
+            else:
+                self._trace("X7.small_gain", "skip",
+                            f"held={held_mins:.1f}m / max_roi={pos['max_roi']:.1%} 未触发前置条件")
+
+        # 4. 中期时间止损 (15min 当前收益仍未达到 5%)
+        if held_mins >= self.cfg.MID_TIME_STOP_MINS and roi < self.cfg.MID_TIME_STOP_ROI:
+            self._trace("X8.time_stop", "block",
+                        f"held={held_mins:.0f}m >= {self.cfg.MID_TIME_STOP_MINS}m | roi={roi:.1%} < {self.cfg.MID_TIME_STOP_ROI:.1%}")
+            return {'action': 'SELL', 'reason': f"TIME_STOP15:{held_mins:.0f}m"}
+
+        # 5. 长期时间止损 (30min 当前收益仍未达到 5%)
         if held_mins > self.cfg.TIME_STOP_MINS and roi < self.cfg.TIME_STOP_ROI:
-            self._trace("X7.time_stop", "block",
+            self._trace("X8.time_stop", "block",
                         f"held={held_mins:.0f}m > {self.cfg.TIME_STOP_MINS}m | roi={roi:.1%} < {self.cfg.TIME_STOP_ROI:.1%}")
             return {'action': 'SELL', 'reason': f"TIME_STOP:{held_mins:.0f}m"}
-        self._trace("X7.time_stop", "pass",
+        self._trace("X8.time_stop", "pass",
                     f"held={held_mins:.1f}m roi={roi:.2%}")
         return None
 
     def _check_exit_liquidity_guard(self, ctx: dict, current_price: float) -> dict:
         """检查平仓时的流动性是否恶化（点差过大）"""
+        if not self._cfg_enabled('EXIT_LIQUIDITY_GUARD_ENABLED', True):
+            self._trace("X9.spread_stop", "skip", "EXIT_LIQUIDITY_GUARD_ENABLED=False")
+            return None
+
         bid = ctx.get('bid', 0.0)
         ask = ctx.get('ask', 0.0)
         if bid > 0 and ask > 0 and current_price > 0.01:
             spread_pct = (ask - bid) / current_price
             if spread_pct > self.cfg.MAX_SPREAD_PCT_EXIT:
-                self._trace("X8.spread_stop", "block",
+                self._trace("X9.spread_stop", "block",
                             f"spread={spread_pct:.2%} > {self.cfg.MAX_SPREAD_PCT_EXIT:.0%}")
                 return {'action': 'SELL', 'reason': f"SPREAD_STOP:{spread_pct:.2%}"}
-            self._trace("X8.spread_stop", "pass", f"spread={spread_pct:.2%}")
+            self._trace("X9.spread_stop", "pass", f"spread={spread_pct:.2%}")
         else:
-            self._trace("X8.spread_stop", "skip", f"bid={bid:.3f}/ask={ask:.3f}/p={current_price:.3f}")
+            self._trace("X9.spread_stop", "skip", f"bid={bid:.3f}/ask={ask:.3f}/p={current_price:.3f}")
         return None
 
     def _check_stop_loss_guards(self, ctx: dict, pos: dict, roi: float, stock_roi: float) -> dict:
@@ -782,6 +831,10 @@ class StrategyCoreV0:
         self._trace("X9a.hard_stop", "pass", f"roi={roi:.1%} ≥ abs_sl={abs_sl:.0%}")
 
         # B. 条件止损 (股价也显示逆势)
+        if not self._cfg_enabled('EXIT_COND_STOP_ENABLED', True):
+            self._trace("X9b.cond_stop", "skip", "EXIT_COND_STOP_ENABLED=False")
+            return None
+
         is_stock_adverse = (pos['dir'] == 1 and stock_roi < 0) or (pos['dir'] == -1 and stock_roi > 0)
         if is_stock_adverse:
             self._trace("X9b.cond_stop", "block",
@@ -793,9 +846,13 @@ class StrategyCoreV0:
 
     def _check_macd_fade(self, ctx: dict, pos: dict, held_mins: float, roi: float) -> dict:
         """检测 MACD 动能衰竭，实现在微利区间的极速收割"""
+        if not self._cfg_enabled('EXIT_MACD_FADE_ENABLED', True):
+            self._trace("X11.macd_fade", "skip", "EXIT_MACD_FADE_ENABLED=False")
+            return None
+
         macd_slope = ctx.get('macd_hist_slope', 0.0)
         # 宽限 1 分钟，且浮盈超过 MACD_FADE 门槛 (3%)
-        if pos['max_roi'] > self.cfg.MACD_FADE_MIN_ROI and held_mins > 1.0:
+        if pos['max_roi'] > self.cfg.MACD_FADE_MIN_ROI and held_mins > 1:
             if (pos['dir'] == 1 and macd_slope < 0) or (pos['dir'] == -1 and macd_slope > 0):
                 self._trace("X11.macd_fade", "block",
                             f"dir={pos['dir']} slope={macd_slope:.4f} 反向 | max_roi={pos['max_roi']:.1%} held={held_mins:.1f}m")
@@ -809,7 +866,11 @@ class StrategyCoreV0:
 
     def _check_signal_flip(self, ctx: dict, pos: dict, held_mins: float) -> dict:
         """检查 Alpha 信号是否发生彻底反向翻转"""
-        if held_mins <= 2.0:
+        if not self._cfg_enabled('EXIT_SIGNAL_FLIP_ENABLED', True):
+            self._trace("X12.signal_flip", "skip", "EXIT_SIGNAL_FLIP_ENABLED=False")
+            return None
+
+        if held_mins <= 2:
             self._trace("X12.signal_flip", "skip", f"held={held_mins:.1f}m ≤ 2m (冷静期)")
             return None
 

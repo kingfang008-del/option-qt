@@ -17,6 +17,7 @@ from config import (
     ENTRY_MAX_REQUOTE_SLIPPAGE_PCT, ENTRY_REQUOTE_STEP_CAP_PCT, AUTO_TRADING_CAPITAL_RATIO,
     LIVE_TRADING_CAPITAL_LIMIT, IS_REALTIME_DRY,
 )
+from entry_risk_rules import get_entry_min_option_price
 from liquidity_rules import LiquidityRiskManager
 from runtime_trading_controls import (
     get_runtime_live_trading_capital_limit,
@@ -111,6 +112,36 @@ class OrchestratorExecution:
                 cnt += 1
         return cnt
 
+    def _effective_position_exposure(self, st, sym: str = "") -> float:
+        try:
+            qty = abs(float(getattr(st, 'qty', 0.0) or 0.0))
+        except Exception:
+            qty = 0.0
+        try:
+            entry_price = float(getattr(st, 'entry_price', 0.0) or 0.0)
+        except Exception:
+            entry_price = 0.0
+        if qty <= 0 or not math.isfinite(entry_price) or entry_price <= 0.0:
+            return 0.0
+
+        # Legacy reconciler once injected ghost positions with entry_price=9999,
+        # which can explode quota math and permanently freeze new entries.
+        if entry_price >= 1000.0 and not bool(getattr(st, 'open_fill_confirmed', False)):
+            try:
+                fallback = float(getattr(st, 'last_opt_price', 0.0) or 0.0)
+            except Exception:
+                fallback = 0.0
+            if math.isfinite(fallback) and 0.01 <= fallback < 1000.0:
+                entry_price = fallback
+            else:
+                logger.warning(
+                    f"🧹 [Exposure-Sanitize] {sym or '?'} ignore abnormal entry_price={getattr(st, 'entry_price', 0.0)} "
+                    f"qty={qty} open_fill_confirmed={bool(getattr(st, 'open_fill_confirmed', False))}"
+                )
+                return 0.0
+
+        return qty * entry_price * 100.0
+
     @staticmethod
     def _fmt_ny_time(ts: float) -> str:
         if not ts:
@@ -119,6 +150,51 @@ class OrchestratorExecution:
             return datetime.fromtimestamp(float(ts), tz=timezone('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')
         except Exception:
             return ""
+
+    def _emit_order_event(self, sym, action, side, qty, price=0.0, reason="", extra=None):
+        try:
+            self.orch.accounting._emit_trade_log({
+                'ts': time.time(),
+                'symbol': sym,
+                'action': action,
+                'side': side,
+                'qty': float(qty or 0.0),
+                'price': float(price or 0.0),
+                'stock_price': 0.0,
+                'mode': self.orch.mode.upper(),
+                'strategy_note': json.dumps({
+                    'reason': str(reason or ''),
+                    **(extra or {}),
+                }, ensure_ascii=True),
+            })
+        except Exception as e:
+            logger.warning(f"⚠️ [OrderEvent] emit failed for {sym} {action}: {e}")
+
+    @staticmethod
+    def _make_pending_order_key(sym: str, intent: str, contract_id: str = "", seed_ts: float = 0.0) -> str:
+        ts_ms = int(float(seed_ts or time.time()) * 1000.0)
+        contract_part = re.sub(r"[^A-Za-z0-9]+", "", str(contract_id or ""))[:24] or "NA"
+        return f"{str(sym or '').upper()}:{str(intent or '').upper()}:{contract_part}:{ts_ms}"
+
+    @staticmethod
+    def _trade_identifiers(trade) -> dict:
+        order = getattr(trade, "order", None)
+        status = getattr(trade, "orderStatus", None)
+        return {
+            "broker_order_id": getattr(order, "orderId", None),
+            "perm_id": getattr(order, "permId", getattr(status, "permId", None)),
+            "client_id": getattr(order, "clientId", None),
+            "broker_status": str(getattr(status, "status", "") or ""),
+        }
+
+    def _upsert_pending_order(self, order_key: str, payload: dict):
+        manager = getattr(self.orch, "order_state", None)
+        if manager is None:
+            return
+        try:
+            manager.upsert(order_key, payload)
+        except Exception as e:
+            logger.warning(f"⚠️ pending order sync failed for {order_key}: {e}")
 
     def _cfg_value(self, key, default):
         cfg = getattr(self.orch, 'cfg', None)
@@ -356,8 +432,24 @@ class OrchestratorExecution:
 
         if bid > 0.0 and ask > 0.0 and ask >= bid:
             mid = (bid + ask) / 2.0
-            improvement = min(0.01 * max(attempt_no, 0), max((ask - mid), 0.0))
-            return round(min(mid * limit_buffer_entry + improvement, ask), 2)
+            spread = max(ask - bid, 0.0)
+            # Entry policy: probe inside the spread and never cross the ask.
+            # Retry can get more aggressive, but still must remain strictly below
+            # the displayed ask to avoid paying the full spread outright.
+            # Moderate inside-spread probing:
+            # - keep the initial order clearly below ask
+            # - let retries lean further into the spread to recover fill rate
+            inside_spread_probe = min(0.20 + 0.12 * max(attempt_no, 0), 0.45)
+            raw_candidate = mid + spread * inside_spread_probe
+            bid_tick = math.floor(bid * 100.0) / 100.0
+            ask_tick = math.ceil(ask * 100.0) / 100.0
+            ask_minus_tick = max(round(ask_tick - 0.01, 2), round(bid_tick, 2))
+            if ask_minus_tick <= 0.0:
+                return 0.0
+            candidate = math.floor(raw_candidate * 100.0) / 100.0
+            candidate = max(round(bid_tick, 2), candidate)
+            candidate = min(candidate, ask_minus_tick)
+            return round(candidate, 2)
 
         if base_price <= 0.0:
             return 0.0
@@ -418,6 +510,7 @@ class OrchestratorExecution:
             
         if st.position != 0:
             # 已有持仓，理论上 SE 不应派发 BUY；出现即视为幽灵，强制清锁后返回。
+            logger.warning(f"🚫 [Entry EarlyReturn] {sym} blocked: state already has position={st.position}")
             self._release_entry_pending(st)
             return
 
@@ -443,7 +536,7 @@ class OrchestratorExecution:
                 if is_p or reserved:
                     pending_locked_cash_by_bot += getattr(s_state, 'locked_cash', 0.0)
                 else:
-                    position_exposure_by_bot += (getattr(s_state, 'qty', 0) * getattr(s_state, 'entry_price', 0.0) * 100)
+                    position_exposure_by_bot += self._effective_position_exposure(s_state, sym=str(s))
         locked_cash_by_bot = position_exposure_by_bot + pending_locked_cash_by_bot
         
         max_positions = max(1, int(self._cfg_value('MAX_POSITIONS', MAX_POSITIONS)))
@@ -518,6 +611,12 @@ class OrchestratorExecution:
         final_alloc = min(raw_alloc, remaining_quota, available_cash_for_new_entries, max_trade_cap)
         
         if final_alloc < 200:
+            logger.warning(
+                f"🚫 [Entry EarlyReturn] {sym} blocked: final_alloc<{200} "
+                f"| final_alloc=${final_alloc:,.2f} raw_alloc=${raw_alloc:,.2f} "
+                f"| remaining_quota=${remaining_quota:,.2f} available_cash=${available_cash_for_new_entries:,.2f} "
+                f"| live_cap=${runtime_live_cap:,.2f} auto_pool=${auto_pool_capital:,.2f}"
+            )
             self._release_entry_pending(st)
             return
         
@@ -527,8 +626,9 @@ class OrchestratorExecution:
             logger.warning(f"⚠️ Data Sparse for {sym}: Using Stale IV {st.last_valid_iv:.2f} & 50% Size")
         
         price = sig.get('price', 0.0)
-        if price <= 0 or price < self.orch.MIN_OPTION_PRICE or math.isnan(price):
-            logger.info(f"✋ [风控拒单 - {sym}] 期权价格 {price:.2f} 低于最低限制 {self.orch.MIN_OPTION_PRICE}")
+        min_option_price = get_entry_min_option_price(getattr(self.orch, 'MIN_OPTION_PRICE', 0.0))
+        if price <= 0 or price < min_option_price or math.isnan(price):
+            logger.info(f"✋ [风控拒单 - {sym}] 期权价格 {price:.2f} 低于最低限制 {min_option_price}")
             self._release_entry_pending(st)
             return
 
@@ -556,6 +656,10 @@ class OrchestratorExecution:
         
         effective_iv = new_iv if new_iv > 0.01 else st.last_valid_iv
         if not PURE_ALPHA_REPLAY and effective_iv < 0.01:
+            logger.warning(
+                f"🚫 [Entry EarlyReturn] {sym} blocked: effective_iv too low "
+                f"| new_iv={float(new_iv or 0.0):.4f} last_valid_iv={float(getattr(st, 'last_valid_iv', 0.0) or 0.0):.4f}"
+            )
             self._release_entry_pending(st)
             return
 
@@ -573,6 +677,10 @@ class OrchestratorExecution:
         logger.info(f"💧 [流动性拆单评估] {sym} 最终核准额度: ${final_alloc:,.0f} | 拆分笔数: {chunks} | 理由: {liq_eval['reason']}")
         
         if final_alloc <= 0 or chunks < 1:
+            logger.warning(
+                f"🚫 [Entry EarlyReturn] {sym} blocked after liquidity eval "
+                f"| final_alloc=${final_alloc:,.2f} chunks={chunks} reason={liq_eval.get('reason')}"
+            )
             self._release_entry_pending(st)
             return
 
@@ -586,6 +694,11 @@ class OrchestratorExecution:
         target_qty = int(final_alloc // cost_per_contract)
         
         if target_qty < 1:
+            logger.warning(
+                f"🚫 [Entry EarlyReturn] {sym} blocked: target_qty<1 "
+                f"| final_alloc=${final_alloc:,.2f} fill_price=${fill_price:,.4f} "
+                f"| cost_per_contract=${cost_per_contract:,.2f}"
+            )
             self._release_entry_pending(st)
             return
         
@@ -632,11 +745,32 @@ class OrchestratorExecution:
         # =========== 冰山发单分流 [Ghost A: 冰山保护] ===========
         # 🚀 [对齐对冲] 如果处于强制确定性模式，即使是 realtime 也必须禁用冰山，对齐 S4 Atomic Fill
         is_deterministic = config.is_forced_deterministic(self.orch.r)
+        entry_contract_id = str(sig.get('meta', {}).get('contract_id', getattr(st, 'contract_id', '') or '') or '')
         if chunks > 1 and self.orch.mode == 'realtime' and not DISABLE_ICEBERG and not SYNC_EXECUTION and not is_deterministic:
             # 关键: 冰山路径也先占用 position slot（上方已赋值并过 HardCap 复核），
             # 避免跨进程同步提前清 pending 时出现 "slot 瞬间丢失" 而超开仓。
             st._async_entry_order_active = True
-            asyncio.create_task(self._smart_entry_order(sym, sig, stock_price, curr_ts, target_qty, chunks, fill_price, total_est_cost, total_est_comm))
+            st.pending_action = 'BUY'
+            st.pending_side = 'BUY'
+            order_key = self._make_pending_order_key(sym, "OPEN", entry_contract_id, curr_ts)
+            self._upsert_pending_order(order_key, {
+                'symbol': sym,
+                'contract_id': entry_contract_id,
+                'intent': 'OPEN',
+                'side': 'BUY',
+                'status': 'PENDING_SUBMIT',
+                'target_qty': int(target_qty),
+                'filled_qty': 0,
+                'remaining_qty': int(target_qty),
+                'limit_price': float(fill_price or 0.0),
+                'retry_count': 0,
+                'reserved_cash': float(total_new_locked or 0.0),
+                'slot_reserved': bool(getattr(st, 'entry_slot_reserved', False)),
+                'submit_ts': float(curr_ts or time.time()),
+                'last_update_ts': time.time(),
+                'reason': str(sig.get('reason', '') or ''),
+            })
+            asyncio.create_task(self._smart_entry_order(sym, sig, stock_price, curr_ts, target_qty, chunks, fill_price, total_est_cost, total_est_comm, order_key=order_key))
             return
         
         if 'meta' in sig:
@@ -797,6 +931,41 @@ class OrchestratorExecution:
                 trade = self.orch.ibkr.place_option_order(real_contract, 'BUY', st.qty, 'LMT', lmt_price=limit_price, stop_loss_pct=stop_loss, custom_time=curr_ts)
                 if trade:
                     st.is_pending = True
+                    st.pending_action = 'BUY'
+                    st.pending_side = 'BUY'
+                    order_key = self._make_pending_order_key(sym, "OPEN", getattr(st, 'contract_id', ''), curr_ts)
+                    self._upsert_pending_order(order_key, {
+                        'symbol': sym,
+                        'contract_id': getattr(st, 'contract_id', ''),
+                        'intent': 'OPEN',
+                        'side': 'BUY',
+                        'status': 'SUBMITTED',
+                        'target_qty': int(st.qty),
+                        'filled_qty': int(getattr(getattr(trade, 'orderStatus', None), 'filled', 0) or 0),
+                        'remaining_qty': int(st.qty),
+                        'limit_price': float(limit_price or 0.0),
+                        'retry_count': 0,
+                        'reserved_cash': float(total_new_locked or 0.0),
+                        'slot_reserved': bool(getattr(st, 'entry_slot_reserved', False)),
+                        'submit_ts': float(start_time),
+                        'last_update_ts': time.time(),
+                        'reason': str(sig.get('reason', '') or ''),
+                        **self._trade_identifiers(trade),
+                    })
+                    self._emit_order_event(
+                        sym,
+                        'ORDER_PENDING',
+                        'BUY',
+                        st.qty,
+                        price=limit_price,
+                        reason=sig.get('reason', ''),
+                        extra={
+                            'tag': sig.get('tag', ''),
+                            'status': str(getattr(getattr(trade, 'orderStatus', None), 'status', '') or 'Submitted'),
+                            'contract_id': getattr(st, 'contract_id', ''),
+                            'pending_action': 'BUY',
+                        },
+                    )
                     asyncio.create_task(
                         self._monitor_realtime_order(
                             sym,
@@ -810,6 +979,7 @@ class OrchestratorExecution:
                             stock_price,
                             sig,
                             st,
+                            order_key,
                         )
                     )
                     return # 监控异步处理
@@ -935,6 +1105,8 @@ class OrchestratorExecution:
                     real_contract.localSymbol = st.contract_id; real_contract.exchange = 'SMART'; real_contract.currency = 'USD'
                     
                 st.is_pending = True 
+                st.pending_action = 'SELL'
+                st.pending_side = 'SELL'
                 original_position = sig.get('original_position', st.position)
                 
                 if not runtime_trading_enabled:
@@ -947,14 +1119,33 @@ class OrchestratorExecution:
                     simulated_exit_price = max(round(raw_price * (1 - slippage_exit_pct), 2), 0.01)
                     self.orch.accounting._process_exit_accounting(sym, st, actual_fill_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0, original_position=original_position)
                 else:
-                    asyncio.create_task(self._smart_exit_order(sym, real_contract, exit_qty, raw_price, stock_price, curr_ts=curr_ts, is_force=is_urgent, bid=bid, ask=ask, reason=reason))
+                    order_key = self._make_pending_order_key(sym, "CLOSE", getattr(st, 'contract_id', ''), curr_ts)
+                    self._upsert_pending_order(order_key, {
+                        'symbol': sym,
+                        'contract_id': getattr(st, 'contract_id', ''),
+                        'intent': 'CLOSE',
+                        'side': 'SELL',
+                        'status': 'PENDING_SUBMIT',
+                        'target_qty': int(exit_qty),
+                        'filled_qty': 0,
+                        'remaining_qty': int(exit_qty),
+                        'limit_price': float(raw_price or 0.0),
+                        'retry_count': 0,
+                        'reserved_cash': float(getattr(st, 'locked_cash', 0.0) or 0.0),
+                        'slot_reserved': bool(getattr(st, 'entry_slot_reserved', False)),
+                        'last_update_ts': time.time(),
+                        'reason': str(reason or ''),
+                    })
+                    asyncio.create_task(self._smart_exit_order(sym, real_contract, exit_qty, raw_price, stock_price, curr_ts=curr_ts, is_force=is_urgent, bid=bid, ask=ask, reason=reason, order_key=order_key))
                     return # 监控异步处理
         finally:
             if not (self.orch.mode == 'realtime' and runtime_trading_enabled):
                 st.is_pending = False
+                st.pending_action = ''
+                st.pending_side = None
             self.orch.state_manager.save_state()
 
-    async def _smart_entry_order(self, sym, sig, stock_price, curr_ts, target_total_qty, chunks, fill_price, total_est_cost, total_est_comm):
+    async def _smart_entry_order(self, sym, sig, stock_price, curr_ts, target_total_qty, chunks, fill_price, total_est_cost, total_est_comm, order_key=None):
         st = self.orch.states.get(sym)
         if not st: return
         
@@ -995,6 +1186,23 @@ class OrchestratorExecution:
                 chunk_est_comm = qty_this_chunk * commission_per_contract
                 
                 trade = self.orch.ibkr.place_option_order(real_contract, 'BUY', qty_this_chunk, 'LMT', lmt_price=limit_price, custom_time=curr_ts)
+                if trade:
+                    self._upsert_pending_order(order_key, {
+                        'symbol': sym,
+                        'contract_id': getattr(st, 'contract_id', ''),
+                        'intent': 'OPEN',
+                        'side': 'BUY',
+                        'status': 'SUBMITTED',
+                        'target_qty': int(target_total_qty),
+                        'filled_qty': int(total_qty_filled),
+                        'remaining_qty': max(int(target_total_qty) - int(total_qty_filled), 0),
+                        'limit_price': float(limit_price or 0.0),
+                        'retry_count': int(max(i, 0)),
+                        'reserved_cash': float(getattr(st, 'locked_cash', 0.0) or 0.0),
+                        'slot_reserved': bool(getattr(st, 'entry_slot_reserved', False)),
+                        'last_update_ts': time.time(),
+                        **self._trade_identifiers(trade),
+                    })
                 
                 if not trade:
                     if not runtime_trading_enabled:
@@ -1008,8 +1216,24 @@ class OrchestratorExecution:
                     await asyncio.wait_for(self._wait_for_fill(trade), timeout=MAX_ICEBERG_DURATION)
                 except asyncio.TimeoutError:
                     logger.warning(f"🧊 [Iceberg Timeout] {sym} 子单 {chunk_num} 超时，执行 Melt 熔断。")
-                    if hasattr(self.orch.ibkr, 'ib'): 
-                        self.orch.ib.cancelOrder(trade.order)
+                    self._upsert_pending_order(order_key, {
+                        'symbol': sym,
+                        'contract_id': getattr(st, 'contract_id', ''),
+                        'intent': 'OPEN',
+                        'side': 'BUY',
+                        'status': 'CANCEL_REQUESTED',
+                        'target_qty': int(target_total_qty),
+                        'filled_qty': int(total_qty_filled),
+                        'remaining_qty': max(int(target_total_qty) - int(total_qty_filled), 0),
+                        'limit_price': float(limit_price or 0.0),
+                        'retry_count': int(max(i, 0)),
+                        'reserved_cash': float(getattr(st, 'locked_cash', 0.0) or 0.0),
+                        'slot_reserved': bool(getattr(st, 'entry_slot_reserved', False)),
+                        'last_update_ts': time.time(),
+                        **self._trade_identifiers(trade),
+                    })
+                    if hasattr(self.orch.ibkr, 'ib'):
+                        self.orch.ibkr.ib.cancelOrder(trade.order)
                     await asyncio.sleep(0.5)
 
                 filled_qty = int(trade.orderStatus.filled)
@@ -1024,6 +1248,22 @@ class OrchestratorExecution:
                 total_qty_filled += filled_qty
                 total_actual_cost += filled_qty * avg_fill_price * 100
                 total_actual_comm += filled_qty * commission_per_contract
+                self._upsert_pending_order(order_key, {
+                    'symbol': sym,
+                    'contract_id': getattr(st, 'contract_id', ''),
+                    'intent': 'OPEN',
+                    'side': 'BUY',
+                    'status': 'PARTIAL_FILLED' if total_qty_filled < target_total_qty else 'FILLED',
+                    'target_qty': int(target_total_qty),
+                    'filled_qty': int(total_qty_filled),
+                    'remaining_qty': max(int(target_total_qty) - int(total_qty_filled), 0),
+                    'limit_price': float(avg_fill_price or limit_price or 0.0),
+                    'retry_count': int(max(i, 0)),
+                    'reserved_cash': float(getattr(st, 'locked_cash', 0.0) or 0.0),
+                    'slot_reserved': bool(getattr(st, 'entry_slot_reserved', False)),
+                    'last_update_ts': time.time(),
+                    **self._trade_identifiers(trade),
+                })
                 
                 if total_qty_filled >= target_total_qty:
                     break
@@ -1068,11 +1308,60 @@ class OrchestratorExecution:
                     duration=fill_ts - iceberg_start_time, ratio=(total_qty_filled / target_total_qty),
                     mode_override='REALTIME', note_suffix=f"|GHOST_A_{chunks}",
                 )
+                self._upsert_pending_order(order_key, {
+                    'symbol': sym,
+                    'contract_id': getattr(st, 'contract_id', ''),
+                    'intent': 'OPEN',
+                    'side': 'BUY',
+                    'status': 'FILLED' if total_qty_filled >= target_total_qty else 'CANCELLED',
+                    'target_qty': int(target_total_qty),
+                    'filled_qty': int(total_qty_filled),
+                    'remaining_qty': max(int(target_total_qty) - int(total_qty_filled), 0),
+                    'limit_price': float(getattr(st, 'entry_price', 0.0) or 0.0),
+                    'retry_count': int(max(chunks - 1, 0)),
+                    'reserved_cash': 0.0,
+                    'slot_reserved': bool(getattr(st, 'entry_slot_reserved', False)),
+                    'last_update_ts': time.time(),
+                    'terminal_ts': time.time(),
+                    'is_terminal': True,
+                })
             else:
                 self._reset_failed_entry_state(st)
+                self._upsert_pending_order(order_key, {
+                    'symbol': sym,
+                    'contract_id': getattr(st, 'contract_id', ''),
+                    'intent': 'OPEN',
+                    'side': 'BUY',
+                    'status': 'CANCELLED',
+                    'target_qty': int(target_total_qty),
+                    'filled_qty': 0,
+                    'remaining_qty': int(target_total_qty),
+                    'limit_price': float(fill_price or 0.0),
+                    'retry_count': int(max(chunks - 1, 0)),
+                    'reserved_cash': 0.0,
+                    'slot_reserved': False,
+                    'last_update_ts': time.time(),
+                    'terminal_ts': time.time(),
+                    'is_terminal': True,
+                })
 
         except Exception as e:
             logger.error(f"🚨 [Iceberg Error] {sym}: {e}", exc_info=True)
+            self._upsert_pending_order(order_key, {
+                'symbol': sym,
+                'contract_id': getattr(st, 'contract_id', ''),
+                'intent': 'OPEN',
+                'side': 'BUY',
+                'status': 'ERROR',
+                'target_qty': int(target_total_qty),
+                'filled_qty': 0,
+                'remaining_qty': int(target_total_qty),
+                'limit_price': float(fill_price or 0.0),
+                'last_update_ts': time.time(),
+                'terminal_ts': time.time(),
+                'is_terminal': True,
+                'last_error': str(e),
+            })
         finally:
             try:
                 st._async_entry_order_active = False
@@ -1080,6 +1369,8 @@ class OrchestratorExecution:
                 pass
             st.locked_cash = 0  
             st.is_pending = False # [Ghost C]
+            st.pending_action = ''
+            st.pending_side = None
             self.orch.state_manager.save_state()
 
     async def _wait_for_fill(self, trade):
@@ -1090,11 +1381,11 @@ class OrchestratorExecution:
                 return True
         return trade.orderStatus.status == 'Filled'
 
-    async def _monitor_realtime_order(self, sym, trade, real_contract, cost, commission, expected_qty, start_time, limit_price, stock_price, sig, st):
+    async def _monitor_realtime_order(self, sym, trade, real_contract, cost, commission, expected_qty, start_time, limit_price, stock_price, sig, st, order_key=None):
         """实盘超时看门狗"""
         try:
             commission_per_contract = float(self._cfg_value('COMMISSION_PER_CONTRACT', COMMISSION_PER_CONTRACT))
-            max_attempts = max(1, int(self._cfg_value('ORDER_MAX_RETRIES', config.ORDER_MAX_RETRIES)))
+            max_attempts = max(1, int(self._cfg_value('EXIT_ORDER_MAX_RETRIES', getattr(config, 'EXIT_ORDER_MAX_RETRIES', config.ORDER_MAX_RETRIES))))
             wait_per_attempt = max(1, int(self._cfg_value('ORDER_TIMEOUT_SECONDS', config.ORDER_TIMEOUT_SECONDS)))
             total_filled_qty = 0
             total_actual_cost = 0.0
@@ -1112,10 +1403,43 @@ class OrchestratorExecution:
 
                 filled_qty = int(current_trade.orderStatus.filled)
                 avg_fill_price = float(current_trade.orderStatus.avgFillPrice) if current_trade.orderStatus.avgFillPrice else float(current_limit_price)
+                broker_status = str(getattr(current_trade.orderStatus, 'status', '') or '')
+                self._upsert_pending_order(order_key, {
+                    'symbol': sym,
+                    'contract_id': getattr(st, 'contract_id', ''),
+                    'intent': 'OPEN',
+                    'side': 'BUY',
+                    'status': 'PARTIAL_FILLED' if filled_qty > 0 and broker_status != 'Filled' else (broker_status or 'SUBMITTED'),
+                    'target_qty': int(expected_qty),
+                    'filled_qty': int(filled_qty),
+                    'remaining_qty': max(int(expected_qty) - int(filled_qty), 0),
+                    'limit_price': float(current_limit_price or 0.0),
+                    'retry_count': int(attempt_no),
+                    'reserved_cash': float(getattr(st, 'locked_cash', 0.0) or 0.0),
+                    'slot_reserved': bool(getattr(st, 'entry_slot_reserved', False)),
+                    'last_update_ts': time.time(),
+                    **self._trade_identifiers(current_trade),
+                })
 
                 if current_trade.orderStatus.status != 'Filled':
+                    self._upsert_pending_order(order_key, {
+                        'symbol': sym,
+                        'contract_id': getattr(st, 'contract_id', ''),
+                        'intent': 'OPEN',
+                        'side': 'BUY',
+                        'status': 'CANCEL_REQUESTED',
+                        'target_qty': int(expected_qty),
+                        'filled_qty': int(filled_qty),
+                        'remaining_qty': max(int(expected_qty) - int(filled_qty), 0),
+                        'limit_price': float(current_limit_price or 0.0),
+                        'retry_count': int(attempt_no),
+                        'reserved_cash': float(getattr(st, 'locked_cash', 0.0) or 0.0),
+                        'slot_reserved': bool(getattr(st, 'entry_slot_reserved', False)),
+                        'last_update_ts': time.time(),
+                        **self._trade_identifiers(current_trade),
+                    })
                     if hasattr(self.orch.ibkr, 'ib') and current_trade.orderStatus.status not in ['Cancelled', 'Inactive', 'ApiCancelled']:
-                        self.orch.ib.cancelOrder(current_trade.order)
+                        self.orch.ibkr.ib.cancelOrder(current_trade.order)
                     await asyncio.sleep(2)
                     filled_qty = int(current_trade.orderStatus.filled)
                     avg_fill_price = float(current_trade.orderStatus.avgFillPrice) if current_trade.orderStatus.avgFillPrice else float(current_limit_price)
@@ -1157,6 +1481,22 @@ class OrchestratorExecution:
                 )
                 if not next_trade:
                     break
+                self._upsert_pending_order(order_key, {
+                    'symbol': sym,
+                    'contract_id': getattr(st, 'contract_id', ''),
+                    'intent': 'OPEN',
+                    'side': 'BUY',
+                    'status': 'REPLACED',
+                    'target_qty': int(expected_qty),
+                    'filled_qty': int(total_filled_qty),
+                    'remaining_qty': int(remaining_qty),
+                    'limit_price': float(current_limit_price or 0.0),
+                    'retry_count': int(attempt_no + 1),
+                    'reserved_cash': float(getattr(st, 'locked_cash', 0.0) or 0.0),
+                    'slot_reserved': bool(getattr(st, 'entry_slot_reserved', False)),
+                    'last_update_ts': time.time(),
+                    **self._trade_identifiers(next_trade),
+                })
                 current_trade = next_trade
 
             actual_commission = total_filled_qty * commission_per_contract
@@ -1169,6 +1509,35 @@ class OrchestratorExecution:
             if total_filled_qty > 0:
                 avg_fill_price = (total_actual_cost / total_filled_qty) / 100.0
                 ratio = total_filled_qty / expected_qty if expected_qty > 0 else 0.0
+                self._emit_order_event(
+                    sym,
+                    'ORDER_FILLED',
+                    'BUY',
+                    total_filled_qty,
+                    price=avg_fill_price,
+                    reason=sig.get('reason', ''),
+                    extra={
+                        'expected_qty': int(expected_qty),
+                        'filled_qty': int(total_filled_qty),
+                        'fill_ratio': float(ratio),
+                        'status': 'Filled' if total_filled_qty >= expected_qty else 'PartialFill',
+                    },
+                )
+                remaining_qty = max(int(expected_qty) - int(total_filled_qty), 0)
+                if remaining_qty > 0:
+                    self._emit_order_event(
+                        sym,
+                        'ORDER_CANCELLED',
+                        'BUY',
+                        remaining_qty,
+                        price=current_limit_price,
+                        reason=f"{sig.get('reason', '')}|UNFILLED_REMAINDER",
+                        extra={
+                            'expected_qty': int(expected_qty),
+                            'filled_qty': int(total_filled_qty),
+                            'status': str(getattr(getattr(current_trade, 'orderStatus', None), 'status', '') or 'Cancelled'),
+                        },
+                    )
                 alpha_label_ts = sig.get('meta', {}).get('alpha_label_ts', 0.0)
                 alpha_available_ts = sig.get('meta', {}).get('alpha_available_ts', 0.0)
                 fill_ts = time.time()
@@ -1186,16 +1555,84 @@ class OrchestratorExecution:
                     timing_fields=timing_fields,
                     mode_override='REALTIME',
                 )
+                self._upsert_pending_order(order_key, {
+                    'symbol': sym,
+                    'contract_id': getattr(st, 'contract_id', ''),
+                    'intent': 'OPEN',
+                    'side': 'BUY',
+                    'status': 'FILLED' if total_filled_qty >= expected_qty else 'CANCELLED',
+                    'target_qty': int(expected_qty),
+                    'filled_qty': int(total_filled_qty),
+                    'remaining_qty': max(int(expected_qty) - int(total_filled_qty), 0),
+                    'limit_price': float(avg_fill_price or current_limit_price or 0.0),
+                    'retry_count': int(max_attempts - 1),
+                    'reserved_cash': 0.0,
+                    'slot_reserved': bool(getattr(st, 'entry_slot_reserved', False)),
+                    'last_update_ts': time.time(),
+                    'terminal_ts': time.time(),
+                    'is_terminal': True,
+                    **self._trade_identifiers(current_trade),
+                })
             else:
+                self._emit_order_event(
+                    sym,
+                    'ORDER_CANCELLED',
+                    'BUY',
+                    expected_qty,
+                    price=current_limit_price,
+                    reason=sig.get('reason', ''),
+                    extra={
+                        'expected_qty': int(expected_qty),
+                        'filled_qty': 0,
+                        'status': str(getattr(getattr(current_trade, 'orderStatus', None), 'status', '') or 'Cancelled'),
+                    },
+                )
                 self._reset_failed_entry_state(st)
+                self._upsert_pending_order(order_key, {
+                    'symbol': sym,
+                    'contract_id': getattr(st, 'contract_id', ''),
+                    'intent': 'OPEN',
+                    'side': 'BUY',
+                    'status': 'CANCELLED',
+                    'target_qty': int(expected_qty),
+                    'filled_qty': 0,
+                    'remaining_qty': int(expected_qty),
+                    'limit_price': float(current_limit_price or 0.0),
+                    'retry_count': int(max_attempts - 1),
+                    'reserved_cash': 0.0,
+                    'slot_reserved': False,
+                    'last_update_ts': time.time(),
+                    'terminal_ts': time.time(),
+                    'is_terminal': True,
+                    **self._trade_identifiers(current_trade),
+                })
 
         except Exception as e:
             logger.error(f"🚨 [Monitor Error] {sym}: {e}", exc_info=True)
+            self._upsert_pending_order(order_key, {
+                'symbol': sym,
+                'contract_id': getattr(st, 'contract_id', ''),
+                'intent': 'OPEN',
+                'side': 'BUY',
+                'status': 'ERROR',
+                'target_qty': int(expected_qty),
+                'filled_qty': int(getattr(getattr(trade, 'orderStatus', None), 'filled', 0) or 0),
+                'remaining_qty': int(expected_qty),
+                'limit_price': float(limit_price or 0.0),
+                'last_update_ts': time.time(),
+                'terminal_ts': time.time(),
+                'is_terminal': True,
+                'last_error': str(e),
+                **self._trade_identifiers(trade),
+            })
         finally:
-            if st: st.is_pending = False
+            if st:
+                st.is_pending = False
+                st.pending_action = ''
+                st.pending_side = None
             self.orch.state_manager.save_state()
 
-    async def _smart_exit_order(self, sym, real_contract, total_qty, base_price, stock_price, curr_ts=None, is_force=False, bid=0.0, ask=0.0, reason=""):
+    async def _smart_exit_order(self, sym, real_contract, total_qty, base_price, stock_price, curr_ts=None, is_force=False, bid=0.0, ask=0.0, reason="", order_key=None):
         """实盘防滑点平仓订单执行器"""
         st = self.orch.states.get(sym)
         if not st: return
@@ -1234,6 +1671,21 @@ class OrchestratorExecution:
 
             if effective_exit_order_type == 'MKT':
                 trade = self.orch.ibkr.place_option_order(real_contract, 'SELL', total_qty, 'MKT', base_price, custom_time=curr_ts, reason=reason)
+                if trade:
+                    self._upsert_pending_order(order_key, {
+                        'symbol': sym,
+                        'contract_id': getattr(st, 'contract_id', ''),
+                        'intent': 'CLOSE',
+                        'side': 'SELL',
+                        'status': str(getattr(getattr(trade, 'orderStatus', None), 'status', '') or 'SUBMITTED').upper(),
+                        'target_qty': int(total_qty),
+                        'filled_qty': int(getattr(getattr(trade, 'orderStatus', None), 'filled', 0) or 0),
+                        'remaining_qty': int(total_qty),
+                        'limit_price': float(base_price or 0.0),
+                        'retry_count': 0,
+                        'last_update_ts': time.time(),
+                        **self._trade_identifiers(trade),
+                    })
                 if not trade:
                     # [🛡️ Safe Fallback] place_option_order 返回 None 有两种语义:
                     #   (a) DRY RUN / TRADING_ENABLED=False → 应该用模拟价清算账本;
@@ -1262,6 +1714,34 @@ class OrchestratorExecution:
                 simulated_exit_price = max(round(limit_sell_price * (1 - slippage_exit_pct), 2), 0.01)
                 self.orch.accounting._process_exit_accounting(sym, st, total_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0)
                 return
+            self._upsert_pending_order(order_key, {
+                'symbol': sym,
+                'contract_id': getattr(st, 'contract_id', ''),
+                'intent': 'CLOSE',
+                'side': 'SELL',
+                'status': 'SUBMITTED',
+                'target_qty': int(total_qty),
+                'filled_qty': 0,
+                'remaining_qty': int(total_qty),
+                'limit_price': float(limit_sell_price or 0.0),
+                'retry_count': 0,
+                'last_update_ts': time.time(),
+                **self._trade_identifiers(current_trade),
+            })
+
+            self._emit_order_event(
+                sym,
+                'ORDER_PENDING',
+                'SELL',
+                total_qty,
+                price=limit_sell_price,
+                reason=reason,
+                extra={
+                    'status': str(getattr(getattr(current_trade, 'orderStatus', None), 'status', '') or 'Submitted'),
+                    'contract_id': getattr(st, 'contract_id', ''),
+                    'pending_action': 'SELL',
+                },
+            )
 
             for attempt_no in range(max_attempts):
                 for _ in range(wait_per_attempt):
@@ -1271,10 +1751,39 @@ class OrchestratorExecution:
 
                 filled_qty = int(current_trade.orderStatus.filled)
                 avg_p = float(current_trade.orderStatus.avgFillPrice) if current_trade.orderStatus.avgFillPrice else float(limit_sell_price)
+                broker_status = str(getattr(current_trade.orderStatus, 'status', '') or '')
+                self._upsert_pending_order(order_key, {
+                    'symbol': sym,
+                    'contract_id': getattr(st, 'contract_id', ''),
+                    'intent': 'CLOSE',
+                    'side': 'SELL',
+                    'status': 'PARTIAL_FILLED' if filled_qty > 0 and broker_status != 'Filled' else (broker_status or 'SUBMITTED'),
+                    'target_qty': int(total_qty),
+                    'filled_qty': int(filled_qty),
+                    'remaining_qty': max(int(total_qty) - int(filled_qty), 0),
+                    'limit_price': float(limit_sell_price or 0.0),
+                    'retry_count': int(attempt_no),
+                    'last_update_ts': time.time(),
+                    **self._trade_identifiers(current_trade),
+                })
 
                 if current_trade.orderStatus.status != 'Filled':
+                    self._upsert_pending_order(order_key, {
+                        'symbol': sym,
+                        'contract_id': getattr(st, 'contract_id', ''),
+                        'intent': 'CLOSE',
+                        'side': 'SELL',
+                        'status': 'CANCEL_REQUESTED',
+                        'target_qty': int(total_qty),
+                        'filled_qty': int(filled_qty),
+                        'remaining_qty': max(int(total_qty) - int(filled_qty), 0),
+                        'limit_price': float(limit_sell_price or 0.0),
+                        'retry_count': int(attempt_no),
+                        'last_update_ts': time.time(),
+                        **self._trade_identifiers(current_trade),
+                    })
                     if hasattr(self.orch.ibkr, 'ib') and current_trade.orderStatus.status not in ['Cancelled', 'Inactive', 'ApiCancelled']:
-                        self.orch.ib.cancelOrder(current_trade.order)
+                        self.orch.ibkr.ib.cancelOrder(current_trade.order)
                     await asyncio.sleep(2)
                     filled_qty = int(current_trade.orderStatus.filled)
                     avg_p = float(current_trade.orderStatus.avgFillPrice) if current_trade.orderStatus.avgFillPrice else float(limit_sell_price)
@@ -1307,10 +1816,54 @@ class OrchestratorExecution:
                 )
                 if not next_trade:
                     break
+                self._upsert_pending_order(order_key, {
+                    'symbol': sym,
+                    'contract_id': getattr(st, 'contract_id', ''),
+                    'intent': 'CLOSE',
+                    'side': 'SELL',
+                    'status': 'REPLACED',
+                    'target_qty': int(total_qty),
+                    'filled_qty': int(total_filled_qty),
+                    'remaining_qty': int(remaining_qty),
+                    'limit_price': float(limit_sell_price or 0.0),
+                    'retry_count': int(attempt_no + 1),
+                    'last_update_ts': time.time(),
+                    **self._trade_identifiers(next_trade),
+                })
                 current_trade = next_trade
 
             if total_filled_qty > 0:
                 avg_exit_price = total_exit_value / total_filled_qty
+                fill_ratio = total_filled_qty / total_qty if total_qty > 0 else 0.0
+                self._emit_order_event(
+                    sym,
+                    'ORDER_FILLED',
+                    'SELL',
+                    total_filled_qty,
+                    price=avg_exit_price,
+                    reason=reason,
+                    extra={
+                        'expected_qty': int(total_qty),
+                        'filled_qty': int(total_filled_qty),
+                        'fill_ratio': float(fill_ratio),
+                        'status': 'Filled' if total_filled_qty >= total_qty else 'PartialFill',
+                    },
+                )
+                remaining_qty = max(int(total_qty) - int(total_filled_qty), 0)
+                if remaining_qty > 0:
+                    self._emit_order_event(
+                        sym,
+                        'ORDER_CANCELLED',
+                        'SELL',
+                        remaining_qty,
+                        price=limit_sell_price,
+                        reason=f"{reason}|UNFILLED_REMAINDER",
+                        extra={
+                            'expected_qty': int(total_qty),
+                            'filled_qty': int(total_filled_qty),
+                            'status': str(getattr(getattr(current_trade, 'orderStatus', None), 'status', '') or 'Cancelled'),
+                        },
+                    )
                 self.orch.accounting._process_exit_accounting(
                     sym,
                     st,
@@ -1320,13 +1873,76 @@ class OrchestratorExecution:
                     curr_ts,
                     reason,
                     time.time() - start_time,
-                    total_filled_qty / total_qty,
+                    fill_ratio,
                 )
+                self._upsert_pending_order(order_key, {
+                    'symbol': sym,
+                    'contract_id': getattr(st, 'contract_id', ''),
+                    'intent': 'CLOSE',
+                    'side': 'SELL',
+                    'status': 'FILLED' if total_filled_qty >= total_qty else 'CANCELLED',
+                    'target_qty': int(total_qty),
+                    'filled_qty': int(total_filled_qty),
+                    'remaining_qty': max(int(total_qty) - int(total_filled_qty), 0),
+                    'limit_price': float(avg_exit_price or limit_sell_price or 0.0),
+                    'retry_count': int(max_attempts - 1),
+                    'last_update_ts': time.time(),
+                    'terminal_ts': time.time(),
+                    'is_terminal': True,
+                    **self._trade_identifiers(current_trade),
+                })
+            else:
+                self._emit_order_event(
+                    sym,
+                    'ORDER_CANCELLED',
+                    'SELL',
+                    total_qty,
+                    price=limit_sell_price,
+                    reason=reason,
+                    extra={
+                        'expected_qty': int(total_qty),
+                        'filled_qty': 0,
+                        'status': str(getattr(getattr(current_trade, 'orderStatus', None), 'status', '') or 'Cancelled'),
+                    },
+                )
+                self._upsert_pending_order(order_key, {
+                    'symbol': sym,
+                    'contract_id': getattr(st, 'contract_id', ''),
+                    'intent': 'CLOSE',
+                    'side': 'SELL',
+                    'status': 'CANCELLED',
+                    'target_qty': int(total_qty),
+                    'filled_qty': 0,
+                    'remaining_qty': int(total_qty),
+                    'limit_price': float(limit_sell_price or 0.0),
+                    'retry_count': int(max_attempts - 1),
+                    'last_update_ts': time.time(),
+                    'terminal_ts': time.time(),
+                    'is_terminal': True,
+                    **self._trade_identifiers(current_trade),
+                })
 
         except Exception as e:
             logger.error(f"🚨 [Exit Error] {sym}: {e}", exc_info=True)
+            self._upsert_pending_order(order_key, {
+                'symbol': sym,
+                'contract_id': getattr(st, 'contract_id', ''),
+                'intent': 'CLOSE',
+                'side': 'SELL',
+                'status': 'ERROR',
+                'target_qty': int(total_qty),
+                'filled_qty': 0,
+                'remaining_qty': int(total_qty),
+                'limit_price': float(base_price or 0.0),
+                'last_update_ts': time.time(),
+                'terminal_ts': time.time(),
+                'is_terminal': True,
+                'last_error': str(e),
+            })
         finally:
             st.is_pending = False
+            st.pending_action = ''
+            st.pending_side = None
             self.orch.state_manager.save_state()
 
     async def force_close_all(self):

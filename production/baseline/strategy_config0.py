@@ -26,24 +26,60 @@ class StrategyConfig:
     START_HOUR: int = 9
     START_MINUTE: int = 45           
     NO_ENTRY_HOUR: int = 15
-    NO_ENTRY_MINUTE: int = 30
+    NO_ENTRY_MINUTE: int = 40
     CLOSE_HOUR: int = 15
-    CLOSE_MINUTE: int = 40           
+    CLOSE_MINUTE: int = 45           
     
     # ================= 3. Entry Thresholds =================
     # V0 逻辑: VOL_MIN 为 -1 (更宽松)，ALPHA_ENTRY 为 0.85
     VOL_MIN_Z: float = -1          
     VOL_MAX_Z: float = 4.0           
-    ALPHA_ENTRY_THRESHOLD: float = 0.7
+    ALPHA_ENTRY_THRESHOLD: float = 0.6
     ALPHA_ENTRY_STRICT: float = 1.2
     MIN_CS_ALPHA_Z: float = 0.5           
     
     # ================= 4. Momentum & Trend =================
     STOCK_MOMENTUM_TOLERANCE: float = 0.001  
-    # 慢涨优质标的（如 NVDA/MSFT）经常在 alpha 已经很强时出现 1m 微回撤；
-    # 这里允许 -3bp 的瞬时回撤，只拦明显逆向，而不是要求每分钟必须上涨。
+    # 强趋势标的经常在 alpha 已经很强时出现 1m 微回撤；
+    # 这里允许 -3bp 的瞬时回撤，只拦明显逆向，而不是要求每分钟必须单边延续。
     MIN_LAST_SNAP_ROC: float = -0.0003
     MAX_SNAP_ROC_LIMIT: float = 0.01          # V0 为 0.01 (1%)
+    # 入场排序从单纯 alpha/iv 改为利润潜力导向:
+    # - alpha 非线性加权，提高真正强信号的排名
+    # - alpha 已是全市场横截面 z-score，IV 不再作为排序主除数
+    ENTRY_RANK_ALPHA_POWER: float = 1.35
+    ENTRY_RANK_IV_PENALTY_POWER: float = 0.5
+    ENTRY_RANK_HIGH_ALPHA_FLOOR: float = 1.20
+    ENTRY_RANK_HIGH_ALPHA_BONUS_SCALE: float = 0.35
+    ENTRY_RANK_HIGH_ALPHA_MAX_BONUS: float = 0.50
+    ENTRY_RANK_ROC_ABS_SCALE: float = 100.0
+    ENTRY_RANK_STOCK_ROC_SCALE: float = 120.0
+    ENTRY_RANK_STOCK_ROC_MAX_BONUS: float = 0.35
+    ENTRY_RANK_SNAP_ROC_SCALE: float = 200.0
+    ENTRY_RANK_SNAP_ROC_MAX_BONUS: float = 0.30
+    ENTRY_RANK_MACD_SCALE: float = 8.0
+    ENTRY_RANK_MACD_MAX_BONUS: float = 0.30
+    # 趋势质量只做温和降权/小幅加分: alpha 仍是主轴，避免高 alpha 但正股路径来回织布的候选排太前。
+    ENTRY_RANK_TREND_QUALITY_ENABLED: bool = True
+    ENTRY_RANK_TREND_WINDOW_MINS: int = 30
+    ENTRY_RANK_TREND_MIN_OBS: int = 16
+    ENTRY_RANK_TREND_NET_TARGET: float = 0.012
+    ENTRY_RANK_TREND_QUALITY_FLOOR: float = 0.25
+    ENTRY_RANK_TREND_QUALITY_BOOST: float = 0.06
+    ENTRY_RANK_TREND_QUALITY_PENALTY: float = 0.04
+    ENTRY_RANK_TREND_MIN_MULT: float = 0.96
+    ENTRY_RANK_TREND_MAX_MULT: float = 1.06
+    # 对“信号强 + 方向确认完整”的候选做通用优先级提升，而不是硬编码某几个标的。
+    ENTRY_PRIORITY_RESERVED_SLOTS: int = 1
+    ENTRY_PRIORITY_ALPHA_FLOOR: float = 0.9
+    ENTRY_PRIORITY_BOOST: float = 0.80
+    ENTRY_PRIORITY_STOCK_ROC_FLOOR: float = 0.0002
+    ENTRY_PRIORITY_STOCK_BONUS: float = 0.25
+    ENTRY_PRIORITY_SNAP_ROC_FLOOR: float = 0.0
+    ENTRY_PRIORITY_SNAP_BONUS: float = 0.15
+    ENTRY_PRIORITY_MACD_FLOOR: float = 0.01
+    ENTRY_PRIORITY_MACD_BONUS: float = 0.20
+    ENTRY_PRIORITY_MIN_CONFIRMATIONS: int = 2
     
     MIN_TREND_ROC: float = 0.0001
     MAX_TREND_ROC: float = 0.0030
@@ -70,10 +106,12 @@ class StrategyConfig:
     COOLDOWN_MINUTES: int = 60
     CIRCUIT_BREAKER_THRESHOLD: int = 3
     CIRCUIT_BREAKER_MINUTES: int = 30
-    MIN_OPTION_PRICE: float = 1.0
+    MIN_OPTION_PRICE: float = 2.0
 
     # ================= 7. Liquidity =================
-    MAX_SPREAD_PCT_ENTRY: float = 0.1         # V0 准入点差 10%
+    MAX_SPREAD_PCT_ENTRY: float = 0.10        # 兼容保留：未区分方向时的默认准入点差
+    MAX_SPREAD_PCT_ENTRY_CALL: float = 0.08   # V0 做多(CALL)开仓点差上限 8%
+    MAX_SPREAD_PCT_ENTRY_PUT: float = 0.10    # V0 做空(PUT)开仓点差上限 10%
     MAX_SPREAD_PCT_EXIT: float = 0.2 
     MAX_SPREAD_DIVERGENCE: float = 0.02
     
@@ -81,8 +119,10 @@ class StrategyConfig:
     # V0 止损较紧: -10% 常规，-15% 绝对
     STOP_LOSS: float = -0.10         
     ABSOLUTE_STOP_LOSS: float = -0.15
-    TIME_STOP_MINS: int = 30          # V0 只有 30 分钟窗口
-    TIME_STOP_ROI: float = 0.05       # 30 分钟内若未达到 5%，则可能离场
+    MID_TIME_STOP_MINS: int = 15      # 15 分钟未走强则提前离场
+    MID_TIME_STOP_ROI: float = 0.05   # 15 分钟时当前收益若仍低于 5%，则离场
+    TIME_STOP_MINS: int = 30          # V0 的长期时间止损窗口
+    TIME_STOP_ROI: float = 0.05       # 30 分钟时当前收益若仍低于 5%，则离场
     ALPHA_FLIP_THRESHOLD: float = 0.8
     HIGH_CONFIDENCE_THRESHOLD: float = 1.2
     
@@ -97,8 +137,9 @@ class StrategyConfig:
     SLIPPAGE_PCT: float = 0.001
     LIMIT_BUFFER_ENTRY: float = 1.03
     LIMIT_BUFFER_EXIT: float = 0.97
-    ORDER_TIMEOUT_SECONDS: int = 5
+    ORDER_TIMEOUT_SECONDS: int = 3
     ORDER_MAX_RETRIES: int = 3
+    EXIT_ORDER_MAX_RETRIES: int = 10
 
     # ================= 11. Profit Guards (Universal Ladder) =================
     # 旧版 V0 的第一档是 15% 才开始保利润，很多单到不了这里就被回撤吃掉。
@@ -192,7 +233,8 @@ class StrategyConfig:
     # False -> 允许秒级风控链路(_process_exits/_process_fast_fused_tick)直接触发平仓
     EXIT_SIGNAL_MINUTE_ONLY: bool = True
 
-    # 仅在启用秒级平仓判定时生效: 高频确认阈值，避免秒级盘口噪声过早打出场
+    # 仅在启用秒级平仓判定时生效: 当前 OMS 主链路默认 minute-only，
+    # 因此这组参数主要保留给归档/实验性 1s exit 路径使用。
     EXIT_CONFIRM_SECONDS_1S: int = 8
     EXIT_CONFIRM_REASON_PREFIXES: Tuple[str, ...] = (
         "HARD_STOP",

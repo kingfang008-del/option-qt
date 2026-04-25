@@ -16,7 +16,7 @@ try:
     from production.baseline.config import PG_DB_URL, NY_TZ
 except ImportError:
     # 基础硬编码兜底 (与 config.py 一致)
-    PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.116 port=5432"
+    PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.229 port=5432"
     NY_TZ = pytz.timezone('America/New_York')
 
 TABLES = [

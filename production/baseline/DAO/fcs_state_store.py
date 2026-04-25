@@ -368,15 +368,25 @@ class FCSStateStore:
             h1 = obj.get('history_1min')
             if isinstance(h1, pd.DataFrame) and not h1.empty:
                 svc.history_1min[sym] = h1
+                if hasattr(svc, 'committed_history_1min'):
+                    svc.committed_history_1min[sym] = h1.copy()
             h5 = obj.get('history_5min')
             if isinstance(h5, pd.DataFrame) and not h5.empty:
                 svc.history_5min[sym] = h5
+                if hasattr(svc, 'committed_history_5min'):
+                    svc.committed_history_5min[sym] = h5.copy()
             o1 = obj.get('option_snapshot')
             if isinstance(o1, np.ndarray) and o1.size > 0:
-                svc.option_snapshot[sym] = o1.astype(np.float32, copy=False)
+                restored_o1 = o1.astype(np.float32, copy=False)
+                svc.option_snapshot[sym] = restored_o1
+                if hasattr(svc, 'committed_option_snapshot'):
+                    svc.committed_option_snapshot[sym] = restored_o1.copy()
+                if hasattr(svc, 'committed_latest_opt_buckets'):
+                    svc.committed_latest_opt_buckets[sym] = restored_o1.copy()
             o5 = obj.get('option_snapshot_5m')
             if isinstance(o5, np.ndarray) and o5.size > 0 and hasattr(svc, 'option_snapshot_5m'):
-                svc.option_snapshot_5m[sym] = o5.astype(np.float32, copy=False)
+                restored_o5 = o5.astype(np.float32, copy=False)
+                svc.option_snapshot_5m[sym] = restored_o5
             lcv1 = obj.get('last_cum_volume')
             if isinstance(lcv1, np.ndarray) and lcv1.size > 0 and hasattr(svc, 'last_cum_volume'):
                 svc.last_cum_volume[sym] = lcv1.astype(np.float32, copy=False)

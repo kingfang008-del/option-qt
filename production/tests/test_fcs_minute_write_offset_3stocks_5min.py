@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import sys
 import types
 from dataclasses import dataclass
@@ -89,6 +90,21 @@ class _DummyProfile:
 
     def is_rth_minute(self, _dt_ny):
         return True
+
+    def count_effective_history(self, idx, label_floor):
+        return int(np.sum(idx <= label_floor))
+
+
+@dataclass
+class _PremarketOnlyProfile:
+    def accept_realtime_tick(self, dt_ny):
+        return True
+
+    def should_flush_premarket(self, dt_ny, _last_date):
+        return False
+
+    def is_rth_minute(self, _dt_ny):
+        return False
 
     def count_effective_history(self, idx, label_floor):
         return int(np.sum(idx <= label_floor))
@@ -326,8 +342,59 @@ def test_fcs_minute_write_offset_3stocks_5min() -> None:
     print("[OK] 3股票*5分钟 秒级驱动下，minute payload 首次产出未早于 label+60+grace")
 
 
+def test_live_premarket_preview_yields_payload_without_atomic_commit() -> None:
+    svc, NY_TZ = _build_service()
+    svc.market_profile = _PremarketOnlyProfile()
+
+    old_run_mode = os.environ.get("RUN_MODE")
+    os.environ["RUN_MODE"] = "REALTIME_DRY"
+    try:
+        start_dt = pd.Timestamp("2026-04-17 08:58:00", tz=NY_TZ)
+        seen_preview_payload = None
+
+        for sec_idx in range(3 * 60):
+            tick_dt = start_dt + timedelta(seconds=sec_idx)
+            ts = float(tick_dt.timestamp())
+            batch = []
+            for sym_idx, sym in enumerate(svc.symbols):
+                base_px = 100.0 + sym_idx * 10.0
+                close_px = base_px + sec_idx * 0.01
+                stock = {
+                    "open": close_px - 0.05,
+                    "high": close_px + 0.1,
+                    "low": close_px - 0.1,
+                    "close": close_px,
+                    "volume": 1000.0 + sec_idx,
+                    "vwap": close_px,
+                }
+                batch.append({
+                    "symbol": sym,
+                    "ts": ts,
+                    "stock": stock,
+                    "buckets": _build_snapshot(sec_idx, sym_idx, base_px).tolist(),
+                    "contracts": _build_contracts(sym),
+                })
+
+            import asyncio
+
+            asyncio.run(svc.process_market_data(batch, current_replay_ts=ts))
+            payload = asyncio.run(svc.run_compute_cycle(ts_from_payload=ts, return_payload=True))
+            if payload and bool(payload.get("is_new_minute")):
+                seen_preview_payload = payload
+                break
+
+        assert seen_preview_payload is not None, "盘前 preview minute payload 未产出"
+        assert not svc.minute_payloads, "盘前 preview minute 不应进入 atomic commit 正式链路"
+    finally:
+        if old_run_mode is None:
+            os.environ.pop("RUN_MODE", None)
+        else:
+            os.environ["RUN_MODE"] = old_run_mode
+
+
 def main() -> None:
     test_fcs_minute_write_offset_3stocks_5min()
+    test_live_premarket_preview_yields_payload_without_atomic_commit()
 
 
 if __name__ == "__main__":

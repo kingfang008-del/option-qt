@@ -125,6 +125,32 @@ class DataPersistenceServicePG:
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_trd_bk_sym_ts ON trade_logs_backtest (symbol, ts)")
 
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS order_events (
+                ts DOUBLE PRECISION,
+                datetime_ny TEXT,
+                symbol TEXT,
+                action TEXT,
+                qty DOUBLE PRECISION,
+                price DOUBLE PRECISION,
+                details_json TEXT
+            ) PARTITION BY RANGE (ts);
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_order_evt_sym_ts ON order_events (symbol, ts)")
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS order_events_backtest (
+                ts DOUBLE PRECISION,
+                datetime_ny TEXT,
+                symbol TEXT,
+                action TEXT,
+                qty DOUBLE PRECISION,
+                price DOUBLE PRECISION,
+                details_json TEXT
+            ) PARTITION BY RANGE (ts);
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_order_evt_bk_sym_ts ON order_events_backtest (symbol, ts)")
+
         # 4. alpha_logs
         c.execute("""
             CREATE TABLE IF NOT EXISTS alpha_logs (
@@ -179,6 +205,7 @@ class DataPersistenceServicePG:
         tables = [
             'market_bars_1s', 'market_bars_1m', 'market_bars_5m',
             'trade_logs', 'trade_logs_backtest',
+            'order_events', 'order_events_backtest',
             'alpha_logs',
             'option_snapshots_1s', 'option_snapshots_1m', 'option_snapshots_5m',
             'feature_logs'
@@ -531,6 +558,8 @@ class DataPersistenceServicePG:
             c = conn.cursor()
             realtime_logs = []
             backtest_logs = []
+            realtime_order_events = []
+            backtest_order_events = []
             from config import NY_TZ
 
             for item in snapshot:
@@ -538,10 +567,17 @@ class DataPersistenceServicePG:
                 dt_ny = datetime.fromtimestamp(ts, NY_TZ).strftime('%Y-%m-%d %H:%M:%S')
                 row = (ts, dt_ny, item[1], item[2], item[3], item[4], item[5])
                 mode = str(item[6] or 'REALTIME').upper()
+                is_order_event = str(item[2] or '').upper().startswith('ORDER_')
                 if mode in ['BACKTEST', 'SHADOW', 'REALTIME_DRY']:
-                    backtest_logs.append(row)
+                    if is_order_event:
+                        backtest_order_events.append(row)
+                    else:
+                        backtest_logs.append(row)
                 else:
-                    realtime_logs.append(row)
+                    if is_order_event:
+                        realtime_order_events.append(row)
+                    else:
+                        realtime_logs.append(row)
 
             if realtime_logs:
                 psycopg2.extras.execute_batch(
@@ -555,6 +591,20 @@ class DataPersistenceServicePG:
                     c,
                     "INSERT INTO trade_logs_backtest VALUES (%s,%s,%s,%s,%s,%s,%s)",
                     backtest_logs,
+                )
+
+            if realtime_order_events:
+                psycopg2.extras.execute_batch(
+                    c,
+                    "INSERT INTO order_events VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    realtime_order_events,
+                )
+
+            if backtest_order_events:
+                psycopg2.extras.execute_batch(
+                    c,
+                    "INSERT INTO order_events_backtest VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    backtest_order_events,
                 )
 
             conn.commit()

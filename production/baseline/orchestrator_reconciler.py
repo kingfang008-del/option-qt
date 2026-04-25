@@ -3,8 +3,10 @@ import logging
 import json
 import time
 import os
+import math
 from config import TRADING_ENABLED
 from runtime_trading_controls import get_runtime_trading_enabled
+from orchestrator_state_manager import infer_open_fill_confirmed
 
 logger = logging.getLogger("V8_Orchestrator.Reconciler")
 
@@ -28,6 +30,33 @@ class OrchestratorReconciler:
         except Exception:
             return bool(TRADING_ENABLED)
 
+    @staticmethod
+    def _state_has_confirmed_open(st) -> bool:
+        return infer_open_fill_confirmed({
+            'position': getattr(st, 'position', 0),
+            'qty': getattr(st, 'qty', 0),
+            'entry_price': getattr(st, 'entry_price', 0.0),
+            'entry_ts': getattr(st, 'entry_ts', 0.0),
+            'open_fill_confirmed': getattr(st, 'open_fill_confirmed', None),
+        })
+
+    def _reconciled_open_fill_confirmed(self, st, broker_qty, broker_entry_price: float = 0.0) -> bool:
+        try:
+            broker_qty = float(broker_qty or 0.0)
+        except Exception:
+            broker_qty = 0.0
+        if broker_qty == 0:
+            return False
+        if self._state_has_confirmed_open(st):
+            return True
+
+        candidates = [
+            float(broker_entry_price or 0.0),
+            float(getattr(st, 'last_opt_price', 0.0) or 0.0),
+            float(getattr(st, 'entry_price', 0.0) or 0.0),
+        ]
+        return any(math.isfinite(px) and px > 0.01 for px in candidates)
+
     async def run_reconciliation_loop(self):
         """
         [防掉单对账器] 后台守护协程
@@ -37,8 +66,9 @@ class OrchestratorReconciler:
         while True:
             await asyncio.sleep(self.reconcile_interval)
             
-            # 仅在实盘且允许交易的模式下进行物理对账
-            if self.orch.mode != 'realtime' or not self._runtime_trading_enabled():
+            # 实盘模式下持续对账。即便 runtime DISARM，也要继续同步真实持仓，
+            # 否则 Dashboard 会在停机观察期丢失 broker 真实状态。
+            if self.orch.mode != 'realtime':
                 continue
                 
             # 确保 IBKR 连接正常
@@ -57,19 +87,60 @@ class OrchestratorReconciler:
         # 注意：在异步环境下，ib.positions() 是即时返回缓存的，实际由内部独立连接维护同步
         real_positions = self.orch.ibkr.ib.positions()
         
-        # 2. 统计真实持仓 (聚合期权到对应的正股 Symbol)
+        # 2. 统计真实持仓 (仅对齐策略相关的 OPT 仓位；股票仓位不能污染期权策略账本)
         broker_state = {}
+        broker_avg_price = {}
+        skipped_non_opt = []
         for pos in real_positions:
+            contract = getattr(pos, 'contract', None)
+            sec_type = str(getattr(contract, 'secType', '') or '').upper()
+            if sec_type != 'OPT':
+                if contract is not None:
+                    skipped_non_opt.append(
+                        f"{getattr(contract, 'symbol', '?')}:{sec_type or 'UNKNOWN'}:{getattr(pos, 'position', 0)}"
+                    )
+                continue
+
             # pos.contract.symbol 在期权合约中通常代表底层正股 (如 'NVDA')
-            sym = pos.contract.symbol
-            qty = pos.position # 多头为正，空头为负
+            sym = getattr(contract, 'symbol', None)
+            qty = float(getattr(pos, 'position', 0) or 0.0) # 多头为正，空头为负
             
-            if qty != 0:
-                # 累加该标的下的所有期权头寸数量 (注意：此处假设每个 symbol 下通常持有一种期权)
-                # 如果存在多腿组合，逻辑可能需要更精细，目前按 Symbol 极简对齐
-                if sym not in broker_state:
-                    broker_state[sym] = 0
-                broker_state[sym] += qty
+            if not sym or qty == 0:
+                continue
+
+            # 累加该标的下的所有期权头寸数量 (注意：此处假设每个 symbol 下通常持有一种期权)
+            # 如果存在多腿组合，逻辑可能需要更精细，目前按 Symbol 极简对齐
+            broker_state[sym] = float(broker_state.get(sym, 0.0) or 0.0) + qty
+
+            try:
+                avg_cost = float(getattr(pos, 'avgCost', 0.0) or 0.0)
+            except Exception:
+                avg_cost = 0.0
+            try:
+                multiplier = float(getattr(contract, 'multiplier', 100) or 100.0)
+            except Exception:
+                multiplier = 100.0
+            multiplier = multiplier if multiplier > 0 else 100.0
+            premium = abs(avg_cost) / multiplier if abs(avg_cost) > 0 else 0.0
+            if math.isfinite(premium) and premium > 0.01:
+                prev = broker_avg_price.get(sym)
+                weight = abs(qty)
+                if not prev:
+                    broker_avg_price[sym] = {'px': premium, 'w': weight}
+                else:
+                    total_w = float(prev.get('w', 0.0) or 0.0) + weight
+                    if total_w > 0:
+                        broker_avg_price[sym] = {
+                            'px': ((float(prev.get('px', 0.0) or 0.0) * float(prev.get('w', 0.0) or 0.0)) + premium * weight) / total_w,
+                            'w': total_w,
+                        }
+
+        if skipped_non_opt:
+            preview = ", ".join(skipped_non_opt[:8])
+            logger.warning(
+                f"🧹 [Reconciler] skipped non-OPT broker positions: {preview}"
+                + (" ..." if len(skipped_non_opt) > 8 else "")
+            )
 
         # 3. 交叉比对本地内存状态
         for sym, st in self.orch.states.items():
@@ -89,77 +160,32 @@ class OrchestratorReconciler:
                 logger.critical(f"🚨 [严重分叉] {sym} 账本不一致! 内存记录: {local_qty}手 vs 券商真实: {broker_qty}手")
                 
                 # 执行自愈逻辑 (Auto-Healing)
-                await self._auto_heal_divergence(sym, st, local_qty, broker_qty)
+                await self._auto_heal_divergence(
+                    sym,
+                    st,
+                    local_qty,
+                    broker_qty,
+                    broker_entry_price=float((broker_avg_price.get(sym) or {}).get('px', 0.0) or 0.0),
+                )
 
         await self._perform_cash_reconciliation()
 
     async def _perform_cash_reconciliation(self):
-        """Cash guard: reconcile local mock_cash against broker available funds."""
-        if not hasattr(self.orch, 'ibkr') or not hasattr(self.orch.ibkr, 'get_account_balance'):
-            return
-        try:
-            broker_cash = float(await self.orch.ibkr.get_account_balance() or 0.0)
-        except Exception:
-            return
-        if broker_cash <= 0:
-            return
+        """Cash reconciliation disabled: broker cash and OMS paper cash use different bases."""
+        return
 
-        local_cash = float(getattr(self.orch, 'mock_cash', 0.0) or 0.0)
-        locked_cash = 0.0
-        pending_cnt = 0
-        for st in getattr(self.orch, 'states', {}).values():
-            try:
-                locked_cash += max(0.0, float(getattr(st, 'locked_cash', 0.0) or 0.0))
-            except Exception:
-                pass
-            if bool(getattr(st, 'is_pending', False)):
-                pending_cnt += 1
-        local_total = local_cash + locked_cash
-        diff_cash = broker_cash - local_cash
-        diff_total = broker_cash - local_total
-        abs_diff = abs(diff_cash)
-        now = time.time()
+    def _safe_reconciled_entry_price(self, st, broker_entry_price: float = 0.0) -> float:
+        candidates = [
+            float(broker_entry_price or 0.0),
+            float(getattr(st, 'last_opt_price', 0.0) or 0.0),
+            float(getattr(st, 'entry_price', 0.0) or 0.0),
+        ]
+        for px in candidates:
+            if math.isfinite(px) and 0.01 <= px < 1000.0:
+                return px
+        return 0.01
 
-        if abs_diff >= self.cash_warn_threshold and (now - self._last_cash_warn_ts) >= 30:
-            self._last_cash_warn_ts = now
-            logger.warning(
-                f"⚠️ [Cash-Reconcile] broker=${broker_cash:,.2f} local_cash=${local_cash:,.2f} "
-                f"locked=${locked_cash:,.2f} local_total=${local_total:,.2f} "
-                f"diff_cash={diff_cash:+,.2f} diff_total={diff_total:+,.2f} pending={pending_cnt}"
-            )
-
-        # Hard guard: large divergence without pending orders means local cash is likely corrupted.
-        if abs_diff >= self.cash_pause_threshold and pending_cnt == 0:
-            if (now - self._last_cash_pause_ts) >= 60:
-                self._last_cash_pause_ts = now
-                self.orch.trading_paused = True
-                logger.critical(
-                    f"🛑 [Cash-Reconcile-HardGuard] Trading paused: broker=${broker_cash:,.2f}, "
-                    f"local_cash=${local_cash:,.2f}, diff={diff_cash:+,.2f} (threshold={self.cash_pause_threshold:.2f})"
-                )
-                try:
-                    self.orch.accounting._emit_trade_log({
-                        'ts': now,
-                        'symbol': 'SYSTEM',
-                        'action': 'CASH_DIVERGENCE',
-                        'side': 'SYS_GUARD',
-                        'qty': 0,
-                        'price': 0.0,
-                        'stock_price': 0.0,
-                        'strategy_note': json.dumps({
-                            'reason': 'CASH_RECONCILE_HARD_GUARD',
-                            'broker_cash': broker_cash,
-                            'local_cash': local_cash,
-                            'locked_cash': locked_cash,
-                            'diff_cash': diff_cash,
-                            'diff_total': diff_total,
-                        }),
-                        'mode': 'REALTIME'
-                    })
-                except Exception:
-                    pass
-
-    async def _auto_heal_divergence(self, sym, st, local_qty, broker_qty):
+    async def _auto_heal_divergence(self, sym, st, local_qty, broker_qty, broker_entry_price: float = 0.0):
         """
         分叉自愈处理逻辑
         """
@@ -171,22 +197,35 @@ class OrchestratorReconciler:
             logger.warning(f"🧟 [{sym}] 发现幽灵持仓！系统强制接管该头寸...")
             st.qty = abs(broker_qty)
             st.position = 1 if broker_qty > 0 else -1
-            # 伪造一个标志性的成本价，迫使策略在下一次逻辑触发时可以识别或优先处理
-            st.entry_price = 9999.0 if st.position == 1 else 0.01 
+            st.entry_price = self._safe_reconciled_entry_price(st, broker_entry_price)
+            st.entry_stock = float(getattr(st, 'last_price', 0.0) or 0.0)
             st.entry_ts = time.time()
             st.max_roi = -0.99 
+            st.locked_cash = 0.0
+            st.entry_slot_reserved = False
+            st.open_fill_confirmed = self._reconciled_open_fill_confirmed(st, broker_qty, broker_entry_price)
 
         # 场景 B：本地以为有仓位，但券商没有（比如期权到期行权了，或者被强平了）
         elif local_qty != 0 and broker_qty == 0:
             logger.warning(f"💨 [{sym}] 持仓已蒸发！本地强制清零...")
             st.qty = 0
             st.position = 0
+            st.entry_price = 0.0
+            st.entry_stock = 0.0
+            st.locked_cash = 0.0
+            st.entry_slot_reserved = False
+            st.open_fill_confirmed = False
             
         # 场景 C：数量对不上（比如只部分成交了，但本地扣减逻辑出错了）
         else:
             logger.warning(f"🩹 [{sym}] 数量错位！强制将本地数量对齐为 {broker_qty}...")
             st.qty = abs(broker_qty)
             st.position = 1 if broker_qty > 0 else -1
+            st.entry_price = self._safe_reconciled_entry_price(st, broker_entry_price)
+            st.entry_stock = float(getattr(st, 'last_price', 0.0) or 0.0)
+            st.locked_cash = 0.0
+            st.entry_slot_reserved = False
+            st.open_fill_confirmed = self._reconciled_open_fill_confirmed(st, broker_qty, broker_entry_price)
 
         # 记录强制修复日志，发送到 Dashboard
         self.orch.accounting._emit_trade_log({
@@ -204,3 +243,9 @@ class OrchestratorReconciler:
         # 解锁并强制持久化
         st.is_pending = False
         self.orch.state_manager.save_state()
+        try:
+            scheduler = getattr(getattr(self.orch, 'accounting', None), '_schedule_live_state_broadcast', None)
+            if scheduler is not None:
+                scheduler()
+        except Exception:
+            pass

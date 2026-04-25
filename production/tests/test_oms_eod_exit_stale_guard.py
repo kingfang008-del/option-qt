@@ -84,3 +84,39 @@ def test_sell_exit_still_blocked_when_no_frame_quote_and_execution_quote_stale()
         )
 
     assert blocked is True
+
+
+def test_time_stop_exit_not_blocked_when_execution_quote_stale() -> None:
+    _bootstrap_imports()
+    ee = _load_execution_engine_module()
+    engine = _build_guard_harness(ee)
+    engine._allow_risk_exit_on_stale_quote = ee.ExecutionEngineV8._allow_risk_exit_on_stale_quote
+
+    with patch("time.time", return_value=10_000.0):
+        blocked = engine._should_block_strategy_on_stale_quote(
+            "NVDA",
+            1_800.0,
+            "SELL",
+            "TIME_STOP15:31m",
+            frame_has_quote=False,
+        )
+
+    assert blocked is False
+
+
+def test_take_profit_exit_still_blocked_when_execution_quote_stale() -> None:
+    _bootstrap_imports()
+    ee = _load_execution_engine_module()
+    engine = _build_guard_harness(ee)
+    engine._allow_risk_exit_on_stale_quote = ee.ExecutionEngineV8._allow_risk_exit_on_stale_quote
+
+    with patch("time.time", return_value=10_000.0):
+        blocked = engine._should_block_strategy_on_stale_quote(
+            "NVDA",
+            1_800.0,
+            "SELL",
+            "LADDER_TIGHT:roi=18%",
+            frame_has_quote=False,
+        )
+
+    assert blocked is True

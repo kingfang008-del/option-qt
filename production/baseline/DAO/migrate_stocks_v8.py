@@ -10,7 +10,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent / "baseline"))
 try:
     from config import PG_DB_URL, TARGET_SYMBOLS
 except ImportError:
-    PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.116 port=5432"
+    PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.229 port=5432"
     TARGET_SYMBOLS = []
 
 # Approved Sector Mapping

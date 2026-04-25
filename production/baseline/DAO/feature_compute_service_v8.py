@@ -14,6 +14,7 @@
 import sys
 import os
 import asyncio
+import socket
 
 # [NEW] Add project root to sys.path to import utils
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -53,7 +54,7 @@ from config import (
     STREAM_FUSED_MARKET, STREAM_INFERENCE,
     get_feature_service_state_file,
     GROUP_FEATURE,
-    LOG_DIR, USE_5M_OPTION_DATA, NON_TRADABLE_SYMBOLS,
+    LOG_DIR, RUN_MODE as CONFIG_RUN_MODE, USE_5M_OPTION_DATA, NON_TRADABLE_SYMBOLS,
     get_option_gate_profile,
      
 )
@@ -78,6 +79,10 @@ def _safe_float_env(name: str, default: float) -> float:
         return float(raw)
     except Exception:
         return float(default)
+
+
+def _runtime_mode() -> str:
+    return os.environ.get("RUN_MODE", "").strip().upper() or str(CONFIG_RUN_MODE).strip().upper()
 
 # Feature service-specific Redis config (extends base)
 REDIS_CFG = {
@@ -316,13 +321,20 @@ class OptionMinuteAggregator:
 class FeatureComputeService:
     def __init__(self, redis_cfg, symbols, config_paths):
         print(f"init Service... Symbols: {len(symbols)}")
-        self.redis_cfg = redis_cfg
+        self.redis_cfg = dict(redis_cfg)
+        default_consumer = f"fcs-{socket.gethostname()}-{os.getpid()}"
+        self.redis_cfg['consumer'] = os.environ.get("FCS_CONSUMER_NAME", "").strip() or default_consumer
         self.symbols = symbols
         self.stock_id_map = {s: i for i, s in enumerate(symbols)}
         self.sector_id_map = {} 
         
         self.r = redis.Redis(**{k:v for k,v in redis_cfg.items() if k in ['host','port','db']})
         self._init_consumer_groups()
+        logger.info(
+            f"📡 Redis Consumer | stream={self.redis_cfg.get('raw_stream')} "
+            f"group={self.redis_cfg.get('group')} consumer={self.redis_cfg.get('consumer')} "
+            f"db={self.redis_cfg.get('db')}"
+        )
         
         # [Performance] Persistent PG Connection
         from config import PG_DB_URL
@@ -752,6 +764,45 @@ class FeatureComputeService:
             try:
                 self.r.xgroup_create(s, target_group, mkstream=True, id='$')
             except redis.exceptions.ResponseError: pass
+
+    @staticmethod
+    def _decode_redis_obj(obj):
+        if isinstance(obj, bytes):
+            return obj.decode('utf-8', errors='ignore')
+        return obj
+
+    def _build_stream_group_diag(self, stream_name: str, group_name: str) -> dict:
+        diag = {'stream': stream_name, 'group': group_name}
+        try:
+            groups = self.r.xinfo_groups(stream_name)
+            groups = [{self._decode_redis_obj(k): self._decode_redis_obj(v) for k, v in g.items()} for g in groups]
+            grp = next((g for g in groups if g.get('name') == group_name), None)
+            if grp:
+                diag.update({
+                    'group_exists': True,
+                    'last_delivered_id': grp.get('last-delivered-id'),
+                    'pending': grp.get('pending'),
+                    'lag': grp.get('lag'),
+                    'entries_read': grp.get('entries-read'),
+                })
+            else:
+                diag['group_exists'] = False
+            try:
+                consumers = self.r.xinfo_consumers(stream_name, group_name)
+                consumers = [{self._decode_redis_obj(k): self._decode_redis_obj(v) for k, v in c.items()} for c in consumers]
+                diag['consumers'] = [
+                    {
+                        'name': c.get('name'),
+                        'pending': c.get('pending'),
+                        'idle': c.get('idle'),
+                    }
+                    for c in consumers
+                ]
+            except Exception as ce:
+                diag['consumers_error'] = str(ce)
+        except Exception as e:
+            diag['diag_error'] = str(e)
+        return diag
  
     async def process_market_data(self, batch, current_replay_ts=None, return_payload=False):
         return await self.realtime_pipeline.process_market_data(
@@ -1132,7 +1183,7 @@ class FeatureComputeService:
             except Exception as e:
                 logger.error(f"Engine Compute Error: {e}", exc_info=True); return None
 
-            run_mode = os.environ.get("RUN_MODE", "").strip().upper()
+            run_mode = _runtime_mode()
             dry_mode = (run_mode == "REALTIME_DRY")
             batch_raw, valid_mask = [], []
             gate_audit = {}
@@ -1306,7 +1357,7 @@ class FeatureComputeService:
         source_snap_for_payload = getattr(self, 'committed_option_snapshot', self.option_snapshot) if is_new_minute else self.option_snapshot
         history_1min_source = self.committed_history_1min if is_new_minute else self.history_1min
 
-        run_mode = os.environ.get("RUN_MODE", "").strip().upper()
+        run_mode = _runtime_mode()
         dry_mode = (run_mode == "REALTIME_DRY")
         for b_idx, sym in enumerate(self.symbols):
             if sym not in ready_symbols or sym not in results_map:
@@ -1790,7 +1841,7 @@ class FeatureComputeService:
                                                         'is_warmed_up': bool(compute_payload.get('is_warmed_up', False)),
                                                     },
                                                 )
-                                                run_mode = os.environ.get("RUN_MODE", "").strip().upper()
+                                                run_mode = _runtime_mode()
                                                 commit_grace_sec = float(getattr(self, "minute_commit_grace_sec", 1.0) or 0.0)
                                                 if run_mode in {"REALTIME", "REALTIME_DRY"}:
                                                     max_committable_label_ts = int((time.time() - commit_grace_sec) // 60) * 60 - 60
@@ -1833,6 +1884,21 @@ class FeatureComputeService:
                             finally:
                                 self.r.xack(self.redis_cfg['raw_stream'], self.redis_cfg['group'], mid)
                                 stats['acks'] += 1
+                else:
+                    now_wall = time.time()
+                    if now_wall - float(getattr(self, "_idle_stream_log_at", 0.0) or 0.0) >= 30.0:
+                        diag = self._build_stream_group_diag(
+                            self.redis_cfg['raw_stream'],
+                            self.redis_cfg['group'],
+                        )
+                        logger.warning(
+                            f"⚠️ [FCS-Idle] no messages from raw stream for 30s "
+                            f"| stream={self.redis_cfg['raw_stream']} group={self.redis_cfg['group']} "
+                            f"| run_mode={_runtime_mode()} "
+                            f"| redis_db={self.r.connection_pool.connection_kwargs.get('db')} "
+                            f"| diag={diag}"
+                        )
+                        self._idle_stream_log_at = now_wall
                 
                 from config import IS_SIMULATED
                 if not IS_SIMULATED:

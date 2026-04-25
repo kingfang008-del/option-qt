@@ -53,6 +53,10 @@ from orchestrator_accounting import OrchestratorAccounting
 from fcs_market_profile import build_market_profile
 
 from utils import serialization_utils as ser
+try:
+    from Domain.shadow_router import get_domain_shadow_router
+except Exception:  # pragma: no cover
+    get_domain_shadow_router = None
 
 # 动态引入组件
 try:
@@ -80,7 +84,8 @@ from config import (
     ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS,
     INDEX_TREND_SYMBOLS,
     IS_BACKTEST,
-    IS_SIMULATED
+    IS_SIMULATED,
+    REALTIME_ALLOW_WARMUP_BYPASS,
 )
 
 from trading_tft_stock_embed import AdvancedAlphaNet
@@ -1229,8 +1234,12 @@ class SignalEngineV8:
             return
 
         # 🚀 以下逻辑仅在分钟整点运行 🚀
-        allow_dry_alpha_during_warmup = (os.environ.get('RUN_MODE', '').upper() == 'REALTIME_DRY')
-        if not use_precalc_feed and not bool(batch.get('is_warmed_up', False)) and not allow_dry_alpha_during_warmup:
+        runtime_mode = (os.environ.get('RUN_MODE', '').upper() or str(config.RUN_MODE).upper())
+        allow_alpha_during_warmup = (
+            runtime_mode == 'REALTIME_DRY'
+            or (runtime_mode == 'REALTIME' and bool(REALTIME_ALLOW_WARMUP_BYPASS))
+        )
+        if not use_precalc_feed and not bool(batch.get('is_warmed_up', False)) and not allow_alpha_during_warmup:
             if getattr(self, '_warmup_gate_log_count', 0) < 10:
                 logger.info(
                     f"⏳ [SE-Warmup-Gate] Skip inference at {ny_now.strftime('%H:%M:%S')} "
@@ -1242,13 +1251,14 @@ class SignalEngineV8:
                 self._warmup_gate_log_count = getattr(self, '_warmup_gate_log_count', 0) + 1
             await self._oms_sync(curr_ts, frame_id=frame_id)
             return
-        elif allow_dry_alpha_during_warmup and not bool(batch.get('is_warmed_up', False)):
-            if getattr(self, '_dry_warmup_bypass_log_count', 0) < 10:
+        elif allow_alpha_during_warmup and not bool(batch.get('is_warmed_up', False)):
+            if getattr(self, '_warmup_bypass_log_count', 0) < 10:
+                bypass_mode = "REALTIME_DRY" if runtime_mode == 'REALTIME_DRY' else "REALTIME"
                 logger.info(
-                    f"🧪 [SE-Dry-Warmup-Bypass] Continue alpha emission in REALTIME_DRY "
+                    f"🧪 [SE-Warmup-Bypass] Continue alpha emission in {bypass_mode} "
                     f"| real_history_len={batch.get('real_history_len', 0)}/{batch.get('warmup_required_len', 31)}"
                 )
-                self._dry_warmup_bypass_log_count = getattr(self, '_dry_warmup_bypass_log_count', 0) + 1
+                self._warmup_bypass_log_count = getattr(self, '_warmup_bypass_log_count', 0) + 1
 
         # 3. 记录行情数据 (为 Alpha 日志准备时间戳)
         # 🚀 [Surgery 24] 逻辑时间戳对齐：如果是整分结算，强制用 ts (逻辑上代表的那一分钟)，否则用 log_ts (物理时间)
@@ -1662,6 +1672,11 @@ class SignalEngineV8:
             await self.signal_queue.put(payload)
         else:
             self.r.xadd('orch_trade_signals', {'data': ser.pack(payload)}, maxlen=5000)
+        if get_domain_shadow_router is not None:
+            try:
+                get_domain_shadow_router().on_alpha_frame(payload)
+            except Exception as e:
+                logger.warning(f"[DomainShadow] alpha_frame hook failed: {e}")
         logger.info(
             f"📡 [ALPHA_ENGINE] Published ALPHA_FRAME ts={curr_ts:.0f} "
             f"frame_id={frame_id} symbols={len(alpha_items)}"

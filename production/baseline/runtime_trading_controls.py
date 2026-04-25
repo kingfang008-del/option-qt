@@ -5,10 +5,17 @@ from typing import Any, Dict, Optional, Tuple
 
 import redis
 
-from config import LIVE_TRADING_CAPITAL_LIMIT, REDIS_CFG, RUN_MODE, TRADING_ENABLED
+from config import LIVE_TRADING_CAPITAL_LIMIT, OMS_STATE_NAMESPACE, REDIS_CFG, RUN_MODE, TRADING_ENABLED
 
 
 RUNTIME_TRADING_CONTROLS_KEY = "meta:runtime_trading_controls"
+
+
+def _namespaced_runtime_controls_key() -> str:
+    namespace = str(OMS_STATE_NAMESPACE or "").strip()
+    if not namespace:
+        return RUNTIME_TRADING_CONTROLS_KEY
+    return f"{RUNTIME_TRADING_CONTROLS_KEY}:{namespace}"
 
 
 def _redis_client():
@@ -18,6 +25,14 @@ def _redis_client():
         db=REDIS_CFG["db"],
         decode_responses=False,
     )
+
+
+def _runtime_controls_candidates() -> list[str]:
+    namespaced = _namespaced_runtime_controls_key()
+    keys = [namespaced]
+    if namespaced != RUNTIME_TRADING_CONTROLS_KEY:
+        keys.append(RUNTIME_TRADING_CONTROLS_KEY)
+    return keys
 
 
 def _decode(value: Any) -> Any:
@@ -31,8 +46,24 @@ def _decode(value: Any) -> Any:
 
 def read_runtime_trading_controls(r=None) -> Dict[str, Any]:
     client = r or _redis_client()
-    raw = client.hgetall(RUNTIME_TRADING_CONTROLS_KEY) or {}
-    return {_decode(k): _decode(v) for k, v in raw.items()}
+    runtime_mode = str(RUN_MODE or "").upper()
+    runtime_ns = str(OMS_STATE_NAMESPACE or "").strip()
+    for key in _runtime_controls_candidates():
+        raw = client.hgetall(key) or {}
+        mapping = {_decode(k): _decode(v) for k, v in raw.items()}
+        if not mapping:
+            continue
+        mapping_ns = str(mapping.get("state_namespace") or "").strip()
+        mapping_mode = str(mapping.get("run_mode") or "").upper()
+        if mapping_ns:
+            if mapping_ns == runtime_ns:
+                return mapping
+            continue
+        if mapping_mode:
+            if mapping_mode == runtime_mode:
+                return mapping
+            continue
+    return {}
 
 
 def get_runtime_live_trading_capital_limit(
@@ -68,30 +99,33 @@ def set_runtime_live_trading_capital_limit(value: float, r=None, source: str = "
     client = r or _redis_client()
     cap = max(0.0, float(value or 0.0))
     client.hset(
-        RUNTIME_TRADING_CONTROLS_KEY,
+        _namespaced_runtime_controls_key(),
         mapping={
             "live_trading_capital_limit": f"{cap:.8f}",
             "updated_at": f"{time.time():.3f}",
             "updated_by": str(source or "dashboard"),
             "run_mode": RUN_MODE,
+            "state_namespace": OMS_STATE_NAMESPACE,
         },
     )
-    client.expire(RUNTIME_TRADING_CONTROLS_KEY, 30 * 24 * 3600)
+    client.expire(_namespaced_runtime_controls_key(), 30 * 24 * 3600)
     return cap
 
 
 def clear_runtime_live_trading_capital_limit(r=None, source: str = "dashboard_reset") -> None:
     client = r or _redis_client()
-    client.hdel(RUNTIME_TRADING_CONTROLS_KEY, "live_trading_capital_limit")
+    key = _namespaced_runtime_controls_key()
+    client.hdel(key, "live_trading_capital_limit")
     client.hset(
-        RUNTIME_TRADING_CONTROLS_KEY,
+        key,
         mapping={
             "updated_at": f"{time.time():.3f}",
             "updated_by": str(source or "dashboard_reset"),
             "run_mode": RUN_MODE,
+            "state_namespace": OMS_STATE_NAMESPACE,
         },
     )
-    client.expire(RUNTIME_TRADING_CONTROLS_KEY, 30 * 24 * 3600)
+    client.expire(key, 30 * 24 * 3600)
 
 
 def get_runtime_trading_enabled(
@@ -130,27 +164,30 @@ def set_runtime_trading_enabled(value: bool, r=None, source: str = "dashboard") 
     client = r or _redis_client()
     enabled = bool(value)
     client.hset(
-        RUNTIME_TRADING_CONTROLS_KEY,
+        _namespaced_runtime_controls_key(),
         mapping={
             "trading_enabled": "1" if enabled else "0",
             "updated_at": f"{time.time():.3f}",
             "updated_by": str(source or "dashboard"),
             "run_mode": RUN_MODE,
+            "state_namespace": OMS_STATE_NAMESPACE,
         },
     )
-    client.expire(RUNTIME_TRADING_CONTROLS_KEY, 30 * 24 * 3600)
+    client.expire(_namespaced_runtime_controls_key(), 30 * 24 * 3600)
     return enabled
 
 
 def clear_runtime_trading_enabled(r=None, source: str = "dashboard_reset") -> None:
     client = r or _redis_client()
-    client.hdel(RUNTIME_TRADING_CONTROLS_KEY, "trading_enabled")
+    key = _namespaced_runtime_controls_key()
+    client.hdel(key, "trading_enabled")
     client.hset(
-        RUNTIME_TRADING_CONTROLS_KEY,
+        key,
         mapping={
             "updated_at": f"{time.time():.3f}",
             "updated_by": str(source or "dashboard_reset"),
             "run_mode": RUN_MODE,
+            "state_namespace": OMS_STATE_NAMESPACE,
         },
     )
-    client.expire(RUNTIME_TRADING_CONTROLS_KEY, 30 * 24 * 3600)
+    client.expire(key, 30 * 24 * 3600)

@@ -12,11 +12,22 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
-from config import ENABLE_DEEP_WARMUP, NY_TZ, PG_DB_URL, FCS_RECENT_STATE_MAX_HOURS
+from config import (
+    ENABLE_DEEP_WARMUP,
+    NY_TZ,
+    PG_DB_URL,
+    FCS_RECENT_STATE_MAX_HOURS,
+    REALTIME_ALLOW_IV_GATE_BYPASS,
+    RUN_MODE as CONFIG_RUN_MODE,
+)
 from utils import serialization_utils as ser
 
 
 logger = logging.getLogger("FeatService")
+
+
+def _runtime_mode() -> str:
+    return os.environ.get("RUN_MODE", "").strip().upper() or str(CONFIG_RUN_MODE).strip().upper()
 
 
 class FCSSupportHandler:
@@ -766,15 +777,17 @@ class FCSSupportHandler:
                 grace_until = state.get('grace_until_ts')
                 if grace_until is not None and current_gate_ts <= float(grace_until):
                     allow = True
-        # REALTIME_DRY 下，IV-Gate 只做质量告警，不应中断 Alpha 产出链路。
-        run_mode = os.environ.get("RUN_MODE", "").strip().upper()
-        if run_mode == "REALTIME_DRY" and (not allow):
-            if getattr(svc, "_dry_gate_bypass_log_count", 0) < 30 and is_new_minute:
+        # REALTIME_DRY / 显式放宽的 REALTIME 下，IV-Gate 只做质量告警，不中断 Alpha 链路。
+        run_mode = _runtime_mode()
+        realtime_bypass = (run_mode == "REALTIME" and bool(REALTIME_ALLOW_IV_GATE_BYPASS))
+        if (run_mode == "REALTIME_DRY" or realtime_bypass) and (not allow):
+            if getattr(svc, "_gate_bypass_log_count", 0) < 30 and is_new_minute:
+                bypass_mode = "REALTIME_DRY" if run_mode == "REALTIME_DRY" else "REALTIME"
                 logger.warning(
-                    f"🧪 [IV-Gate Dry-Bypass] {sym}: gate blocked but bypassed in REALTIME_DRY "
+                    f"🧪 [IV-Gate Bypass] {sym}: gate blocked but bypassed in {bypass_mode} "
                     f"(snapshot_ok={snapshot_ok}, frame_ok={frame_ok}, ready={state.get('ready', False)})"
                 )
-                svc._dry_gate_bypass_log_count = getattr(svc, "_dry_gate_bypass_log_count", 0) + 1
+                svc._gate_bypass_log_count = getattr(svc, "_gate_bypass_log_count", 0) + 1
             allow = True
         if is_new_minute and not allow:
             logger.warning(

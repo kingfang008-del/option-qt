@@ -45,6 +45,7 @@ from strategy_selector import ACTIVE_STRATEGY_CORE_VERSION, StrategyCore, Strate
 
 # [Refactor] 引入模块化执行组件
 from orchestrator_state_manager import OrchestratorStateManager
+from orchestrator_order_state import OrchestratorOrderStateManager
 from orchestrator_accounting import OrchestratorAccounting
 from orchestrator_execution import OrchestratorExecution
 from orchestrator_reconciler import OrchestratorReconciler
@@ -371,8 +372,10 @@ class V8Orchestrator:
         self.strategy = StrategyCore(StrategyConfig())
         self.cfg = self.strategy.cfg  # [Fix] 显式暴露配置给组件
         logger.info(f"🧭 Active strategy core: {ACTIVE_STRATEGY_CORE_VERSION}")
+        self.pending_orders = {}
         
         # [Refactor] 模块化组件初始化
+        self.order_state = OrchestratorOrderStateManager(self)
         self.state_manager = OrchestratorStateManager(self)
         self.accounting = OrchestratorAccounting(self)
         self.execution = OrchestratorExecution(self)
@@ -391,7 +394,7 @@ class V8Orchestrator:
         self.global_cooldown_until = 0      # 全局冷却截止时间戳
         self.CIRCUIT_BREAKER_THRESHOLD = 3 # 连续 N 笔止损后触发
         self.CIRCUIT_BREAKER_MINUTES = 30  # 熔断暂停时间(分钟)
-        self.MIN_OPTION_PRICE = 2.5        # 最低期权进场价格
+        self.MIN_OPTION_PRICE = self.cfg.MIN_OPTION_PRICE
         self.last_save_time = 0
 
         # [新增] 逆势交易统计 (Counter-trend tracking)
@@ -443,6 +446,7 @@ class V8Orchestrator:
 
         # 1. State Management (Load ONCE)
         self._load_state() 
+        self.order_state.restore_active_orders()
         print(f"DEBUG: State Loaded. Symbols: {list(self.states.keys())}")
         
         # [🔥] 盈亏报告时间追踪
@@ -793,7 +797,9 @@ class V8Orchestrator:
                 'entry_price': st.entry_price, 'entry_stock': st.entry_stock, 
                 'entry_ts': st.entry_ts, 'dir': st.position, 
                 'max_roi': st.max_roi, 'entry_spy_roc': getattr(st, 'entry_spy_roc', 0.0),
-                'entry_index_trend': getattr(st, 'entry_index_trend', 0)
+                'entry_index_trend': getattr(st, 'entry_index_trend', 0),
+                'entry_alpha_z': getattr(st, 'entry_alpha_z', 0.0),
+                'entry_iv': getattr(st, 'entry_iv', getattr(st, 'last_valid_iv', 0.5))
             },
             'curr_price': market_opt_price, 'curr_stock': stock_price,
             'bid': bid,

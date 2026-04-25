@@ -1,0 +1,178 @@
+# V0 Config Effective Checklist
+
+本文只回答一件事：`strategy_config0.py` 里的字段，当前在 `V0` 实盘链路里到底有没有生效。
+
+范围：
+- 策略核心：`strategy_core_v0.py`
+- OMS 上下文与分钟帧：`execution_engine_v8.py`
+- 执行层：`orchestrator_execution.py`
+
+结论先说：
+- `V0` 现在不是“所有配置都可调”，而是只有一部分字段真正接到了生产链路。
+- 后续优化时，应优先围绕“已接线字段”补测试，再处理“声明了但未接线”的字段。
+
+## 1. 直接被 `strategy_core_v0.py` 读取
+
+这些字段改了会直接影响 `V0` 的 `decide_entry()` / `check_exit()`。
+
+### 交易时段
+- `START_HOUR`
+- `START_MINUTE`
+- `NO_ENTRY_HOUR`
+- `NO_ENTRY_MINUTE`
+- `CLOSE_HOUR`
+- `CLOSE_MINUTE`
+
+说明：
+- `START_TIME` / `NO_ENTRY_TIME` / `CLOSE_TIME` 只是字符串别名，当前 `V0` core 不直接读取。
+
+### 入场过滤
+- `ENTRY_LIQUIDITY_GUARD_ENABLED`
+- `SLOW_BULL_CHANNEL_ENABLED`
+- `VOL_MIN_Z`
+- `VOL_MAX_Z`
+- `ALPHA_ENTRY_THRESHOLD`
+- `STOCK_MOMENTUM_TOLERANCE`
+- `MIN_LAST_SNAP_ROC`
+- `MAX_SNAP_ROC_LIMIT`
+- `MIN_OPTION_PRICE`
+- `MAX_SPREAD_PCT_ENTRY`
+- `MAX_SPREAD_PCT_ENTRY_CALL`
+- `MAX_SPREAD_PCT_ENTRY_PUT`
+- `MAX_SPREAD_DIVERGENCE`
+- `INDEX_GUARD_ENABLED`
+- `INDEX_GUARD_SHORT_BLOCK_ENABLED`
+- `INDEX_ROC_THRESHOLD`
+- `MACD_HIST_CONFIRM_ENABLED`
+- `MACD_HIST_THRESHOLD`
+
+### 慢牛通道 / Regime
+- `SLOW_BULL_MAX_VOL_Z`
+- `SLOW_BULL_ALPHA_THRESHOLD`
+- `SLOW_BULL_MACD_THRESHOLD`
+- `SLOW_BULL_MIN_INDEX_ROC`
+- `REGIME_GUARD_ENABLED`
+- `REGIME_ENTRY_GUARD_ENABLED`
+- `REGIME_REVERSAL_THRESHOLD`
+- `REGIME_ADAPTIVE_STOCK_STOP_ENABLED`
+
+### 利润保护与退出
+- `EXIT_COUNTER_TREND_ENABLED`
+- `EXIT_INDEX_REVERSAL_ENABLED`
+- `DYNAMIC_LADDER_ENABLED`
+- `HIGH_ALPHA_WIDE_THRESHOLD`
+- `LADDER_TIGHT`
+- `LADDER_WIDE`
+- `COUNTER_TREND_PROTECT_TRIGGER`
+- `COUNTER_TREND_PROTECT_EXIT`
+- `TRAILING_TRIGGER_ROI`
+- `TRAILING_KEEP_RATIO`
+- `FLASH_PROTECT_TRIGGER`
+- `FLASH_PROTECT_EXIT`
+- `COUNTER_TREND_MAX_MINS`
+- `INDEX_REVERSAL_EXIT_ENABLED`
+- `EXIT_STOCK_HARD_STOP_ENABLED`
+- `HIGH_CONFIDENCE_THRESHOLD`
+- `STOCK_HARD_STOP_TIGHT`
+- `STOCK_HARD_STOP_LOOSE`
+- `STOCK_HARD_STOP_TIGHT_MIXED`
+- `STOCK_HARD_STOP_LOOSE_MIXED`
+- `STOCK_HARD_STOP_TIGHT_VOLATILE`
+- `STOCK_HARD_STOP_LOOSE_VOLATILE`
+- `NO_MOMENTUM_MINS`
+- `NO_MOMENTUM_MIN_MAX_ROI`
+- `EXIT_ZOMBIE_STOP_ENABLED`
+- `ZOMBIE_EXIT_MINS`
+- `EXIT_SMALL_GAIN_ENABLED`
+- `SMALL_GAIN_THRESHOLD`
+- `SMALL_GAIN_MINS`
+- `SMALL_GAIN_LOCKED_ROI`
+- `MID_TIME_STOP_MINS`
+- `MID_TIME_STOP_ROI`
+- `TIME_STOP_MINS`
+- `TIME_STOP_ROI`
+- `EXIT_LIQUIDITY_GUARD_ENABLED`
+- `MAX_SPREAD_PCT_EXIT`
+- `STOP_LOSS`
+- `ABSOLUTE_STOP_LOSS`
+- `EXIT_COND_STOP_ENABLED`
+- `EXIT_MACD_FADE_ENABLED`
+- `MACD_FADE_MIN_ROI`
+- `EXIT_SIGNAL_FLIP_ENABLED`
+- `ALPHA_FLIP_THRESHOLD`
+
+## 2. 不由 `strategy_core_v0.py` 直接读，但会影响 V0 运行
+
+这些字段更多由 OMS / 执行层读取。
+
+### 仓位与资金
+- `MAX_POSITIONS`
+- `POSITION_RATIO`
+- `MAX_TRADE_CAP`
+- `GLOBAL_EXPOSURE_LIMIT`
+- `COMMISSION_PER_CONTRACT`
+- `COOLDOWN_MINUTES`
+- `CIRCUIT_BREAKER_THRESHOLD`
+- `CIRCUIT_BREAKER_MINUTES`
+
+### 执行参数
+- `LIMIT_BUFFER_ENTRY`
+- `LIMIT_BUFFER_EXIT`
+- `ORDER_TIMEOUT_SECONDS`
+- `ORDER_MAX_RETRIES`
+- `EXIT_ORDER_MAX_RETRIES`
+- `EXIT_SIGNAL_MINUTE_ONLY`
+
+说明：
+- 这些字段不决定策略信号本身，但会影响 V0 是否能下单、如何重试、是否只在分钟级发出平仓。
+
+## 3. 当前声明了，但在 `V0` core 里没有真正接线
+
+这些字段最容易造成“以为改了，实际没生效”。
+
+### 兼容/遗留字段
+- `INITIAL_ACCOUNT`
+- `ALPHA_ENTRY_STRICT`
+- `MIN_CS_ALPHA_Z`
+- `MIN_TREND_ROC`
+- `MAX_TREND_ROC`
+- `ROLLING_WINDOW_MINS`
+- `CORR_THRESHOLD`
+- `STOCK_HARD_STOP_EVENT`
+- `EVENT_PROB_THRESHOLD`
+- `EVENT_HODL_MINS`
+- `EARLY_STOP_MINS`
+- `EARLY_STOP_ROI`
+- `PARITY_STRICT_MODE`
+
+### 守卫开关（当前大多未接线）
+- `EXIT_CONFIRM_SECONDS_1S`
+- `EXIT_CONFIRM_REASON_PREFIXES`
+
+说明：
+- `ENTRY_MOMENTUM_GUARD_ENABLED` 已接线，当前控制 `Channel A` 和 `Slow Bull` 两条入场动量门槛。
+- `EXIT_CONFIRM_SECONDS_1S` / `EXIT_CONFIRM_REASON_PREFIXES` 目前仍只对归档/实验性的秒级 exit 路径有意义；
+  在默认 `EXIT_SIGNAL_MINUTE_ONLY=True` 的 OMS 主链路里不生效。
+- 后续优化时，这一组字段需要二选一：
+  - 要么真正接线；
+  - 要么明确标注 deprecated，避免继续误导调参。
+
+## 4. 当前最值得优先收敛的漂移点
+
+1. `MIN_OPTION_PRICE`
+   - 现在已在策略层、OMS 候选层、执行层都有约束。
+   - 后续建议收敛成统一语义，并补跨层测试。
+
+2. `spread_divergence`
+   - 策略有入场规则，但空仓时的真实 `ctx` 默认常常是 `0.0`。
+   - 这类字段要靠 `ExecutionEngineV8._build_strategy_ctx()` 契约测试锁住。
+
+3. `EXIT_*_ENABLED` / `ENTRY_*_ENABLED`
+   - `ENTRY_LIQUIDITY_GUARD_ENABLED`、`ENTRY_MOMENTUM_GUARD_ENABLED` 与多数组 `EXIT_*_ENABLED` 已接线。
+   - 剩余待收口的主要是秒级确认参数及其是否继续保留。
+
+## 5. 建议的后续动作
+
+1. 先补 `ExecutionEngineV8._build_strategy_ctx()` 契约测试。
+2. 再把“已声明但未接线”的 guard switches 做一次清理。
+3. 最后统一策略层与执行层的单一规则来源，避免继续打地鼠。

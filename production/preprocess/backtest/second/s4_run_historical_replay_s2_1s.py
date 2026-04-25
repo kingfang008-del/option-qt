@@ -37,6 +37,10 @@ print(f"🔍 [Import Trace] Using MockIBKR from: {mock_ibkr_historical_1s.__file
 import config
 import signal_engine_v8
 import execution_engine_v8
+try:
+    from Domain import ReplaySemanticAuditor
+except Exception:  # pragma: no cover
+    ReplaySemanticAuditor = None
 
 BACKTEST_STREAM = "backtest_stream"
 BACKTEST_GROUP = "backtest_group"
@@ -177,6 +181,16 @@ async def main():
         action="store_true",
         help="Debug only: run the old per-second process_batch loop. Default is synchronized minute-window mode.",
     )
+    parser.add_argument(
+        "--domain-semantic-audit",
+        action="store_true",
+        help="Run Domain semantic audit alongside replay without changing mainline logic.",
+    )
+    parser.add_argument(
+        "--domain-semantic-audit-strict",
+        action="store_true",
+        help="Raise assertion on first Domain semantic mismatch. Implies --domain-semantic-audit.",
+    )
     args = parser.parse_args()
 
     db_path = resolve_db_path(args)
@@ -195,6 +209,17 @@ async def main():
     symbols = [args.symbol] if args.symbol else TARGET_SYMBOLS
 
     logger.info("🛠️ Building S2 dual engine (1s execution path)...")
+    domain_auditor = None
+    if ReplaySemanticAuditor is not None and (args.domain_semantic_audit or args.domain_semantic_audit_strict):
+        domain_auditor = ReplaySemanticAuditor(
+            enabled=True,
+            strict=bool(args.domain_semantic_audit_strict),
+        )
+        logger.info(
+            "🧪 [Domain Audit] enabled strict=%s log_every=%s",
+            bool(args.domain_semantic_audit_strict),
+            domain_auditor.log_every,
+        )
     signal_engine = SignalEngineV8(
         symbols=symbols,
         mode='backtest',
@@ -377,6 +402,8 @@ async def main():
         if args.legacy_per_second_strategy:
             # Debug-only compatibility path: old behavior, one process_batch per second.
             for quote_packet in quotes:
+                if domain_auditor is not None:
+                    domain_auditor.audit_quote_packet(quote_packet)
                 quote_packet['is_new_minute'] = (float(quote_packet['ts']) == float(quotes[0]['ts']))
                 await signal_engine.process_batch(quote_packet)
                 exec_engine._cache_execution_market_packet(quote_packet)
@@ -384,11 +411,17 @@ async def main():
                 await drain_signal_queue(shared_signal_queue, exec_engine)
                 await exec_engine.process_trade_signal({'action': 'SYNC', 'ts': float(quote_packet['ts']), 'payload': {}})
                 signal_engine.mock_cash = exec_engine.mock_cash
+                if domain_auditor is not None:
+                    domain_auditor.audit_post_window(minute_ts, exec_engine, quote_packet)
             continue
 
         signal_packet = window['signal_packet']
         if signal_packet is None:
             continue
+        if domain_auditor is not None:
+            domain_auditor.audit_pre_window(minute_ts, signal_packet)
+            for quote_packet in quotes:
+                domain_auditor.audit_quote_packet(quote_packet)
 
         # [Step A] 用 ExecutionWindow 把 alpha_frame + 60 秒 quotes 打包成一等契约,
         # OMS 通过 execute_window() 单入口编排 "分钟边界一次 + 秒级循环"。
@@ -404,6 +437,8 @@ async def main():
         # OMS: 分钟边界 cache/drain + 秒级 ingest/SYNC
         await exec_engine.execute_window(exec_window)
         signal_engine.mock_cash = exec_engine.mock_cash
+        if domain_auditor is not None:
+            domain_auditor.audit_post_window(minute_ts, exec_engine, quotes[-1])
 
     elapsed = time.time() - start_time
     print(f"\n✅ S2 1S Replay Finished in {elapsed:.1f}s.")
@@ -430,6 +465,8 @@ async def main():
     print("\n" + "=" * 50)
     print("📊 FINAL BACKTEST PERFORMANCE SUMMARY (S2 1S DUAL)")
     print("=" * 50)
+    if domain_auditor is not None:
+        print(f"🧪 Domain semantic audit stats: {domain_auditor.stats()}")
     print("ℹ️ 最终收益统计以 MockIBKR 生成的成交账本为准（已包含 execution delay / FIFO / 手续费 / chunk 撮合）。")
     print("ℹ️ ExecutionEngine 内部 realized_pnl 口径与 Mock 重撮合价不同，这里不再重复打印，避免双账本混淆。")
     exec_engine.accounting.print_counter_trend_summary()

@@ -8,10 +8,14 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
 
-from config import NY_TZ, USE_5M_OPTION_DATA
+from config import NY_TZ, RUN_MODE as CONFIG_RUN_MODE, USE_5M_OPTION_DATA
 
 
 logger = logging.getLogger("FeatService")
+
+
+def _runtime_mode() -> str:
+    return os.environ.get("RUN_MODE", "").strip().upper() or str(CONFIG_RUN_MODE).strip().upper()
 
 
 class FCSRealtimePipeline:
@@ -82,7 +86,7 @@ class FCSRealtimePipeline:
                 commit_grace_sec = float(getattr(svc, "minute_commit_grace_sec", 1.0) or 0.0)
                 watermark_ts = max(float(ts) - commit_grace_sec, 0.0)
                 watermark_minute = datetime.fromtimestamp(watermark_ts, timezone.utc).astimezone(NY_TZ).replace(second=0, microsecond=0)
-                run_mode = os.environ.get("RUN_MODE", "").strip().upper()
+                run_mode = _runtime_mode()
                 allow_live_preagg = os.environ.get("FCS_ALLOW_PREAGG_REALTIME", "0").strip().lower() in {"1", "true", "yes", "on"}
                 is_preaggregated_1m = bool(payload.get('bar_preaggregated_1m', False))
                 if is_preaggregated_1m and run_mode in {"REALTIME", "REALTIME_DRY"} and not allow_live_preagg:
@@ -319,7 +323,7 @@ class FCSRealtimePipeline:
         svc = self.service
         current_replay_ts = ts_from_payload if ts_from_payload else svc.r.get("replay:current_ts")
         sync_ts = float(current_replay_ts) if current_replay_ts else time.time()
-        run_mode = os.environ.get("RUN_MODE", "").strip().upper()
+        run_mode = _runtime_mode()
         allow_live_preagg = os.environ.get("FCS_ALLOW_PREAGG_REALTIME", "0").strip().lower() in {"1", "true", "yes", "on"}
         if ts_from_payload is not None and run_mode in {"REALTIME", "REALTIME_DRY"}:
             wall_ts = time.time()
@@ -348,12 +352,63 @@ class FCSRealtimePipeline:
         else:
             svc.global_last_minute = curr_minute_dt
 
+        def _fmt_ts(val):
+            if val is None:
+                return "None"
+            try:
+                ts_obj = val if isinstance(val, pd.Timestamp) else pd.Timestamp(val)
+                if getattr(ts_obj, "tz", None) is None:
+                    ts_obj = ts_obj.tz_localize(NY_TZ)
+                else:
+                    ts_obj = ts_obj.tz_convert(NY_TZ)
+                return ts_obj.strftime("%Y-%m-%d %H:%M:%S %Z")
+            except Exception:
+                return str(val)
+
+        def _log_blocked_compute(reason: str, extra: dict | None = None):
+            now_wall = time.time()
+            if now_wall - float(getattr(svc, "_blocked_compute_log_at", 0.0) or 0.0) < 30.0:
+                return
+            diag = {
+                "reason": reason,
+                "sync_ts": float(sync_ts),
+                "target_time": target_time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "watermark_time": watermark_time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "curr_minute_dt": _fmt_ts(curr_minute_dt),
+                "global_last_minute": _fmt_ts(getattr(svc, "global_last_minute", None)),
+                "committed_last_minute": _fmt_ts(getattr(svc, "committed_last_minute", None)),
+                "committed_minutes": len(committed_minutes),
+                "run_mode": run_mode,
+                "preagg_mode": bool(getattr(svc, "preaggregated_1m_mode", False)),
+            }
+            if extra:
+                diag.update(extra)
+            logger.warning(f"⚠️ [FCS-Blocked] {diag}")
+            svc._blocked_compute_log_at = now_wall
+
         ready_symbols = [s for s in svc.symbols if not svc.committed_history_1min.get(s, pd.DataFrame()).empty]
         if not ready_symbols:
+            sample_history = {}
+            for sym in list(getattr(svc, "symbols", []) or [])[:3]:
+                hist = svc.history_1min.get(sym, pd.DataFrame())
+                sample_history[sym] = {
+                    "history_len": int(len(hist)) if hist is not None else 0,
+                    "history_last": _fmt_ts(hist.index[-1]) if hist is not None and not hist.empty else "None",
+                }
+            _log_blocked_compute("no_ready_symbols", {"sample_history": sample_history})
             svc._set_feature_sync_ack(sync_ts, frame_id=str(int(sync_ts)))
             return None
         sample_s = ready_symbols[0]
         if len(svc.committed_history_1min.get(sample_s, pd.DataFrame())) < 1:
+            hist = svc.committed_history_1min.get(sample_s, pd.DataFrame())
+            _log_blocked_compute(
+                "sample_committed_history_empty",
+                {
+                    "sample_symbol": sample_s,
+                    "sample_committed_len": int(len(hist)) if hist is not None else 0,
+                    "sample_committed_last": _fmt_ts(hist.index[-1]) if hist is not None and not hist.empty else "None",
+                },
+            )
             svc._set_feature_sync_ack(sync_ts, frame_id=str(int(sync_ts)))
             return None
 
@@ -457,9 +512,26 @@ class FCSRealtimePipeline:
                 )
                 svc._warmup_diag_log_count = getattr(svc, '_warmup_diag_log_count', 0) + 1
 
+        label_dt_ny = datetime.fromtimestamp(float(payload.get('ts', data_ts) or data_ts), NY_TZ)
+        allow_atomic_commit = True
+        profile = getattr(svc, "market_profile", None)
+        if bool(payload.get('is_new_minute')) and profile is not None and not profile.is_rth_minute(label_dt_ny):
+            allow_atomic_commit = False
+            if getattr(svc, '_non_rth_preview_log_count', 0) < 30:
+                logger.info(
+                    f"🩺 [FCS-Preview-Only] keep non-RTH minute for debug visibility only "
+                    f"| ts={int(float(payload.get('ts', 0.0) or 0.0))} "
+                    f"| label_ny={label_dt_ny.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"| run_mode={run_mode}"
+                )
+                svc._non_rth_preview_log_count = getattr(svc, '_non_rth_preview_log_count', 0) + 1
+
         if payload.get('is_new_minute'):
-            ok = svc._atomic_commit_minute_payload(payload)
-            if not ok:
+            if allow_atomic_commit:
+                ok = svc._atomic_commit_minute_payload(payload)
+                if not ok:
+                    svc._set_feature_sync_ack(data_ts, frame_id=str(int(data_ts)))
+            else:
                 svc._set_feature_sync_ack(data_ts, frame_id=str(int(data_ts)))
         else:
             svc._set_feature_sync_ack(data_ts, frame_id=str(int(data_ts)))

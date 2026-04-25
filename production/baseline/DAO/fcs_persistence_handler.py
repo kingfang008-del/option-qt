@@ -9,11 +9,15 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from config import NY_TZ
+from config import NY_TZ, RUN_MODE as CONFIG_RUN_MODE
 from utils import serialization_utils as ser
 
 
 logger = logging.getLogger("FeatService")
+
+
+def _runtime_mode() -> str:
+    return os.environ.get("RUN_MODE", "").strip().upper() or str(CONFIG_RUN_MODE).strip().upper()
 
 
 class FCSPersistenceHandler:
@@ -53,12 +57,19 @@ class FCSPersistenceHandler:
         if getattr(svc, 'global_last_minute', None) is None:
             svc.global_last_minute = target_minute_dt
             return committed_minutes
+        run_mode = _runtime_mode()
+        profile = getattr(svc, "market_profile", None)
+        allow_live_non_rth_preview = bool(
+            profile is not None
+            and run_mode in {"REALTIME", "REALTIME_DRY"}
+            and not profile.is_rth_minute(target_minute_dt)
+        )
         while svc.global_last_minute < target_minute_dt:
             commit_dt = svc.global_last_minute
-            profile = getattr(svc, "market_profile", None)
             if profile is not None and not profile.is_rth_minute(commit_dt):
-                svc.global_last_minute += pd.Timedelta(minutes=1)
-                continue
+                if not allow_live_non_rth_preview:
+                    svc.global_last_minute += pd.Timedelta(minutes=1)
+                    continue
             for sym in svc.symbols:
                 self._prepare_minute_commit_state(sym, commit_dt)
             for sym in svc.symbols:
@@ -238,7 +249,7 @@ class FCSPersistenceHandler:
         svc = self.service
         try:
             ts_val = float(payload.get('ts', 0.0))
-            run_mode = os.environ.get("RUN_MODE", "").strip().upper()
+            run_mode = _runtime_mode()
             commit_grace_sec = float(getattr(svc, "minute_commit_grace_sec", 1.0) or 0.0)
             if bool(payload.get('is_new_minute')):
                 svc._log_minute_write_audit(

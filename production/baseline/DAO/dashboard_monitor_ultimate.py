@@ -54,6 +54,7 @@ from runtime_trading_controls import (
     set_runtime_live_trading_capital_limit,
     set_runtime_trading_enabled,
 )
+from orchestrator_order_state import namespaced_pending_orders_key
 
 # [Fix 1] 补全 Dashboard 所需的 Redis Key 映射
 REDIS_CFG['hash_snapshot']    = HASH_OPTION_SNAPSHOT     # 'live_option_snapshot'
@@ -186,6 +187,109 @@ def fetch_live_broker_balance():
         return net_liq, avail
     except Exception:
         return None, None
+
+
+def _safe_quantile(series, q):
+    vals = pd.to_numeric(series, errors='coerce').dropna()
+    if vals.empty:
+        return np.nan
+    return float(vals.quantile(q))
+
+
+def _build_execution_event_time(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype='datetime64[ns, America/New_York]')
+    for col in ['order_submit_ts_ny', 'fill_ts_ny']:
+        if col in df.columns:
+            ts = pd.to_datetime(df[col], errors='coerce')
+            if not ts.dropna().empty:
+                return ts
+    if 'datetime_ny' in df.columns:
+        ts = pd.to_datetime(df['datetime_ny'], errors='coerce')
+        if getattr(ts.dt, 'tz', None) is None:
+            ts = ts.dt.tz_localize(NY_TZ, ambiguous='NaT', nonexistent='NaT')
+        else:
+            ts = ts.dt.tz_convert(NY_TZ)
+        if not ts.dropna().empty:
+            return ts
+    if 'ts' in df.columns:
+        return pd.to_datetime(df['ts'], unit='s', errors='coerce', utc=True).dt.tz_convert(NY_TZ)
+    return pd.Series(pd.NaT, index=df.index, dtype='datetime64[ns, America/New_York]')
+
+
+def _execution_bucket_suggestion(row) -> str:
+    samples = int(row.get('open_count', 0) or 0)
+    avg_fill_ratio = float(row.get('avg_fill_ratio', np.nan))
+    full_fill_rate = float(row.get('full_fill_rate', np.nan))
+    partial_fill_rate = float(row.get('partial_fill_rate', np.nan))
+    p50_ms = float(row.get('submit_to_fill_p50_ms', np.nan))
+    p90_ms = float(row.get('submit_to_fill_p90_ms', np.nan))
+
+    if samples < 3:
+        return "样本不足，先继续收集"
+    if partial_fill_rate >= 0.35 and p90_ms >= 8000:
+        return "尾部等待偏长且部分成交高，优先减小单笔名义金额"
+    if full_fill_rate < 0.45 and p90_ms >= 5000:
+        return "全成率偏低，可提高初始 probe 或加快重提"
+    if avg_fill_ratio < 0.75 and p50_ms >= 2500:
+        return "成交推进偏慢，重点看 submit->fill 尾部拥堵"
+    if full_fill_rate >= 0.85 and p50_ms <= 1200:
+        return "成交较充足，可考虑略收窄初始探价"
+    return "当前执行质量稳定，暂不建议调整"
+
+
+def _overall_execution_advice(exec_summary: pd.DataFrame) -> str:
+    if exec_summary.empty:
+        return "今日 OPEN 样本不足，暂时无法生成建议。"
+
+    sample_count = int(exec_summary['open_count'].sum())
+    avg_fill_ratio = float(pd.to_numeric(exec_summary['avg_fill_ratio'], errors='coerce').mean())
+    avg_full_fill_rate = float(pd.to_numeric(exec_summary['full_fill_rate'], errors='coerce').mean())
+    p90_candidates = pd.to_numeric(exec_summary['submit_to_fill_p90_ms'], errors='coerce').dropna()
+    avg_p90_ms = float(p90_candidates.mean()) if not p90_candidates.empty else np.nan
+
+    if sample_count < 5:
+        return "OPEN 样本还少，先观察更多 bucket 后再调参数。"
+    if avg_full_fill_rate < 0.45 and avg_p90_ms >= 6000:
+        return "全成率偏低且尾部等待偏长，优先从初始 probe / 重提 aggressiveness 入手。"
+    if avg_fill_ratio < 0.75:
+        return "平均 fill_ratio 偏低，建议先减小单笔名义金额，再观察 latency 尾部是否回落。"
+    if avg_full_fill_rate >= 0.85 and avg_p90_ms <= 2000:
+        return "执行质量已较好，当前参数可维持，后续可尝试小幅收窄初始限价。"
+    return "执行质量中性，先盯 p90 submit->fill 与 partial fill 的时段集中度。"
+
+
+def build_execution_quality_summary(df_open: pd.DataFrame, bucket_minutes: int = 15) -> pd.DataFrame:
+    if df_open.empty:
+        return pd.DataFrame()
+
+    work = df_open.copy()
+    work['event_time_ny'] = _build_execution_event_time(work)
+    work['fill_ratio_num'] = pd.to_numeric(work.get('fill_ratio'), errors='coerce')
+    work['submit_to_fill_ms_num'] = pd.to_numeric(work.get('submit_to_fill_ms'), errors='coerce')
+    work['alpha_to_fill_ms_num'] = pd.to_numeric(work.get('alpha_to_fill_ms'), errors='coerce')
+    work = work.dropna(subset=['event_time_ny'])
+    if work.empty:
+        return pd.DataFrame()
+
+    work['time_bucket'] = work['event_time_ny'].dt.floor(f'{int(bucket_minutes)}min')
+    summary = (
+        work.groupby('time_bucket', dropna=False)
+        .apply(
+            lambda g: pd.Series({
+                'open_count': int(len(g)),
+                'avg_fill_ratio': float(pd.to_numeric(g['fill_ratio_num'], errors='coerce').dropna().mean()) if not pd.to_numeric(g['fill_ratio_num'], errors='coerce').dropna().empty else np.nan,
+                'full_fill_rate': float((pd.to_numeric(g['fill_ratio_num'], errors='coerce') >= 0.999).mean()),
+                'partial_fill_rate': float(((pd.to_numeric(g['fill_ratio_num'], errors='coerce') > 0) & (pd.to_numeric(g['fill_ratio_num'], errors='coerce') < 0.999)).mean()),
+                'submit_to_fill_p50_ms': _safe_quantile(g['submit_to_fill_ms_num'], 0.50),
+                'submit_to_fill_p90_ms': _safe_quantile(g['submit_to_fill_ms_num'], 0.90),
+                'alpha_to_fill_p90_ms': _safe_quantile(g['alpha_to_fill_ms_num'], 0.90),
+            })
+        )
+        .reset_index()
+    )
+    summary['suggestion'] = summary.apply(_execution_bucket_suggestion, axis=1)
+    return summary
 
 _FEAT_JSON_DIR = BASE_PROJECT_DIR.parent / "CONFIG"
 if not (_FEAT_JSON_DIR / "slow_feature.json").exists():
@@ -384,9 +488,9 @@ def _calc_auto_open_notional_from_redis(rds):
                 else:
                     txt = str(raw_val)
                 state = json.loads(txt)
-                pos = int(state.get("position", 0) or 0)
+                pos = int(state.get("position", state.get("pos", 0)) or 0)
                 qty = float(state.get("qty", 0.0) or 0.0)
-                entry_price = float(state.get("entry_price", 0.0) or 0.0)
+                entry_price = float(state.get("entry_price", state.get("price", 0.0)) or 0.0)
                 if pos != 0 and qty > 0 and entry_price > 0:
                     total += qty * entry_price * 100.0
             except Exception:
@@ -424,6 +528,100 @@ def _build_manual_capital_snapshot(total_equity, ib_portfolio, rds):
         "auto_available": max(0.0, auto_budget - auto_used),
         "manual_available": max(0.0, manual_budget - manual_used),
     }
+
+
+def fetch_live_oms_positions(
+    max_age_sec: float = 120.0,
+    allow_stale: bool = False,
+    expected_modes=None,
+):
+    """Return current OMS live positions when the live ledger is fresh/mode-matched."""
+    positions = {}
+    try:
+        r = redis.Redis(**{k: v for k, v in REDIS_CFG.items() if k in ['host', 'port', 'db']}, decode_responses=False)
+        ledger = r.hgetall("meta:oms_ledger") or {}
+        cash_raw = r.hget("oms:live_positions", "____SYSTEM_CASH____")
+        ledger_cash, _ = parse_oms_ledger_hash(
+            ledger,
+            max_age_sec=max_age_sec,
+            allow_stale=allow_stale,
+            expected_modes=expected_modes,
+        )
+        live_cash, _ = parse_oms_live_cash_payload(
+            cash_raw,
+            max_age_sec=max_age_sec,
+            allow_stale=allow_stale,
+            expected_modes=expected_modes,
+        )
+        if ledger_cash is None and live_cash is None:
+            return {}
+
+        raw_map = r.hgetall("oms:live_positions") or {}
+        for raw_sym, raw_val in raw_map.items():
+            try:
+                sym = raw_sym.decode("utf-8", errors="ignore") if isinstance(raw_sym, (bytes, bytearray)) else str(raw_sym)
+                if sym == "____SYSTEM_CASH____":
+                    continue
+                txt = raw_val.decode("utf-8", errors="ignore") if isinstance(raw_val, (bytes, bytearray)) else str(raw_val)
+                state = json.loads(txt)
+                pos = int(state.get("position", state.get("pos", 0)) or 0)
+                qty = float(state.get("qty", 0.0) or 0.0)
+                cost = float(state.get("entry_price", state.get("price", 0.0)) or 0.0)
+                stock = float(state.get("entry_stock", state.get("stock", 0.0)) or 0.0)
+                if pos == 0 or qty <= 0:
+                    continue
+                positions[sym] = {
+                    'qty': qty,
+                    'cost': cost if np.isfinite(cost) and cost > 0 else 0.0,
+                    'stock': stock if np.isfinite(stock) and stock > 0 else 0.0,
+                    'tag': '',
+                    'source': 'OMS live',
+                }
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return positions
+
+
+def fetch_live_pending_orders():
+    rows = []
+    try:
+        r = redis.Redis(**{k: v for k, v in REDIS_CFG.items() if k in ['host', 'port', 'db']}, decode_responses=False)
+        raw_map = r.hgetall(namespaced_pending_orders_key(OMS_STATE_NAMESPACE)) or {}
+        for raw_key, raw_val in raw_map.items():
+            try:
+                order_key = raw_key.decode("utf-8", errors="ignore") if isinstance(raw_key, (bytes, bytearray)) else str(raw_key)
+                txt = raw_val.decode("utf-8", errors="ignore") if isinstance(raw_val, (bytes, bytearray)) else str(raw_val)
+                payload = json.loads(txt)
+                rows.append({
+                    "order_key": order_key,
+                    "symbol": str(payload.get("symbol", "") or ""),
+                    "contract_id": str(payload.get("contract_id", "") or ""),
+                    "intent": str(payload.get("intent", "") or ""),
+                    "side": str(payload.get("side", "") or ""),
+                    "status": str(payload.get("status", "") or ""),
+                    "target_qty": int(payload.get("target_qty", 0) or 0),
+                    "filled_qty": int(payload.get("filled_qty", 0) or 0),
+                    "remaining_qty": int(payload.get("remaining_qty", 0) or 0),
+                    "limit_price": float(payload.get("limit_price", 0.0) or 0.0),
+                    "retry_count": int(payload.get("retry_count", 0) or 0),
+                    "reserved_cash": float(payload.get("reserved_cash", 0.0) or 0.0),
+                    "slot_reserved": bool(payload.get("slot_reserved", False)),
+                    "broker_status": str(payload.get("broker_status", "") or ""),
+                    "updated_at": float(payload.get("last_update_ts", 0.0) or 0.0),
+                    "reason": str(payload.get("reason", "") or ""),
+                })
+            except Exception:
+                continue
+    except Exception:
+        return pd.DataFrame()
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    if "updated_at" in df.columns:
+        df["updated_at_ny"] = pd.to_datetime(df["updated_at"], unit="s", errors="coerce", utc=True).dt.tz_convert(NY_TZ)
+    return df.sort_values(["updated_at", "symbol"], ascending=[False, True], na_position="last")
 
 def _fetch_latest_option_snapshot(symbol):
     """读取某 symbol 最新 buckets/contracts 快照（优先 Redis，失败回退 PG）。"""
@@ -749,11 +947,17 @@ def load_trade_logs_for_chart(r, symbol):
     try:
         entries = r.xrevrange(REDIS_CFG['trade_log'], count=1000)
         trades = []
+        current_mode = _normalize_trade_mode(RUN_MODE)
         for _, payload in entries:
             if b'pickle' in payload:
                 msg = ser.unpack(payload[b'pickle'])
                 # [Fix] 过滤掉 ALPHA 日志，只保留真实交易
                 if msg.get('action') == 'ALPHA': continue
+                msg_mode = _normalize_trade_mode(msg.get('mode'))
+                if msg_mode and msg_mode != current_mode:
+                    continue
+                if not msg_mode and current_mode != 'REALTIME':
+                    continue
                 
                 if msg.get('symbol') == symbol:
                     try:
@@ -943,7 +1147,26 @@ def load_option_quote_quality(symbol, limit=240):
 
 
 @st.cache_data(ttl=30)
-def fetch_alpha_execution_funnel(query_date, target_table):
+def _normalize_trade_mode(value) -> str:
+    mode = str(value or "").strip().upper()
+    return mode if mode in {"REALTIME", "REALTIME_DRY", "BACKTEST", "SHADOW"} else ""
+
+
+def _build_trade_mode_mask(df: pd.DataFrame, expected_mode: str) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype=bool)
+    current_mode = _normalize_trade_mode(expected_mode)
+    if not current_mode:
+        return pd.Series(True, index=df.index)
+    mode_series = df.get('mode', pd.Series(index=df.index, dtype=object)).map(_normalize_trade_mode)
+    mask = mode_series.eq(current_mode)
+    if current_mode == "REALTIME" and 'source_table' in df.columns:
+        legacy_live_mask = mode_series.eq("") & df['source_table'].astype(str).eq('trade_logs')
+        mask = mask | legacy_live_mask
+    return mask.fillna(False)
+
+
+def fetch_alpha_execution_funnel(query_date, target_table, expected_mode=None):
     """统计 alpha -> open/fill/close 的漏斗。"""
     try:
         start_dt = datetime.combine(query_date, dt_time(0, 0, 0))
@@ -981,6 +1204,8 @@ def fetch_alpha_execution_funnel(query_date, target_table):
                     return default
 
             df_trade['fill_ratio'] = df_trade['details_json'].apply(lambda r: _parse_detail(r, 'fill_ratio'))
+            df_trade['mode'] = df_trade['details_json'].apply(lambda r: _parse_detail(r, 'mode', ''))
+            df_trade = df_trade[_build_trade_mode_mask(df_trade, expected_mode or RUN_MODE)].copy()
 
         eligible_alpha = df_alpha[(df_alpha['alpha'].abs() >= 0.8) & (df_alpha['vol_z'] >= -1.0)].copy() if not df_alpha.empty else pd.DataFrame()
         open_df = df_trade[df_trade['action'] == 'OPEN'].copy() if not df_trade.empty else pd.DataFrame()
@@ -1976,8 +2201,9 @@ with st.sidebar:
     symbol = st.selectbox("Symbol", symbols, index=1)
     auto_refresh = st.checkbox("Auto Refresh (1s)", True)
     if st.button("Manual Refresh"): st.rerun()
-    if RUN_MODE == "REALTIME":
+    if RUN_MODE.startswith("REALTIME"):
         st.markdown("### Live Risk Controls")
+        st.caption(f"run_mode: {RUN_MODE}")
         current_trading_enabled, current_trading_meta = get_runtime_trading_enabled(
             default_value=TRADING_ENABLED,
             r=r,
@@ -1992,8 +2218,17 @@ with st.sidebar:
         st.caption(
             f"source: {current_trading_meta.get('source', 'config')} | by: {current_trading_meta.get('updated_by') or 'config'}"
         )
+        if RUN_MODE != "REALTIME":
+            st.info(
+                "Current process is running in REALTIME_DRY. You can preconfigure the cap here, "
+                "but real-order arming stays blocked until the service itself is started in REALTIME."
+            )
         tc1, tc2 = st.columns(2)
-        if tc1.button("Arm Trading", use_container_width=True, disabled=(not TRADING_ENABLED or current_trading_enabled)):
+        if tc1.button(
+            "Arm Trading",
+            use_container_width=True,
+            disabled=(RUN_MODE != "REALTIME" or not TRADING_ENABLED or current_trading_enabled),
+        ):
             st.session_state["runtime_control_pending"] = {
                 "action": "set_trading",
                 "value": True,
@@ -2050,7 +2285,7 @@ status = SystemStatus(r, symbol)
 st.plotly_chart(draw_topology(status), use_container_width=True)
 render_momentum_panel()
 
-if RUN_MODE == "REALTIME":
+if RUN_MODE.startswith("REALTIME"):
     top_live_trading_enabled, top_live_trading_meta = get_runtime_trading_enabled(
         default_value=TRADING_ENABLED,
         r=r,
@@ -2058,7 +2293,19 @@ if RUN_MODE == "REALTIME":
     )
     top_live_trading_source = top_live_trading_meta.get("source", "config")
     top_live_trading_by = top_live_trading_meta.get("updated_by") or "config"
-    if top_live_trading_enabled:
+    if RUN_MODE != "REALTIME":
+        st.markdown(
+            f"""
+            <div style='background:#1A2942; border:1px solid #4C78A8; color:#EEF5FF; padding:12px 16px; border-radius:10px; margin:8px 0 14px 0; font-weight:600;'>
+                REALTIME_DRY MODE
+                <span style='font-weight:400; margin-left:10px; opacity:0.9;'>
+                    live orders blocked by run mode | source: {top_live_trading_source} | by: {top_live_trading_by}
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    elif top_live_trading_enabled:
         st.markdown(
             f"""
             <div style='background:#5A1E1E; border:1px solid #EF553B; color:#FFF4F2; padding:12px 16px; border-radius:10px; margin:8px 0 14px 0; font-weight:600;'>
@@ -2718,6 +2965,20 @@ with tab10:
                     hide_index=True
                 )
 
+        st.subheader("Pending Orders")
+        df_pending = fetch_live_pending_orders()
+        if df_pending.empty:
+            st.info("No active OMS pending orders.")
+        else:
+            display_cols = [
+                "symbol", "intent", "side", "status",
+                "target_qty", "filled_qty", "remaining_qty",
+                "limit_price", "retry_count", "reserved_cash",
+                "slot_reserved", "broker_status", "updated_at_ny", "reason",
+            ]
+            exist_cols = [c for c in display_cols if c in df_pending.columns]
+            st.dataframe(df_pending[exist_cols], use_container_width=True, hide_index=True)
+
         st.subheader("Active Positions")
         if not portfolio:
             st.info("No active positions found in IBKR account.")
@@ -2951,10 +3212,10 @@ with tab5:
             target_end_ts = target_start_ts + 86400
             
             # [🔥 模式切换] 根据全局开关切换查询目标表，确保空跑和实盘流水不混淆
-            from config import TRADING_ENABLED
-            target_table = 'trade_logs' if TRADING_ENABLED else 'trade_logs_backtest'
+            current_mode = _normalize_trade_mode(RUN_MODE)
+            target_table = 'trade_logs' if current_mode == 'REALTIME' else 'trade_logs_backtest'
 
-            funnel = fetch_alpha_execution_funnel(query_date, target_table)
+            funnel = fetch_alpha_execution_funnel(query_date, target_table, expected_mode=current_mode)
             st.write("##### Alpha -> Execution Funnel")
             f1, f2, f3, f4, f5, f6 = st.columns(6)
             f1.metric("Alpha Total", f"{funnel['alpha_total']}")
@@ -3028,106 +3289,237 @@ with tab5:
                 df_all['alpha'] = df_all['details_json'].apply(lambda r: extract_note(r, 'alpha'))
                 df_all['reason'] = df_all['details_json'].apply(lambda r: extract_note(r, 'reason'))
                 df_all['tag'] = df_all['details_json'].apply(lambda r: extract_note(r, 'tag'))
+                mode_mask = _build_trade_mode_mask(df_all, current_mode)
+                filtered_out = int((~mode_mask).sum())
+                df_all = df_all[mode_mask].copy()
+                if filtered_out > 0:
+                    st.caption(f"Mode filter dropped {filtered_out} rows not matching `{current_mode}`.")
 
-                for ts_col in ['alpha_label_ts', 'alpha_available_ts', 'order_submit_ts', 'fill_ts']:
-                    if ts_col in df_all.columns:
-                        df_all[f'{ts_col}_ny'] = pd.to_datetime(
-                            df_all[ts_col], unit='s', errors='coerce', utc=True
-                        ).dt.tz_convert('America/New_York')
+                if df_all.empty:
+                    st.info(f"No trades executed on {query_date} for mode {current_mode}.")
+                else:
 
-                # ✅ 2. 遍历计算已平仓盈亏 & 找出当前未平仓头寸
-                open_positions = {}
-                closed_pnl = 0.0
-                wins, losses = 0, 0
-                
-                for _, row in df_all.iterrows():
-                    sym = row['symbol']
-                    qty = float(row.get('qty', 0))
-                    price = float(row.get('price', 0))
-                    action = row.get('action', '')
-                    tag = row.get('tag', '')
+                    for ts_col in ['alpha_label_ts', 'alpha_available_ts', 'order_submit_ts', 'fill_ts']:
+                        if ts_col in df_all.columns:
+                            df_all[f'{ts_col}_ny'] = pd.to_datetime(
+                                df_all[ts_col], unit='s', errors='coerce', utc=True
+                            ).dt.tz_convert('America/New_York')
+
+                    # ✅ 2. 遍历计算已平仓盈亏 & 找出当前未平仓头寸
+                    open_positions = {}
+                    closed_pnl = 0.0
+                    wins, losses = 0, 0
                     
-                    if action == 'OPEN':
-                        if sym not in open_positions:
-                            open_positions[sym] = {'qty': 0, 'cost': 0.0, 'tag': tag}
-                        old_qty = open_positions[sym]['qty']
-                        old_cost = open_positions[sym]['cost']
-                        new_qty = old_qty + qty
-                        open_positions[sym]['cost'] = (old_qty * old_cost + qty * price) / new_qty if new_qty > 0 else 0
-                        open_positions[sym]['qty'] = new_qty
-                        if tag: open_positions[sym]['tag'] = tag
+                    for _, row in df_all.iterrows():
+                        sym = row['symbol']
+                        qty = float(row.get('qty', 0))
+                        price = float(row.get('price', 0))
+                        action = row.get('action', '')
+                        tag = row.get('tag', '')
                         
-                    elif action == 'CLOSE':
-                        if sym in open_positions:
-                            open_positions[sym]['qty'] -= qty
-                            if open_positions[sym]['qty'] <= 0:
-                                del open_positions[sym]
-                                
-                        pnl_val = float(row.get('pnl', 0) if pd.notna(row.get('pnl')) else 0)
-                        closed_pnl += pnl_val
-                        if pnl_val > 0: wins += 1
-                        elif pnl_val < 0: losses += 1
+                        if action == 'OPEN':
+                            if sym not in open_positions:
+                                open_positions[sym] = {'qty': 0, 'cost': 0.0, 'tag': tag}
+                            old_qty = open_positions[sym]['qty']
+                            old_cost = open_positions[sym]['cost']
+                            new_qty = old_qty + qty
+                            open_positions[sym]['cost'] = (old_qty * old_cost + qty * price) / new_qty if new_qty > 0 else 0
+                            open_positions[sym]['qty'] = new_qty
+                            if tag: open_positions[sym]['tag'] = tag
+                            
+                        elif action == 'CLOSE':
+                            if sym in open_positions:
+                                open_positions[sym]['qty'] -= qty
+                                if open_positions[sym]['qty'] <= 0:
+                                    del open_positions[sym]
+                                    
+                            pnl_val = float(row.get('pnl', 0) if pd.notna(row.get('pnl')) else 0)
+                            closed_pnl += pnl_val
+                            if pnl_val > 0: wins += 1
+                            elif pnl_val < 0: losses += 1
 
-                open_df = df_all[df_all['action'] == 'OPEN'].copy()
-                if not open_df.empty:
-                    lat_cols = st.columns(3)
-                    avg_a2s = pd.to_numeric(open_df['alpha_to_submit_ms'], errors='coerce').dropna()
-                    avg_s2f = pd.to_numeric(open_df['submit_to_fill_ms'], errors='coerce').dropna()
-                    avg_a2f = pd.to_numeric(open_df['alpha_to_fill_ms'], errors='coerce').dropna()
-                    lat_cols[0].metric("Alpha->Submit", f"{avg_a2s.mean():.0f} ms" if not avg_a2s.empty else "N/A")
-                    lat_cols[1].metric("Submit->Fill", f"{avg_s2f.mean():.0f} ms" if not avg_s2f.empty else "N/A")
-                    lat_cols[2].metric("Alpha->Fill", f"{avg_a2f.mean():.0f} ms" if not avg_a2f.empty else "N/A")
-
-                    chain_cols = st.columns(4)
-                    alpha_label_delay = (
-                        (pd.to_numeric(open_df['alpha_available_ts'], errors='coerce') - pd.to_numeric(open_df['alpha_label_ts'], errors='coerce')) * 1000.0
-                    ).dropna()
-                    if not alpha_label_delay.empty:
-                        chain_cols[0].metric("Label->Available", f"{alpha_label_delay.mean():.0f} ms")
-                    else:
-                        chain_cols[0].metric("Label->Available", "N/A")
-                    if not avg_a2s.empty:
-                        chain_cols[1].metric("Available->Submit", f"{avg_a2s.mean():.0f} ms")
-                    else:
-                        chain_cols[1].metric("Available->Submit", "N/A")
-                    if not avg_s2f.empty:
-                        chain_cols[2].metric("Submit->Fill", f"{avg_s2f.mean():.0f} ms")
-                    else:
-                        chain_cols[2].metric("Submit->Fill", "N/A")
-                    if not avg_a2f.empty:
-                        chain_cols[3].metric("Available->Fill", f"{avg_a2f.mean():.0f} ms")
-                    else:
-                        chain_cols[3].metric("Available->Fill", "N/A")
-
-                    st.caption("`Label->Available` 目前用 `alpha_label_ts -> alpha_available_ts` 近似，代表分钟标签落点到信号真正可下单之间的链路耗时。")
-
-                    latency_plot_df = pd.DataFrame({
-                        'Available->Submit': avg_a2s,
-                        'Submit->Fill': avg_s2f,
-                        'Available->Fill': avg_a2f,
-                    })
-                    latency_long = latency_plot_df.melt(var_name='stage', value_name='latency_ms').dropna()
-                    if not latency_long.empty:
-                        fig_lat = px.box(
-                            latency_long,
-                            x='stage',
-                            y='latency_ms',
-                            color='stage',
-                            points='outliers',
-                            title="Decision Chain Latency Distribution"
+                    log_open_positions = dict(open_positions)
+                    if current_mode.startswith("REALTIME"):
+                        live_open_positions = fetch_live_oms_positions(
+                            max_age_sec=120.0,
+                            allow_stale=False,
+                            expected_modes=[RUN_MODE],
                         )
-                        fig_lat.update_layout(height=320, margin=dict(t=40, b=10, l=10, r=10), template=PLOTLY_THEME, showlegend=False)
-                        st.plotly_chart(fig_lat, use_container_width=True)
+                        if live_open_positions:
+                            stale_log_symbols = sorted(set(log_open_positions) - set(live_open_positions))
+                            broker_only_symbols = sorted(set(live_open_positions) - set(log_open_positions))
+                            for sym, pos in live_open_positions.items():
+                                log_pos = log_open_positions.get(sym, {})
+                                if not pos.get('tag') and log_pos.get('tag'):
+                                    pos['tag'] = log_pos.get('tag', '')
+                                if pos.get('cost', 0.0) <= 0 and float(log_pos.get('cost', 0.0) or 0.0) > 0:
+                                    pos['cost'] = float(log_pos.get('cost', 0.0) or 0.0)
+                            open_positions = live_open_positions
+                            if stale_log_symbols or broker_only_symbols:
+                                parts = []
+                                if stale_log_symbols:
+                                    parts.append(f"dropped stale log-only: {', '.join(stale_log_symbols[:6])}")
+                                if broker_only_symbols:
+                                    parts.append(f"adopted OMS live-only: {', '.join(broker_only_symbols[:6])}")
+                                st.caption("Current positions use `oms:live_positions` in realtime; " + " | ".join(parts))
 
-                    st.markdown("#### Alpha Timing Audit")
-                    timing_cols = [
-                        'datetime_ny', 'symbol', 'action', 'qty', 'price', 'tag', 'reason',
-                        'alpha_label_ts_ny', 'alpha_available_ts_ny', 'order_submit_ts_ny', 'fill_ts_ny',
-                        'alpha_to_submit_ms', 'submit_to_fill_ms', 'alpha_to_fill_ms',
-                        'fill_ratio', 'fill_duration'
-                    ]
-                    exist_cols = [c for c in timing_cols if c in open_df.columns]
-                    st.dataframe(open_df[exist_cols], use_container_width=True)
+                    open_df = df_all[df_all['action'] == 'OPEN'].copy()
+                    if not open_df.empty:
+                        lat_cols = st.columns(3)
+                        avg_a2s = pd.to_numeric(open_df['alpha_to_submit_ms'], errors='coerce').dropna()
+                        avg_s2f = pd.to_numeric(open_df['submit_to_fill_ms'], errors='coerce').dropna()
+                        avg_a2f = pd.to_numeric(open_df['alpha_to_fill_ms'], errors='coerce').dropna()
+                        lat_cols[0].metric("Alpha->Submit", f"{avg_a2s.mean():.0f} ms" if not avg_a2s.empty else "N/A")
+                        lat_cols[1].metric("Submit->Fill", f"{avg_s2f.mean():.0f} ms" if not avg_s2f.empty else "N/A")
+                        lat_cols[2].metric("Alpha->Fill", f"{avg_a2f.mean():.0f} ms" if not avg_a2f.empty else "N/A")
+
+                        chain_cols = st.columns(4)
+                        alpha_label_delay = (
+                            (pd.to_numeric(open_df['alpha_available_ts'], errors='coerce') - pd.to_numeric(open_df['alpha_label_ts'], errors='coerce')) * 1000.0
+                        ).dropna()
+                        if not alpha_label_delay.empty:
+                            chain_cols[0].metric("Label->Available", f"{alpha_label_delay.mean():.0f} ms")
+                        else:
+                            chain_cols[0].metric("Label->Available", "N/A")
+                        if not avg_a2s.empty:
+                            chain_cols[1].metric("Available->Submit", f"{avg_a2s.mean():.0f} ms")
+                        else:
+                            chain_cols[1].metric("Available->Submit", "N/A")
+                        if not avg_s2f.empty:
+                            chain_cols[2].metric("Submit->Fill", f"{avg_s2f.mean():.0f} ms")
+                        else:
+                            chain_cols[2].metric("Submit->Fill", "N/A")
+                        if not avg_a2f.empty:
+                            chain_cols[3].metric("Available->Fill", f"{avg_a2f.mean():.0f} ms")
+                        else:
+                            chain_cols[3].metric("Available->Fill", "N/A")
+
+                        st.caption("`Label->Available` 目前用 `alpha_label_ts -> alpha_available_ts` 近似，代表分钟标签落点到信号真正可下单之间的链路耗时。")
+
+                        latency_plot_df = pd.DataFrame({
+                            'Available->Submit': avg_a2s,
+                            'Submit->Fill': avg_s2f,
+                            'Available->Fill': avg_a2f,
+                        })
+                        latency_long = latency_plot_df.melt(var_name='stage', value_name='latency_ms').dropna()
+                        if not latency_long.empty:
+                            fig_lat = px.box(
+                                latency_long,
+                                x='stage',
+                                y='latency_ms',
+                                color='stage',
+                                points='outliers',
+                                title="Decision Chain Latency Distribution"
+                            )
+                            fig_lat.update_layout(height=320, margin=dict(t=40, b=10, l=10, r=10), template=PLOTLY_THEME, showlegend=False)
+                            st.plotly_chart(fig_lat, use_container_width=True)
+
+                        st.markdown("#### Execution Quality Advisor")
+                        bucket_minutes = st.selectbox(
+                            "Time Bucket",
+                            options=[5, 15, 30],
+                            index=1,
+                            key="trade_log_exec_bucket_minutes",
+                        )
+                        exec_summary = build_execution_quality_summary(open_df, bucket_minutes=bucket_minutes)
+                        if exec_summary.empty:
+                            st.info("Execution quality summary unavailable for current sample.")
+                        else:
+                            advisor_cols = st.columns(4)
+                            advisor_cols[0].metric(
+                                "Avg Fill Ratio",
+                                f"{pd.to_numeric(exec_summary['avg_fill_ratio'], errors='coerce').mean():.2f}"
+                                if not exec_summary.empty else "N/A",
+                            )
+                            advisor_cols[1].metric(
+                                "Full Fill Rate",
+                                f"{pd.to_numeric(exec_summary['full_fill_rate'], errors='coerce').mean():.1%}"
+                                if not exec_summary.empty else "N/A",
+                            )
+                            p90_ms = pd.to_numeric(exec_summary['submit_to_fill_p90_ms'], errors='coerce').dropna()
+                            advisor_cols[2].metric(
+                                "Submit->Fill P90",
+                                f"{p90_ms.mean():.0f} ms" if not p90_ms.empty else "N/A",
+                            )
+                            advisor_cols[3].metric(
+                                "Buckets",
+                                f"{len(exec_summary)}",
+                                delta=f"samples {int(exec_summary['open_count'].sum())}",
+                            )
+                            st.caption(_overall_execution_advice(exec_summary))
+
+                            trend_cols = st.columns(2)
+                            exec_summary_plot = exec_summary.copy()
+                            exec_summary_plot['bucket_label'] = exec_summary_plot['time_bucket'].dt.strftime('%H:%M')
+                            with trend_cols[0]:
+                                fig_fill = px.line(
+                                    exec_summary_plot,
+                                    x='bucket_label',
+                                    y=['avg_fill_ratio', 'full_fill_rate'],
+                                    markers=True,
+                                    title="Fill Quality by Time Bucket",
+                                )
+                                fig_fill.update_layout(height=300, margin=dict(t=40, b=10, l=10, r=10), template=PLOTLY_THEME, legend_title_text="")
+                                st.plotly_chart(fig_fill, use_container_width=True)
+                            with trend_cols[1]:
+                                fig_tail = px.line(
+                                    exec_summary_plot,
+                                    x='bucket_label',
+                                    y=['submit_to_fill_p50_ms', 'submit_to_fill_p90_ms'],
+                                    markers=True,
+                                    title="Submit->Fill Latency Tail",
+                                )
+                                fig_tail.update_layout(height=300, margin=dict(t=40, b=10, l=10, r=10), template=PLOTLY_THEME, legend_title_text="")
+                                st.plotly_chart(fig_tail, use_container_width=True)
+
+                            scatter_df = open_df.copy()
+                            scatter_df['fill_ratio_num'] = pd.to_numeric(scatter_df['fill_ratio'], errors='coerce')
+                            scatter_df['submit_to_fill_ms_num'] = pd.to_numeric(scatter_df['submit_to_fill_ms'], errors='coerce')
+                            scatter_df = scatter_df.dropna(subset=['fill_ratio_num', 'submit_to_fill_ms_num'])
+                            if not scatter_df.empty:
+                                fig_exec_scatter = px.scatter(
+                                    scatter_df,
+                                    x='submit_to_fill_ms_num',
+                                    y='fill_ratio_num',
+                                    color='tag' if 'tag' in scatter_df.columns else None,
+                                    hover_data=['symbol', 'reason'] if {'symbol', 'reason'}.issubset(scatter_df.columns) else None,
+                                    title="Fill Ratio vs Submit->Fill Latency",
+                                )
+                                fig_exec_scatter.update_layout(height=320, margin=dict(t=40, b=10, l=10, r=10), template=PLOTLY_THEME)
+                                st.plotly_chart(fig_exec_scatter, use_container_width=True)
+
+                            exec_display = exec_summary.copy()
+                            exec_display['time_bucket'] = exec_display['time_bucket'].dt.strftime('%H:%M')
+                            exec_display['avg_fill_ratio'] = pd.to_numeric(exec_display['avg_fill_ratio'], errors='coerce').map(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
+                            exec_display['full_fill_rate'] = pd.to_numeric(exec_display['full_fill_rate'], errors='coerce').map(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A")
+                            exec_display['partial_fill_rate'] = pd.to_numeric(exec_display['partial_fill_rate'], errors='coerce').map(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A")
+                            exec_display['submit_to_fill_p50_ms'] = pd.to_numeric(exec_display['submit_to_fill_p50_ms'], errors='coerce').map(lambda x: f"{x:.0f} ms" if pd.notna(x) else "N/A")
+                            exec_display['submit_to_fill_p90_ms'] = pd.to_numeric(exec_display['submit_to_fill_p90_ms'], errors='coerce').map(lambda x: f"{x:.0f} ms" if pd.notna(x) else "N/A")
+                            exec_display['alpha_to_fill_p90_ms'] = pd.to_numeric(exec_display['alpha_to_fill_p90_ms'], errors='coerce').map(lambda x: f"{x:.0f} ms" if pd.notna(x) else "N/A")
+                            st.dataframe(
+                                exec_display.rename(columns={
+                                    'time_bucket': 'Bucket',
+                                    'open_count': 'OPEN Count',
+                                    'avg_fill_ratio': 'Avg Fill Ratio',
+                                    'full_fill_rate': 'Full Fill Rate',
+                                    'partial_fill_rate': 'Partial Fill Rate',
+                                    'submit_to_fill_p50_ms': 'Submit->Fill P50',
+                                    'submit_to_fill_p90_ms': 'Submit->Fill P90',
+                                    'alpha_to_fill_p90_ms': 'Alpha->Fill P90',
+                                    'suggestion': 'Suggestion',
+                                }),
+                                use_container_width=True,
+                            )
+
+                        st.markdown("#### Alpha Timing Audit")
+                        timing_cols = [
+                            'datetime_ny', 'symbol', 'action', 'qty', 'price', 'tag', 'reason',
+                            'alpha_label_ts_ny', 'alpha_available_ts_ny', 'order_submit_ts_ny', 'fill_ts_ny',
+                            'alpha_to_submit_ms', 'submit_to_fill_ms', 'alpha_to_fill_ms',
+                            'fill_ratio', 'fill_duration'
+                        ]
+                        exist_cols = [c for c in timing_cols if c in open_df.columns]
+                        st.dataframe(open_df[exist_cols], use_container_width=True)
 
                 # ✅ 3+4. Live Price 流式刷新卡片 (独立每 3s 自动更新，不需全页刷新)
                 @st.fragment(run_every=3)

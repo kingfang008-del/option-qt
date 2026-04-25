@@ -61,6 +61,18 @@ TRADING_ENABLED = (
     and not IS_REALTIME_DRY
 )
 
+# ================= REALTIME 上游诊断旁路 =================
+# 仅放宽 Alpha/FCS 上游门禁，帮助定位 “REALTIME 无 Alpha/无交易记录” 问题。
+# 不影响 OMS 的 stale quote / no option feed / alpha barrier 等真实下单保护。
+REALTIME_ALLOW_WARMUP_BYPASS = _env_flag(
+    "REALTIME_ALLOW_WARMUP_BYPASS",
+    RUN_MODE == "REALTIME",
+)
+REALTIME_ALLOW_IV_GATE_BYPASS = _env_flag(
+    "REALTIME_ALLOW_IV_GATE_BYPASS",
+    RUN_MODE == "REALTIME",
+)
+
 # ================= OMS 断流保护 (防自杀式平仓) =================
 # 当 IBKR/Gateway 断流或行情明显陈旧时, 阻止 OMS 用过期报价触发策略交易。
 # 典型场景: REALTIME_DRY 停掉 Gateway 后, 旧报价导致 ROI 失真并触发异常止损。
@@ -180,7 +192,7 @@ REDIS_CFG = {
 HASH_OPTION_SNAPSHOT = 'live_option_snapshot'      # IBKR Connector → Dashboard
 
 # ================= 数据库配置 (PostgreSQL) =================
-PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.116 port=5432"
+PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.229 port=5432"
 
 # ================= 核心交易标的 =================
 # GS 先注释掉，生产的时候再恢复，因为秒级回测数据里没有 GS 的期权数据，可能会导致回测失败
@@ -208,7 +220,7 @@ INDEX_TREND_SYMBOLS = ['SPY', 'QQQ']
 ENABLE_DEEP_WARMUP = _env_flag("ENABLE_DEEP_WARMUP", True) 
 
 # 连续通过 N 个分钟边界才放行到模型输入（非阻塞）
-OPTION_GATE_MIN_CONSECUTIVE_PASS = 2
+OPTION_GATE_MIN_CONSECUTIVE_PASS = 1
 # 放行后连续失败 M 个分钟边界才撤销放行（防抖）
 OPTION_GATE_MAX_CONSECUTIVE_FAIL = 2
 # 已放行后允许短抖的宽限期（分钟）

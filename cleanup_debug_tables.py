@@ -3,7 +3,7 @@ import sys
 import os
 
 # Hardcode PG_DB_URL to avoid dependency issues with config.py imports (like pytz)
-PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.116 port=5432"
+PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.229 port=5432"
 
 def cleanup_debug_tables():
     conn = None

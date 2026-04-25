@@ -63,7 +63,11 @@ class _DummyIBKR:
     def __init__(self) -> None:
         self.locked_contracts = {}
         self.orders = []
-        self.ib = SimpleNamespace(cancelOrder=lambda *_args, **_kwargs: None)
+        self.cancelled_orders = []
+        self.ib = SimpleNamespace(
+            cancelOrder=lambda order, *_args, **_kwargs: self.cancelled_orders.append(order),
+            isConnected=lambda: True,
+        )
 
     def place_option_order(self, *args, **kwargs):
         self.orders.append((args, kwargs))
@@ -374,6 +378,40 @@ def test_execution_cfg_override_limit_buffers() -> None:
     assert abs(exit_px - 1.7) < 1e-9, f"应使用 cfg.LIMIT_BUFFER_EXIT=0.85，实际 {exit_px}"
 
 
+def test_entry_limit_price_never_crosses_ask_on_initial_quote() -> None:
+    _bootstrap_imports()
+    import orchestrator_execution as oe  # noqa: E402
+
+    orch = _build_orch(mode="realtime")
+    ex = oe.OrchestratorExecution(orch)
+
+    sig = {"meta": {"bid": 1.96, "ask": 2.04}}
+    limit_px = ex._get_entry_limit_price(sig, base_price=2.0, attempt_no=0)
+
+    assert limit_px < 2.04, f"初始建仓限价不应直接等于 ask，实际 {limit_px}"
+    assert limit_px >= 1.96, f"初始建仓限价不应低于 bid，实际 {limit_px}"
+
+
+def test_entry_requote_price_stays_below_live_ask() -> None:
+    _bootstrap_imports()
+    import orchestrator_execution as oe  # noqa: E402
+
+    orch = _build_orch(mode="realtime")
+    ex = oe.OrchestratorExecution(orch)
+
+    sig = {"price": 2.0, "meta": {"bid": 1.96, "ask": 2.04}}
+    next_limit = ex._next_entry_requote_price(
+        sig=sig,
+        prev_limit_price=2.00,
+        attempt_no=1,
+        cap_price=2.04,
+        real_contract=None,
+    )
+
+    assert next_limit < 2.04, f"追价也不应直接等于 ask，实际 {next_limit}"
+    assert next_limit >= 2.00, f"追价至少不应低于上一笔限价，实际 {next_limit}"
+
+
 class _FakeOrderStatus:
     def __init__(self) -> None:
         self.status = "Submitted"
@@ -429,13 +467,56 @@ def test_entry_requote_cap_blocks_over_2pct() -> None:
     assert len(orch.ibkr.orders) == 0, "追价超过 2% 上限时不应继续发送 re-quote 订单"
 
 
+def test_realtime_order_timeout_uses_ibkr_connector_cancel() -> None:
+    _bootstrap_imports()
+    import orchestrator_execution as oe  # noqa: E402
+
+    orch = _build_orch(mode="realtime")
+    orch.cfg.ORDER_TIMEOUT_SECONDS = 1
+    orch.cfg.ORDER_MAX_RETRIES = 1
+    delattr(orch, "ib")
+    ex = oe.OrchestratorExecution(orch)
+    st = orch.states["NVDA"]
+    trade = _FakeTrade()
+    sig = {
+        "reason": "UNIT_TIMEOUT_CANCEL",
+        "price": 2.0,
+        "meta": {"alpha_available_ts": 1_777_777_777.0},
+    }
+
+    async def _fast_sleep(_secs: float):
+        return None
+
+    with patch("asyncio.sleep", _fast_sleep):
+        asyncio.run(
+            ex._monitor_realtime_order(
+                "NVDA",
+                trade,
+                object(),
+                cost=1000.0,
+                commission=10.0,
+                expected_qty=1,
+                start_time=1_777_777_700.0,
+                limit_price=2.0,
+                stock_price=100.0,
+                sig=sig,
+                st=st,
+            )
+        )
+
+    assert orch.ibkr.cancelled_orders == [trade.order], "超时撤单必须走 orch.ibkr.ib.cancelOrder"
+
+
 def main() -> None:
     test_execute_entry_scope_guard_no_unboundlocalerror()
     test_realtime_iceberg_entry_keeps_pending_until_background_task_finishes()
     test_entry_allows_fourth_slot_but_blocks_fifth()
     test_execute_exit_put_uses_bid_size_in_dry_mode()
     test_execution_cfg_override_limit_buffers()
+    test_entry_limit_price_never_crosses_ask_on_initial_quote()
+    test_entry_requote_price_stays_below_live_ask()
     test_entry_requote_cap_blocks_over_2pct()
+    test_realtime_order_timeout_uses_ibkr_connector_cancel()
     print("[OK] orchestrator execution guards passed")
 
 

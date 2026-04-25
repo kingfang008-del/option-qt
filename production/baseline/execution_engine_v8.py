@@ -40,6 +40,7 @@ from scipy.stats import norm
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from entry_risk_rules import evaluate_entry_liquidity
 
 # 引入纯策略核心
 from strategy_selector import ACTIVE_STRATEGY_CORE_VERSION, StrategyCore, StrategyConfig
@@ -47,10 +48,15 @@ from strategy_selector import ACTIVE_STRATEGY_CORE_VERSION, StrategyCore, Strate
 
 # [Refactor] 引入模块化执行组件
 from orchestrator_state_manager import OrchestratorStateManager
+from orchestrator_order_state import OrchestratorOrderStateManager
 from orchestrator_accounting import OrchestratorAccounting
 from orchestrator_execution import OrchestratorExecution
 from orchestrator_reconciler import OrchestratorReconciler
 from utils import serialization_utils as ser
+try:
+    from Domain.shadow_router import get_domain_shadow_router
+except Exception:  # pragma: no cover
+    get_domain_shadow_router = None
 
  
     # 🚀 [Fix] 切换为秒级专用模拟器 (1s Precision)
@@ -396,7 +402,207 @@ class SymbolState:
         self.ema_slow_val = data.get('ema_slow_val')
         self.dea_val = data.get('dea_val')
 
+
+def compute_entry_priority_score(
+    *,
+    alpha: float,
+    iv: float,
+    roc_5m: float,
+    snap_roc: float,
+    macd_hist: float,
+    entry_dir: int,
+    cfg,
+    pure_alpha_replay: bool = False,
+    trend_net: float = 0.0,
+    trend_efficiency: float = 0.0,
+    trend_r2: float = 0.0,
+    trend_observations: int = 0,
+) -> Dict[str, float]:
+    alpha_abs = abs(float(alpha or 0.0))
+    effective_iv = max(0.1, float(iv or 0.0))
+    direction = 1 if int(entry_dir or 0) >= 0 else -1
+
+    alpha_power = float(getattr(cfg, 'ENTRY_RANK_ALPHA_POWER', 1.35))
+    iv_penalty_power = float(getattr(cfg, 'ENTRY_RANK_IV_PENALTY_POWER', 0.0))
+    base_alpha = alpha_abs ** alpha_power
+    base_score = base_alpha if pure_alpha_replay else base_alpha / (effective_iv ** iv_penalty_power)
+
+    high_alpha_bonus = min(
+        max(
+            0.0,
+            alpha_abs - float(getattr(cfg, 'ENTRY_RANK_HIGH_ALPHA_FLOOR', 1.20)),
+        )
+        * float(getattr(cfg, 'ENTRY_RANK_HIGH_ALPHA_BONUS_SCALE', 0.35)),
+        float(getattr(cfg, 'ENTRY_RANK_HIGH_ALPHA_MAX_BONUS', 0.50)),
+    )
+    alpha_mult = 1.0 + high_alpha_bonus
+
+    abs_roc_mult = 1.0 + abs(float(roc_5m or 0.0)) * float(
+        getattr(cfg, 'ENTRY_RANK_ROC_ABS_SCALE', 100.0) or 100.0
+    )
+
+    stock_bonus = min(
+        max(0.0, float(roc_5m or 0.0) * direction)
+        * float(getattr(cfg, 'ENTRY_RANK_STOCK_ROC_SCALE', 120.0) or 120.0),
+        float(getattr(cfg, 'ENTRY_RANK_STOCK_ROC_MAX_BONUS', 0.35) or 0.35),
+    )
+    stock_mult = 1.0 + stock_bonus
+
+    snap_bonus = min(
+        max(0.0, float(snap_roc or 0.0) * direction)
+        * float(getattr(cfg, 'ENTRY_RANK_SNAP_ROC_SCALE', 200.0) or 200.0),
+        float(getattr(cfg, 'ENTRY_RANK_SNAP_ROC_MAX_BONUS', 0.30) or 0.30),
+    )
+    snap_mult = 1.0 + snap_bonus
+
+    macd_bonus = min(
+        max(0.0, float(macd_hist or 0.0) * direction)
+        * float(getattr(cfg, 'ENTRY_RANK_MACD_SCALE', 8.0) or 8.0),
+        float(getattr(cfg, 'ENTRY_RANK_MACD_MAX_BONUS', 0.30) or 0.30),
+    )
+    macd_mult = 1.0 + macd_bonus
+
+    stock_ok = float(roc_5m or 0.0) * direction >= float(
+        getattr(cfg, 'ENTRY_PRIORITY_STOCK_ROC_FLOOR', 0.0002) or 0.0002
+    )
+    snap_ok = float(snap_roc or 0.0) * direction >= float(
+        getattr(cfg, 'ENTRY_PRIORITY_SNAP_ROC_FLOOR', 0.0) or 0.0
+    )
+    macd_ok = float(macd_hist or 0.0) * direction >= float(
+        getattr(cfg, 'ENTRY_PRIORITY_MACD_FLOOR', 0.01) or 0.01
+    )
+    confirmation_count = int(stock_ok) + int(snap_ok) + int(macd_ok)
+    is_priority_candidate = (
+        alpha_abs >= float(getattr(cfg, 'ENTRY_PRIORITY_ALPHA_FLOOR', 0.9) or 0.9)
+        and confirmation_count >= int(getattr(cfg, 'ENTRY_PRIORITY_MIN_CONFIRMATIONS', 2) or 2)
+    )
+
+    priority_mult = 1.0
+    if is_priority_candidate:
+        priority_mult += float(getattr(cfg, 'ENTRY_PRIORITY_BOOST', 0.80) or 0.80)
+        if stock_ok:
+            priority_mult += float(getattr(cfg, 'ENTRY_PRIORITY_STOCK_BONUS', 0.25) or 0.25)
+        if snap_ok:
+            priority_mult += float(getattr(cfg, 'ENTRY_PRIORITY_SNAP_BONUS', 0.15) or 0.15)
+        if macd_ok:
+            priority_mult += float(getattr(cfg, 'ENTRY_PRIORITY_MACD_BONUS', 0.20) or 0.20)
+
+    trend_mult = 1.0
+    if bool(getattr(cfg, 'ENTRY_RANK_TREND_QUALITY_ENABLED', True)):
+        min_obs = int(getattr(cfg, 'ENTRY_RANK_TREND_MIN_OBS', 16))
+        if int(trend_observations or 0) >= min_obs:
+            net_target = max(1e-6, float(getattr(cfg, 'ENTRY_RANK_TREND_NET_TARGET', 0.012)))
+            net_score = min(1.0, max(0.0, float(trend_net or 0.0)) / net_target)
+            eff_score = min(1.0, max(0.0, float(trend_efficiency or 0.0)))
+            r2_score = min(1.0, max(0.0, float(trend_r2 or 0.0)))
+            trend_quality = 0.45 * net_score + 0.30 * eff_score + 0.25 * r2_score
+            floor = max(1e-6, float(getattr(cfg, 'ENTRY_RANK_TREND_QUALITY_FLOOR', 0.25)))
+            trend_mult += float(getattr(cfg, 'ENTRY_RANK_TREND_QUALITY_BOOST', 0.12)) * trend_quality
+            if trend_quality < floor:
+                trend_mult -= float(getattr(cfg, 'ENTRY_RANK_TREND_QUALITY_PENALTY', 0.25)) * ((floor - trend_quality) / floor)
+            trend_mult = min(
+                float(getattr(cfg, 'ENTRY_RANK_TREND_MAX_MULT', 1.12)),
+                max(float(getattr(cfg, 'ENTRY_RANK_TREND_MIN_MULT', 0.75)), trend_mult),
+            )
+
+    score = base_score * alpha_mult * abs_roc_mult * stock_mult * snap_mult * macd_mult * priority_mult * trend_mult
+    return {
+        'score': float(score),
+        'base_score': float(base_score),
+        'alpha_mult': float(alpha_mult),
+        'abs_roc_mult': float(abs_roc_mult),
+        'stock_mult': float(stock_mult),
+        'snap_mult': float(snap_mult),
+        'macd_mult': float(macd_mult),
+        'priority_mult': float(priority_mult),
+        'trend_mult': float(trend_mult),
+        'confirmation_count': float(confirmation_count),
+        'is_priority_candidate': float(1.0 if is_priority_candidate else 0.0),
+    }
+
+
+def compute_entry_trend_quality(prices: Any, entry_dir: int, window_mins: int = 30) -> Dict[str, float]:
+    try:
+        price_list = [float(p) for p in list(prices)[-int(window_mins + 1):] if float(p) > 0]
+    except Exception:
+        price_list = []
+    if len(price_list) < 2:
+        return {'trend_net': 0.0, 'trend_efficiency': 0.0, 'trend_r2': 0.0, 'trend_observations': float(len(price_list))}
+
+    direction = 1 if int(entry_dir or 0) >= 0 else -1
+    returns = [
+        (price_list[i] - price_list[i - 1]) / price_list[i - 1]
+        for i in range(1, len(price_list))
+        if price_list[i - 1] > 0
+    ]
+    raw_net = (price_list[-1] - price_list[0]) / price_list[0] if price_list[0] > 0 else 0.0
+    trend_net = raw_net * direction
+    path = sum(abs(x) for x in returns)
+    trend_efficiency = max(0.0, trend_net) / path if path > 0 else 0.0
+
+    n = len(price_list)
+    xs = list(range(n))
+    mean_x = sum(xs) / n
+    mean_y = sum(price_list) / n
+    sxx = sum((x - mean_x) ** 2 for x in xs)
+    syy = sum((y - mean_y) ** 2 for y in price_list)
+    if sxx > 0 and syy > 0:
+        sxy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, price_list))
+        trend_r2 = max(0.0, min(1.0, (sxy * sxy) / (sxx * syy)))
+    else:
+        trend_r2 = 0.0
+
+    return {
+        'trend_net': float(trend_net),
+        'trend_efficiency': float(trend_efficiency),
+        'trend_r2': float(trend_r2),
+        'trend_observations': float(len(price_list)),
+    }
+
+
+def reserve_priority_entry_slots(entry_candidates: List[Dict[str, Any]], allowed_entries: int, cfg) -> List[Dict[str, Any]]:
+    if allowed_entries <= 0 or not entry_candidates:
+        return []
+
+    selected = list(entry_candidates[:allowed_entries])
+    reserved_slots = max(0, int(getattr(cfg, 'ENTRY_PRIORITY_RESERVED_SLOTS', 1) or 0))
+    if reserved_slots <= 0:
+        return selected
+
+    def _is_priority_candidate(cand: Dict[str, Any]) -> bool:
+        return bool(cand.get('is_priority_candidate', False))
+
+    priority_pool = [cand for cand in entry_candidates if _is_priority_candidate(cand)]
+    if not priority_pool:
+        return selected
+
+    selected_priority = sum(1 for cand in selected if _is_priority_candidate(cand))
+    if selected_priority >= min(reserved_slots, allowed_entries):
+        return selected
+
+    missing = min(reserved_slots, allowed_entries) - selected_priority
+    selected_keys = {(cand.get('sym'), cand.get('batch_idx')) for cand in selected}
+    replacements = [cand for cand in priority_pool if (cand.get('sym'), cand.get('batch_idx')) not in selected_keys][:missing]
+    if not replacements:
+        return selected
+
+    replaceable_idx = [
+        idx for idx in range(len(selected) - 1, -1, -1)
+        if not _is_priority_candidate(selected[idx])
+    ]
+    for cand, idx in zip(replacements, replaceable_idx):
+        selected[idx] = cand
+
+    return sorted(selected, key=lambda x: float(x.get('alpha_strength', 0.0) or 0.0), reverse=True)
+
 class ExecutionEngineV8:
+    STALE_GUARD_RISK_EXIT_TOKENS = (
+        "TIME_STOP",
+        "TIME_STOP15",
+        "NO_MOMENTUM",
+        "ZOMBIE_STOP",
+    )
+
     def __init__(self, symbols, mode='realtime', config_paths=None, model_paths=None, shared_states=None, signal_queue=None):
         print(f"DEBUG: V8Orchestrator Initializing... Mode={mode}")
         self.mode = mode
@@ -415,14 +621,17 @@ class ExecutionEngineV8:
         self.strategy = StrategyCore(StrategyConfig())
         self.cfg = self.strategy.cfg
         logger.info(f"🧭 [OMS] Active strategy core: {ACTIVE_STRATEGY_CORE_VERSION}")
+        self.pending_orders = {}
 
         self.disable_db_save = True
         
         # [Refactor] 模块化组件初始化
+        self.order_state = OrchestratorOrderStateManager(self)
         self.state_manager = OrchestratorStateManager(self)
         self.accounting = OrchestratorAccounting(self)
         self.execution = OrchestratorExecution(self)
         self.reconciler = OrchestratorReconciler(self)
+        self.order_state.restore_active_orders()
         
         # Redis Init
         self.r = redis.Redis(**{k:v for k,v in REDIS_CFG.items() if k in ['host','port','db']})
@@ -792,6 +1001,13 @@ class ExecutionEngineV8:
                 'put_ask': _safe(put_asks),
             }
             self.latest_execution_quote_by_symbol[sym] = quote
+            if get_domain_shadow_router is not None:
+                try:
+                    st = self.states.get(sym)
+                    legacy_position = int(getattr(st, 'position', 0) or 0) if st is not None else None
+                    get_domain_shadow_router().on_execution_quote(sym, quote, legacy_position=legacy_position)
+                except Exception as e:
+                    logger.warning(f"[DomainShadow] execution_quote hook failed for {sym}: {e}")
 
             # Hard boundary: seconds-level quotes are execution-only. They must
             # not mutate StrategyCore state (last_opt_price/max_roi/bid/ask),
@@ -1333,6 +1549,82 @@ class ExecutionEngineV8:
         except Exception:
             pass
 
+    @staticmethod
+    def _diff_counter_map(after, before):
+        delta = {}
+        keys = set((before or {}).keys()) | set((after or {}).keys())
+        for key in keys:
+            diff = int((after or {}).get(key, 0) or 0) - int((before or {}).get(key, 0) or 0)
+            if diff > 0:
+                delta[str(key)] = diff
+        return delta
+
+    def _publish_entry_diag(
+        self,
+        *,
+        frame: dict,
+        items_count: int,
+        entry_candidates_count: int,
+        min_symbols: int,
+        reject_before: dict,
+        attempt_before: int,
+        pass_before: int,
+        diag_reason: str = "",
+        diag_extra: dict | None = None,
+    ):
+        try:
+            attempts_delta = int(getattr(self, '_entry_attempt_count', 0) or 0) - int(attempt_before or 0)
+            passes_delta = int(getattr(self, '_entry_pass_count', 0) or 0) - int(pass_before or 0)
+            reject_delta = self._diff_counter_map(getattr(self, '_entry_reject_counts', {}), reject_before or {})
+
+            top_reject = ""
+            top_reject_count = 0
+            if reject_delta:
+                top_reject, top_reject_count = max(reject_delta.items(), key=lambda kv: kv[1])
+
+            frame_id = str(frame.get('frame_id') or '')
+            frame_ts = float(frame.get('ts', 0.0) or 0.0)
+            payload = {
+                'frame_id': frame_id,
+                'frame_ts': f"{frame_ts:.3f}",
+                'items': str(int(items_count or 0)),
+                'entry_attempts': str(int(attempts_delta)),
+                'entry_candidates': str(int(entry_candidates_count or 0)),
+                'entry_passes': str(int(passes_delta)),
+                'min_symbols': str(int(min_symbols or 0)),
+                'diag_reason': str(diag_reason or top_reject or ''),
+                'top_reject': str(top_reject or ''),
+                'top_reject_count': str(int(top_reject_count or 0)),
+                'updated_at': f"{time.time():.3f}",
+            }
+            if diag_extra:
+                for k, v in list(diag_extra.items())[:6]:
+                    payload[f"extra_{k}"] = str(v)
+            sample = self._entry_reject_samples.get(top_reject or diag_reason, {})
+            if sample:
+                payload['sample'] = json.dumps(sample, ensure_ascii=False)
+
+            try:
+                pipe = self.r.pipeline()
+                pipe.delete("meta:oms_entry_diag")
+                pipe.hset("meta:oms_entry_diag", mapping=payload)
+                pipe.expire("meta:oms_entry_diag", 180)
+                pipe.execute()
+            except Exception:
+                pass
+
+            if attempts_delta > 0 or diag_reason:
+                logger.warning(
+                    f"⚠️ [OMS-Entry-Diag] frame={frame_id or 'na'} ts={int(frame_ts) if frame_ts > 0 else 0} "
+                    f"| items={items_count} candidates={entry_candidates_count} min_symbols={min_symbols} "
+                    f"| attempts={attempts_delta} passes={passes_delta} "
+                    f"| diag_reason={diag_reason or top_reject or 'none'} "
+                    f"| top_reject={top_reject or 'none'}:{top_reject_count} "
+                    f"| reject_delta={reject_delta or {}}"
+                )
+        except Exception as e:
+            logger.warning(f"⚠️ [OMS-Entry-Diag] publish failed: {e}")
+
     def _publish_strategy_config_snapshot(self, force: bool = False):
         """把 OMS 当前持有的 self.strategy.cfg 展平后写入 Redis meta:strategy_config.
 
@@ -1606,6 +1898,12 @@ class ExecutionEngineV8:
         )
         return bool(is_fresh), float(lag), float(wall_lag), q
 
+    @classmethod
+    def _allow_risk_exit_on_stale_quote(cls, reason: str) -> bool:
+        """Allow time/risk exits to proceed even if the execution quote cache is stale."""
+        reason_text = str(reason or "").upper()
+        return any(token in reason_text for token in cls.STALE_GUARD_RISK_EXIT_TOKENS)
+
     def _should_block_strategy_on_stale_quote(
         self,
         sym: str,
@@ -1634,6 +1932,9 @@ class ExecutionEngineV8:
 
         is_fresh, lag, wall_lag, _ = self._execution_quote_freshness(sym, curr_ts)
         if is_fresh:
+            return False
+
+        if action == 'SELL' and self._allow_risk_exit_on_stale_quote(reason):
             return False
 
         if action == 'SELL' and OMS_ALLOW_EOD_EXIT_ON_STALE:
@@ -1731,6 +2032,13 @@ class ExecutionEngineV8:
         st.last_price = price
         st.last_tick_price = price
         st.last_tick_opt_data = opt_data
+        if price > 0 and int(getattr(st, 'last_min_ts', 0) or 0) != int(curr_ts):
+            st.prices.append(float(price))
+            st.alpha_history.append(float(final_alpha))
+            if len(st.prices) >= 2 and list(st.prices)[-2] > 0:
+                prev_price = list(st.prices)[-2]
+                st.pct_history.append((float(price) - prev_price) / prev_price)
+            st.last_min_ts = int(curr_ts)
         st.prev_alpha_z = float(getattr(st, 'last_alpha_z', 0.0) or 0.0)
         st.last_alpha_z = final_alpha
         st.last_vol_z = float(item.get('vol_z', 0.0) or 0.0)
@@ -1804,6 +2112,9 @@ class ExecutionEngineV8:
 
     async def _process_alpha_frame(self, frame: dict):
         curr_ts = float(frame.get('ts', time.time()) or time.time())
+        reject_before = dict(getattr(self, '_entry_reject_counts', {}) or {})
+        attempt_before = int(getattr(self, '_entry_attempt_count', 0) or 0)
+        pass_before = int(getattr(self, '_entry_pass_count', 0) or 0)
         frame_key = self._alpha_frame_key(frame, curr_ts)
         if self._is_duplicate_alpha_frame(frame, curr_ts):
             logger.warning(f"♻️ [OMS AlphaFrame] Skip duplicated frame {frame_key}")
@@ -1908,8 +2219,31 @@ class ExecutionEngineV8:
                 t_bid = t_price
                 t_ask = t_price
             fair_p = self._get_fair_market_price(t_price, t_bid, t_ask)
-            if fair_p < 0.05:
-                self._bump_entry_reject('opt_fair_price_low', sym)
+            liquidity_decision = evaluate_entry_liquidity(
+                bid=t_bid,
+                ask=t_ask,
+                curr_price=fair_p,
+                alpha_z=float(entry_sig.get('dir', item.get('alpha', 0.0)) or 0.0),
+                spread_divergence=ctx.get('spread_divergence', 0.0),
+                cfg=self.cfg,
+            )
+            if not liquidity_decision['ok']:
+                reject_map = {
+                    'bidask_invalid': 'opt_bidask_invalid',
+                    'min_option_price': 'opt_fair_price_low',
+                    'spread_too_wide': 'opt_spread_too_wide',
+                    'spread_divergence': 'opt_spread_divergence',
+                }
+                self._bump_entry_reject(
+                    reject_map.get(liquidity_decision['reason'], 'opt_liquidity_guard'),
+                    sym,
+                    extra={
+                        'fair_p': float(fair_p or 0.0),
+                        'bid': float(t_bid or 0.0),
+                        'ask': float(t_ask or 0.0),
+                        'th': float(liquidity_decision.get('spread_threshold', 0.0) or 0.0),
+                    },
+                )
                 continue
             if not t_id:
                 self._bump_entry_reject('opt_missing_contract_id', sym)
@@ -1942,18 +2276,53 @@ class ExecutionEngineV8:
                     'alpha_available_ts': item.get('alpha_available_ts', curr_ts),
                 }
             })
-            raw_rank = abs(float(item.get('alpha', 0.0) or 0.0)) if PURE_ALPHA_REPLAY else abs(float(item.get('alpha', 0.0) or 0.0)) / max(0.1, st.last_valid_iv)
-            mom_multiplier = 1.0 + abs(float(item.get('roc_5m', 0.0) or 0.0)) * 100.0
+            entry_dir = int(entry_sig.get('dir', 1 if float(item.get('alpha', 0.0) or 0.0) >= 0 else -1) or 0)
+            trend_info = compute_entry_trend_quality(
+                getattr(st, 'prices', []),
+                entry_dir,
+                window_mins=int(getattr(self.cfg, 'ENTRY_RANK_TREND_WINDOW_MINS', 30) or 30),
+            )
+            rank_info = compute_entry_priority_score(
+                alpha=float(item.get('alpha', 0.0) or 0.0),
+                iv=float(getattr(st, 'last_valid_iv', 0.0) or 0.0),
+                roc_5m=float(item.get('roc_5m', 0.0) or 0.0),
+                snap_roc=float(item.get('snap_roc', 0.0) or 0.0),
+                macd_hist=float(item.get('macd', 0.0) or 0.0),
+                entry_dir=entry_dir,
+                cfg=self.cfg,
+                pure_alpha_replay=PURE_ALPHA_REPLAY,
+                **trend_info,
+            )
             entry_candidates.append({
                 'sym': sym,
                 'sig': entry_sig,
                 'price': stock_price,
                 'curr_ts': curr_ts,
                 'batch_idx': idx,
-                'alpha_strength': raw_rank * mom_multiplier,
+                'alpha_strength': rank_info['score'],
+                'is_priority_candidate': bool(rank_info['is_priority_candidate']),
+                'rank_detail': (
+                    f"base={rank_info['base_score']:.3f} "
+                    f"alpha={rank_info['alpha_mult']:.2f} "
+                    f"abs5m={rank_info['abs_roc_mult']:.2f} "
+                    f"roc={rank_info['stock_mult']:.2f} "
+                    f"snap={rank_info['snap_mult']:.2f} "
+                    f"macd={rank_info['macd_mult']:.2f} "
+                    f"prio={rank_info['priority_mult']:.2f} "
+                    f"trend={rank_info['trend_mult']:.2f} "
+                    f"conf={int(rank_info['confirmation_count'])}"
+                ),
             })
 
         min_symbols = 1 if (IS_BACKTEST or IS_SIMULATED) else 10
+        diag_reason = ""
+        diag_extra = {}
+        if entry_candidates and len(items) < min_symbols:
+            diag_reason = "min_symbols_gate"
+            diag_extra = {
+                'items': len(items),
+                'candidates': len(entry_candidates),
+            }
         if entry_candidates and len(items) >= min_symbols:
             entry_candidates.sort(key=lambda x: x['alpha_strength'], reverse=True)
             max_entries = 3
@@ -1961,14 +2330,37 @@ class ExecutionEngineV8:
             max_slots = int(getattr(self.cfg, 'MAX_POSITIONS', 0) or 0)
             remaining_slots = max(0, max_slots - active_slots_now)
             if remaining_slots <= 0:
+                diag_reason = "batch_limit_frame"
+                diag_extra = {
+                    'active_slots': active_slots_now,
+                    'max_slots': max_slots,
+                }
                 logger.info(
                     f"🚫 [OMS Batch-Limit] frame blocked | active_slots={active_slots_now} >= max={max_slots}"
+                )
+                self._publish_entry_diag(
+                    frame=frame,
+                    items_count=len(items),
+                    entry_candidates_count=len(entry_candidates),
+                    min_symbols=min_symbols,
+                    reject_before=reject_before,
+                    attempt_before=attempt_before,
+                    pass_before=pass_before,
+                    diag_reason=diag_reason,
+                    diag_extra=diag_extra,
                 )
                 await self._broadcast_state_to_redis()
                 return
             allowed_entries = min(max_entries, remaining_slots)
 
-            for cand in entry_candidates[:allowed_entries]:
+            selected_candidates = reserve_priority_entry_slots(entry_candidates, allowed_entries, self.cfg)
+            if selected_candidates != entry_candidates[:allowed_entries]:
+                logger.info(
+                    "⭐ [OMS Priority-Slot] reserved entry slot for priority leaders | "
+                    f"picked={[cand['sym'] for cand in selected_candidates]}"
+                )
+
+            for cand in selected_candidates:
                 active_count = self._count_entry_slots()
                 if active_count >= int(getattr(self.cfg, 'MAX_POSITIONS', 0)):
                     logger.info(
@@ -1979,13 +2371,25 @@ class ExecutionEngineV8:
                 self._entry_pass_count += 1
                 logger.info(
                     f"🎯 [OMS Strategy Entry] {cand['sym']} | "
-                    f"{cand['sig'].get('reason')} | rank={cand['alpha_strength']:.3f}"
+                    f"{cand['sig'].get('reason')} | rank={cand['alpha_strength']:.3f} "
+                    f"| {cand.get('rank_detail', '')}"
                 )
                 await self._submit_strategy_order(
                     'BUY', cand['sym'], cand['sig'], cand['price'], cand['curr_ts'], cand['batch_idx'],
                     frame_id=frame.get('frame_id')
                 )
 
+        self._publish_entry_diag(
+            frame=frame,
+            items_count=len(items),
+            entry_candidates_count=len(entry_candidates),
+            min_symbols=min_symbols,
+            reject_before=reject_before,
+            attempt_before=attempt_before,
+            pass_before=pass_before,
+            diag_reason=diag_reason,
+            diag_extra=diag_extra,
+        )
         await self._broadcast_state_to_redis()
 
     async def _evaluate_shadow_signals(self, payload: dict):
@@ -2020,8 +2424,13 @@ class ExecutionEngineV8:
                     'price': st.entry_price,
                     'stock': st.entry_stock,
                     'ts': st.entry_ts,
+                    'contract_id': getattr(st, 'contract_id', '') or '',
+                    'opt_type': getattr(st, 'opt_type', '') or '',
                     'max_roi': getattr(st, 'max_roi', 0.0),
                     'is_pending': st.is_pending,
+                    'entry_slot_reserved': bool(getattr(st, 'entry_slot_reserved', False)),
+                    'pending_action': getattr(st, 'pending_action', None) or getattr(st, 'pending_side', '') or '',
+                    'open_fill_confirmed': bool(getattr(st, 'open_fill_confirmed', False)),
                     # 仅供 Dashboard/诊断展示，不能作为 SE 策略状态输入。
                     'entry_spy_roc': getattr(st, 'entry_spy_roc', 0.0),
                     'entry_index_trend': getattr(st, 'entry_index_trend', 0),

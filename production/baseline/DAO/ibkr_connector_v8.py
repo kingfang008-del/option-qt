@@ -49,6 +49,7 @@ from config import (
     TRADING_ENABLED, DB_DIR, BUCKET_SPECS, TAG_TO_INDEX,
     ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS
 )
+from runtime_trading_controls import get_runtime_trading_enabled
 
 NO_OPTION_LOCK_SYMBOLS = set(ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS)
 
@@ -1258,6 +1259,22 @@ class IBKRConnectorFinal:
         if not TRADING_ENABLED:
             logger.warning(f"🛑 [DRY RUN 空跑拦截] config.TRADING_ENABLED=False: {action} {qty}手 {contract.localSymbol} @ {order_type} | 限价: {lmt_price}")
             return None  # 强行返回，绝对不向交易所发任何单！
+
+        try:
+            runtime_trading_enabled = bool(
+                get_runtime_trading_enabled(
+                    default_value=TRADING_ENABLED,
+                    r=getattr(self, "redis", None),
+                )
+            )
+        except Exception:
+            runtime_trading_enabled = bool(TRADING_ENABLED)
+        if not runtime_trading_enabled:
+            logger.warning(
+                f"🛑 [RUNTIME DISARM 拦截] trading_enabled=0: "
+                f"{action} {qty}手 {getattr(contract, 'localSymbol', contract)} @ {order_type} | 限价: {lmt_price}"
+            )
+            return None
 
         # [🛡️ Connection Guard] IBKR 未连接时不要让 ib_insync 抛 ConnectionError,
         # 否则每秒数条退出信号都会各自产生一条 traceback, 同时 _smart_exit_order 里的

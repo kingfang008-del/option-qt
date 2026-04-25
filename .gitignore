@@ -12,6 +12,7 @@ build/
 develop-eggs/
 dist/
 downloads/
+.VSCodeCounter/
 eggs/
 .eggs/
 lib/
