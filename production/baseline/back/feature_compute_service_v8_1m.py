@@ -45,7 +45,7 @@ from config import (
     REDIS_CFG as _REDIS_BASE, NY_TZ,
     STREAM_FUSED_MARKET, STREAM_INFERENCE,
     FEATURE_SERVICE_STATE_FILE as STATE_FILE, DB_DIR,
-    LOG_DIR, USE_5M_OPTION_DATA
+    LOG_DIR
 )
 
 logging.basicConfig(
@@ -587,7 +587,7 @@ class FeatureComputeService:
                 if r[0] not in sym_to_opt_row:
                     sym_to_opt_row[r[0]] = r[1]
 
-            if USE_5M_OPTION_DATA:
+            if True:
                 c.execute("""
                     SELECT symbol, buckets_json, ts
                     FROM option_snapshots_5m 
@@ -641,7 +641,7 @@ class FeatureComputeService:
                             self.warmup_needed[sym] = False
                     except: pass
                 
-                if USE_5M_OPTION_DATA:
+                if True:
                     opt_snap_5m = sym_to_opt_row_5m.get(sym)
                     if opt_snap_5m:
                         try:
@@ -909,12 +909,12 @@ class FeatureComputeService:
                     
                     # 🚀 [终极修复] 5m 期权快照直接实时镜像 1m 快照！
                     # 期权特征算的是瞬时截面 IV/Gamma，不需要时间聚合，直接复用最新状态即可，消灭断流！
-                    if USE_5M_OPTION_DATA:
+                    if True:
                         self.option_snapshot_5m[sym] = arr.copy()
 
             # 5min Options (仅在 5 分钟整数倍时间点入库)
             # 🚀 [Fix] 如果缺失 5m 专用桶数据，自动复用 1m 桶数据作为 Fallback
-            if USE_5M_OPTION_DATA:
+            if True:
                 buckets_5m = payload.get('option_buckets_5m')
                 if not buckets_5m and dt_ny.minute % 5 == 0:
                     buckets_5m = payload.get('option_buckets')

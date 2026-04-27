@@ -3009,15 +3009,12 @@ def process_option_labels_file_vectorized(feature_file_path: Path, config: dict)
         if 'tk_mid_price' in feature_df.columns and 't0_mid_price' in feature_df.columns:
             feature_df['label_option_return'] = (feature_df['tk_mid_price'] - feature_df['t0_mid_price']) / (feature_df['t0_mid_price'] + 1e-9)
         
-        # [已回滚] 恢复原始的 IV-RV Spread 逻辑
         base_iv = feature_df.get('robust_atm_iv', pd.Series(np.nan)).fillna(feature_df.get('t0_iv', 0))
-        rv_safe = feature_df['label_rv_k_steps'].replace(0, np.nan)
+        iv_safe = base_iv.where(base_iv > 1e-6, np.nan)
         
-        # 🚀 [终极去泄露：切断特征自相关]
-        # 标签不再定义为 IV - RV，因为特征里包含 IV，会导致模型直接“复述”当前 IV。
-        # 现在的标签直接指向未来的已实现波动率 (RV)。如果模型能预测出这个，才是真 Alpha。
-        feature_df['label_iv_rv_spread'] = feature_df['label_rv_k_steps'].clip(0, 5.0).fillna(0.0)
-        feature_df['label_iv_rv_ratio'] = np.log1p(feature_df['label_iv_rv_spread'])
+        # 交易语义: 正值表示未来实现波动率高于当前隐含波动率，当前 IV 偏便宜。
+        feature_df['label_iv_rv_spread'] = (feature_df['label_rv_k_steps'] - base_iv).clip(-5.0, 5.0).fillna(0.0)
+        feature_df['label_iv_rv_ratio'] = ((feature_df['label_rv_k_steps'] / iv_safe) - 1.0).clip(-5.0, 5.0).fillna(0.0)
 
 
         
@@ -3031,13 +3028,7 @@ def process_option_labels_file_vectorized(feature_file_path: Path, config: dict)
         # 默认设为 1 (Flat)
         feature_df['label_vol_direction'] = 1.0
         
-        # Spread > 0.01 -> 认为波动率溢价高，未来波动率可能下跌回归? 
-        # 或者 这里的定义是：IV 比 RV 高 -> 看涨波动率溢价?
-        # 通常：
-        # Spread > 0 (IV > RV) -> Market prices high volatility (Fear/Event) -> Up (2)
-        # Spread < 0 (IV < RV) -> Market prices low volatility (Complacency) -> Down (0)
-        
-        # 逻辑修改：映射到 2.0 (Up) 和 0.0 (Down)
+        # Spread > 0: 未来 RV 高于当前 IV，偏做多波动率；Spread < 0 反之。
         feature_df.loc[feature_df['label_iv_rv_spread'] > threshold, 'label_vol_direction'] = 2.0
         feature_df.loc[feature_df['label_iv_rv_spread'] < -threshold, 'label_vol_direction'] = 0.0
         

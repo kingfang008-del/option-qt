@@ -70,8 +70,6 @@ from config import (
     GLOBAL_EXPOSURE_LIMIT,      # 全局风险敞口上限
     COMMISSION_PER_CONTRACT,    # 期权手续费 ($/手)
     USE_BID_ASK_PRICING,        # [New] 价格模式开关
-    SLIPPAGE_ENTRY_PCT,         # [Fix] Added to imports
-    SLIPPAGE_EXIT_PCT,          # [Fix] Added to imports
     IS_LIVEREPLAY,
     IS_BACKTEST,
     IS_SIMULATED

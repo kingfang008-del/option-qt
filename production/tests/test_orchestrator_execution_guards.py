@@ -52,6 +52,7 @@ class _State:
         self.last_opt_price = 2.0
         self.cooldown_until = 0.0
         self.entry_slot_reserved = False
+        self.open_fill_confirmed = False
 
 
 class _DummyRedis:
@@ -86,6 +87,9 @@ class _DummyAccounting:
     def _process_exit_accounting(self, *args, **kwargs):
         self.exit_calls.append((args, kwargs))
 
+    def _emit_trade_log(self, *_args, **_kwargs):
+        return None
+
 
 class _DummyStateManager:
     def save_state(self):
@@ -104,6 +108,7 @@ def _build_orch(mode: str = "realtime") -> SimpleNamespace:
         LIMIT_BUFFER_EXIT=0.97,
         ORDER_TIMEOUT_SECONDS=7,
         ORDER_MAX_RETRIES=2,
+        EXIT_ORDER_MAX_RETRIES=5,
         EXIT_ORDER_TYPE="LMT",
         SLIPPAGE_PCT=0.001,
         ENTRY_MAX_REQUOTE_SLIPPAGE_PCT=0.02,
@@ -425,6 +430,159 @@ class _FakeTrade:
         self.order = object()
 
 
+def test_mkt_urgent_exit_records_accounting_when_broker_reports_fill() -> None:
+    _bootstrap_imports()
+    import orchestrator_execution as oe  # noqa: E402
+
+    orch = _build_orch(mode="realtime")
+    orch.cfg.EXIT_ORDER_TYPE = "MKT"
+    orch.cfg.ORDER_TIMEOUT_SECONDS = 1
+    ex = oe.OrchestratorExecution(orch)
+    st = orch.states["NVDA"]
+    st.position = 1
+    st.qty = 4
+    st.entry_price = 2.0
+    st.entry_ts = 1_777_777_000.0
+    st.entry_slot_reserved = True
+    st.open_fill_confirmed = True
+
+    trade = _FakeTrade()
+    trade.orderStatus.status = "Filled"
+    trade.orderStatus.filled = 4
+    trade.orderStatus.avgFillPrice = 1.85
+
+    def _filled_mkt_order(*args, **kwargs):
+        orch.ibkr.orders.append((args, kwargs))
+        return trade
+
+    async def _fast_sleep(_secs: float):
+        return None
+
+    orch.ibkr.place_option_order = _filled_mkt_order
+    with patch("asyncio.sleep", _fast_sleep), \
+         patch.object(oe.OrchestratorExecution, "_runtime_trading_enabled", return_value=True):
+        asyncio.run(
+            ex._smart_exit_order(
+                "NVDA",
+                real_contract=object(),
+                total_qty=4,
+                base_price=1.80,
+                stock_price=100.0,
+                curr_ts=1_777_777_120.0,
+                is_force=False,
+                bid=1.75,
+                ask=1.85,
+                reason="HARD_STOP:-16%",
+            )
+        )
+
+    assert orch.accounting.exit_calls, "MKT 紧急平仓成交后必须进入 exit accounting 闭环"
+    call_args = orch.accounting.exit_calls[0][0]
+    assert int(call_args[2]) == 4
+    assert abs(float(call_args[3]) - 1.85) < 1e-9
+
+
+def test_realtime_entry_monitor_error_without_fill_resets_pre_entry_state() -> None:
+    _bootstrap_imports()
+    import orchestrator_execution as oe  # noqa: E402
+
+    orch = _build_orch(mode="realtime")
+    orch.cfg.ORDER_TIMEOUT_SECONDS = 1
+    orch.cfg.ORDER_MAX_RETRIES = 2
+    ex = oe.OrchestratorExecution(orch)
+    st = orch.states["NVDA"]
+    st.position = 1
+    st.qty = 5
+    st.entry_price = 2.0
+    st.locked_cash = 1000.0
+    st.entry_slot_reserved = True
+    st.is_pending = True
+    trade = _FakeTrade()
+    sig = {
+        "reason": "UNIT_MONITOR_ERROR",
+        "price": 2.0,
+        "meta": {"alpha_available_ts": 1_777_777_777.0},
+    }
+
+    async def _fast_sleep(_secs: float):
+        return None
+
+    with patch("asyncio.sleep", _fast_sleep):
+        with patch.object(oe.OrchestratorExecution, "_next_entry_requote_price", side_effect=RuntimeError("requote failed")):
+            asyncio.run(
+                ex._monitor_realtime_order(
+                    "NVDA",
+                    trade,
+                    object(),
+                    cost=1000.0,
+                    commission=10.0,
+                    expected_qty=5,
+                    start_time=1_777_777_700.0,
+                    limit_price=2.0,
+                    stock_price=100.0,
+                    sig=sig,
+                    st=st,
+                )
+            )
+
+    assert st.position == 0
+    assert st.qty == 0
+    assert st.locked_cash == 0.0
+    assert st.entry_slot_reserved is False
+    assert st.is_pending is False
+
+
+def test_entry_monitor_uses_entry_retry_config_not_exit_retry_config() -> None:
+    _bootstrap_imports()
+    import orchestrator_execution as oe  # noqa: E402
+
+    orch = _build_orch(mode="realtime")
+    orch.cfg.ORDER_TIMEOUT_SECONDS = 1
+    orch.cfg.ORDER_MAX_RETRIES = 2
+    orch.cfg.EXIT_ORDER_MAX_RETRIES = 5
+    ex = oe.OrchestratorExecution(orch)
+    st = orch.states["NVDA"]
+    st.position = 1
+    st.qty = 5
+    st.entry_price = 2.0
+    st.locked_cash = 1000.0
+    st.entry_slot_reserved = True
+    trade = _FakeTrade()
+    sig = {
+        "reason": "UNIT_ENTRY_RETRY_CFG",
+        "price": 2.0,
+        "meta": {"alpha_available_ts": 1_777_777_777.0},
+    }
+
+    def _return_unfilled_trade(*args, **kwargs):
+        orch.ibkr.orders.append((args, kwargs))
+        return _FakeTrade()
+
+    async def _fast_sleep(_secs: float):
+        return None
+
+    orch.ibkr.place_option_order = _return_unfilled_trade
+    with patch("asyncio.sleep", _fast_sleep):
+        with patch.object(oe.OrchestratorExecution, "_next_entry_requote_price", return_value=2.01):
+            asyncio.run(
+                ex._monitor_realtime_order(
+                    "NVDA",
+                    trade,
+                    object(),
+                    cost=1000.0,
+                    commission=10.0,
+                    expected_qty=5,
+                    start_time=1_777_777_700.0,
+                    limit_price=2.0,
+                    stock_price=100.0,
+                    sig=sig,
+                    st=st,
+                )
+            )
+
+    assert len(orch.ibkr.orders) == 1, "开仓监控应按 ORDER_MAX_RETRIES=2，只允许 1 次 re-quote"
+
+
 def test_entry_requote_cap_blocks_over_2pct() -> None:
     _bootstrap_imports()
     import orchestrator_execution as oe  # noqa: E402
@@ -515,6 +673,8 @@ def main() -> None:
     test_execution_cfg_override_limit_buffers()
     test_entry_limit_price_never_crosses_ask_on_initial_quote()
     test_entry_requote_price_stays_below_live_ask()
+    test_realtime_entry_monitor_error_without_fill_resets_pre_entry_state()
+    test_entry_monitor_uses_entry_retry_config_not_exit_retry_config()
     test_entry_requote_cap_blocks_over_2pct()
     test_realtime_order_timeout_uses_ibkr_connector_cancel()
     print("[OK] orchestrator execution guards passed")

@@ -40,7 +40,7 @@ FEATURE_SERVICE_STATE_FILE = CACHE_DIR / "feature_service_state.pkl"
 # - 'BACKTEST'      : 极速回测 (模拟)
 # 通过环境变量隔离，确保所有子进程对当前环境的认知绝对一致
 # 默认使用 REALTIME_DRY，防止未显式设置 RUN_MODE 时误入可成交路径。
-RUN_MODE = os.environ.get("RUN_MODE", "REALTIME_DRY").upper()
+RUN_MODE = os.environ.get("RUN_MODE", "REALTIME").upper()
 _LEGACY_STREAM_REPLAY_MODE = "LIVE" + "REPLAY"
 if RUN_MODE == _LEGACY_STREAM_REPLAY_MODE:
     RUN_MODE = "BACKTEST"
@@ -196,9 +196,18 @@ PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.
 
 # ================= 核心交易标的 =================
 # GS 先注释掉，生产的时候再恢复，因为秒级回测数据里没有 GS 的期权数据，可能会导致回测失败
+# TARGET_SYMBOLS =  [
+#     # --- Tier 1: 巨无霸 ---
+#     'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'UNH', 'AMZN', 'AMD', 'MSTR', 'QQQ',
+#     # --- Tier 2: 核心蓝筹 ---
+#     'NFLX', 'CRWV', 'AVGO', 'MSFT', 'HOOD', 'MU',  'GOOGL', 'WMT', 'COIN', 'SPY',
+#     # --- Tier 3: 高流动性 --- 
+#     'SMCI', 'ADBE', 'ORCL', 'NKE', 'XOM', 'INTC', 'DELL', 'IWM', 'GLD', 'VIXY'
+# ]
+
 TARGET_SYMBOLS =  [
     # --- Tier 1: 巨无霸 ---
-    'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'UNH', 'AMZN', 'AMD', 'MSTR', 'QQQ',
+    'NVDA', 'AAPL', 'META', 'PLTR',   'UNH', 'AMZN', 'AMD', 'MSTR', 'QQQ',
     # --- Tier 2: 核心蓝筹 ---
     'NFLX', 'CRWV', 'AVGO', 'MSFT', 'HOOD', 'MU',  'GOOGL', 'WMT', 'COIN', 'SPY',
     # --- Tier 3: 高流动性 --- 
@@ -207,10 +216,10 @@ TARGET_SYMBOLS =  [
 
 # ================= 交易与归一化白/黑名单 =================
 # 仅用于禁止交易，不影响行情订阅与特征计算
-NON_TRADABLE_SYMBOLS = ['SPY', 'VIXY']
+NON_TRADABLE_SYMBOLS = ['SPY','QQQ', 'VIXY']
 
 # 截面 Alpha 归一化时剔除的符号（避免指数成分污染）
-ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS = ['SPY', 'VIXY']
+ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS = ['SPY', 'QQQ','VIXY']
 
 # 指数趋势计算参考符号
 INDEX_TREND_SYMBOLS = ['SPY', 'QQQ']
@@ -249,9 +258,6 @@ def get_option_gate_profile() -> dict:
         "min_iv": float(os.environ.get("OPTION_GATE_MIN_IV", OPTION_GATE_MIN_IV)),
         "require_frame_consistency": bool(require_frame),
     }
-
-# ================= 价格模式 =================
-USE_5M_OPTION_DATA  = True  # 关闭 5min 维度期权数据，用于排查爆仓问题
 
 # ================= 资金管理与风控 =================
 INITIAL_ACCOUNT         = 50000.0     # 初始资金 ($)
@@ -308,8 +314,6 @@ LIMIT_BUFFER_ENTRY    = 1.03       # 买入限价缓冲 (Ask * 1.03)
 LIMIT_BUFFER_EXIT     = 0.97       # 卖出限价缓冲 (Bid * 0.97)
 ENTRY_MAX_REQUOTE_SLIPPAGE_PCT = float(os.environ.get("ENTRY_MAX_REQUOTE_SLIPPAGE_PCT", "0.02"))  # 建仓追价最大偏离(相对初始信号价)
 ENTRY_REQUOTE_STEP_CAP_PCT = float(os.environ.get("ENTRY_REQUOTE_STEP_CAP_PCT", "0.006"))  # 建仓单次重提最大涨幅(相对上一笔限价)
-SLIPPAGE_ENTRY_PCT    = 0.001      # 建仓滑点 (0.1%)
-SLIPPAGE_EXIT_PCT     = 0.001      # 平仓滑点 (0.1%)
 EXIT_ORDER_TYPE       = 'MKT'      # 平仓订单类型 (MKT/LMT)
 DISABLE_ICEBERG       = _env_flag("DISABLE_ICEBERG", False)      # [新增] 是否禁用冰山拆单逻辑 (用于对比秒级与分钟级一致性)
 SYNC_EXECUTION        = _env_flag("SYNC_EXECUTION", False)       # [新增] 同步执行模式 (用于 bit-perfect 确定性回放验证)

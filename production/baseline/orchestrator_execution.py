@@ -5,12 +5,13 @@ import re
 import math
 import asyncio
 import os
+from collections import deque
 from datetime import datetime, timedelta, time as dt_time
 from pytz import timezone
 import config
 from config import (
     COMMISSION_PER_CONTRACT, MAX_POSITIONS, POSITION_RATIO, MAX_TRADE_CAP, 
-    GLOBAL_EXPOSURE_LIMIT, SLIPPAGE_ENTRY_PCT, SLIPPAGE_EXIT_PCT, 
+    GLOBAL_EXPOSURE_LIMIT,
     EXIT_ORDER_TYPE, TRADING_ENABLED,
     DISABLE_ICEBERG, SYNC_EXECUTION, BACKTEST_1S_DISABLE_ICEBERG,
     BACKTEST_1S_STRICT_EXECUTION,
@@ -38,10 +39,22 @@ class OrchestratorExecution:
         "FORCE",
         "FLIP",
     )
+    FAST_STOP_EXIT_REASON_TOKENS = (
+        "HARD_STOP",
+        "ABSOLUTE_STOP",
+        "STOP_LOSS",
+        "STOCK_STOP",
+        "COND_STOP",
+    )
 
     def __init__(self, orchestrator):
         self.orch = orchestrator
         self._refund_once_keys = {}
+        # [#8] 用 Condition 取代 Lock: sleep 时释放锁, 让其他协程能并发检查配额。
+        self._ibkr_pacing_cond = asyncio.Condition()
+        self._ibkr_order_msg_times = deque()
+        # [#7] warning 节流: 同一 reason 30s 内最多打一条。
+        self._ibkr_pacing_warn_log = {}
 
     def _cash_set(self, value: float, reason: str, sym: str = ""):
         logger.critical(
@@ -213,6 +226,92 @@ class OrchestratorExecution:
         except Exception:
             return bool(TRADING_ENABLED)
 
+    @staticmethod
+    def _is_high_priority_pacing_reason(reason: str) -> bool:
+        """[#7] exit/cancel/MKT fallback 享有优先级:
+        - 4 个仓位群发止损时, exit cancel/replace 总量会冲击 30 msg/s 上限,
+          原本"止损要快"的目标会被 pacing guard 反向限速。
+        - HIGH 标签的请求享有 high_priority_boost 倍数的有效配额。
+        """
+        r = str(reason or "").lower()
+        return (
+            r.startswith("exit_")
+            or r.startswith("manual_exit")
+            or "mkt_fallback" in r
+            or "cancel" in r
+        )
+
+    def _maybe_log_pacing_throttle(self, reason: str, queued: int, limit: int, wait_sec: float, is_high_priority: bool) -> None:
+        """[#7] 同一 reason 30s 内最多一条 warning, 避免群发止损时刷屏。"""
+        bucket = f"{reason}|{int(is_high_priority)}"
+        now = time.time()
+        last = self._ibkr_pacing_warn_log.get(bucket, 0.0)
+        if now - last < 30.0:
+            return
+        self._ibkr_pacing_warn_log[bucket] = now
+        msg = (
+            f"⏱️ [IBKR Pacing] throttling API order messages | "
+            f"queued={queued} limit={limit}/s wait={wait_sec:.3f}s reason={reason} "
+            f"priority={'HIGH' if is_high_priority else 'NORMAL'}"
+        )
+        if is_high_priority:
+            logger.warning(msg)
+        else:
+            logger.info(msg)
+
+    async def _await_ibkr_pacing_slot(self, messages: int = 1, reason: str = ""):
+        if self.orch.mode != 'realtime' or not self._runtime_trading_enabled():
+            return
+
+        msg_count = max(1, int(messages or 1))
+        base_limit = max(1, int(self._cfg_value('IBKR_API_MAX_MESSAGES_PER_SECOND', 35) or 35))
+        window_sec = max(0.1, float(self._cfg_value('IBKR_API_PACING_WINDOW_SECONDS', 1.0) or 1.0))
+        safety_sleep = max(0.0, float(self._cfg_value('IBKR_API_PACING_SAFETY_SLEEP', 0.02) or 0.02))
+
+        is_high_priority = self._is_high_priority_pacing_reason(reason)
+        if is_high_priority:
+            boost = max(1.0, float(self._cfg_value('IBKR_API_HIGH_PRIORITY_BOOST', 1.15) or 1.0))
+            high_priority_cap = max(
+                base_limit,
+                int(self._cfg_value('IBKR_API_HIGH_PRIORITY_MAX_MESSAGES_PER_SECOND', 45) or 45),
+            )
+            limit = min(high_priority_cap, max(base_limit, int(base_limit * boost)))
+        else:
+            limit = base_limit
+
+        # [#8] Condition.wait_for(timeout=...) 在等待期间会释放底层锁,
+        # 让其他协程也能进来检查配额; 任何持有者拿到配额后 notify_all,
+        # 等待者立即重新评估而不必空跑完整 wait_sec。
+        async with self._ibkr_pacing_cond:
+            while True:
+                now = time.time()
+                cutoff = now - window_sec
+                while self._ibkr_order_msg_times and self._ibkr_order_msg_times[0] <= cutoff:
+                    self._ibkr_order_msg_times.popleft()
+
+                if len(self._ibkr_order_msg_times) + msg_count <= limit:
+                    for _ in range(msg_count):
+                        self._ibkr_order_msg_times.append(now)
+                    self._ibkr_pacing_cond.notify_all()
+                    return
+
+                oldest = self._ibkr_order_msg_times[0] if self._ibkr_order_msg_times else now
+                wait_sec = max((oldest + window_sec + safety_sleep) - now, safety_sleep)
+                self._maybe_log_pacing_throttle(reason, len(self._ibkr_order_msg_times), limit, wait_sec, is_high_priority)
+                try:
+                    await asyncio.wait_for(self._ibkr_pacing_cond.wait(), timeout=wait_sec)
+                except asyncio.TimeoutError:
+                    pass
+
+    async def _place_option_order_paced(self, *args, pacing_reason: str = "", **kwargs):
+        await self._await_ibkr_pacing_slot(1, pacing_reason or "place_order")
+        return self.orch.ibkr.place_option_order(*args, **kwargs)
+
+    async def _cancel_order_paced(self, order, pacing_reason: str = ""):
+        # cancel 默认就是 high priority (字符串里带 cancel), 不再额外标识。
+        await self._await_ibkr_pacing_slot(1, pacing_reason or "cancel_order")
+        return self.orch.ibkr.ib.cancelOrder(order)
+
     @classmethod
     def _is_urgent_exit_reason(cls, reason: str, is_force: bool = False) -> bool:
         """Only true risk exits should use emergency execution semantics.
@@ -227,20 +326,74 @@ class OrchestratorExecution:
         return any(token in reason_text for token in cls.URGENT_EXIT_REASON_TOKENS)
 
     @classmethod
+    def _is_fast_stop_exit_reason(cls, reason: str) -> bool:
+        reason_text = str(reason or "").upper()
+        return any(token in reason_text for token in cls.FAST_STOP_EXIT_REASON_TOKENS)
+
+    @classmethod
     def _resolve_exit_order_type(cls, configured_order_type: str, reason: str, is_force: bool = False) -> str:
         """Map configured exit order type to the safe effective order type."""
         configured = str(configured_order_type or "LMT").upper()
+        reason_text = str(reason or "").upper()
+        if "DASHBOARD_FORCE_CLOSE" in reason_text:
+            # Manual dashboard closes keep urgent timing semantics, but use the
+            # LMT requote loop because live option MKT orders can sit behind
+            # broker/exchange price protection.
+            return "LMT"
         if configured != "MKT":
             return "LMT"
         return "MKT" if cls._is_urgent_exit_reason(reason, is_force=is_force) else "LMT"
+
+    @staticmethod
+    def _exit_retry_root_reason(reason: str) -> str:
+        root = str(reason or "EXIT_UNFILLED").strip() or "EXIT_UNFILLED"
+        for marker in ("|UNFILLED_RETRY_", "|MKT_NO_FILL", "|UNFILLED_REMAINDER", "|IBKR_NOT_CONNECTED", "|EXIT_ERROR"):
+            if marker in root:
+                root = root.split(marker, 1)[0]
+        return root or "EXIT_UNFILLED"
+
+    def _clear_unfilled_exit_retry(self, st, reason: str = ""):
+        if not getattr(st, 'pending_exit_retry_reason', ''):
+            return
+        logger.info(
+            f"✅ [Exit Retry Clear] {getattr(st, 'symbol', '?')} | "
+            f"reason={reason or 'cleared'} | last={getattr(st, 'pending_exit_retry_reason', '')}"
+        )
+        st.pending_exit_retry_reason = ""
+        st.pending_exit_retry_count = 0
+        st.pending_exit_retry_first_ts = 0.0
+        st.pending_exit_retry_last_ts = 0.0
+
+    def _arm_unfilled_exit_retry(self, sym: str, st, reason: str, curr_ts: float = None):
+        if not st or int(getattr(st, 'position', 0) or 0) == 0 or int(getattr(st, 'qty', 0) or 0) <= 0:
+            if st:
+                self._clear_unfilled_exit_retry(st, "no_open_position")
+            return
+
+        root_reason = self._exit_retry_root_reason(reason)
+        prev_reason = str(getattr(st, 'pending_exit_retry_reason', '') or '')
+        if prev_reason == root_reason:
+            retry_count = int(getattr(st, 'pending_exit_retry_count', 0) or 0) + 1
+        else:
+            retry_count = 1
+            st.pending_exit_retry_first_ts = float(curr_ts or time.time())
+
+        st.pending_exit_retry_reason = root_reason
+        st.pending_exit_retry_count = retry_count
+        st.pending_exit_retry_last_ts = float(curr_ts or time.time())
+        max_frames = max(0, int(self._cfg_value('EXIT_UNFILLED_RETRY_FRAMES', 3) or 0))
+        log_fn = logger.error if retry_count > max_frames else logger.warning
+        log_fn(
+            f"🔁 [Exit Retry Armed] {sym} still open after unfilled close | "
+            f"retry_count={retry_count}/{max_frames} qty={getattr(st, 'qty', 0)} reason={root_reason}"
+        )
 
     def _effective_slippage_pct(self, side: str = 'entry') -> float:
         """[REALTIME_DRY 友好] 返回当前运行模式下实际生效的滑点比例.
 
         - REALTIME_DRY: 默认 0.0, 便于干净地评估 alpha 链路真实收益.
           若要复刻实盘体验, 设 REALTIME_DRY_APPLY_SLIPPAGE=1 即可恢复配置值.
-        - 其他模式 (REALTIME / BACKTEST): 维持原优先级,
-          SLIPPAGE_PCT → SLIPPAGE_{ENTRY|EXIT}_PCT → config 默认值.
+        - 其他模式 (REALTIME / BACKTEST): 使用当前策略配置里的 SLIPPAGE_PCT。
         """
         try:
             from config import IS_REALTIME_DRY as runtime_is_realtime_dry
@@ -252,11 +405,7 @@ class OrchestratorExecution:
             if apply_flag not in ('1', 'true', 'yes'):
                 return 0.0
 
-        if side == 'entry':
-            fallback_key, default_val = 'SLIPPAGE_ENTRY_PCT', SLIPPAGE_ENTRY_PCT
-        else:
-            fallback_key, default_val = 'SLIPPAGE_EXIT_PCT', SLIPPAGE_EXIT_PCT
-        return float(self._cfg_value('SLIPPAGE_PCT', self._cfg_value(fallback_key, default_val)))
+        return float(self._cfg_value('SLIPPAGE_PCT', 0.001))
 
     # ------------------------------------------------------------------
     # [🛡️ IBKR Connection Guard]
@@ -328,6 +477,43 @@ class OrchestratorExecution:
             return 0.0, 0.0
         except Exception:
             return 0.0, 0.0
+
+    async def _await_cancel_settle(self, trade, max_wait: float):
+        """
+        等待 IB 撤单 ack: poll orderStatus 直到进入终态或超时。
+
+        原实现是 `await asyncio.sleep(cancel_settle_seconds)` 死等,
+        在快速重报模式下 (0.05~0.20s) 经常 cancel 还没 ack 就发新单,
+        导致 IB 拒单或重复挂单。这里改成最早达到终态就立刻返回,
+        既保证撤单确认, 又不浪费时间窗口。
+        """
+        wait = max(0.0, float(max_wait or 0.0))
+        if wait <= 0:
+            return
+        deadline = time.time() + wait
+        terminal_states = ('Filled', 'Cancelled', 'ApiCancelled', 'Inactive')
+        # 至少给 IB 一次 25ms 的 sleep, 否则有些 ib_insync 版本 status 不会立刻刷新。
+        first_sleep = min(0.025, wait)
+        await asyncio.sleep(first_sleep)
+        if str(getattr(getattr(trade, 'orderStatus', None), 'status', '') or '') in terminal_states:
+            return
+        while time.time() < deadline:
+            status = str(getattr(getattr(trade, 'orderStatus', None), 'status', '') or '')
+            if status in terminal_states:
+                return
+            await asyncio.sleep(min(0.05, max(deadline - time.time(), 0.01)))
+
+    def _refresh_quote_into_locals(self, real_contract, bid, ask, base_price):
+        """
+        在 fast 模式下首单或重报前刷新 live quote, 覆盖 SE 时点的旧数据。
+
+        返回: (bid, ask, base_price); 拿不到 live 报价时原样返回。
+        """
+        live_bid, live_ask = self._try_get_live_option_quote(real_contract)
+        if live_bid > 0.0 and live_ask >= live_bid:
+            new_base = (live_bid + live_ask) / 2.0
+            return float(live_bid), float(live_ask), float(new_base)
+        return float(bid or 0.0), float(ask or 0.0), float(base_price or 0.0)
 
     def _next_entry_requote_price(self, sig, prev_limit_price, attempt_no, cap_price, real_contract=None):
         """
@@ -414,6 +600,16 @@ class OrchestratorExecution:
         st.entry_slot_reserved = False
         st.open_fill_confirmed = False
 
+    def _reset_unfilled_entry_after_async_error(self, st, sym: str, reason: str, filled_qty: int = 0):
+        if int(filled_qty or 0) > 0:
+            logger.error(
+                f"🚨 [Entry Async Error] {sym} {reason}; broker reports filled_qty={filled_qty}, "
+                "keeping local position for reconciler instead of resetting."
+            )
+            return
+        logger.error(f"🧹 [Entry Async Error] {sym} {reason}; no fill detected, resetting local pre-entry state.")
+        self._reset_failed_entry_state(st)
+
     def _use_gentle_1s_backtest_execution(self) -> bool:
         if self.orch.mode != 'backtest':
             return False
@@ -457,13 +653,50 @@ class OrchestratorExecution:
         requote_step = 0.005 * max(attempt_no, 0)
         return round(base_price * (fallback_buf + requote_step), 2)
 
-    def _get_exit_limit_price(self, base_price, bid=0.0, ask=0.0, is_urgent=False, attempt_no=0):
+    def _get_exit_limit_price(
+        self,
+        base_price,
+        bid=0.0,
+        ask=0.0,
+        is_urgent=False,
+        attempt_no=0,
+        fast_stop=False,
+        fast_requote=False,
+    ):
         bid = float(bid or 0.0)
         ask = float(ask or 0.0)
         base_price = float(base_price or 0.0)
         limit_buffer_exit = float(self._cfg_value('LIMIT_BUFFER_EXIT', config.LIMIT_BUFFER_EXIT))
 
+        def _floor_price(reference_price: float) -> float:
+            """[#10] 分路 floor:
+            - fast_stop:  允许跌破 bid (倒贴换成交), floor = max(ref*0.90, ref-0.15)
+            - fast_requote: 不允许跌破 bid (bid 已是市场最佳买价, 不应主动倒贴)
+            - 默认: 0.01
+            """
+            ref = float(reference_price or 0.0)
+            if ref <= 0.0:
+                return 0.01
+            if fast_stop:
+                min_ratio = float(self._cfg_value('STOP_EXIT_FAST_MIN_BID_RATIO', 0.90) or 0.90)
+                max_abs_discount = float(self._cfg_value('STOP_EXIT_FAST_MAX_ABS_DISCOUNT', 0.15) or 0.15)
+                return round(max(ref * min_ratio, ref - max_abs_discount, 0.01), 2)
+            if fast_requote:
+                # 普通获利平仓不主动倒贴: floor 锚定 bid (ref==bid 时即为 bid 自身)。
+                return round(max(ref, 0.01), 2)
+            return 0.01
+
         if bid > 0.01:
+            if fast_stop:
+                initial_offset = max(0.0, float(self._cfg_value('STOP_EXIT_FAST_INITIAL_BID_OFFSET', 0.01) or 0.0))
+                step_down = max(0.0, float(self._cfg_value('STOP_EXIT_FAST_REQUOTE_STEP', 0.03) or 0.0)) * max(attempt_no, 0)
+                return round(max(bid - initial_offset - step_down, _floor_price(bid)), 2)
+            if fast_requote:
+                # fast_requote 起手 = bid (offset 默认 0), 后续每轮下移 step_down,
+                # 但下界锁定在 bid 本身, 不主动跌破。
+                initial_offset = max(0.0, float(self._cfg_value('EXIT_FAST_REQUOTE_INITIAL_BID_OFFSET', 0.0) or 0.0))
+                step_down = max(0.0, float(self._cfg_value('EXIT_FAST_REQUOTE_STEP', 0.01) or 0.0)) * max(attempt_no, 0)
+                return round(max(bid - initial_offset - step_down, bid), 2)
             if is_urgent:
                 return round(max(bid - (0.01 * max(attempt_no, 0)), 0.01), 2)
             mid = (bid + ask) / 2.0 if ask > 0.0 else bid
@@ -475,8 +708,14 @@ class OrchestratorExecution:
             return 0.01
         requote_discount = 0.005 * max(attempt_no, 0)
         base_discount = max(0.0, 1.0 - limit_buffer_exit)
+        if fast_stop:
+            base_discount = max(base_discount, float(self._cfg_value('STOP_EXIT_FAST_BASE_DISCOUNT', 0.06) or 0.0))
+            requote_discount = float(self._cfg_value('STOP_EXIT_FAST_REQUOTE_DISCOUNT', 0.03) or 0.0) * max(attempt_no, 0)
+        elif fast_requote:
+            base_discount = max(base_discount, float(self._cfg_value('EXIT_FAST_REQUOTE_BASE_DISCOUNT', 0.03) or 0.0))
+            requote_discount = float(self._cfg_value('EXIT_FAST_REQUOTE_DISCOUNT', 0.01) or 0.0) * max(attempt_no, 0)
         total_discount = base_discount + requote_discount
-        return round(max(base_price * (1 - total_discount), 0.01), 2)
+        return round(max(base_price * (1 - total_discount), _floor_price(base_price)), 2)
 
     def _release_entry_pending(self, st):
         """[🛡️ Ghost Pending Fix]
@@ -886,7 +1125,24 @@ class OrchestratorExecution:
             trade = None
             runtime_trading_enabled = self._runtime_trading_enabled()
             try:    
-                limit_price = self._get_entry_limit_price(sig, fill_price, attempt_no=0)
+                # [#1 + #6] 入场首单: 在 fast requote 模式下用 live quote 刷新, 覆盖 SE 时点的旧 bid/ask。
+                entry_fast_requote_enabled = bool(
+                    self._cfg_value('ENTRY_FAST_REQUOTE_MODE_ENABLED', True)
+                    and runtime_trading_enabled
+                )
+                refreshed_sig_for_first = sig
+                if entry_fast_requote_enabled and hasattr(self.orch.ibkr, 'locked_contracts'):
+                    _tag = sig.get('tag')
+                    _live_contract = self.orch.ibkr.locked_contracts.get(sym, {}).get(_tag)
+                    if _live_contract is not None:
+                        live_bid, live_ask = self._try_get_live_option_quote(_live_contract)
+                        if live_bid > 0.0 and live_ask >= live_bid:
+                            refreshed_sig_for_first = dict(sig)
+                            refreshed_meta = dict(sig.get('meta', {}) or {})
+                            refreshed_meta['bid'] = live_bid
+                            refreshed_meta['ask'] = live_ask
+                            refreshed_sig_for_first['meta'] = refreshed_meta
+                limit_price = self._get_entry_limit_price(refreshed_sig_for_first, fill_price, attempt_no=0)
                 if limit_price < 0.05:
                     # 下单前只预占 locked_cash，拒单时释放预占，不修改 cash。
                     self._refund_locked_cash_once(
@@ -928,7 +1184,16 @@ class OrchestratorExecution:
                 
                 stop_loss = abs(self.orch.strategy.cfg.STOP_LOSS)
                 start_time = time.time()
-                trade = self.orch.ibkr.place_option_order(real_contract, 'BUY', st.qty, 'LMT', lmt_price=limit_price, stop_loss_pct=stop_loss, custom_time=curr_ts)
+                trade = await self._place_option_order_paced(
+                    real_contract,
+                    'BUY',
+                    st.qty,
+                    'LMT',
+                    lmt_price=limit_price,
+                    stop_loss_pct=stop_loss,
+                    custom_time=curr_ts,
+                    pacing_reason=f"entry:{sym}",
+                )
                 if trade:
                     st.is_pending = True
                     st.pending_action = 'BUY'
@@ -1152,7 +1417,13 @@ class OrchestratorExecution:
         # 🚀 [Ghost A Protections]
         MAX_ICEBERG_DURATION = 3.0     # 子单熔断超时
         MAX_SLIPPAGE_TOLERANCE = 0.02 # 滑点熔断阈值 (2%)
-        
+        # [#6] 冰山子单刷新 quote: 每 chunk 起点重新读 bid/ask, 避免锁死旧价。
+        refresh_quote_per_chunk = bool(self._cfg_value('ENTRY_ICEBERG_REFRESH_QUOTE_PER_CHUNK', True))
+        # 入场追价上限锚定首笔参考价, 防止冰山中段被刷到天花板。
+        entry_ref_price = float(sig.get('price', fill_price) or fill_price or 0.0)
+        cap_price = self._entry_requote_cap_price(entry_ref_price)
+
+        total_qty_filled = 0
         try:
             logger.info(f"🧊 [Iceberg Start] {sym} 开始执行冰山拆单 (Ghost A Protection Enabled)...")
             if target_total_qty < 1: return
@@ -1167,7 +1438,6 @@ class OrchestratorExecution:
             if hasattr(self.orch.ibkr, 'locked_contracts'):
                 real_contract = self.orch.ibkr.locked_contracts.get(sym, {}).get(tag)
             
-            total_qty_filled = 0
             total_actual_cost = 0.0
             total_actual_comm = 0.0
             iceberg_start_time = time.time()
@@ -1181,11 +1451,36 @@ class OrchestratorExecution:
                 qty_this_chunk = base_chunk_qty + (1 if i < remainder_qty else 0)
                 if qty_this_chunk < 1: continue
                 
-                limit_price = fill_price  
+                # 默认沿用首单的限价; 如果开启 quote 刷新且能拿到 live 报价, 则按当前盘口重新计算追价。
+                limit_price = float(fill_price)
+                if refresh_quote_per_chunk and runtime_trading_enabled:
+                    live_bid, live_ask = self._try_get_live_option_quote(real_contract)
+                    if live_bid > 0.0 and live_ask >= live_bid:
+                        refreshed_sig = dict(sig)
+                        refreshed_meta = dict(sig.get('meta', {}) or {})
+                        refreshed_meta['bid'] = live_bid
+                        refreshed_meta['ask'] = live_ask
+                        refreshed_sig['meta'] = refreshed_meta
+                        candidate = self._get_entry_limit_price(refreshed_sig, (live_bid + live_ask) / 2.0, attempt_no=0)
+                        if candidate >= 0.05:
+                            limit_price = min(candidate, cap_price) if math.isfinite(cap_price) else candidate
+                if cap_price > 0 and math.isfinite(cap_price) and limit_price > cap_price:
+                    logger.warning(
+                        f"🛑 [Iceberg Requote Cap] {sym} chunk={chunk_num} 追价 {limit_price:.4f} > cap {cap_price:.4f}, 停止追价"
+                    )
+                    break
                 chunk_est_cost = qty_this_chunk * limit_price * 100
                 chunk_est_comm = qty_this_chunk * commission_per_contract
                 
-                trade = self.orch.ibkr.place_option_order(real_contract, 'BUY', qty_this_chunk, 'LMT', lmt_price=limit_price, custom_time=curr_ts)
+                trade = await self._place_option_order_paced(
+                    real_contract,
+                    'BUY',
+                    qty_this_chunk,
+                    'LMT',
+                    lmt_price=limit_price,
+                    custom_time=curr_ts,
+                    pacing_reason=f"iceberg_entry:{sym}:{chunk_num}",
+                )
                 if trade:
                     self._upsert_pending_order(order_key, {
                         'symbol': sym,
@@ -1233,7 +1528,7 @@ class OrchestratorExecution:
                         **self._trade_identifiers(trade),
                     })
                     if hasattr(self.orch.ibkr, 'ib'):
-                        self.orch.ibkr.ib.cancelOrder(trade.order)
+                        await self._cancel_order_paced(trade.order, pacing_reason=f"iceberg_cancel:{sym}:{chunk_num}")
                     await asyncio.sleep(0.5)
 
                 filled_qty = int(trade.orderStatus.filled)
@@ -1347,6 +1642,7 @@ class OrchestratorExecution:
 
         except Exception as e:
             logger.error(f"🚨 [Iceberg Error] {sym}: {e}", exc_info=True)
+            self._reset_unfilled_entry_after_async_error(st, sym, "ICEBERG_ERROR", filled_qty=total_qty_filled)
             self._upsert_pending_order(order_key, {
                 'symbol': sym,
                 'contract_id': getattr(st, 'contract_id', ''),
@@ -1383,11 +1679,35 @@ class OrchestratorExecution:
 
     async def _monitor_realtime_order(self, sym, trade, real_contract, cost, commission, expected_qty, start_time, limit_price, stock_price, sig, st, order_key=None):
         """实盘超时看门狗"""
+        total_filled_qty = 0
         try:
             commission_per_contract = float(self._cfg_value('COMMISSION_PER_CONTRACT', COMMISSION_PER_CONTRACT))
-            max_attempts = max(1, int(self._cfg_value('EXIT_ORDER_MAX_RETRIES', getattr(config, 'EXIT_ORDER_MAX_RETRIES', config.ORDER_MAX_RETRIES))))
-            wait_per_attempt = max(1, int(self._cfg_value('ORDER_TIMEOUT_SECONDS', config.ORDER_TIMEOUT_SECONDS)))
-            total_filled_qty = 0
+            # [#6] 入场侧 fast requote: 0.4s 间隔 × 7~8 次 ≈ 3s 窗口, 跟得上 ask 上跳。
+            entry_fast_requote_enabled = bool(
+                self._cfg_value('ENTRY_FAST_REQUOTE_MODE_ENABLED', True)
+                and self.orch.mode == 'realtime'
+                and self._runtime_trading_enabled()
+            )
+            if entry_fast_requote_enabled:
+                requote_interval = max(0.05, float(self._cfg_value('ENTRY_FAST_REQUOTE_INTERVAL_SECONDS', 0.40) or 0.40))
+                max_window_seconds = max(
+                    requote_interval,
+                    float(self._cfg_value('ENTRY_FAST_REQUOTE_MAX_SECONDS', 3.0) or 3.0),
+                )
+                max_attempts = max(1, int(math.ceil(max_window_seconds / requote_interval)))
+                wait_per_attempt = requote_interval
+                cancel_settle_seconds = max(
+                    0.0,
+                    float(self._cfg_value('ENTRY_FAST_REQUOTE_CANCEL_SETTLE_SECONDS', 0.20) or 0.0),
+                )
+                logger.info(
+                    f"⚡ [Entry Fast-Requote] {sym} | attempts={max_attempts} "
+                    f"interval={requote_interval:.2f}s window≈{max_attempts * requote_interval:.2f}s"
+                )
+            else:
+                max_attempts = max(1, int(self._cfg_value('ORDER_MAX_RETRIES', config.ORDER_MAX_RETRIES)))
+                wait_per_attempt = max(1, int(self._cfg_value('ORDER_TIMEOUT_SECONDS', config.ORDER_TIMEOUT_SECONDS)))
+                cancel_settle_seconds = 2.0
             total_actual_cost = 0.0
             remaining_qty = int(expected_qty)
             current_trade = trade
@@ -1396,10 +1716,13 @@ class OrchestratorExecution:
             cap_price = self._entry_requote_cap_price(entry_ref_price)
 
             for attempt_no in range(max_attempts):
-                for _ in range(wait_per_attempt):
-                    await asyncio.sleep(1)
-                    if current_trade.orderStatus.status == 'Filled':
-                        break
+                if entry_fast_requote_enabled:
+                    await asyncio.sleep(wait_per_attempt)
+                else:
+                    for _ in range(int(wait_per_attempt)):
+                        await asyncio.sleep(1)
+                        if current_trade.orderStatus.status == 'Filled':
+                            break
 
                 filled_qty = int(current_trade.orderStatus.filled)
                 avg_fill_price = float(current_trade.orderStatus.avgFillPrice) if current_trade.orderStatus.avgFillPrice else float(current_limit_price)
@@ -1439,8 +1762,9 @@ class OrchestratorExecution:
                         **self._trade_identifiers(current_trade),
                     })
                     if hasattr(self.orch.ibkr, 'ib') and current_trade.orderStatus.status not in ['Cancelled', 'Inactive', 'ApiCancelled']:
-                        self.orch.ibkr.ib.cancelOrder(current_trade.order)
-                    await asyncio.sleep(2)
+                        await self._cancel_order_paced(current_trade.order, pacing_reason=f"entry_cancel:{sym}:{attempt_no}")
+                    if cancel_settle_seconds > 0:
+                        await self._await_cancel_settle(current_trade, cancel_settle_seconds)
                     filled_qty = int(current_trade.orderStatus.filled)
                     avg_fill_price = float(current_trade.orderStatus.avgFillPrice) if current_trade.orderStatus.avgFillPrice else float(current_limit_price)
 
@@ -1469,7 +1793,7 @@ class OrchestratorExecution:
                     )
                     break
 
-                next_trade = self.orch.ibkr.place_option_order(
+                next_trade = await self._place_option_order_paced(
                     real_contract,
                     'BUY',
                     remaining_qty,
@@ -1478,6 +1802,7 @@ class OrchestratorExecution:
                     custom_time=sig.get('meta', {}).get('alpha_available_ts', time.time()),
                     reason=f"{sig.get('reason', '')}|REQUOTE_{attempt_no + 1}",
                     stock_price=stock_price,
+                    pacing_reason=f"entry_requote:{sym}:{attempt_no + 1}",
                 )
                 if not next_trade:
                     break
@@ -1609,6 +1934,13 @@ class OrchestratorExecution:
 
         except Exception as e:
             logger.error(f"🚨 [Monitor Error] {sym}: {e}", exc_info=True)
+            broker_filled_qty = int(getattr(getattr(trade, 'orderStatus', None), 'filled', 0) or 0)
+            self._reset_unfilled_entry_after_async_error(
+                st,
+                sym,
+                "REALTIME_ENTRY_MONITOR_ERROR",
+                filled_qty=max(int(total_filled_qty or 0), broker_filled_qty),
+            )
             self._upsert_pending_order(order_key, {
                 'symbol': sym,
                 'contract_id': getattr(st, 'contract_id', ''),
@@ -1646,6 +1978,7 @@ class OrchestratorExecution:
         #   - is_pending 重置为 False, 让下一个 exit 信号到达时能重新尝试.
         if runtime_trading_enabled and not self._ibkr_is_connected():
             self._log_ibkr_disconnect_throttled(sym, reason)
+            self._arm_unfilled_exit_retry(sym, st, f"{reason}|IBKR_NOT_CONNECTED", curr_ts)
             try:
                 st.is_pending = False
             except Exception:
@@ -1661,8 +1994,24 @@ class OrchestratorExecution:
                 reason,
                 is_force=is_force,
             )
-            max_attempts = max(1, int(self._cfg_value('ORDER_MAX_RETRIES', config.ORDER_MAX_RETRIES)))
+            max_attempts = max(1, int(self._cfg_value('EXIT_ORDER_MAX_RETRIES', getattr(config, 'EXIT_ORDER_MAX_RETRIES', config.ORDER_MAX_RETRIES))))
             order_timeout_seconds = max(1, int(self._cfg_value('ORDER_TIMEOUT_SECONDS', config.ORDER_TIMEOUT_SECONDS)))
+            fast_stop_enabled = bool(self._cfg_value('STOP_EXIT_FAST_MODE_ENABLED', True))
+            is_fast_stop_exit = bool(
+                fast_stop_enabled
+                and runtime_trading_enabled
+                and self.orch.mode == 'realtime'
+                and self._is_fast_stop_exit_reason(reason)
+            )
+            if is_fast_stop_exit:
+                logger.warning(
+                    f"⚡ [Fast Stop Exit] {sym} risk stop uses aggressive LMT pricing | reason={reason}"
+                )
+                if effective_exit_order_type == 'MKT':
+                    effective_exit_order_type = 'LMT'
+                    logger.warning(
+                        f"⚡ [Fast Stop Exit] {sym} overrides MKT to rapid LMT requote | reason={reason}"
+                    )
 
             if configured_exit_order_type == 'MKT' and effective_exit_order_type == 'LMT':
                 logger.info(
@@ -1670,14 +2019,24 @@ class OrchestratorExecution:
                 )
 
             if effective_exit_order_type == 'MKT':
-                trade = self.orch.ibkr.place_option_order(real_contract, 'SELL', total_qty, 'MKT', base_price, custom_time=curr_ts, reason=reason)
+                trade = await self._place_option_order_paced(
+                    real_contract,
+                    'SELL',
+                    total_qty,
+                    'MKT',
+                    base_price,
+                    custom_time=curr_ts,
+                    reason=reason,
+                    pacing_reason=f"exit_mkt:{sym}",
+                )
                 if trade:
+                    submit_status = str(getattr(getattr(trade, 'orderStatus', None), 'status', '') or 'SUBMITTED').upper()
                     self._upsert_pending_order(order_key, {
                         'symbol': sym,
                         'contract_id': getattr(st, 'contract_id', ''),
                         'intent': 'CLOSE',
                         'side': 'SELL',
-                        'status': str(getattr(getattr(trade, 'orderStatus', None), 'status', '') or 'SUBMITTED').upper(),
+                        'status': submit_status,
                         'target_qty': int(total_qty),
                         'filled_qty': int(getattr(getattr(trade, 'orderStatus', None), 'filled', 0) or 0),
                         'remaining_qty': int(total_qty),
@@ -1686,6 +2045,134 @@ class OrchestratorExecution:
                         'last_update_ts': time.time(),
                         **self._trade_identifiers(trade),
                     })
+                    self._emit_order_event(
+                        sym,
+                        'ORDER_PENDING',
+                        'SELL',
+                        total_qty,
+                        price=base_price,
+                        reason=reason,
+                        extra={
+                            'status': submit_status,
+                            'contract_id': getattr(st, 'contract_id', ''),
+                            'pending_action': 'SELL',
+                            'order_type': 'MKT',
+                        },
+                    )
+                    wait_deadline = time.time() + max(2.0, min(float(order_timeout_seconds), 10.0))
+                    while time.time() < wait_deadline:
+                        status = str(getattr(getattr(trade, 'orderStatus', None), 'status', '') or '')
+                        filled_now = int(getattr(getattr(trade, 'orderStatus', None), 'filled', 0) or 0)
+                        if status in ['Filled', 'Cancelled', 'Inactive', 'ApiCancelled'] or filled_now >= int(total_qty):
+                            break
+                        await asyncio.sleep(0.25)
+
+                    broker_status = str(getattr(getattr(trade, 'orderStatus', None), 'status', '') or submit_status)
+                    filled_qty = min(int(getattr(getattr(trade, 'orderStatus', None), 'filled', 0) or 0), int(total_qty))
+                    avg_fill_price = float(getattr(getattr(trade, 'orderStatus', None), 'avgFillPrice', 0.0) or 0.0)
+                    if avg_fill_price <= 0.0:
+                        avg_fill_price = max(float(base_price or 0.0), 0.01)
+
+                    if filled_qty > 0:
+                        fill_ratio = filled_qty / int(total_qty) if int(total_qty) > 0 else 0.0
+                        self._emit_order_event(
+                            sym,
+                            'ORDER_FILLED',
+                            'SELL',
+                            filled_qty,
+                            price=avg_fill_price,
+                            reason=reason,
+                            extra={
+                                'expected_qty': int(total_qty),
+                                'filled_qty': int(filled_qty),
+                                'fill_ratio': float(fill_ratio),
+                                'status': 'Filled' if filled_qty >= int(total_qty) else 'PartialFill',
+                                'order_type': 'MKT',
+                            },
+                        )
+                        remaining_qty = max(int(total_qty) - int(filled_qty), 0)
+                        if remaining_qty > 0:
+                            self._emit_order_event(
+                                sym,
+                                'ORDER_CANCELLED',
+                                'SELL',
+                                remaining_qty,
+                                price=avg_fill_price,
+                                reason=f"{reason}|MKT_UNFILLED_REMAINDER",
+                                extra={
+                                    'expected_qty': int(total_qty),
+                                    'filled_qty': int(filled_qty),
+                                    'status': broker_status,
+                                    'order_type': 'MKT',
+                                },
+                            )
+                        self.orch.accounting._process_exit_accounting(
+                            sym,
+                            st,
+                            filled_qty,
+                            avg_fill_price,
+                            stock_price,
+                            curr_ts,
+                            reason,
+                            time.time() - start_time,
+                            fill_ratio,
+                        )
+                        if remaining_qty > 0 and int(getattr(st, 'position', 0) or 0) != 0:
+                            self._arm_unfilled_exit_retry(sym, st, f"{reason}|MKT_UNFILLED_REMAINDER", curr_ts)
+                        else:
+                            self._clear_unfilled_exit_retry(st, "exit_filled")
+                        self._upsert_pending_order(order_key, {
+                            'symbol': sym,
+                            'contract_id': getattr(st, 'contract_id', ''),
+                            'intent': 'CLOSE',
+                            'side': 'SELL',
+                            'status': 'FILLED' if filled_qty >= int(total_qty) else 'CANCELLED',
+                            'target_qty': int(total_qty),
+                            'filled_qty': int(filled_qty),
+                            'remaining_qty': max(int(total_qty) - int(filled_qty), 0),
+                            'limit_price': float(avg_fill_price or base_price or 0.0),
+                            'retry_count': 0,
+                            'last_update_ts': time.time(),
+                            'terminal_ts': time.time(),
+                            'is_terminal': True,
+                            **self._trade_identifiers(trade),
+                        })
+                    else:
+                        terminal = broker_status in ['Cancelled', 'Inactive', 'ApiCancelled']
+                        self._emit_order_event(
+                            sym,
+                            'ORDER_CANCELLED',
+                            'SELL',
+                            total_qty,
+                            price=base_price,
+                            reason=f"{reason}|MKT_NO_FILL",
+                            extra={
+                                'expected_qty': int(total_qty),
+                                'filled_qty': 0,
+                                'status': broker_status,
+                                'order_type': 'MKT',
+                            },
+                        )
+                        self._upsert_pending_order(order_key, {
+                            'symbol': sym,
+                            'contract_id': getattr(st, 'contract_id', ''),
+                            'intent': 'CLOSE',
+                            'side': 'SELL',
+                            'status': 'CANCELLED' if terminal else broker_status.upper(),
+                            'target_qty': int(total_qty),
+                            'filled_qty': 0,
+                            'remaining_qty': int(total_qty),
+                            'limit_price': float(base_price or 0.0),
+                            'retry_count': 0,
+                            'last_update_ts': time.time(),
+                            **({'terminal_ts': time.time(), 'is_terminal': True} if terminal else {}),
+                            **self._trade_identifiers(trade),
+                        })
+                        logger.warning(
+                            f"⚠️ [Exit MKT NoFill] {sym} no fill observed within wait window | "
+                            f"status={broker_status} qty={total_qty} reason={reason}"
+                        )
+                        self._arm_unfilled_exit_retry(sym, st, f"{reason}|MKT_NO_FILL", curr_ts)
                 if not trade:
                     # [🛡️ Safe Fallback] place_option_order 返回 None 有两种语义:
                     #   (a) DRY RUN / TRADING_ENABLED=False → 应该用模拟价清算账本;
@@ -1693,26 +2180,125 @@ class OrchestratorExecution:
                     # 用 last_not_connected_ts 窗口 + TRADING_ENABLED 联合判断.
                     if runtime_trading_enabled and self._ibkr_recently_failed():
                         self._log_ibkr_disconnect_throttled(sym, reason)
+                        self._arm_unfilled_exit_retry(sym, st, f"{reason}|IBKR_NOT_CONNECTED", curr_ts)
+                        self._upsert_pending_order(order_key, {
+                            'symbol': sym,
+                            'contract_id': getattr(st, 'contract_id', ''),
+                            'intent': 'CLOSE',
+                            'side': 'SELL',
+                            'status': 'ERROR',
+                            'target_qty': int(total_qty),
+                            'filled_qty': 0,
+                            'remaining_qty': int(total_qty),
+                            'limit_price': float(base_price or 0.0),
+                            'last_update_ts': time.time(),
+                            'terminal_ts': time.time(),
+                            'is_terminal': True,
+                            'last_error': 'IBKR_NOT_CONNECTED',
+                        })
                     else:
                         simulated_exit_price = max(round(base_price * (1 - slippage_exit_pct), 2), 0.01)
                         self.orch.accounting._process_exit_accounting(sym, st, total_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0)
+                        self._clear_unfilled_exit_retry(st, "simulated_exit_filled")
+                        self._upsert_pending_order(order_key, {
+                            'symbol': sym,
+                            'contract_id': getattr(st, 'contract_id', ''),
+                            'intent': 'CLOSE',
+                            'side': 'SELL',
+                            'status': 'FILLED',
+                            'target_qty': int(total_qty),
+                            'filled_qty': int(total_qty),
+                            'remaining_qty': 0,
+                            'limit_price': float(simulated_exit_price or 0.0),
+                            'last_update_ts': time.time(),
+                            'terminal_ts': time.time(),
+                            'is_terminal': True,
+                            'simulated': True,
+                        })
                 return
                 
-            wait_per_attempt = max(1, order_timeout_seconds // 2) if is_urgent else order_timeout_seconds
+            fast_requote_enabled = bool(
+                self._cfg_value('EXIT_FAST_REQUOTE_MODE_ENABLED', True)
+                and runtime_trading_enabled
+                and self.orch.mode == 'realtime'
+            )
+            # fast_stop 拥有自己的节奏 (更紧凑的间隔, 更激进的步长);
+            # 当两者同时启用时, fast_stop 优先, 避免被 fast_requote 稀释。
+            if is_fast_stop_exit:
+                requote_interval = max(0.05, float(self._cfg_value('STOP_EXIT_FAST_INTERVAL_SECONDS', 0.50) or 0.50))
+                max_requote_seconds = max(
+                    requote_interval,
+                    float(self._cfg_value('STOP_EXIT_FAST_MAX_SECONDS', 3.0) or 3.0),
+                )
+                max_attempts = max(1, int(math.ceil(max_requote_seconds / requote_interval)))
+                wait_per_attempt = requote_interval
+                cancel_settle_seconds = max(
+                    0.0,
+                    float(self._cfg_value('STOP_EXIT_FAST_CANCEL_SETTLE_SECONDS', 0.30) or 0.0),
+                )
+                logger.warning(
+                    f"⚡ [Fast Stop Cadence] {sym} | attempts={max_attempts} "
+                    f"interval={requote_interval:.2f}s window≈{max_attempts * requote_interval:.2f}s "
+                    f"cancel_settle={cancel_settle_seconds:.2f}s reason={reason}"
+                )
+            elif fast_requote_enabled:
+                requote_interval = max(0.05, float(self._cfg_value('EXIT_FAST_REQUOTE_INTERVAL_SECONDS', 0.40) or 0.40))
+                max_requote_seconds = max(
+                    requote_interval,
+                    float(self._cfg_value('EXIT_FAST_REQUOTE_MAX_SECONDS', 3.0) or 3.0),
+                )
+                max_attempts = max(1, int(math.ceil(max_requote_seconds / requote_interval)))
+                wait_per_attempt = requote_interval
+                cancel_settle_seconds = max(
+                    0.0,
+                    float(self._cfg_value('EXIT_FAST_REQUOTE_CANCEL_SETTLE_SECONDS', 0.20) or 0.0),
+                )
+                logger.info(
+                    f"⚡ [Exit Fast-Requote] {sym} close priority mode | "
+                    f"attempts={max_attempts} interval={requote_interval:.2f}s "
+                    f"window≈{max_attempts * requote_interval:.2f}s reason={reason}"
+                )
+            else:
+                wait_per_attempt = max(1, order_timeout_seconds // 2) if is_urgent else order_timeout_seconds
+                cancel_settle_seconds = 2.0
             remaining_qty = int(total_qty)
             total_filled_qty = 0
             total_exit_value = 0.0
 
-            limit_sell_price = self._get_exit_limit_price(base_price, bid=bid, ask=ask, is_urgent=is_urgent, attempt_no=0)
-            current_trade = self.orch.ibkr.place_option_order(real_contract, 'SELL', remaining_qty, 'LMT', lmt_price=limit_sell_price, custom_time=curr_ts, reason=reason)
+            # [#1] 首单前刷新 live quote, 覆盖 SE 时点的旧数据 (200ms~1s 旧报价
+            # 会让起手价跑偏, 浪费第一次重报机会)。
+            if is_fast_stop_exit or fast_requote_enabled:
+                bid, ask, base_price = self._refresh_quote_into_locals(real_contract, bid, ask, base_price)
+
+            limit_sell_price = self._get_exit_limit_price(
+                base_price,
+                bid=bid,
+                ask=ask,
+                is_urgent=is_urgent,
+                attempt_no=0,
+                fast_stop=is_fast_stop_exit,
+                fast_requote=fast_requote_enabled,
+            )
+            current_trade = await self._place_option_order_paced(
+                real_contract,
+                'SELL',
+                remaining_qty,
+                'LMT',
+                lmt_price=limit_sell_price,
+                custom_time=curr_ts,
+                reason=reason,
+                pacing_reason=f"exit_lmt:{sym}:0",
+            )
             if not current_trade:
                 # [🛡️ Safe Fallback] 同上 MKT 分支: 区分 DRY RUN (模拟成交) 与
                 # 实盘连接断开 (跳过, 等待重连后由下一个 exit 信号重试).
                 if runtime_trading_enabled and self._ibkr_recently_failed():
                     self._log_ibkr_disconnect_throttled(sym, reason)
+                    self._arm_unfilled_exit_retry(sym, st, f"{reason}|IBKR_NOT_CONNECTED", curr_ts)
                     return
                 simulated_exit_price = max(round(limit_sell_price * (1 - slippage_exit_pct), 2), 0.01)
                 self.orch.accounting._process_exit_accounting(sym, st, total_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0)
+                self._clear_unfilled_exit_retry(st, "simulated_exit_filled")
                 return
             self._upsert_pending_order(order_key, {
                 'symbol': sym,
@@ -1743,11 +2329,16 @@ class OrchestratorExecution:
                 },
             )
 
+            # [#9] fast_stop 触底检测: 价格连续两次完全相同(已撞 floor)就提前退出 LMT 循环,
+            # 让 MKT fallback (#5) 接管, 避免在 floor 价上反复 cancel/replace 浪费 IBKR 配额。
+            stop_floor_streak = 0
+            stop_floor_streak_threshold = max(
+                1,
+                int(self._cfg_value('STOP_EXIT_FAST_FLOOR_STREAK_THRESHOLD', 2) or 2),
+            )
+            last_limit_price = float(limit_sell_price)
             for attempt_no in range(max_attempts):
-                for _ in range(wait_per_attempt):
-                    await asyncio.sleep(1)
-                    if current_trade.orderStatus.status == 'Filled':
-                        break
+                await asyncio.sleep(wait_per_attempt)
 
                 filled_qty = int(current_trade.orderStatus.filled)
                 avg_p = float(current_trade.orderStatus.avgFillPrice) if current_trade.orderStatus.avgFillPrice else float(limit_sell_price)
@@ -1783,8 +2374,11 @@ class OrchestratorExecution:
                         **self._trade_identifiers(current_trade),
                     })
                     if hasattr(self.orch.ibkr, 'ib') and current_trade.orderStatus.status not in ['Cancelled', 'Inactive', 'ApiCancelled']:
-                        self.orch.ibkr.ib.cancelOrder(current_trade.order)
-                    await asyncio.sleep(2)
+                        await self._cancel_order_paced(current_trade.order, pacing_reason=f"exit_cancel:{sym}:{attempt_no}")
+                    # [#2] poll 状态而不是死等: cancel→ack 通常 100~300ms,
+                    # 提早进入终态就立刻继续, 避免浪费追价时间。
+                    if cancel_settle_seconds > 0:
+                        await self._await_cancel_settle(current_trade, cancel_settle_seconds)
                     filled_qty = int(current_trade.orderStatus.filled)
                     avg_p = float(current_trade.orderStatus.avgFillPrice) if current_trade.orderStatus.avgFillPrice else float(limit_sell_price)
 
@@ -1798,14 +2392,31 @@ class OrchestratorExecution:
                 if attempt_no >= max_attempts - 1:
                     break
 
+                if is_fast_stop_exit or fast_requote_enabled:
+                    bid, ask, base_price = self._refresh_quote_into_locals(real_contract, bid, ask, base_price)
+
                 limit_sell_price = self._get_exit_limit_price(
                     base_price,
                     bid=bid,
                     ask=ask,
                     is_urgent=is_urgent,
                     attempt_no=attempt_no + 1,
+                    fast_stop=is_fast_stop_exit,
+                    fast_requote=fast_requote_enabled,
                 )
-                next_trade = self.orch.ibkr.place_option_order(
+                # [#9] 触底检测 (仅 fast_stop): 价格已无下移空间, 直接 break 进 MKT fallback。
+                if is_fast_stop_exit and abs(limit_sell_price - last_limit_price) < 0.005:
+                    stop_floor_streak += 1
+                    if stop_floor_streak >= stop_floor_streak_threshold:
+                        logger.warning(
+                            f"🛑 [Fast Stop Floor Hit] {sym} attempt={attempt_no + 1} "
+                            f"limit={limit_sell_price:.2f} 与上一笔相同, 触底, 提前进 MKT fallback"
+                        )
+                        break
+                else:
+                    stop_floor_streak = 0
+                last_limit_price = float(limit_sell_price)
+                next_trade = await self._place_option_order_paced(
                     real_contract,
                     'SELL',
                     remaining_qty,
@@ -1813,6 +2424,7 @@ class OrchestratorExecution:
                     lmt_price=limit_sell_price,
                     custom_time=curr_ts,
                     reason=f"{reason}|REQUOTE_{attempt_no + 1}",
+                    pacing_reason=f"exit_requote:{sym}:{attempt_no + 1}",
                 )
                 if not next_trade:
                     break
@@ -1831,6 +2443,56 @@ class OrchestratorExecution:
                     **self._trade_identifiers(next_trade),
                 })
                 current_trade = next_trade
+
+            # [#5] fast_stop 兜底: LMT 全部超时仍未成交 → 升级到 MKT,
+            # 防止止损单一直挂在 floor 价附近不成交, 而行情继续下跌。
+            mkt_fallback_executed = False
+            mkt_fallback_filled = 0
+            mkt_fallback_avg = 0.0
+            mkt_fallback_status = ''
+            if (
+                is_fast_stop_exit
+                and total_filled_qty < total_qty
+                and bool(self._cfg_value('STOP_EXIT_FAST_MKT_FALLBACK_ENABLED', True))
+            ):
+                mkt_fallback_executed = True
+                mkt_remaining = max(int(total_qty) - int(total_filled_qty), 0)
+                mkt_wait = max(0.5, float(self._cfg_value('STOP_EXIT_FAST_MKT_FALLBACK_WAIT_SECONDS', 2.0) or 2.0))
+                logger.error(
+                    f"🚨 [Fast Stop MKT Fallback] {sym} LMT 重报全部失败 → 升级 MKT | "
+                    f"remaining={mkt_remaining}/{total_qty} reason={reason}"
+                )
+                fallback_trade = await self._place_option_order_paced(
+                    real_contract,
+                    'SELL',
+                    mkt_remaining,
+                    'MKT',
+                    base_price,
+                    custom_time=curr_ts,
+                    reason=f"{reason}|FAST_STOP_MKT_FALLBACK",
+                    pacing_reason=f"exit_mkt_fallback:{sym}",
+                )
+                if fallback_trade:
+                    fallback_deadline = time.time() + mkt_wait
+                    while time.time() < fallback_deadline:
+                        fb_status = str(getattr(getattr(fallback_trade, 'orderStatus', None), 'status', '') or '')
+                        fb_filled = int(getattr(getattr(fallback_trade, 'orderStatus', None), 'filled', 0) or 0)
+                        if fb_status in ('Filled', 'Cancelled', 'ApiCancelled', 'Inactive') or fb_filled >= mkt_remaining:
+                            break
+                        await asyncio.sleep(0.1)
+                    mkt_fallback_status = str(getattr(getattr(fallback_trade, 'orderStatus', None), 'status', '') or '')
+                    mkt_fallback_filled = min(int(getattr(getattr(fallback_trade, 'orderStatus', None), 'filled', 0) or 0), mkt_remaining)
+                    mkt_fallback_avg = float(getattr(getattr(fallback_trade, 'orderStatus', None), 'avgFillPrice', 0.0) or 0.0)
+                    if mkt_fallback_avg <= 0.0 and mkt_fallback_filled > 0:
+                        mkt_fallback_avg = max(float(base_price or 0.0), 0.01)
+                    if mkt_fallback_filled > 0:
+                        total_filled_qty += mkt_fallback_filled
+                        total_exit_value += mkt_fallback_filled * mkt_fallback_avg
+                        current_trade = fallback_trade
+                        logger.warning(
+                            f"✅ [Fast Stop MKT Fallback] {sym} filled={mkt_fallback_filled} "
+                            f"avg={mkt_fallback_avg:.2f} status={mkt_fallback_status}"
+                        )
 
             if total_filled_qty > 0:
                 avg_exit_price = total_exit_value / total_filled_qty
@@ -1875,6 +2537,10 @@ class OrchestratorExecution:
                     time.time() - start_time,
                     fill_ratio,
                 )
+                if remaining_qty > 0 and int(getattr(st, 'position', 0) or 0) != 0:
+                    self._arm_unfilled_exit_retry(sym, st, f"{reason}|UNFILLED_REMAINDER", curr_ts)
+                else:
+                    self._clear_unfilled_exit_retry(st, "exit_filled")
                 self._upsert_pending_order(order_key, {
                     'symbol': sym,
                     'contract_id': getattr(st, 'contract_id', ''),
@@ -1921,9 +2587,11 @@ class OrchestratorExecution:
                     'is_terminal': True,
                     **self._trade_identifiers(current_trade),
                 })
+                self._arm_unfilled_exit_retry(sym, st, reason, curr_ts)
 
         except Exception as e:
             logger.error(f"🚨 [Exit Error] {sym}: {e}", exc_info=True)
+            self._arm_unfilled_exit_retry(sym, st, f"{reason}|EXIT_ERROR", curr_ts)
             self._upsert_pending_order(order_key, {
                 'symbol': sym,
                 'contract_id': getattr(st, 'contract_id', ''),

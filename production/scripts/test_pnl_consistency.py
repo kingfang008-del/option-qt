@@ -43,12 +43,12 @@ class TestPnLConsistency(unittest.TestCase):
         config.TRADING_ENABLED = False
         config.SYNC_EXECUTION = True
         
-        # Use config slippage
-        self.slippage_entry = config.SLIPPAGE_ENTRY_PCT
-        self.slippage_exit = config.SLIPPAGE_EXIT_PCT
-        
         self.symbols = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'NFLX', 'AMD', 'PLTR']
         self.orch = V8Orchestrator(self.symbols, mode='backtest')
+
+        # Backtest slippage is owned by the strategy config, not global config.py.
+        self.slippage_entry = self.orch.cfg.SLIPPAGE_PCT
+        self.slippage_exit = self.orch.cfg.SLIPPAGE_PCT
         
         # Ensure MockIBKR has 0 delay as per user edit
         self.orch.ibkr.execution_delay_seconds = 0

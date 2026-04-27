@@ -534,9 +534,18 @@ def fetch_live_oms_positions(
     max_age_sec: float = 120.0,
     allow_stale: bool = False,
     expected_modes=None,
+    return_meta: bool = False,
 ):
     """Return current OMS live positions when the live ledger is fresh/mode-matched."""
+    def _valid_bucket_tag(raw_tag: str) -> str:
+        tag = str(raw_tag or "").strip().upper()
+        return tag if tag in TAG_TO_INDEX else ""
+
     positions = {}
+    meta = {
+        "fresh": False,
+        "skipped_unconfirmed": 0,
+    }
     try:
         r = redis.Redis(**{k: v for k, v in REDIS_CFG.items() if k in ['host', 'port', 'db']}, decode_responses=False)
         ledger = r.hgetall("meta:oms_ledger") or {}
@@ -554,7 +563,8 @@ def fetch_live_oms_positions(
             expected_modes=expected_modes,
         )
         if ledger_cash is None and live_cash is None:
-            return {}
+            return (positions, meta) if return_meta else positions
+        meta["fresh"] = True
 
         raw_map = r.hgetall("oms:live_positions") or {}
         for raw_sym, raw_val in raw_map.items():
@@ -570,18 +580,74 @@ def fetch_live_oms_positions(
                 stock = float(state.get("entry_stock", state.get("stock", 0.0)) or 0.0)
                 if pos == 0 or qty <= 0:
                     continue
+                if not bool(state.get("open_fill_confirmed", False)):
+                    meta["skipped_unconfirmed"] += 1
+                    continue
+                opt_type = str(state.get("opt_type", "") or "").strip().lower()
                 positions[sym] = {
+                    'position': pos,
                     'qty': qty,
                     'cost': cost if np.isfinite(cost) and cost > 0 else 0.0,
                     'stock': stock if np.isfinite(stock) and stock > 0 else 0.0,
-                    'tag': '',
+                    'tag': _valid_bucket_tag(state.get("tag", "")),
+                    'opt_type': opt_type,
+                    'contract_id': str(state.get("contract_id", "") or ""),
+                    'last_opt_price': float(state.get("last_opt_price", 0.0) or 0.0),
+                    'entry_ts': float(state.get("entry_ts", 0.0) or 0.0),
                     'source': 'OMS live',
                 }
             except Exception:
                 continue
     except Exception:
-        return {}
-    return positions
+        return (positions, meta) if return_meta else positions
+    return (positions, meta) if return_meta else positions
+
+
+def submit_oms_manual_close(symbol: str, position: int, qty: float, ref_price: float, stock_price: float = 0.0, contract_id: str = ""):
+    """Send a manual close request to OMS, reusing ExecutionEngine's SELL path."""
+    sym = str(symbol or "").strip().upper()
+    pos = int(position or 0)
+    qty = float(qty or 0.0)
+    ref_price = float(ref_price or 0.0)
+    if not sym:
+        return False, "missing symbol"
+    if pos == 0 or qty <= 0:
+        return False, f"{sym} has no valid OMS position/qty"
+    try:
+        r_cmd = redis.Redis(**{k: v for k, v in REDIS_CFG.items() if k in ['host', 'port', 'db']}, decode_responses=False)
+        now_ts = time.time()
+        request_id = f"dashboard-close-{sym}-{int(now_ts * 1000)}"
+        payload = {
+            "source": "dashboard_manual_close",
+            "action": "SELL",
+            "ts": now_ts,
+            "symbol": sym,
+            "stock_price": float(stock_price or 0.0),
+            "batch_idx": -1,
+            "frame_id": request_id,
+            "sig": {
+                "action": "SELL",
+                "dir": pos,
+                "target_side": pos,
+                "original_position": pos,
+                "price": max(ref_price, 0.01),
+                "market_price": max(ref_price, 0.01),
+                "bid": 0.0,
+                "ask": 0.0,
+                "bid_size": qty,
+                "ask_size": qty,
+                "reason": f"DASHBOARD_FORCE_CLOSE:{request_id}",
+                "meta": {
+                    "contract_id": str(contract_id or ""),
+                    "manual_close": True,
+                    "request_id": request_id,
+                },
+            },
+        }
+        r_cmd.xadd(STREAM_ORCH_SIGNAL, {"data": ser.pack(payload)}, maxlen=10000)
+        return True, request_id
+    except Exception as e:
+        return False, str(e)
 
 
 def fetch_live_pending_orders():
@@ -3340,12 +3406,13 @@ with tab5:
 
                     log_open_positions = dict(open_positions)
                     if current_mode.startswith("REALTIME"):
-                        live_open_positions = fetch_live_oms_positions(
+                        live_open_positions, live_positions_meta = fetch_live_oms_positions(
                             max_age_sec=120.0,
                             allow_stale=False,
                             expected_modes=[RUN_MODE],
+                            return_meta=True,
                         )
-                        if live_open_positions:
+                        if live_positions_meta.get("fresh"):
                             stale_log_symbols = sorted(set(log_open_positions) - set(live_open_positions))
                             broker_only_symbols = sorted(set(live_open_positions) - set(log_open_positions))
                             for sym, pos in live_open_positions.items():
@@ -3355,13 +3422,21 @@ with tab5:
                                 if pos.get('cost', 0.0) <= 0 and float(log_pos.get('cost', 0.0) or 0.0) > 0:
                                     pos['cost'] = float(log_pos.get('cost', 0.0) or 0.0)
                             open_positions = live_open_positions
-                            if stale_log_symbols or broker_only_symbols:
+                            skipped_unconfirmed = int(live_positions_meta.get("skipped_unconfirmed", 0) or 0)
+                            if stale_log_symbols or broker_only_symbols or skipped_unconfirmed:
                                 parts = []
                                 if stale_log_symbols:
                                     parts.append(f"dropped stale log-only: {', '.join(stale_log_symbols[:6])}")
                                 if broker_only_symbols:
                                     parts.append(f"adopted OMS live-only: {', '.join(broker_only_symbols[:6])}")
+                                if skipped_unconfirmed:
+                                    parts.append(f"ignored unconfirmed pending: {skipped_unconfirmed}")
                                 st.caption("Current positions use `oms:live_positions` in realtime; " + " | ".join(parts))
+                        else:
+                            st.caption("OMS live position projection is stale/unavailable; falling back to trade-log reconstruction.")
+
+                    # NOTE: Trade Log 上面那张 "Current Positions" + 平仓按钮已迁移到
+                    # Intraday Performance（持仓表内嵌"请求平仓"列），此处不再重复渲染。
 
                     open_df = df_all[df_all['action'] == 'OPEN'].copy()
                     if not open_df.empty:
@@ -3536,10 +3611,42 @@ with tab5:
                             r_live = redis.Redis(**{k:v for k,v in REDIS_CFG.items() if k in ['host','port','db']}, decode_responses=False)
                         except: r_live = None
 
+                        def _effective_bucket_tag(pos: dict) -> str:
+                            tag_val = str(pos.get('tag', '') or '').strip().upper()
+                            if tag_val in TAG_TO_INDEX:
+                                return tag_val
+                            opt_type = str(pos.get('opt_type', '') or '').strip().lower()
+                            direction = int(pos.get('position', 0) or 0)
+                            if opt_type == 'call' or direction == 1:
+                                return 'CALL_ATM'
+                            if opt_type == 'put' or direction == -1:
+                                return 'PUT_ATM'
+                            return ''
+
                         for sym, pos in open_positions.items():
-                            live_price = pos['cost']
-                            tag = pos['tag']
+                            live_price = float(pos.get('last_opt_price', 0.0) or 0.0)
+                            if live_price <= 0:
+                                live_price = pos['cost']
+                            tag = _effective_bucket_tag(pos)
                             found_live = False
+
+                            # 估值口径：统一使用 mid = (bid + ask) / 2，反映真实可平仓估值。
+                            # last 在期权上常常 stale（OTM/远月合约几分钟无成交），不能作为可靠估值依据。
+                            # 开仓瞬间出现的"半个 spread"浮亏属于真实入场成本，不应被 last 美化。
+                            # 回退顺序：mid → bid → ask → last → cost（兜底）。
+                            def _pick_live_price(_last: float, _bid: float, _ask: float) -> float:
+                                _last = float(_last or 0.0)
+                                _bid = float(_bid or 0.0)
+                                _ask = float(_ask or 0.0)
+                                if _bid > 0.01 and _ask > 0.01 and _ask >= _bid:
+                                    return (_bid + _ask) / 2.0
+                                if _bid > 0.01:
+                                    return _bid
+                                if _ask > 0.01:
+                                    return _ask
+                                if _last > 0.01:
+                                    return _last
+                                return 0.0
 
                             if r_live:
                                 try:
@@ -3553,11 +3660,10 @@ with tab5:
                                             _last = float(bucket[0])
                                             _bid  = float(bucket[8]) if len(bucket) > 8 else 0.0
                                             _ask  = float(bucket[9]) if len(bucket) > 9 else 0.0
-                                            if _bid > 0.01 and _ask > 0.01:
-                                                live_price = (_bid + _ask) / 2.0
-                                            else:
-                                                live_price = _last
-                                            found_live = True
+                                            picked = _pick_live_price(_last, _bid, _ask)
+                                            if picked > 0.01:
+                                                live_price = picked
+                                                found_live = True
                                 except: pass
 
                             if not found_live:
@@ -3576,10 +3682,9 @@ with tab5:
                                             _last = float(bucket[0])
                                             _bid  = float(bucket[8]) if len(bucket) > 8 else 0.0
                                             _ask  = float(bucket[9]) if len(bucket) > 9 else 0.0
-                                            if _bid > 0.01 and _ask > 0.01:
-                                                live_price = (_bid + _ask) / 2.0
-                                            else:
-                                                live_price = _last
+                                            picked = _pick_live_price(_last, _bid, _ask)
+                                            if picked > 0.01:
+                                                live_price = picked
                                     pg_conn.close()
                                 except: pass
 
@@ -3683,13 +3788,91 @@ with tab5:
                     )
 
                     if paper_details:
-                        st.dataframe(
-                            pd.DataFrame(paper_details).style.applymap(
-                                lambda x: 'color: #00CC96' if x > 0 else ('color: #EF553B' if x < 0 else ''),
-                                subset=['Paper PnL ($)', 'ROI (%)']
-                            ),
-                            use_container_width=True
-                        )
+                        # 🛑 Realtime 下：在持仓表最右一列内嵌"请求平仓"按钮
+                        # （Streamlit st.dataframe 无法嵌按钮 → 用 st.columns 自定义行渲染替代）
+                        intraday_close_enabled = False
+                        show_close_button = bool(current_mode.startswith("REALTIME") and open_positions)
+
+                        # 用带边框的容器包裹整张表（含密码确认 + 表头 + 数据行），视觉更分明
+                        with st.container(border=True):
+                            if show_close_button:
+                                confirm_intraday_close = st.text_input(
+                                    "Type `CLOSE` to enable manual close buttons (Quick Close 列)",
+                                    key="intraday_manual_close_confirm",
+                                    type="password",
+                                )
+                                intraday_close_enabled = confirm_intraday_close.strip().upper() == "CLOSE"
+                                st.caption(
+                                    "右侧 `请求平仓` 按钮通过 OMS 复用执行引擎的 LMT 成交优先 + 重试 + MKT fallback 路径。"
+                                )
+
+                            # 列宽对齐 Symbol / Tag / Qty / Cost / Live / MV / Paper PnL / ROI / Action
+                            if show_close_button:
+                                col_ratios = [1.0, 1.0, 0.7, 0.9, 0.9, 1.1, 1.1, 0.9, 1.3]
+                            else:
+                                col_ratios = [1.0, 1.0, 0.7, 0.9, 0.9, 1.1, 1.1, 0.9]
+
+                            header_cols = st.columns(col_ratios)
+                            header_cols[0].markdown("**Symbol**")
+                            header_cols[1].markdown("**Tag**")
+                            header_cols[2].markdown("**Qty**")
+                            header_cols[3].markdown("**Cost**")
+                            header_cols[4].markdown("**Live 🔴**")
+                            header_cols[5].markdown("**MV ($)**")
+                            header_cols[6].markdown("**Paper PnL ($)**")
+                            header_cols[7].markdown("**ROI (%)**")
+                            if show_close_button:
+                                header_cols[8].markdown("**Action**")
+
+                            st.divider()
+
+                            for row in paper_details:
+                                sym = row.get('Symbol', '')
+                                row_cols = st.columns(col_ratios)
+                                paper_pnl_v = float(row.get('Paper PnL ($)', 0.0) or 0.0)
+                                roi_v = float(row.get('ROI (%)', 0.0) or 0.0)
+                                pnl_color = "#00CC96" if paper_pnl_v > 0 else ("#EF553B" if paper_pnl_v < 0 else "#AAAAAA")
+                                roi_color = "#00CC96" if roi_v > 0 else ("#EF553B" if roi_v < 0 else "#AAAAAA")
+
+                                row_cols[0].markdown(f"**{sym}**")
+                                row_cols[1].write(str(row.get('Tag', '') or ''))
+                                row_cols[2].write(f"{float(row.get('Qty', 0.0) or 0.0):.0f}")
+                                row_cols[3].write(f"${float(row.get('Cost', 0.0) or 0.0):.2f}")
+                                row_cols[4].write(f"${float(row.get('Live 🔴', 0.0) or 0.0):.2f}")
+                                row_cols[5].write(f"${float(row.get('MarketValue ($)', 0.0) or 0.0):,.0f}")
+                                row_cols[6].markdown(
+                                    f"<span style='color:{pnl_color}'>${paper_pnl_v:,.2f}</span>",
+                                    unsafe_allow_html=True,
+                                )
+                                row_cols[7].markdown(
+                                    f"<span style='color:{roi_color}'>{roi_v:+.2f}%</span>",
+                                    unsafe_allow_html=True,
+                                )
+                                if show_close_button:
+                                    pos = open_positions.get(sym, {}) or {}
+                                    pos_dir = int(pos.get("position", 0) or 0)
+                                    qty_val = float(pos.get("qty", 0.0) or 0.0)
+                                    if row_cols[8].button(
+                                        "请求平仓",
+                                        key=f"intraday_oms_manual_close_{sym}",
+                                        disabled=(not intraday_close_enabled) or pos_dir == 0 or qty_val <= 0,
+                                        type="primary" if intraday_close_enabled else "secondary",
+                                        use_container_width=True,
+                                    ):
+                                        ref_price = float(pos.get("last_opt_price", 0.0) or pos.get("cost", 0.0) or 0.01)
+                                        ok, msg = submit_oms_manual_close(
+                                            sym,
+                                            pos_dir,
+                                            qty_val,
+                                            ref_price=ref_price,
+                                            stock_price=float(pos.get("stock", 0.0) or 0.0),
+                                            contract_id=str(pos.get("contract_id", "") or ""),
+                                        )
+                                        if ok:
+                                            st.success(f"{sym} manual close request sent to OMS: {msg}")
+                                            st.rerun()
+                                        else:
+                                            st.error(f"{sym} manual close request failed: {msg}")
 
                 _live_price_card(open_positions, closed_pnl, wins, losses)
                 st.divider()

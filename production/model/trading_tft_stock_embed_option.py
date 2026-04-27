@@ -281,12 +281,14 @@ class AdvancedAlphaNet(nn.Module):
         # Fusion 层
         self.fusion = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.ELU(), nn.Dropout(dropout))
        
-       # --- 期权定价核心输出头 ---
-        # 1. 预测归一化后的 Gamma P&L (连续值)：代表做多跨式组合的期望收益
+        # --- 波动率 Alpha 输出头 ---
+        # 1. 兼容旧 checkpoint/研究输出: 理论 Gamma P&L，不再作为主训练目标
         self.head_gamma = nn.Sequential(nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Linear(hidden_dim//2, 1))
-        # 2. 预测 IV-RV Spread (连续值)：代表定价偏差，用于寻找被高估或低估的波动率
-        self.head_spread = nn.Sequential(nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Linear(hidden_dim//2, 1))
-        # 3. 预测波动率方向 (分类)：0=下降, 1=平稳, 2=上升
+        # 2. 预测未来 realized volatility
+        self.head_rv = nn.Sequential(nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Linear(hidden_dim//2, 1))
+        # 3. 预测 future RV - current IV，正值表示当前 IV 偏便宜
+        self.head_vrp = nn.Sequential(nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Linear(hidden_dim//2, 1))
+        # 4. 预测波动率错价方向：0=IV偏贵, 1=中性, 2=IV偏便宜
         self.head_vdir = nn.Sequential(nn.Linear(hidden_dim, hidden_dim//2), nn.ReLU(), nn.Linear(hidden_dim//2, 3))
     def _analyze_features(self, feature_config):
         # [修改] 重构特征分析逻辑，分离 Stock 和 Option
@@ -335,9 +337,13 @@ class AdvancedAlphaNet(nn.Module):
         emb_option = self.tft_option(x_option[..., self.feat_info['option']['real']], x_option[..., self.feat_info['option']['cat']], c_s, c_h, c_c)
         
         fused = self.fusion(torch.cat([emb_stock, emb_option], dim=-1))
+        pred_vrp = self.head_vrp(fused).squeeze(-1)
+        pred_rv = self.head_rv(fused).squeeze(-1)
         return {
             'pred_gamma': self.head_gamma(fused).squeeze(-1),
-            'pred_spread': self.head_spread(fused).squeeze(-1),
+            'pred_rv': pred_rv,
+            'pred_vrp': pred_vrp,
+            'pred_spread': pred_vrp,
             'logits_vdir': self.head_vdir(fused)
         }
 
@@ -345,9 +351,10 @@ class AdvancedAlphaNet(nn.Module):
 # 3. UnifiedLMDBDataset (同步重构)
 # ==============================================================================
 class UnifiedLMDBDataset(Dataset):
-    def __init__(self, db_path, config, stage='train', seq_len=30):
+    def __init__(self, db_path, config, stage='train', seq_len=30, feature_lag=1):
         self.db_path = db_path
         self.seq_len = seq_len
+        self.feature_lag = max(0, int(feature_lag))
         self.dctx = zstd.ZstdDecompressor()
         
         # 1. 预处理特征映射
@@ -403,20 +410,19 @@ class UnifiedLMDBDataset(Dataset):
     def _sanity_check(self):
         self._init_env()
         check_count = min(100, len(self.keys))
-        zero_gamma_count = 0
+        zero_rv_count = 0
         for i in range(check_count):
             val = self.txn.get(self.keys[i])
             if not val: continue
             data = msgpack.unpackb(self.dctx.decompress(val), raw=False)
             lbl = data.get('labels', {})
             
-            # [修复] 检查新的核心标签：Gamma P&L
-            g_val = lbl.get('label_gamma_pnl_std', 0.0)
-            if abs(g_val) < 1e-9: 
-                zero_gamma_count += 1
+            rv_val = lbl.get('label_rv_k_steps', 0.0)
+            if abs(rv_val) < 1e-9: 
+                zero_rv_count += 1
                 
-        if zero_gamma_count == check_count:
-            logger.warning(f"🚨 [WARNING] 前 {check_count} 条数据的 label_gamma_pnl_std 全为 0！请检查期权特征是否成功合并。")
+        if zero_rv_count == check_count:
+            logger.warning(f"🚨 [WARNING] 前 {check_count} 条数据的 label_rv_k_steps 全为 0！请检查波动率标签生成。")
     def __len__(self): return len(self.keys)
     
     def __getitem__(self, idx):
@@ -466,16 +472,14 @@ class UnifiedLMDBDataset(Dataset):
                     l = min(len(v), self.seq_len)
                     if l > 0: x_option[-l:, tgt_idx] = v[-l:]
 
-        # 3. [核心修正] 填充完数据后再进行物理平移压测
-        SHIFT_TEST = True 
-        if SHIFT_TEST:
-            # 真实平移：模型在 T 时刻只能看到 T-1 的数据
+        # 3. 特征可交易时点滞后。默认只让模型看到 T-1 及以前的数据。
+        if self.feature_lag > 0:
             x_stock_shifted = np.zeros_like(x_stock)
-            x_stock_shifted[1:] = x_stock[:-1]
+            x_stock_shifted[self.feature_lag:] = x_stock[:-self.feature_lag]
             x_stock = x_stock_shifted
             
             x_option_shifted = np.zeros_like(x_option)
-            x_option_shifted[1:] = x_option[:-1]
+            x_option_shifted[self.feature_lag:] = x_option[:-self.feature_lag]
             x_option = x_option_shifted
 
         # 4. 标签提取与数值清洗
@@ -488,13 +492,19 @@ class UnifiedLMDBDataset(Dataset):
 
         tgt = {
             'gamma_pnl_std': np.clip(safe_convert(lbl.get('label_gamma_pnl_std')), -10, 10), 
-            'iv_rv_spread': np.clip(safe_convert(lbl.get('label_iv_rv_spread')), -2, 2),
+            'iv_rv_spread': np.clip(safe_convert(lbl.get('label_iv_rv_spread')), -5, 5),
             'vol_direction': int(safe_convert(lbl.get('label_vol_direction', 1.0), default=1.0)),
             'rv_k_steps': np.clip(safe_convert(lbl.get('label_rv_k_steps')), 0, 5)
         }
         
         meta = data.get('metadata', {})
-        return x_stock, x_option, {'stock_id': int(meta.get('stock_id', 0)), 'sector_id': int(meta.get('sector_id', 0)), 'day_of_week': 0}, tgt, meta.get('timestamp', 0)
+        ts = meta.get('timestamp', 0)
+        day_of_week = 0
+        try:
+            day_of_week = int(pd.Timestamp(int(ts), tz='America/New_York').dayofweek) + 1
+        except Exception:
+            day_of_week = 0
+        return x_stock, x_option, {'stock_id': int(meta.get('stock_id', 0)), 'sector_id': int(meta.get('sector_id', 0)), 'day_of_week': day_of_week}, tgt, ts
 # [修改] Collate Fn 适配 Tuple 结构
 def collate_fn(batch):
     batch = [b for b in batch if b]
@@ -521,23 +531,21 @@ class StrategicOptionsLoss(nn.Module):
     def __init__(self):
         super().__init__()
         self.ce = nn.CrossEntropyLoss()
-        self.smooth_l1 = nn.HuberLoss(delta=1.0) # 对极端的 Gamma 爆发非常有效
+        self.smooth_l1 = nn.HuberLoss(delta=0.5)
         
     def forward(self, out, target):
         # 1. 波动率方向分类损失
         l_vdir = self.ce(out['logits_vdir'], target['vol_direction'])
         
-        # 2. Gamma P&L 回归损失
-        # 我们希望模型精确预测爆发的猛烈程度
-        l_gamma = self.smooth_l1(out['pred_gamma'], target['gamma_pnl_std'])
+        # 2. 未来 realized volatility
+        l_rv = self.smooth_l1(out['pred_rv'], target['rv_k_steps'])
         
-        # 3. IV-RV 偏差回归损失
-        l_spread = F.mse_loss(out['pred_spread'], target['iv_rv_spread'])
+        # 3. future RV - current IV，真正的波动率错价目标
+        l_vrp = self.smooth_l1(out['pred_vrp'], target['iv_rv_spread'])
         
-        # 加权总损失 (与 JSON 权重匹配)
-        total_loss = 5.0 * l_gamma + 2.0 * l_spread + 1.0 * l_vdir
+        total_loss = 2.0 * l_vrp + 1.0 * l_rv + 0.5 * l_vdir
         
-        return total_loss, l_gamma.item(), l_spread.item()
+        return total_loss, l_rv.item(), l_vrp.item()
 
 class StrategicAlphaLoss(nn.Module):
     def __init__(self):
@@ -572,7 +580,7 @@ class StrategicAlphaLoss(nn.Module):
 
 def validate(model, loader, device):
     model.eval()
-    p_gamma, t_gamma, p_spread, t_spread, tss = [], [], [], [], []
+    p_rv, t_rv, p_vrp, t_vrp, tss = [], [], [], [], []
     
     with torch.no_grad():
         for b in tqdm(loader, desc="Val", leave=False):
@@ -583,20 +591,20 @@ def validate(model, loader, device):
             
             o = model(x_stk, x_opt, s)
             
-            p_gamma.extend(o['pred_gamma'].cpu().numpy().flatten())
-            t_gamma.extend(t['gamma_pnl_std'].numpy().flatten())
+            p_rv.extend(o['pred_rv'].cpu().numpy().flatten())
+            t_rv.extend(t['rv_k_steps'].numpy().flatten())
             
-            p_spread.extend(o['pred_spread'].cpu().numpy().flatten())
-            t_spread.extend(t['iv_rv_spread'].numpy().flatten())
+            p_vrp.extend(o['pred_vrp'].cpu().numpy().flatten())
+            t_vrp.extend(t['iv_rv_spread'].numpy().flatten())
             
             tss.extend(ts)
             
-    df = pd.DataFrame({'p_g': p_gamma, 't_g': t_gamma, 'p_s': p_spread, 't_s': t_spread, 't': tss})
+    df = pd.DataFrame({'p_rv': p_rv, 't_rv': t_rv, 'p_vrp': p_vrp, 't_vrp': t_vrp, 't': tss})
     
     # 🛡️ [核心修复 1] 拦截空验证集，防止后续计算崩溃
     if len(df) == 0:
         logger.warning("🚨 [Val] 验证集 DataFrame 为空！请检查 val_dl 是否有数据。")
-        return {'ic_gamma': 0.0, 'ic_spread': 0.0}
+        return {'ic_rv': 0.0, 'ic_vrp': 0.0, 'ic_gamma': 0.0, 'ic_spread': 0.0}
     
     # 计算 Spearman IC
     def safe_spearman(x, col_p, col_t):
@@ -605,16 +613,16 @@ def validate(model, loader, device):
         return x[col_p].corr(x[col_t], method='spearman')
     
     # 🛡️ [核心修复 2] 显式转换类型，并使用安全的 groupby 方式
-    ic_g_series = df.groupby('t').apply(lambda x: safe_spearman(x, 'p_g', 't_g'))
-    ic_s_series = df.groupby('t').apply(lambda x: safe_spearman(x, 'p_s', 't_s'))
+    ic_rv_series = df.groupby('t').apply(lambda x: safe_spearman(x, 'p_rv', 't_rv'))
+    ic_vrp_series = df.groupby('t').apply(lambda x: safe_spearman(x, 'p_vrp', 't_vrp'))
     
     # 强制转换为 Python float
-    ic_gamma = float(ic_g_series.mean()) if not ic_g_series.empty else 0.0
-    ic_spread = float(ic_s_series.mean()) if not ic_s_series.empty else 0.0
+    ic_rv = float(ic_rv_series.mean()) if not ic_rv_series.empty else 0.0
+    ic_vrp = float(ic_vrp_series.mean()) if not ic_vrp_series.empty else 0.0
     
-    logger.info(f"[Val] Gamma PnL Mean={df['t_g'].mean():.6f}, Std={df['t_g'].std():.6f}")
-    logger.info(f"[Val] Gamma IC={ic_gamma:.4f} | Spread IC={ic_spread:.4f}")
-    return {'ic_gamma': ic_gamma, 'ic_spread': ic_spread}
+    logger.info(f"[Val] RV Mean={df['t_rv'].mean():.6f}, Std={df['t_rv'].std():.6f}")
+    logger.info(f"[Val] RV IC={ic_rv:.4f} | VRP IC={ic_vrp:.4f}")
+    return {'ic_rv': ic_rv, 'ic_vrp': ic_vrp, 'ic_gamma': ic_vrp, 'ic_spread': ic_vrp}
 
 def load_meta_info():
     try:
@@ -631,6 +639,15 @@ def load_meta_info():
         logger.error(f"Error loading meta info from PG: {e}")
         return {'max_stock_id': 18000, 'max_sector_id': 200}
 
+def migrate_option_state_dict(state_dict):
+    migrated = dict(state_dict)
+    for key, value in state_dict.items():
+        if key.startswith('head_spread.'):
+            suffix = key[len('head_spread.'):]
+            migrated.setdefault(f'head_vrp.{suffix}', value)
+            migrated.setdefault(f'head_rv.{suffix}', value)
+    return migrated
+
 def load_checkpoint(model, optimizer, scheduler, checkpoint_dir):
     latest_path = checkpoint_dir / "advanced_alpha_latest.pth"
     if not latest_path.exists():
@@ -642,10 +659,15 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_dir):
         # [核心修改] 添加 weights_only=False 以兼容 PyTorch 2.6+
         checkpoint = torch.load(latest_path, map_location='cpu', weights_only=False)
         
-        model.load_state_dict(checkpoint['state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        if scheduler and 'scheduler' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler'])
+        missing, unexpected = model.load_state_dict(migrate_option_state_dict(checkpoint['state_dict']), strict=False)
+        if missing or unexpected:
+            logger.info(f"Checkpoint loaded with migration | missing={len(missing)} unexpected={len(unexpected)}")
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            if scheduler and 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+        except Exception as opt_e:
+            logger.warning(f"Optimizer/Scheduler state skipped after head migration: {opt_e}")
         
         # 兼容旧版 best_ic 或新版 best_score
         best_score = checkpoint.get('best_score', checkpoint.get('best_ic', -1.0))
@@ -716,7 +738,7 @@ def fine_tune():
         logger.info(f"🔄 Loading Base Weights for Fine-Tuning: {best_ckpt_path}")
         checkpoint = torch.load(best_ckpt_path, map_location=device, weights_only=False)
         state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
-        model.load_state_dict(state_dict, strict=False)
+        model.load_state_dict(migrate_option_state_dict(state_dict), strict=False)
         best_ic = checkpoint.get('best_ic', -1.0)
         logger.info(f"✅ Base Weights Loaded. Previous Best IC: {best_ic:.4f}")
     else:
@@ -738,9 +760,9 @@ def fine_tune():
         'pos_wise_grn',    
         'post_pos_gate',   
         'fusion',          
-        'head_gamma',      # [修复] 替换旧的 head_dir
-        'head_spread',     # [修复] 替换旧的 head_rank
-        'head_vdir'        # [修复] 替换旧的 head_event
+        'head_rv',
+        'head_vrp',
+        'head_vdir'
     ]
     
     for name, param in model.named_parameters():
@@ -801,17 +823,15 @@ def fine_tune():
             scheduler.step()
             
             logs.append(loss.item())
-            pbar.set_postfix({'L': f"{loss.item():.4f}", 'gam': f"{lr_val:.4f}", 'spr': f"{lev_val:.4f}"})
+            pbar.set_postfix({'L': f"{loss.item():.4f}", 'rv': f"{lr_val:.4f}", 'vrp': f"{lev_val:.4f}"})
             
         metrics = validate(model, val_dl, device)
-        ic_gamma = metrics['ic_gamma']
-        ic_spread = metrics['ic_spread']
+        ic_rv = metrics['ic_rv']
+        ic_vrp = metrics['ic_vrp']
         
-        # [NEW] 复合评分：以预测 Gamma P&L 的 IC 为核心目标
-        # 可以适当加入 Spread IC 作为辅助
-        comb_score = ic_gamma + ic_spread * 0.2
+        comb_score = ic_vrp + ic_rv * 0.2
         
-        logger.info(f"Ep {ep}: Loss={np.mean(logs):.4f}, Gamma IC={ic_gamma:.4f}, Spread IC={ic_spread:.4f}, Score={comb_score:.4f}")
+        logger.info(f"Ep {ep}: Loss={np.mean(logs):.4f}, RV IC={ic_rv:.4f}, VRP IC={ic_vrp:.4f}, Score={comb_score:.4f}")
         
         is_best = comb_score > current_ft_best_ic
         if is_best: 
@@ -904,18 +924,16 @@ def main():
             optim.step()
             scheduler.step()
             logs.append(loss.item())
-            pbar.set_postfix({'L': f"{loss.item():.4f}", 'gam': f"{lr_val:.4f}", 'spr': f"{lev_val:.4f}"})
+            pbar.set_postfix({'L': f"{loss.item():.4f}", 'rv': f"{lr_val:.4f}", 'vrp': f"{lev_val:.4f}"})
             #pbar.set_postfix({'L': f"{loss.item():.2f}", 'rk': f"{lr_val:.3f}", 'ev': f"{lev_val:.3f}"})
             
         metrics = validate(model, val_dl, device)
-        ic_gamma = metrics['ic_gamma']
-        ic_spread = metrics['ic_spread']
+        ic_rv = metrics['ic_rv']
+        ic_vrp = metrics['ic_vrp']
         
-        # [NEW] 复合评分：以预测 Gamma P&L 的 IC 为核心目标
-        # 可以适当加入 Spread IC 作为辅助
-        comb_score = ic_gamma + ic_spread * 0.2
+        comb_score = ic_vrp + ic_rv * 0.2
         
-        logger.info(f"Ep {ep}: Loss={np.mean(logs):.4f}, Gamma IC={ic_gamma:.4f}, Spread IC={ic_spread:.4f}, Score={comb_score:.4f}")
+        logger.info(f"Ep {ep}: Loss={np.mean(logs):.4f}, RV IC={ic_rv:.4f}, VRP IC={ic_vrp:.4f}, Score={comb_score:.4f}")
         is_best = comb_score > best_ic
         if is_best: best_ic = comb_score
         save_checkpoint({

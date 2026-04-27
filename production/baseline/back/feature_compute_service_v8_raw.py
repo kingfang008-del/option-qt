@@ -45,7 +45,7 @@ from config import (
     REDIS_CFG as _REDIS_BASE, NY_TZ,
     STREAM_FUSED_MARKET, STREAM_INFERENCE,
     FEATURE_SERVICE_STATE_FILE as STATE_FILE, DB_DIR,
-    LOG_DIR, USE_5M_OPTION_DATA
+    LOG_DIR
 )
 
 logging.basicConfig(
@@ -608,7 +608,7 @@ class FeatureComputeService:
                 if r[0] not in sym_to_opt_row:
                     sym_to_opt_row[r[0]] = r[1]
 
-            if USE_5M_OPTION_DATA:
+            if True:
                 c.execute("""
                     SELECT symbol, buckets_json, ts
                     FROM option_snapshots_5m 
@@ -662,7 +662,7 @@ class FeatureComputeService:
                             self.warmup_needed[sym] = False
                     except: pass
                 
-                if USE_5M_OPTION_DATA:
+                if True:
                     opt_snap_5m = sym_to_opt_row_5m.get(sym)
                     if opt_snap_5m:
                         try:
@@ -997,14 +997,14 @@ class FeatureComputeService:
                         # Index 1-4, 5, 7, 10, 11 保持不变 (由引擎后续计算填充)
                     
                     self.option_snapshot[sym] = old_snap
-                    if USE_5M_OPTION_DATA:
+                    if True:
                         self.option_snapshot_5m[sym] = old_snap.copy()
                     
                     self.warmup_needed[sym] = False
     
                 # 5min Options (仅在 5 分钟整数倍时间点入库)
                 # 🚀 [Fix] 如果缺失 5m 专用桶数据，自动复用 1m 桶数据作为 Fallback
-                if USE_5M_OPTION_DATA:
+                if True:
                     buckets_5m = payload.get('buckets_5m')
                     if not buckets_5m or len(buckets_5m) == 0:
                         buckets_5m = payload.get('option_buckets_5m')
@@ -1582,7 +1582,6 @@ class FeatureComputeService:
         live_options = {}
         live_options_5m = {} 
         
-        from config import USE_5M_OPTION_DATA
         source_snap_5m_for_payload = getattr(self, 'frozen_option_snapshot_5m', getattr(self, 'option_snapshot_5m', {})) if is_new_minute else getattr(self, 'option_snapshot_5m', {})
 
         for sym in batch_symbols:
@@ -1590,7 +1589,7 @@ class FeatureComputeService:
                 'buckets': source_opt_buckets.get(sym, []),
                 'contracts': getattr(self, 'latest_opt_contracts', {}).get(sym, [])
             }
-            if USE_5M_OPTION_DATA:
+            if True:
                 snap_5m = source_snap_5m_for_payload.get(sym)
                 if snap_5m is not None:
                     live_options_5m[sym] = {
@@ -2023,7 +2022,7 @@ class FeatureComputeService:
                         'buckets': source_opt_buckets.get(sym, []),
                         'contracts': getattr(self, 'latest_opt_contracts', {}).get(sym, [])
                     }
-                    if USE_5M_OPTION_DATA:
+                    if True:
                         snap_5m = source_snap_5m_for_payload.get(sym)
 
                         if snap_5m is not None:

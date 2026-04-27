@@ -63,6 +63,57 @@ def safe_col(group, col, default_val, dtype=np.float32):
     return np.full(len(group), default_val, dtype=dtype)
 
 
+def _float_env(name: str, default_val: float) -> float:
+    try:
+        return float(os.environ.get(name, default_val))
+    except (TypeError, ValueError):
+        return float(default_val)
+
+
+def merge_asof_per_symbol(left, right, value_cols, *, tolerance=None):
+    """Backward-asof join per symbol while preserving the caller's row order."""
+    left = left.copy()
+    if '_row_order' not in left.columns:
+        left['_row_order'] = np.arange(len(left), dtype=np.int64)
+
+    value_cols = [c for c in value_cols if c in right.columns]
+    if not value_cols or right.empty:
+        out = left.copy()
+        for col in value_cols:
+            out[col] = np.nan
+        return out.sort_values('_row_order').reset_index(drop=True)
+
+    right = (
+        right[['ts', 'symbol'] + value_cols]
+        .dropna(subset=['ts', 'symbol'])
+        .drop_duplicates(['ts', 'symbol'], keep='last')
+    )
+
+    parts = []
+    for sym, left_g in left.groupby('symbol', sort=False):
+        left_g = left_g.sort_values('ts')
+        right_g = right[right['symbol'] == sym].sort_values('ts')[['ts'] + value_cols]
+        if right_g.empty:
+            merged = left_g.copy()
+            for col in value_cols:
+                merged[col] = np.nan
+        else:
+            merged = pd.merge_asof(
+                left_g,
+                right_g,
+                on='ts',
+                direction='backward',
+                tolerance=tolerance,
+            )
+        parts.append(merged)
+
+    return (
+        pd.concat(parts, ignore_index=True)
+        .sort_values('_row_order')
+        .reset_index(drop=True)
+    )
+
+
 def build_option_arrays(group):
     put_prices, call_prices = [], []
     put_ks, call_ks = [], []
@@ -112,6 +163,43 @@ def build_option_arrays(group):
         'call_bids': np.array(call_bids, dtype=np.float32),
         'call_asks': np.array(call_asks, dtype=np.float32),
         'symbols_with_data': symbols_with_data,
+    }
+
+
+def build_replay_packet(group, ts_val, is_new_minute=False):
+    symbols_list = group['symbol'].tolist()
+    opt = build_option_arrays(group)
+    return {
+        'symbols': symbols_list,
+        'ts': float(ts_val),
+        'stock_price': safe_col(group, 'close', 0.0),
+        'fast_vol': safe_col(group, 'fast_vol', 0.0),
+        'precalc_alpha': safe_col(group, 'alpha_score', 0.0),
+        'alpha_label_ts': safe_col(group, 'alpha_label_ts', 0.0, dtype=np.float64),
+        'alpha_available_ts': np.full(len(group), float(ts_val), dtype=np.float64),
+        'spy_roc_5min': safe_col(group, 'spy_roc_5min', 0.0),
+        'qqq_roc_5min': safe_col(group, 'qqq_roc_5min', 0.0),
+        'is_new_minute': bool(is_new_minute),
+        'symbols_with_data': opt['symbols_with_data'],
+        'feed_put_price': opt['put_prices'],
+        'feed_call_price': opt['call_prices'],
+        'feed_put_k': opt['put_ks'],
+        'feed_call_k': opt['call_ks'],
+        'feed_put_iv': opt['put_ivs'],
+        'feed_call_iv': opt['call_ivs'],
+        'feed_put_bid': opt['put_bids'],
+        'feed_put_ask': opt['put_asks'],
+        'feed_call_bid': opt['call_bids'],
+        'feed_call_ask': opt['call_asks'],
+        'feed_put_vol': np.ones(len(group), dtype=np.float32),
+        'feed_call_vol': np.ones(len(group), dtype=np.float32),
+        'feed_call_bid_size': np.full(len(group), 100.0, dtype=np.float32),
+        'feed_call_ask_size': np.full(len(group), 100.0, dtype=np.float32),
+        'feed_put_bid_size': np.full(len(group), 100.0, dtype=np.float32),
+        'feed_put_ask_size': np.full(len(group), 100.0, dtype=np.float32),
+        'slow_1m': np.zeros((len(symbols_list), 30, 1), dtype=np.float32),
+        'feed_put_id': [""] * len(group),
+        'feed_call_id': [""] * len(group),
     }
 
 
@@ -190,41 +278,98 @@ async def main():
     cur.close()
     conn.close()
 
-    df_s['ts'] = df_s['ts'].astype(float)
-    df_idx = df_s[df_s['symbol'].isin(['SPY', 'QQQ'])].pivot(index='ts', columns='symbol', values='close')
+    for df_tmp in [df_a, df_s, df_o]:
+        df_tmp['ts'] = df_tmp['ts'].astype(float)
+        df_tmp['symbol'] = df_tmp['symbol'].astype(str)
 
+    # PG 1s partitions are sparse event streams. Build a dense replay clock first
+    # so every signal frame sees the same fixed symbol universe.
     unique_ts = sorted(df_s['ts'].unique())
-    df_roc_map = pd.DataFrame(index=unique_ts)
+    if not unique_ts:
+        logger.error("❌ market_bars_1s partition is EMPTY! Check PG partitions.")
+        return
+
+    df_idx = (
+        df_s[df_s['symbol'].isin(['SPY', 'QQQ'])]
+        .drop_duplicates(['ts', 'symbol'], keep='last')
+        .pivot(index='ts', columns='symbol', values='close')
+        .reindex(unique_ts)
+        .ffill()
+    )
+    df_roc_map = pd.DataFrame({'ts': unique_ts})
     for col in ['SPY', 'QQQ']:
         if col in df_idx.columns:
-            df_roc_map[f'{col.lower()}_roc_5min'] = df_idx[col].pct_change(periods=300).fillna(0.0)
+            df_roc_map[f'{col.lower()}_roc_5min'] = df_idx[col].pct_change(periods=300).fillna(0.0).values
         else:
             df_roc_map[f'{col.lower()}_roc_5min'] = 0.0
-    df_s = df_s.merge(df_roc_map.reset_index().rename(columns={'index': 'ts'}), on='ts', how='left')
 
     if symbols:
         df_a = df_a[df_a['symbol'].isin(symbols)]
         df_s = df_s[df_s['symbol'].isin(symbols)]
         df_o = df_o[df_o['symbol'].isin(symbols)]
 
-    for df_tmp in [df_a, df_s, df_o]:
-        df_tmp['ts'] = df_tmp['ts'].astype(float)
-        df_tmp['symbol'] = df_tmp['symbol'].astype(str)
+    dense_index = pd.MultiIndex.from_product([unique_ts, symbols], names=['ts', 'symbol'])
+    dense_base = dense_index.to_frame(index=False)
+    dense_base['_row_order'] = np.arange(len(dense_base), dtype=np.int64)
+
+    stock_tolerance = _float_env('REPLAY_1S_STOCK_ASOF_TOLERANCE_SEC', 300.0)
+    option_tolerance = _float_env('REPLAY_1S_OPTION_ASOF_TOLERANCE_SEC', 60.0)
+    alpha_tolerance = _float_env('REPLAY_1S_ALPHA_ASOF_TOLERANCE_SEC', 120.0)
+
+    stock_cols = [c for c in ['open', 'high', 'low', 'close', 'volume'] if c in df_s.columns]
+    df_s_dense = merge_asof_per_symbol(
+        dense_base,
+        df_s,
+        stock_cols,
+        tolerance=None if stock_tolerance <= 0 else stock_tolerance,
+    )
+    df_s_dense = df_s_dense.merge(df_roc_map, on='ts', how='left')
 
     df_a['alpha_label_ts'] = df_a['ts']
     df_a['ts'] = df_a['ts'] + ALPHA_AVAILABLE_DELAY_SECONDS
     df_a = df_a.sort_values('ts')
-    df_s = df_s.sort_values('ts')
     df_o = df_o.sort_values('ts')
 
-    df_market = pd.merge_asof(df_s, df_o, on='ts', by='symbol', direction='backward', tolerance=2)
-    df = pd.merge_asof(df_market, df_a, on='ts', by='symbol', direction='backward', tolerance=120)
+    df_market = merge_asof_per_symbol(
+        df_s_dense,
+        df_o,
+        ['buckets_json'],
+        tolerance=None if option_tolerance <= 0 else option_tolerance,
+    )
+    df = merge_asof_per_symbol(
+        df_market,
+        df_a,
+        ['alpha_score', 'fast_vol', 'alpha_label_ts'],
+        tolerance=None if alpha_tolerance <= 0 else alpha_tolerance,
+    )
+    df = df.sort_values(['ts', '_row_order']).reset_index(drop=True)
     if df.empty:
         logger.error("❌ Merged dataset is EMPTY! Check PG partitions.")
         return
 
-    grouped = df.sort_values('ts', ascending=True).groupby('ts')
+    grouped = df.sort_values(['ts', '_row_order'], ascending=True).groupby('ts')
     unique_groups = df['ts'].nunique()
+    expected_symbol_count = len(symbols)
+    symbol_rows_per_tick = df.groupby('ts')['symbol'].nunique()
+    incomplete_ticks = int((symbol_rows_per_tick < expected_symbol_count).sum())
+    missing_stock_rows = int(df['close'].isna().sum()) if 'close' in df.columns else 0
+    missing_option_rows = int(df['buckets_json'].isna().sum()) if 'buckets_json' in df.columns else 0
+    missing_alpha_rows = int(df['alpha_score'].isna().sum()) if 'alpha_score' in df.columns else 0
+    logger.info(
+        "🧩 [REPLAY_S2_PG_1S-DENSE] ticks=%d symbols=%d rows=%d | "
+        "incomplete_ticks=%d stock_missing_rows=%d option_missing_rows=%d alpha_missing_rows=%d | "
+        "tol(stock/option/alpha)=%.0fs/%.0fs/%.0fs",
+        int(unique_groups),
+        int(expected_symbol_count),
+        int(len(df)),
+        incomplete_ticks,
+        missing_stock_rows,
+        missing_option_rows,
+        missing_alpha_rows,
+        stock_tolerance,
+        option_tolerance,
+        alpha_tolerance,
+    )
 
     logger.info(f"🚀 Starting S2 PG 1s replay bus ({unique_groups} ticks)...")
     start_time = time.time()
@@ -241,45 +386,18 @@ async def main():
         is_new_minute = (last_minute != current_minute)
         last_minute = current_minute
 
-        symbols_list = group['symbol'].tolist()
-        opt = build_option_arrays(group)
-        packet = {
-            'symbols': symbols_list,
-            'ts': float(ts_val),
-            'stock_price': group['close'].values.astype(np.float32),
-            'fast_vol': safe_col(group, 'fast_vol', 0.0),
-            'precalc_alpha': safe_col(group, 'alpha_score', 0.0),
-            'alpha_label_ts': safe_col(group, 'alpha_label_ts', 0.0, dtype=np.float64),
-            'alpha_available_ts': np.full(len(group), float(ts_val), dtype=np.float64),
-            'spy_roc_5min': safe_col(group, 'spy_roc_5min', 0.0),
-            'qqq_roc_5min': safe_col(group, 'qqq_roc_5min', 0.0),
-            'is_new_minute': is_new_minute,
-            'symbols_with_data': opt['symbols_with_data'],
-            'feed_put_price': opt['put_prices'],
-            'feed_call_price': opt['call_prices'],
-            'feed_put_k': opt['put_ks'],
-            'feed_call_k': opt['call_ks'],
-            'feed_put_iv': opt['put_ivs'],
-            'feed_call_iv': opt['call_ivs'],
-            'feed_put_bid': opt['put_bids'],
-            'feed_put_ask': opt['put_asks'],
-            'feed_call_bid': opt['call_bids'],
-            'feed_call_ask': opt['call_asks'],
-            'feed_put_vol': np.ones(len(group), dtype=np.float32),
-            'feed_call_vol': np.ones(len(group), dtype=np.float32),
-            'feed_call_bid_size': np.full(len(group), 100.0, dtype=np.float32),
-            'feed_call_ask_size': np.full(len(group), 100.0, dtype=np.float32),
-            'feed_put_bid_size': np.full(len(group), 100.0, dtype=np.float32),
-            'feed_put_ask_size': np.full(len(group), 100.0, dtype=np.float32),
-            'slow_1m': np.zeros((len(symbols_list), 30, 1), dtype=np.float32),
-            'feed_put_id': [""] * len(group),
-            'feed_call_id': [""] * len(group),
-        }
+        packet = build_replay_packet(group, ts_val, is_new_minute=is_new_minute)
 
         if is_new_minute:
             sig_count = int((packet['precalc_alpha'] != 0).sum())
             if sig_count > 0:
-                logger.info(f"📡 [REPLAY_S2_PG_1S] Minute {current_minute} | Active Signals: {sig_count}")
+                logger.info(
+                    "📡 [REPLAY_S2_PG_1S] Minute %d | Active Signals: %d | symbols=%d | opt_symbols=%d",
+                    current_minute,
+                    sig_count,
+                    len(packet['symbols']),
+                    len(packet['symbols_with_data']),
+                )
 
         await signal_engine.process_batch(packet)
         mock_ibkr.record_market_data(packet, alphas=packet['precalc_alpha'])

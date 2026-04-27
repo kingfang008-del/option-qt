@@ -7,9 +7,7 @@ from torch.utils.data import DataLoader
 import logging
 from pathlib import Path
 import json
-# 导入你模型定义文件中的类
-# 假设你的模型文件名是 trading_tft_stock_embed_new.py
-from trading_tft_stock_embed_new import AdvancedAlphaNet, UnifiedLMDBDataset, collate_fn
+from trading_tft_stock_embed_option import AdvancedAlphaNet, UnifiedLMDBDataset, collate_fn, migrate_option_state_dict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger("Backtest")
@@ -66,7 +64,7 @@ def run_oos_backtest(model_path, db_path, config_path, start_date, end_date, dev
         state_dict = checkpoint
         logger.info("直接从 checkpoint 加载 state_dict...")
 
-    model.load_state_dict(state_dict)
+    model.load_state_dict(migrate_option_state_dict(state_dict), strict=False)
     # -----------------------
 
     model.eval()
@@ -88,15 +86,18 @@ def run_oos_backtest(model_path, db_path, config_path, start_date, end_date, dev
             # 记录结果
             res = pd.DataFrame({
                 'timestamp': ts,
-                'pred_gamma': out['pred_gamma'].cpu().numpy(),
-                'true_gamma': t['gamma_pnl_std'].numpy(),
-                'pred_spread': out['pred_spread'].cpu().numpy(),
-                'true_spread': t['iv_rv_spread'].numpy()
+                'pred_rv': out['pred_rv'].cpu().numpy(),
+                'true_rv': t['rv_k_steps'].numpy(),
+                'pred_vrp': out['pred_vrp'].cpu().numpy(),
+                'true_vrp': t['iv_rv_spread'].numpy()
             })
             all_results.append(res)
 
+    if not all_results:
+        raise ValueError("筛选后的样本为空，请检查 LMDB 时间戳单位、日期范围和数据路径。")
+
     df = pd.concat(all_results)
-    df['date'] = pd.to_datetime(df['timestamp']).dt.date
+    df['date'] = pd.to_datetime(df['timestamp'], unit='ns', utc=True).dt.tz_convert('America/New_York').dt.date
     
     # 4. IC 核心验证逻辑
     def calc_ic(group, p_col, t_col):
@@ -105,15 +106,15 @@ def run_oos_backtest(model_path, db_path, config_path, start_date, end_date, dev
 
     # 按日计算 IC
     daily_ic = df.groupby('date').apply(lambda x: pd.Series({
-        'gamma_ic': calc_ic(x, 'pred_gamma', 'true_gamma'),
-        'spread_ic': calc_ic(x, 'pred_spread', 'true_spread')
+        'rv_ic': calc_ic(x, 'pred_rv', 'true_rv'),
+        'vrp_ic': calc_ic(x, 'pred_vrp', 'true_vrp')
     }))
 
     # 5. 打印报表
     print("\n" + "="*40)
     print(f"📊 样本外 IC 验证报告 ({start_date} - {end_date})")
     print("-" * 40)
-    for col in ['gamma_ic', 'spread_ic']:
+    for col in ['rv_ic', 'vrp_ic']:
         ic_mean = daily_ic[col].mean()
         ic_std = daily_ic[col].std()
         ic_ir = ic_mean / ic_std if ic_std > 0 else 0
@@ -124,17 +125,16 @@ def run_oos_backtest(model_path, db_path, config_path, start_date, end_date, dev
         print(f"  Win Rate (IC>0): {(daily_ic[col] > 0).mean():.2%}")
     print("="*40 + "\n")
 
-    # 6. 简易 P&L 模拟 (验证 Gamma 信号的盈利潜力)
-    # 策略：每天做多 pred_gamma 最强的 Top 10% 标的
-    df['gamma_rank'] = df.groupby('date')['pred_gamma'].rank(pct=True)
-    strategy_returns = df[df['gamma_rank'] > 0.90].groupby('date')['true_gamma'].mean()
+    # 6. 简易 VRP 模拟：每天做多 pred_vrp 最强的 Top 10% 标的
+    df['vrp_rank'] = df.groupby('date')['pred_vrp'].rank(pct=True)
+    strategy_returns = df[df['vrp_rank'] > 0.90].groupby('date')['true_vrp'].mean()
     
     # 绘图
     plt.figure(figsize=(12, 6))
     plt.subplot(1, 2, 1)
-    daily_ic['gamma_ic'].cumsum().plot(title="Cumulative Gamma IC")
+    daily_ic['vrp_ic'].cumsum().plot(title="Cumulative VRP IC")
     plt.subplot(1, 2, 2)
-    strategy_returns.cumsum().plot(title="Simulated Strategy Returns (Top 10% Gamma)")
+    strategy_returns.cumsum().plot(title="Simulated Strategy Returns (Top 10% VRP)")
     plt.tight_layout()
     plt.savefig("backtest_results.png")
     plt.show()

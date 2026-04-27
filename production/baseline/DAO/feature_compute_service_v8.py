@@ -54,7 +54,7 @@ from config import (
     STREAM_FUSED_MARKET, STREAM_INFERENCE,
     get_feature_service_state_file,
     GROUP_FEATURE,
-    LOG_DIR, RUN_MODE as CONFIG_RUN_MODE, USE_5M_OPTION_DATA, NON_TRADABLE_SYMBOLS,
+    LOG_DIR, RUN_MODE as CONFIG_RUN_MODE, NON_TRADABLE_SYMBOLS,
     get_option_gate_profile,
      
 )
@@ -713,10 +713,23 @@ class FeatureComputeService:
             return []
         batch_syms = compute_payload.get('symbols', []) or []
         feats_dict = compute_payload.get('features_dict', {}) or {}
+        calendar_debug_vals = {}
+        try:
+            dt_ny = datetime.fromtimestamp(float(compute_payload.get('ts', 0.0) or 0.0), NY_TZ)
+            calendar_debug_vals = {
+                "hour": float(dt_ny.hour),
+                "day_of_week": float(dt_ny.weekday()),
+                "minute": float(dt_ny.minute),
+            }
+        except Exception:
+            calendar_debug_vals = {}
         slow_data_list = []
         for i, sym in enumerate(batch_syms):
             vals = []
             for fn in self.slow_feat_names:
+                if fn in calendar_debug_vals:
+                    vals.append(float(calendar_debug_vals[fn]))
+                    continue
                 f_tensor = feats_dict.get(fn)
                 if f_tensor is not None and i < f_tensor.shape[0]:
                     vals.append(float(f_tensor[i, -1]))
@@ -1239,13 +1252,12 @@ class FeatureComputeService:
                         if is_new_minute and hasattr(self, 'committed_latest_opt_buckets'):
                             self.committed_latest_opt_buckets[sym] = np.asarray(enriched, dtype=np.float32).copy()
 
-
                         try:
                             atm_c_iv = float(enriched[2, 7]) if enriched.shape[0] > 2 else 0.0
                             atm_p_iv = float(enriched[0, 7]) if enriched.shape[0] > 0 else 0.0
-                            
+
                             payload = {
-                                'buckets': enriched.tolist() if hasattr(enriched, 'tolist') else enriched, 
+                                'buckets': enriched.tolist() if hasattr(enriched, 'tolist') else enriched,
                                 'contracts': source_contracts.get(sym, []), # 🚀 使用严密对应的合约
                                 'atm_c_iv': atm_c_iv,
                                 'atm_p_iv': atm_p_iv
@@ -1253,6 +1265,14 @@ class FeatureComputeService:
                             self.r.hset(f"BAR_OPT:1M:{sym}", str(int(alpha_label_ts)), json.dumps(payload))
                         except Exception as e:
                             logger.error(f"❌ [Redis Write Error] Failed to write optic bar for {sym}: {e}")
+
+                    enriched_5m = res_sym.get('updated_buckets_5m')
+                    if enriched_5m is not None:
+                        enriched_5m_arr = np.asarray(enriched_5m, dtype=np.float32).copy()
+                        if hasattr(self, 'option_snapshot_5m'):
+                            self.option_snapshot_5m[sym] = enriched_5m_arr
+                        if is_new_minute and hasattr(self, 'frozen_option_snapshot_5m'):
+                            self.frozen_option_snapshot_5m[sym] = enriched_5m_arr.copy()
                     
                     # Dry 旁路时也必须填充有效特征，避免“空向量入模”。
                     if is_valid or dry_mode:
@@ -1461,13 +1481,12 @@ class FeatureComputeService:
                 # 下游持久化据此决定是否允许写入 option_snapshots_1m
                 'greeks_ready': bool(greeks_ready),
             }
-            if USE_5M_OPTION_DATA:
-                snap_5m = source_snap_5m_for_payload.get(sym)
-                if snap_5m is not None:
-                    live_options_5m[sym] = {
-                        'buckets': snap_5m.tolist() if isinstance(snap_5m, np.ndarray) else snap_5m,
-                        'contracts': getattr(self, 'latest_opt_contracts', {}).get(sym, []) # 5m暂保持宽松要求
-                    }
+            snap_5m = source_snap_5m_for_payload.get(sym)
+            if snap_5m is not None:
+                live_options_5m[sym] = {
+                    'buckets': snap_5m.tolist() if isinstance(snap_5m, np.ndarray) else snap_5m,
+                    'contracts': getattr(self, 'latest_opt_contracts', {}).get(sym, []) # 5m暂保持宽松要求
+                }
         
         # 🚀 [Warmup 对齐修复 v2]
         # 仅统计 RTH(09:30-16:00) 的分钟历史，并对 alpha_label_ts 的“回退 1 分钟标签”做补偿。

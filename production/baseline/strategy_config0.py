@@ -34,7 +34,7 @@ class StrategyConfig:
     # V0 逻辑: VOL_MIN 为 -1 (更宽松)，ALPHA_ENTRY 为 0.85
     VOL_MIN_Z: float = -1          
     VOL_MAX_Z: float = 4.0           
-    ALPHA_ENTRY_THRESHOLD: float = 0.6
+    ALPHA_ENTRY_THRESHOLD: float = 0.4
     ALPHA_ENTRY_STRICT: float = 1.2
     MIN_CS_ALPHA_Z: float = 0.5           
     
@@ -80,6 +80,8 @@ class StrategyConfig:
     ENTRY_PRIORITY_MACD_FLOOR: float = 0.01
     ENTRY_PRIORITY_MACD_BONUS: float = 0.20
     ENTRY_PRIORITY_MIN_CONFIRMATIONS: int = 2
+    # CALL/PUT 分池排序：避免强负 alpha PUT 与慢涨 CALL 在同一个 abs(alpha) 池里抢光入场名额。
+    ENTRY_DIRECTION_SPLIT_POOL_ENABLED: bool = True
     
     MIN_TREND_ROC: float = 0.0001
     MAX_TREND_ROC: float = 0.0030
@@ -134,12 +136,60 @@ class StrategyConfig:
     NO_MOMENTUM_MIN_MAX_ROI: float = 0.02
 
     # ================= 10. Execution Parameters =================
-    SLIPPAGE_PCT: float = 0.001
+    SLIPPAGE_PCT: float = 0.002
     LIMIT_BUFFER_ENTRY: float = 1.03
     LIMIT_BUFFER_EXIT: float = 0.97
     ORDER_TIMEOUT_SECONDS: int = 3
     ORDER_MAX_RETRIES: int = 3
     EXIT_ORDER_MAX_RETRIES: int = 10
+    EXIT_UNFILLED_RETRY_FRAMES: int = 3
+    # 平仓快速重报: 节奏放慢到 IB 端能稳定 ack 的节拍 (cancel→ack ~150ms / new→ack ~150ms)。
+    # 0.25s 间隔在实盘会因为 cancel 还没 ack 就再下单, 触发 IB 拒绝或重复挂单。
+    # 普通 fast_requote 以低滑点为优先: 挂在 bid 附近等待成交, 不主动跌破 bid。
+    # 真正风险止损由 STOP_EXIT_FAST_* 接管, 会使用更激进的价格和 MKT fallback。
+    EXIT_FAST_REQUOTE_MODE_ENABLED: bool = True
+    EXIT_FAST_REQUOTE_MAX_SECONDS: float = 3.0
+    EXIT_FAST_REQUOTE_INTERVAL_SECONDS: float = 0.40
+    EXIT_FAST_REQUOTE_CANCEL_SETTLE_SECONDS: float = 0.20
+    EXIT_FAST_REQUOTE_INITIAL_BID_OFFSET: float = 0.0
+    EXIT_FAST_REQUOTE_STEP: float = 0.01
+    EXIT_FAST_REQUOTE_BASE_DISCOUNT: float = 0.03
+    EXIT_FAST_REQUOTE_DISCOUNT: float = 0.01
+    EXIT_FAST_REQUOTE_MIN_BID_RATIO: float = 0.97
+    EXIT_FAST_REQUOTE_MAX_ABS_DISCOUNT: float = 0.05
+    # 止损专用快速模式: 节奏比通用 fast_requote 更紧凑 (0.5s/次, 6 次), 价格更激进。
+    # 触底后强制升级到 MKT 兜底, 避免亏损一直扩大。
+    STOP_EXIT_FAST_MODE_ENABLED: bool = True
+    STOP_EXIT_FAST_MAX_SECONDS: float = 3.0
+    STOP_EXIT_FAST_INTERVAL_SECONDS: float = 0.50
+    STOP_EXIT_FAST_CANCEL_SETTLE_SECONDS: float = 0.30
+    STOP_EXIT_FAST_INITIAL_BID_OFFSET: float = 0.01
+    STOP_EXIT_FAST_REQUOTE_STEP: float = 0.03
+    STOP_EXIT_FAST_BASE_DISCOUNT: float = 0.06
+    STOP_EXIT_FAST_REQUOTE_DISCOUNT: float = 0.03
+    STOP_EXIT_FAST_MIN_BID_RATIO: float = 0.90
+    STOP_EXIT_FAST_MAX_ABS_DISCOUNT: float = 0.15
+    STOP_EXIT_FAST_MKT_FALLBACK_ENABLED: bool = True
+    STOP_EXIT_FAST_MKT_FALLBACK_WAIT_SECONDS: float = 2.0
+    STOP_EXIT_FAST_FLOOR_STREAK_THRESHOLD: int = 2
+    # 兼容旧字段(已被 INTERVAL_SECONDS / MAX_SECONDS 取代, 保留以防外部读取)
+    STOP_EXIT_FAST_MAX_RETRIES: int = 6
+    STOP_EXIT_FAST_WAIT_SECONDS: int = 1
+    # 入场快速重报: 与平仓节奏对齐, 让追价跟得上 ask 上跳。
+    ENTRY_FAST_REQUOTE_MODE_ENABLED: bool = True
+    ENTRY_FAST_REQUOTE_MAX_SECONDS: float = 3.0
+    ENTRY_FAST_REQUOTE_INTERVAL_SECONDS: float = 0.40
+    ENTRY_FAST_REQUOTE_CANCEL_SETTLE_SECONDS: float = 0.20
+    # 冰山子单刷新 quote 开关: 每个 chunk 起点都重新读 bid/ask, 避免锁死旧价。
+    ENTRY_ICEBERG_REFRESH_QUOTE_PER_CHUNK: bool = True
+    # IBKR TWS API hard limit is commonly 50 msg/s; keep headroom for callbacks/manual actions.
+    # 35 留足余量给 marketData/accountUpdate/手工操作; high priority 约 40 msg/s,
+    # 并由 MAX_MESSAGES_PER_SECOND 硬封顶，避免贴近 IBKR 50 msg/s pacing 限制。
+    IBKR_API_MAX_MESSAGES_PER_SECOND: int = 35
+    IBKR_API_PACING_WINDOW_SECONDS: float = 1.0
+    IBKR_API_PACING_SAFETY_SLEEP: float = 0.02
+    IBKR_API_HIGH_PRIORITY_BOOST: float = 1.15
+    IBKR_API_HIGH_PRIORITY_MAX_MESSAGES_PER_SECOND: int = 45
 
     # ================= 11. Profit Guards (Universal Ladder) =================
     # 旧版 V0 的第一档是 15% 才开始保利润，很多单到不了这里就被回撤吃掉。
@@ -179,7 +229,7 @@ class StrategyConfig:
     
     # ================= 13. Inactivity & Small Gain =================
     ZOMBIE_EXIT_MINS: int = 20
-    COUNTER_TREND_MAX_MINS: int = 5
+    COUNTER_TREND_MAX_MINS: int = 10
     INDEX_REVERSAL_EXIT_ENABLED: bool = True
     SMALL_GAIN_THRESHOLD: float = 0.08
     SMALL_GAIN_MINS: int = 15

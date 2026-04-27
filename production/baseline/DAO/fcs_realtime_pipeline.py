@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
 
-from config import NY_TZ, RUN_MODE as CONFIG_RUN_MODE, USE_5M_OPTION_DATA
+from config import NY_TZ, RUN_MODE as CONFIG_RUN_MODE
 
 
 logger = logging.getLogger("FeatService")
@@ -276,10 +276,9 @@ class FCSRealtimePipeline:
                         svc.last_option_update_ts[sym] = float(ts)
                         if not is_preaggregated_1m:
                             svc.option_minute_agg.update(sym, curr_minute, arr, c_data, update_ts=ts)
-                        if USE_5M_OPTION_DATA:
-                            if not hasattr(svc, 'option_snapshot_5m'):
-                                svc.option_snapshot_5m = {}
-                            svc.option_snapshot_5m[sym] = arr.copy()
+                        if not hasattr(svc, 'option_snapshot_5m'):
+                            svc.option_snapshot_5m = {}
+                        svc.option_snapshot_5m[sym] = arr.copy()
                         if is_preaggregated_1m:
                             if not hasattr(svc, 'frozen_option_snapshot'):
                                 svc.frozen_option_snapshot = {}
@@ -291,25 +290,24 @@ class FCSRealtimePipeline:
                             svc.frozen_latest_opt_contracts[sym] = list(c_data) if c_data else []
                         svc.warmup_needed[sym] = False
 
-                if USE_5M_OPTION_DATA:
-                    buckets_5m = payload.get('buckets_5m', payload.get('option_buckets_5m'))
-                    if (not buckets_5m or len(buckets_5m) == 0) and dt_ny.minute % 5 == 0:
-                        buckets_5m = payload.get('buckets', payload.get('option_buckets'))
-                    if buckets_5m and len(buckets_5m) > 0 and dt_ny.minute % 5 == 0:
-                        arr = np.array(buckets_5m, dtype=np.float32)
-                        if arr.shape[1] < 12:
-                            arr = np.hstack([arr, np.zeros((arr.shape[0], 12 - arr.shape[1]), dtype=np.float32)])
-                        if arr.shape[0] < 6:
-                            arr = np.vstack([arr, np.zeros((6 - arr.shape[0], 12), dtype=np.float32)])
-                        valid_quote_mask_5m = (arr[:, 8] > 0) & (arr[:, 9] > 0)
-                        arr[valid_quote_mask_5m, 0] = (arr[valid_quote_mask_5m, 8] + arr[valid_quote_mask_5m, 9]) / 2.0
-                        if np.sum(arr[:, 6]) > 0.0001:
-                            svc.last_cum_volume_5m[sym] = arr[:, 6].copy()
-                            if not hasattr(svc, 'option_snapshot_5m'):
-                                svc.option_snapshot_5m = {}
-                            svc.option_snapshot_5m[sym] = arr
-                            if is_preaggregated_1m and hasattr(svc, 'frozen_option_snapshot_5m'):
-                                svc.frozen_option_snapshot_5m[sym] = arr.copy()
+                buckets_5m = payload.get('buckets_5m', payload.get('option_buckets_5m'))
+                if (not buckets_5m or len(buckets_5m) == 0) and dt_ny.minute % 5 == 0:
+                    buckets_5m = payload.get('buckets', payload.get('option_buckets'))
+                if buckets_5m and len(buckets_5m) > 0 and dt_ny.minute % 5 == 0:
+                    arr = np.array(buckets_5m, dtype=np.float32)
+                    if arr.shape[1] < 12:
+                        arr = np.hstack([arr, np.zeros((arr.shape[0], 12 - arr.shape[1]), dtype=np.float32)])
+                    if arr.shape[0] < 6:
+                        arr = np.vstack([arr, np.zeros((6 - arr.shape[0], 12), dtype=np.float32)])
+                    valid_quote_mask_5m = (arr[:, 8] > 0) & (arr[:, 9] > 0)
+                    arr[valid_quote_mask_5m, 0] = (arr[valid_quote_mask_5m, 8] + arr[valid_quote_mask_5m, 9]) / 2.0
+                    if np.sum(arr[:, 6]) > 0.0001:
+                        svc.last_cum_volume_5m[sym] = arr[:, 6].copy()
+                        if not hasattr(svc, 'option_snapshot_5m'):
+                            svc.option_snapshot_5m = {}
+                        svc.option_snapshot_5m[sym] = arr
+                        if is_preaggregated_1m and hasattr(svc, 'frozen_option_snapshot_5m'):
+                            svc.frozen_option_snapshot_5m[sym] = arr.copy()
 
                 stock_close = float(stock.get('close', stock.get('c', 0.0))) if stock else 0.0
                 if (not is_preaggregated_1m) and stock_close > 0:

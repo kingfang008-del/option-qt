@@ -146,7 +146,11 @@ def test_exit_counter_trend_guard_can_be_disabled() -> None:
     core = StrategyCoreV0(cfg)
     ctx = _exit_ctx(held_mins=6.0, index_trend=-1, entry_index_trend=-1)
     sig = core._check_exit_pre_conditions(ctx, ctx["holding"])
-    assert sig and "CT_TIMEOUT" in str(sig.get("reason", "")), f"默认应触发 CT_TIMEOUT，实际: {sig}"
+    assert sig is None, f"默认 10 分钟前不应触发 CT_TIMEOUT，实际: {sig}"
+
+    ctx = _exit_ctx(held_mins=10.0, index_trend=-1, entry_index_trend=-1)
+    sig = core._check_exit_pre_conditions(ctx, ctx["holding"])
+    assert sig and "CT_TIMEOUT" in str(sig.get("reason", "")), f"满 10 分钟应触发 CT_TIMEOUT，实际: {sig}"
 
     cfg.EXIT_COUNTER_TREND_ENABLED = False
     core = StrategyCoreV0(cfg)
@@ -163,12 +167,12 @@ def test_exit_index_reversal_guard_can_be_disabled() -> None:
     core = StrategyCoreV0(cfg)
     ctx = _exit_ctx(held_mins=3.0, index_trend=-1, entry_index_trend=1)
     sig = core._check_trend_reversal_guard(ctx, ctx["holding"])
-    assert sig and "IDX_REVERSAL" in str(sig.get("reason", "")), f"默认应触发指数反转离场，实际: {sig}"
+    assert sig is None, f"默认关闭指数反转离场，实际: {sig}"
 
-    cfg.EXIT_INDEX_REVERSAL_ENABLED = False
+    cfg.EXIT_INDEX_REVERSAL_ENABLED = True
     core = StrategyCoreV0(cfg)
     sig = core._check_trend_reversal_guard(ctx, ctx["holding"])
-    assert sig is None, "关闭 EXIT_INDEX_REVERSAL_ENABLED 后不应触发指数反转离场"
+    assert sig and "IDX_REVERSAL" in str(sig.get("reason", "")), f"显式开启后应触发指数反转离场，实际: {sig}"
 
 
 def test_exit_stock_hard_stop_and_liquidity_guard_can_be_disabled() -> None:

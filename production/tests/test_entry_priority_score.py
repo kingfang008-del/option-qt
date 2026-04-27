@@ -79,6 +79,7 @@ def _cfg():
         ENTRY_PRIORITY_MACD_FLOOR=0.01,
         ENTRY_PRIORITY_MACD_BONUS=0.20,
         ENTRY_PRIORITY_MIN_CONFIRMATIONS=2,
+        ENTRY_DIRECTION_SPLIT_POOL_ENABLED=True,
     )
 
 
@@ -221,3 +222,51 @@ def test_reserved_priority_slot_keeps_existing_priority_pick() -> None:
     selected = ee.reserve_priority_entry_slots(candidates, 2, cfg)
 
     assert [cand["sym"] for cand in selected] == ["AMD", "QQQ"]
+
+
+def test_direction_split_keeps_call_slot_when_puts_dominate() -> None:
+    _bootstrap_imports()
+    ee = _load_execution_engine_module()
+    cfg = _cfg()
+
+    candidates = [
+        {"sym": "XOM", "sig": {"dir": -1}, "alpha_strength": 20.0, "batch_idx": 0, "is_priority_candidate": False},
+        {"sym": "UNH", "sig": {"dir": -1}, "alpha_strength": 18.0, "batch_idx": 1, "is_priority_candidate": False},
+        {"sym": "MSFT", "sig": {"dir": 1}, "alpha_strength": 9.0, "batch_idx": 2, "is_priority_candidate": False},
+    ]
+
+    selected = ee.select_direction_split_entry_slots(candidates, 2, cfg)
+
+    assert [cand["sym"] for cand in selected] == ["XOM", "MSFT"]
+
+
+def test_direction_split_falls_back_to_priority_when_one_sided() -> None:
+    _bootstrap_imports()
+    ee = _load_execution_engine_module()
+    cfg = _cfg()
+
+    candidates = [
+        {"sym": "XOM", "sig": {"dir": -1}, "alpha_strength": 20.0, "batch_idx": 0, "is_priority_candidate": False},
+        {"sym": "UNH", "sig": {"dir": -1}, "alpha_strength": 18.0, "batch_idx": 1, "is_priority_candidate": False},
+        {"sym": "META", "sig": {"dir": -1}, "alpha_strength": 6.0, "batch_idx": 2, "is_priority_candidate": True},
+    ]
+
+    selected = ee.select_direction_split_entry_slots(candidates, 2, cfg)
+
+    assert [cand["sym"] for cand in selected] == ["XOM", "META"]
+
+
+def test_direction_split_preserves_priority_within_same_direction() -> None:
+    _bootstrap_imports()
+    ee = _load_execution_engine_module()
+    cfg = _cfg()
+
+    candidates = [
+        {"sym": "XOM", "sig": {"dir": -1}, "alpha_strength": 20.0, "batch_idx": 0, "is_priority_candidate": False},
+        {"sym": "MSFT", "sig": {"dir": 1}, "alpha_strength": 9.0, "batch_idx": 1, "is_priority_candidate": False},
+        {"sym": "AAPL", "sig": {"dir": 1}, "alpha_strength": 7.0, "batch_idx": 2, "is_priority_candidate": True},
+    ]
+
+    selected = ee.select_direction_split_entry_slots(candidates, 2, cfg)
+
+    assert [cand["sym"] for cand in selected] == ["XOM", "AAPL"]

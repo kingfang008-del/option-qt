@@ -77,11 +77,30 @@ def test_v0_no_momentum_triggers_at_five_minutes_when_current_roi_stays_weak() -
     )
     sig = core.check_exit(ctx)
 
-    assert sig is not None, "满 5 分钟且当前 roi < 2% 应触发平仓"
+    assert sig is not None, "满 5 分钟、当前 roi < 2%、且 max_roi 未达到 8% 豁免线时应触发平仓"
     assert "NO_MOMENTUM" in str(sig.get("reason", "")), f"应触发 NO_MOMENTUM，实际: {sig}"
 
 
-def test_v0_no_momentum_skips_when_current_roi_reached_threshold() -> None:
+def test_v0_no_momentum_skips_when_trade_reached_profit_exemption() -> None:
+    _bootstrap_imports()
+    from strategy_core_v0 import StrategyCoreV0  # noqa: E402
+    from strategy_config0 import StrategyConfig  # noqa: E402
+
+    core = StrategyCoreV0(StrategyConfig())
+    entry_ts = 1_777_000_000.0
+
+    ctx = _mk_ctx(
+        curr_ts=entry_ts + 6 * 60,
+        entry_ts=entry_ts,
+        curr_price=1.005,
+        max_roi=0.08,
+    )
+    sig = core.check_exit(ctx)
+
+    assert not (sig and "NO_MOMENTUM" in str(sig.get("reason", ""))), f"曾经 max_roi 达到 8% 豁免线时不应触发 NO_MOMENTUM，实际: {sig}"
+
+
+def test_v0_no_momentum_skips_when_current_roi_recovered() -> None:
     _bootstrap_imports()
     from strategy_core_v0 import StrategyCoreV0  # noqa: E402
     from strategy_config0 import StrategyConfig  # noqa: E402
@@ -93,11 +112,11 @@ def test_v0_no_momentum_skips_when_current_roi_reached_threshold() -> None:
         curr_ts=entry_ts + 6 * 60,
         entry_ts=entry_ts,
         curr_price=1.03,
-        max_roi=0.03,
+        max_roi=0.015,
     )
     sig = core.check_exit(ctx)
 
-    assert not (sig and "NO_MOMENTUM" in str(sig.get("reason", ""))), f"当前 roi 已超过阈值时不应触发 NO_MOMENTUM，实际: {sig}"
+    assert not (sig and "NO_MOMENTUM" in str(sig.get("reason", ""))), f"当前 roi 已恢复时不应触发 NO_MOMENTUM，实际: {sig}"
 
 
 def test_v0_no_momentum_skips_before_five_minutes() -> None:

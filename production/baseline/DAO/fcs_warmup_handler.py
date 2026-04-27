@@ -9,7 +9,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 
-from config import NY_TZ, USE_5M_OPTION_DATA
+from config import NY_TZ
 
 
 logger = logging.getLogger("FeatService")
@@ -80,16 +80,15 @@ class FCSWarmupHandler:
                 if r[0] not in sym_to_opt_row:
                     sym_to_opt_row[r[0]] = r[1]
 
-            if USE_5M_OPTION_DATA:
-                c.execute("""
-                    SELECT symbol, buckets_json, ts
-                    FROM option_snapshots_5m
-                    WHERE symbol IN %s AND ts < %s
-                    ORDER BY ts DESC
-                """, (all_symbols, replay_start_ts))
-                for r in c.fetchall():
-                    if r[0] not in sym_to_opt_row_5m:
-                        sym_to_opt_row_5m[r[0]] = r[1]
+            c.execute("""
+                SELECT symbol, buckets_json, ts
+                FROM option_snapshots_5m
+                WHERE symbol IN %s AND ts < %s
+                ORDER BY ts DESC
+            """, (all_symbols, replay_start_ts))
+            for r in c.fetchall():
+                if r[0] not in sym_to_opt_row_5m:
+                    sym_to_opt_row_5m[r[0]] = r[1]
 
             for sym in svc.symbols:
                 rows = sym_to_rows_1m.get(sym, [])
@@ -138,30 +137,40 @@ class FCSWarmupHandler:
                     except Exception:
                         pass
 
-                if USE_5M_OPTION_DATA:
-                    opt_snap_5m = sym_to_opt_row_5m.get(sym)
-                    if opt_snap_5m:
-                        try:
-                            if isinstance(opt_snap_5m, str):
-                                opt_snap_5m = json.loads(opt_snap_5m)
-                            buckets = opt_snap_5m.get('buckets', [])
-                            arr = np.array(buckets, dtype=np.float32)
-                            if arr.shape[0] < 6:
-                                arr = np.vstack([arr, np.zeros((6 - arr.shape[0], arr.shape[1]), dtype=np.float32)])
-                            if arr.shape[1] < 12:
-                                arr = np.hstack([arr, np.zeros((arr.shape[0], 12 - arr.shape[1]), dtype=np.float32)])
-                            svc.option_snapshot_5m[sym] = arr[:, :12]
-                            if np.sum(arr[:, 6]) > 0:
-                                svc.last_cum_volume_5m[sym] = arr[:, 6].copy()
-                                svc.warmup_needed_5m[sym] = False
-                        except Exception:
-                            pass
+                opt_snap_5m = sym_to_opt_row_5m.get(sym)
+                if opt_snap_5m:
+                    try:
+                        if isinstance(opt_snap_5m, str):
+                            opt_snap_5m = json.loads(opt_snap_5m)
+                        buckets = opt_snap_5m.get('buckets', [])
+                        arr = np.array(buckets, dtype=np.float32)
+                        if arr.shape[0] < 6:
+                            arr = np.vstack([arr, np.zeros((6 - arr.shape[0], arr.shape[1]), dtype=np.float32)])
+                        if arr.shape[1] < 12:
+                            arr = np.hstack([arr, np.zeros((arr.shape[0], 12 - arr.shape[1]), dtype=np.float32)])
+                        svc.option_snapshot_5m[sym] = arr[:, :12]
+                        if np.sum(arr[:, 6]) > 0:
+                            svc.last_cum_volume_5m[sym] = arr[:, 6].copy()
+                            svc.warmup_needed_5m[sym] = False
+                    except Exception:
+                        pass
 
                 if replay_features and not svc.history_1min[sym].empty and len(svc.history_1min[sym]) > 50:
                     sliced_snaps = {s: snap[:, :12] for s, snap in svc.option_snapshot.items()}
+                    sliced_snaps_5m = {
+                        s: snap[:, :12]
+                        for s, snap in getattr(svc, 'option_snapshot_5m', svc.option_snapshot).items()
+                    }
                     res = svc.engine.compute_all_inputs(
-                        {sym: svc.history_1min[sym]}, svc.fast_feat_names, svc.slow_feat_names, sliced_snaps,
-                        skip_scaling=True, recalc_greeks=svc.recalc_greeks
+                        history_1min={sym: svc.history_1min[sym]},
+                        fast_feats=svc.fast_feat_names,
+                        slow_feats=svc.slow_feat_names,
+                        option_snapshots=sliced_snaps,
+                        history_5min={sym: svc.history_5min.get(sym, pd.DataFrame())},
+                        option_snapshot_5m=sliced_snaps_5m,
+                        feat_resolutions=getattr(svc, 'feat_resolutions', {}),
+                        skip_scaling=True,
+                        recalc_greeks=svc.recalc_greeks,
                     )
                     if sym in res:
                         t_fast = res[sym]['fast_1m'][0].cpu().numpy()
@@ -241,9 +250,20 @@ class FCSWarmupHandler:
 
                 if len(df_hist) > 50:
                     sliced_snaps = {s: snap[:, :12] for s, snap in svc.option_snapshot.items()}
+                    sliced_snaps_5m = {
+                        s: snap[:, :12]
+                        for s, snap in getattr(svc, 'option_snapshot_5m', svc.option_snapshot).items()
+                    }
                     res = svc.engine.compute_all_inputs(
-                        {sym: df_hist}, svc.fast_feat_names, svc.slow_feat_names, sliced_snaps,
-                        skip_scaling=True, recalc_greeks=svc.recalc_greeks
+                        history_1min={sym: df_hist},
+                        fast_feats=svc.fast_feat_names,
+                        slow_feats=svc.slow_feat_names,
+                        option_snapshots=sliced_snaps,
+                        history_5min={sym: svc.history_5min.get(sym, pd.DataFrame())},
+                        option_snapshot_5m=sliced_snaps_5m,
+                        feat_resolutions=getattr(svc, 'feat_resolutions', {}),
+                        skip_scaling=True,
+                        recalc_greeks=svc.recalc_greeks,
                     )
                     if sym in res:
                         t_fast = res[sym]['fast_1m'][0].cpu().numpy()

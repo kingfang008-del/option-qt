@@ -81,8 +81,6 @@ from config import (
     MAX_TRADE_CAP,              # 单笔交易最大金额
     GLOBAL_EXPOSURE_LIMIT,      # 全局风险敞口上限
     COMMISSION_PER_CONTRACT,    # 期权手续费 ($/手)
-    SLIPPAGE_ENTRY_PCT,         # [Fix] Added to imports
-    SLIPPAGE_EXIT_PCT,          # [Fix] Added to imports
     OMS_SIGNAL_DELAY_BARS,
     OMS_SIGNAL_DELAY_ACTIONS,
     IS_BACKTEST,
@@ -261,6 +259,10 @@ class SymbolState:
         # be cleared by async order lifecycles; this one represents capacity.
         self.entry_slot_reserved = False
         self.open_fill_confirmed = False
+        self.pending_exit_retry_reason = ""
+        self.pending_exit_retry_count = 0
+        self.pending_exit_retry_first_ts = 0.0
+        self.pending_exit_retry_last_ts = 0.0
 
         self.prev_macd_hist = 0.0
         
@@ -335,6 +337,10 @@ class SymbolState:
             'last_spread_pct': self.last_spread_pct, # 🚨 [修复]
             'entry_slot_reserved': bool(self.entry_slot_reserved),
             'open_fill_confirmed': bool(self.open_fill_confirmed),
+            'pending_exit_retry_reason': self.pending_exit_retry_reason,
+            'pending_exit_retry_count': int(self.pending_exit_retry_count),
+            'pending_exit_retry_first_ts': float(self.pending_exit_retry_first_ts),
+            'pending_exit_retry_last_ts': float(self.pending_exit_retry_last_ts),
 
             # [新增] 历史数据 Buffer 持久化
             'prices': list(self.prices),
@@ -392,6 +398,10 @@ class SymbolState:
             )
         else:
             self.open_fill_confirmed = bool(explicit_open_fill)
+        self.pending_exit_retry_reason = str(data.get('pending_exit_retry_reason', '') or '')
+        self.pending_exit_retry_count = _coerce_int(data.get('pending_exit_retry_count', 0))
+        self.pending_exit_retry_first_ts = _coerce_float(data.get('pending_exit_retry_first_ts', 0.0))
+        self.pending_exit_retry_last_ts = _coerce_float(data.get('pending_exit_retry_last_ts', 0.0))
         
         # [新增] 恢复 Buffer
         if 'prices' in data: self.prices = deque(data['prices'], maxlen=self.prices.maxlen)
@@ -592,6 +602,78 @@ def reserve_priority_entry_slots(entry_candidates: List[Dict[str, Any]], allowed
     ]
     for cand, idx in zip(replacements, replaceable_idx):
         selected[idx] = cand
+
+    return sorted(selected, key=lambda x: float(x.get('alpha_strength', 0.0) or 0.0), reverse=True)
+
+
+def select_direction_split_entry_slots(entry_candidates: List[Dict[str, Any]], allowed_entries: int, cfg) -> List[Dict[str, Any]]:
+    if allowed_entries <= 0 or not entry_candidates:
+        return []
+
+    if not bool(getattr(cfg, 'ENTRY_DIRECTION_SPLIT_POOL_ENABLED', True)):
+        return reserve_priority_entry_slots(entry_candidates, allowed_entries, cfg)
+
+    sorted_candidates = sorted(
+        entry_candidates,
+        key=lambda x: float(x.get('alpha_strength', 0.0) or 0.0),
+        reverse=True,
+    )
+    if allowed_entries == 1:
+        return sorted_candidates[:1]
+
+    def _direction(cand: Dict[str, Any]) -> int:
+        try:
+            return 1 if int((cand.get('sig') or {}).get('dir', 0) or 0) >= 0 else -1
+        except Exception:
+            return 1
+
+    call_pool = [cand for cand in sorted_candidates if _direction(cand) == 1]
+    put_pool = [cand for cand in sorted_candidates if _direction(cand) == -1]
+    if not call_pool or not put_pool:
+        return reserve_priority_entry_slots(sorted_candidates, allowed_entries, cfg)
+
+    selected: List[Dict[str, Any]] = []
+    selected_keys = set()
+
+    def _add(cand: Dict[str, Any]) -> None:
+        key = (cand.get('sym'), cand.get('batch_idx'))
+        if key not in selected_keys and len(selected) < allowed_entries:
+            selected.append(cand)
+            selected_keys.add(key)
+
+    # 名额足够时先各保留一个方向槽，避免 CALL/PUT 在同一 abs(alpha) 池里互相挤掉。
+    _add(call_pool[0])
+    _add(put_pool[0])
+
+    for cand in sorted_candidates:
+        _add(cand)
+        if len(selected) >= allowed_entries:
+            break
+
+    reserved_slots = max(0, int(getattr(cfg, 'ENTRY_PRIORITY_RESERVED_SLOTS', 1) or 0))
+    if reserved_slots > 0:
+        selected_priority = sum(1 for cand in selected if bool(cand.get('is_priority_candidate', False)))
+        missing_priority = min(reserved_slots, allowed_entries) - selected_priority
+        priority_pool = [cand for cand in sorted_candidates if bool(cand.get('is_priority_candidate', False))]
+        for priority_cand in priority_pool:
+            if missing_priority <= 0:
+                break
+            priority_key = (priority_cand.get('sym'), priority_cand.get('batch_idx'))
+            if priority_key in selected_keys:
+                continue
+            priority_dir = _direction(priority_cand)
+            replace_idx = None
+            for idx in range(len(selected) - 1, -1, -1):
+                if _direction(selected[idx]) == priority_dir and not bool(selected[idx].get('is_priority_candidate', False)):
+                    replace_idx = idx
+                    break
+            if replace_idx is None:
+                continue
+            old_key = (selected[replace_idx].get('sym'), selected[replace_idx].get('batch_idx'))
+            selected_keys.discard(old_key)
+            selected[replace_idx] = priority_cand
+            selected_keys.add(priority_key)
+            missing_priority -= 1
 
     return sorted(selected, key=lambda x: float(x.get('alpha_strength', 0.0) or 0.0), reverse=True)
 
@@ -1314,7 +1396,9 @@ class ExecutionEngineV8:
             f"| LIVE_TRADING_CAPITAL_LIMIT=${cap:,.2f}"
         )
 
-    def _should_delay_signal(self, action: str) -> bool:
+    def _should_delay_signal(self, action: str, source: str = None) -> bool:
+        if str(source or '').strip().lower() == 'dashboard_manual_close':
+            return False
         return OMS_SIGNAL_DELAY_BARS > 0 and str(action).upper() in OMS_SIGNAL_DELAY_ACTIONS
 
     def _eligible_trade_ts(self, signal_ts: float) -> float:
@@ -2110,6 +2194,82 @@ class ExecutionEngineV8:
 
         return ctx, market_opt_price, ctx_curr_price, ctx_bid, ctx_ask
 
+    def _clear_pending_exit_retry(self, st, reason: str = ""):
+        if not getattr(st, 'pending_exit_retry_reason', ''):
+            return
+        logger.info(
+            f"✅ [Exit Retry Clear] {getattr(st, 'symbol', '?')} | "
+            f"reason={reason or 'cleared'} | last={getattr(st, 'pending_exit_retry_reason', '')}"
+        )
+        st.pending_exit_retry_reason = ""
+        st.pending_exit_retry_count = 0
+        st.pending_exit_retry_first_ts = 0.0
+        st.pending_exit_retry_last_ts = 0.0
+
+    def _build_pending_exit_retry_signal(
+        self,
+        sym: str,
+        st,
+        ctx: dict,
+        opt_data: dict,
+        market_opt_price: float,
+        ctx_curr_price: float,
+        ctx_bid: float,
+        ctx_ask: float,
+        curr_ts: float,
+    ) -> Optional[Dict[str, Any]]:
+        if int(getattr(st, 'position', 0) or 0) == 0:
+            self._clear_pending_exit_retry(st, "no_position")
+            return None
+        if bool(getattr(st, 'is_pending', False)):
+            return None
+
+        retry_reason = str(getattr(st, 'pending_exit_retry_reason', '') or '').strip()
+        if not retry_reason:
+            return None
+
+        max_frames = max(0, int(getattr(self.cfg, 'EXIT_UNFILLED_RETRY_FRAMES', 3) or 0))
+        retry_count = int(getattr(st, 'pending_exit_retry_count', 0) or 0)
+        if max_frames <= 0 or retry_count > max_frames:
+            logger.error(
+                f"🚨 [Exit Retry Exhausted] {sym} still open after unfilled exits | "
+                f"retry_count={retry_count} max_frames={max_frames} reason={retry_reason}"
+            )
+            return None
+
+        if ctx_curr_price <= 0.01:
+            logger.warning(f"⚠️ [Exit Retry Skip] {sym} invalid option price={ctx_curr_price} reason={retry_reason}")
+            return None
+
+        retry_sig = {
+            'action': 'SELL',
+            'dir': int(getattr(st, 'position', 0) or 0),
+            'target_side': int(getattr(st, 'position', 0) or 0),
+            'reason': f"{retry_reason}|UNFILLED_RETRY_{retry_count}",
+            'retry_root_reason': retry_reason,
+            'price': ctx_curr_price,
+            'market_price': market_opt_price,
+            'original_position': int(getattr(st, 'position', 0) or 0),
+            'meta': dict(ctx.get('meta', {}) or {}),
+        }
+        if opt_data.get('has_feed'):
+            retry_sig['bid'] = ctx_bid
+            retry_sig['ask'] = ctx_ask
+            retry_sig['bid_size'] = opt_data.get('call_bid_size' if st.position == 1 else 'put_bid_size', 0.0)
+            retry_sig['ask_size'] = opt_data.get('call_ask_size' if st.position == 1 else 'put_ask_size', 0.0)
+        else:
+            retry_sig['bid'] = ctx_curr_price
+            retry_sig['ask'] = ctx_curr_price
+            retry_sig['bid_size'] = 999.0
+            retry_sig['ask_size'] = 999.0
+
+        st.pending_exit_retry_last_ts = float(curr_ts or time.time())
+        logger.warning(
+            f"🔁 [Exit Retry] {sym} retry pending close | "
+            f"count={retry_count}/{max_frames} reason={retry_reason} price={ctx_curr_price:.2f}"
+        )
+        return retry_sig
+
     async def _process_alpha_frame(self, frame: dict):
         curr_ts = float(frame.get('ts', time.time()) or time.time())
         reject_before = dict(getattr(self, '_entry_reject_counts', {}) or {})
@@ -2149,6 +2309,20 @@ class ExecutionEngineV8:
             if st.position != 0:
                 exit_sig = self.strategy.check_exit(ctx)
                 self._publish_gate_trace(sym, 'exit', exit_sig, event_ts=curr_ts)
+                if exit_sig and getattr(st, 'pending_exit_retry_reason', ''):
+                    self._clear_pending_exit_retry(st, "strategy_exit_retriggered")
+                if not exit_sig:
+                    exit_sig = self._build_pending_exit_retry_signal(
+                        sym,
+                        st,
+                        ctx,
+                        opt_data,
+                        market_opt_price,
+                        ctx_curr_price,
+                        ctx_bid,
+                        ctx_ask,
+                        curr_ts,
+                    )
                 if exit_sig:
                     frame_has_quote = bool(
                         opt_data.get('has_feed')
@@ -2353,10 +2527,10 @@ class ExecutionEngineV8:
                 return
             allowed_entries = min(max_entries, remaining_slots)
 
-            selected_candidates = reserve_priority_entry_slots(entry_candidates, allowed_entries, self.cfg)
+            selected_candidates = select_direction_split_entry_slots(entry_candidates, allowed_entries, self.cfg)
             if selected_candidates != entry_candidates[:allowed_entries]:
                 logger.info(
-                    "⭐ [OMS Priority-Slot] reserved entry slot for priority leaders | "
+                    "⭐ [OMS Entry-Slot] adjusted entry slots by direction/priority policy | "
                     f"picked={[cand['sym'] for cand in selected_candidates]}"
                 )
 
@@ -2415,22 +2589,35 @@ class ExecutionEngineV8:
             if isinstance(sym, bytes):
                 sym = sym.decode('utf-8')
                 
-            # 只要 OMS 确认持仓，或者正在处理订单，就发布只读投影。
-            if self._state_uses_entry_slot(st) or st.is_pending:
+            pos = int(getattr(st, 'position', 0) or 0)
+            qty = float(getattr(st, 'qty', 0) or 0)
+            open_fill_confirmed = bool(getattr(st, 'open_fill_confirmed', False))
+
+            # `oms:live_positions` 必须只表达真实已成交持仓。
+            # pending BUY 仍会占用 entry slot，但应通过 pending_orders 展示，不能污染持仓表。
+            if pos != 0 and qty > 0 and open_fill_confirmed:
+                opt_type = str(getattr(st, 'opt_type', '') or '').lower()
+                tag = 'CALL_ATM' if (pos == 1 or opt_type == 'call') else ('PUT_ATM' if (pos == -1 or opt_type == 'put') else '')
                 active_states[sym] = json.dumps({
                     'projection_only': True,
                     'pos': st.position,
-                    'qty': getattr(st, 'qty', 0),
+                    'position': st.position,
+                    'qty': qty,
                     'price': st.entry_price,
+                    'entry_price': st.entry_price,
                     'stock': st.entry_stock,
+                    'entry_stock': st.entry_stock,
                     'ts': st.entry_ts,
+                    'entry_ts': st.entry_ts,
                     'contract_id': getattr(st, 'contract_id', '') or '',
-                    'opt_type': getattr(st, 'opt_type', '') or '',
+                    'opt_type': opt_type,
+                    'tag': tag,
+                    'last_opt_price': getattr(st, 'last_opt_price', 0.0),
                     'max_roi': getattr(st, 'max_roi', 0.0),
                     'is_pending': st.is_pending,
                     'entry_slot_reserved': bool(getattr(st, 'entry_slot_reserved', False)),
                     'pending_action': getattr(st, 'pending_action', None) or getattr(st, 'pending_side', '') or '',
-                    'open_fill_confirmed': bool(getattr(st, 'open_fill_confirmed', False)),
+                    'open_fill_confirmed': open_fill_confirmed,
                     # 仅供 Dashboard/诊断展示，不能作为 SE 策略状态输入。
                     'entry_spy_roc': getattr(st, 'entry_spy_roc', 0.0),
                     'entry_index_trend': getattr(st, 'entry_index_trend', 0),
@@ -2567,7 +2754,7 @@ class ExecutionEngineV8:
         if action in ('BUY', 'SELL') and not self._strategy_alpha_ready(action, source):
             return
 
-        if allow_delay_queue and action in ('BUY', 'SELL') and self._should_delay_signal(action):
+        if allow_delay_queue and action in ('BUY', 'SELL') and self._should_delay_signal(action, source):
             await self._queue_delayed_signal(payload)
             return
 

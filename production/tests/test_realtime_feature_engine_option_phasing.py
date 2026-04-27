@@ -122,3 +122,53 @@ def test_compute_batch_features_preserves_existing_option_history_sequence() -> 
 
     seq = res["slow_1m"][0, 0].cpu().numpy()
     np.testing.assert_allclose(seq, np.array(expected, dtype=np.float32), atol=1e-6)
+
+
+def test_option_feature_formulas_match_offline_front_four_bucket_semantics() -> None:
+    _bootstrap_imports()
+    from realtime_feature_engine import RealTimeFeatureEngine  # noqa: E402
+    import torch  # noqa: E402
+
+    stats_path = _build_stats_file()
+    engine = RealTimeFeatureEngine(stats_path=stats_path, device="cpu")
+
+    snap = np.zeros((1, 6, 12), dtype=np.float32)
+    snap[0, :, 7] = np.array([0.10, 0.20, 0.30, 0.40, 0.50, 0.70], dtype=np.float32)
+    snap[0, 0:4, 6] = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+
+    out = engine._calc_opt_feats_batch(
+        torch.tensor(snap, dtype=torch.float32),
+        torch.tensor([100.0], dtype=torch.float32),
+    )
+
+    assert abs(float(out["options_vw_iv"][0]) - 0.30) < 1e-6
+    assert abs(float(out["options_pcr_volume"][0]) - (3.0 / 7.0)) < 1e-6
+    assert abs(float(out["options_flow_skew"][0]) - (0.15 / 0.35)) < 1e-6
+    assert abs(float(out["options_struc_skew"][0]) - 0.50) < 1e-6
+    assert abs(float(out["options_struc_atm_iv"][0]) - 0.20) < 1e-6
+    assert abs(float(out["options_struc_term"][0]) - 0.40) < 1e-6
+
+
+def test_vwap_diff_uses_intraday_cumulative_vwap() -> None:
+    _bootstrap_imports()
+    from realtime_feature_engine import RealTimeFeatureEngine  # noqa: E402
+
+    stats_path = _build_stats_file()
+    engine = RealTimeFeatureEngine(stats_path=stats_path, device="cpu")
+    idx = pd.date_range("2026-04-24 09:30:00", periods=2, freq="1min")
+    df = pd.DataFrame(
+        {
+            "open": [10.0, 14.0],
+            "high": [10.0, 14.0],
+            "low": [10.0, 14.0],
+            "close": [10.0, 14.0],
+            "volume": [1.0, 3.0],
+            "vwap": [999.0, 999.0],
+        },
+        index=idx,
+    )
+
+    out = engine._pandas_compute_features(df, ["vwap_diff"])
+
+    expected_second = (14.0 - 13.0) / 13.0
+    assert abs(float(out["vwap_diff"].iloc[-1]) - expected_second) < 1e-6

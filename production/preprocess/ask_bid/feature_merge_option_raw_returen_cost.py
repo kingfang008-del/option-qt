@@ -3064,12 +3064,12 @@ def process_option_labels_file_vectorized(feature_file_path: Path, config: dict)
         if 'tk_mid_price' in feature_df.columns and 't0_mid_price' in feature_df.columns:
             feature_df['label_option_return'] = (feature_df['tk_mid_price'] - feature_df['t0_mid_price']) / (feature_df['t0_mid_price'] + 1e-9)
         
-        # 6.4 IV-RV Spread & Ratio
         base_iv = feature_df.get('robust_atm_iv', pd.Series(np.nan)).fillna(feature_df.get('t0_iv', 0))
-        rv_safe = feature_df['label_rv_k_steps'].replace(0, np.nan) # 避免除零
+        iv_safe = base_iv.where(base_iv > 1e-6, np.nan)
         
-        feature_df['label_iv_rv_spread'] = base_iv - feature_df['label_rv_k_steps']
-        feature_df['label_iv_rv_ratio'] = (base_iv / rv_safe) - 1.0
+        # 正值表示未来实现波动率高于当前隐含波动率，当前 IV 偏便宜。
+        feature_df['label_iv_rv_spread'] = (feature_df['label_rv_k_steps'] - base_iv).clip(-5.0, 5.0).fillna(0.0)
+        feature_df['label_iv_rv_ratio'] = ((feature_df['label_rv_k_steps'] / iv_safe) - 1.0).clip(-5.0, 5.0).fillna(0.0)
 
 
         
@@ -3083,13 +3083,7 @@ def process_option_labels_file_vectorized(feature_file_path: Path, config: dict)
         # 默认设为 1 (Flat)
         feature_df['label_vol_direction'] = 1.0
         
-        # Spread > 0.01 -> 认为波动率溢价高，未来波动率可能下跌回归? 
-        # 或者 这里的定义是：IV 比 RV 高 -> 看涨波动率溢价?
-        # 通常：
-        # Spread > 0 (IV > RV) -> Market prices high volatility (Fear/Event) -> Up (2)
-        # Spread < 0 (IV < RV) -> Market prices low volatility (Complacency) -> Down (0)
-        
-        # 逻辑修改：映射到 2.0 (Up) 和 0.0 (Down)
+        # Spread > 0: 未来 RV 高于当前 IV，偏做多波动率；Spread < 0 反之。
         feature_df.loc[feature_df['label_iv_rv_spread'] > threshold, 'label_vol_direction'] = 2.0
         feature_df.loc[feature_df['label_iv_rv_spread'] < -threshold, 'label_vol_direction'] = 0.0
         

@@ -368,6 +368,10 @@ class OrchestratorAccounting:
             st.entry_ts = 0.0
             st.max_roi = 0.0
             st.open_fill_confirmed = False
+            st.pending_exit_retry_reason = ""
+            st.pending_exit_retry_count = 0
+            st.pending_exit_retry_first_ts = 0.0
+            st.pending_exit_retry_last_ts = 0.0
 
         # [🛡️ Atomic State Snapshot] 平仓后强制快照，避免 mock_cash 更新
         # 与下次重启状态不一致。save_state 内部是后台线程写，非阻塞。
