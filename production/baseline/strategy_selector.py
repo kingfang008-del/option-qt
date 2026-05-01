@@ -13,9 +13,11 @@ from config import STRATEGY_CORE_VERSION
 
 def _normalize_version(version: str) -> str:
     normalized = str(version or "V1").strip().upper()
-    if normalized not in {"V0", "V1"}:
+    if normalized in {"V_TREND", "TREND", "TREND_V0"}:
+        normalized = "TREND"
+    if normalized not in {"V0", "V1", "TREND"}:
         raise ValueError(
-            f"Unsupported STRATEGY_CORE_VERSION={version!r}; expected 'V0' or 'V1'."
+            f"Unsupported STRATEGY_CORE_VERSION={version!r}; expected 'V0', 'V1', or 'TREND'."
         )
     return normalized
 
@@ -26,6 +28,8 @@ if ACTIVE_STRATEGY_CORE_VERSION == "V0":
     from strategy_core_v0 import StrategyCoreV0 as StrategyCore, StrategyConfig
 elif ACTIVE_STRATEGY_CORE_VERSION == "V1":
     from strategy_core_v1 import StrategyCoreV1 as StrategyCore, StrategyConfig
+elif ACTIVE_STRATEGY_CORE_VERSION == "TREND":
+    from strategy_core_trend import StrategyCoreTrend as StrategyCore, StrategyConfig
 
 
 def create_strategy(config: StrategyConfig = None) -> StrategyCore:

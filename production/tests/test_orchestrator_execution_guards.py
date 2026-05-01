@@ -367,6 +367,58 @@ def test_execute_exit_put_uses_bid_size_in_dry_mode() -> None:
     assert filled_qty == 3, f"PUT 平仓应按 bid_size 成交，期望 3，实际 {filled_qty}"
 
 
+def test_dashboard_manual_close_hydrates_contract_for_live_exit() -> None:
+    _bootstrap_imports()
+    import orchestrator_execution as oe  # noqa: E402
+
+    orch = _build_orch(mode="realtime")
+    st = orch.states["NVDA"]
+    st.position = 1
+    st.qty = 2
+    st.entry_price = 2.2
+    st.entry_ts = 1_777_777_000.0
+    st.open_fill_confirmed = True
+    st.contract_id = ""
+    st.opt_type = ""
+
+    ex = oe.OrchestratorExecution(orch)
+    sig = {
+        "reason": "DASHBOARD_FORCE_CLOSE:unit",
+        "price": 2.0,
+        "market_price": 2.0,
+        "bid": 1.95,
+        "ask": 2.05,
+        "original_position": 1,
+        "meta": {
+            "manual_close": True,
+            "contract_id": "NVDA260313C00180000",
+        },
+    }
+    seen = {}
+
+    def _capture_smart_exit(_self, _sym, real_contract, *_args, **_kwargs):
+        seen["localSymbol"] = getattr(real_contract, "localSymbol", "")
+
+        async def _noop():
+            return None
+
+        return _noop()
+
+    def _capture_task(coro):
+        coro.close()
+        return SimpleNamespace(cancel=lambda: None)
+
+    with patch.object(oe.OrchestratorExecution, "_runtime_trading_enabled", return_value=True), \
+         patch.object(oe, "SYNC_EXECUTION", False), \
+         patch.object(oe.OrchestratorExecution, "_smart_exit_order", _capture_smart_exit), \
+         patch("asyncio.create_task", side_effect=_capture_task):
+        asyncio.run(ex._execute_exit("NVDA", sig, stock_price=101.0, curr_ts=1_777_777_120.0, batch_idx=0))
+
+    assert st.contract_id == "NVDA260313C00180000"
+    assert st.opt_type == "call"
+    assert seen["localSymbol"] == "NVDA260313C00180000", "实盘平仓应使用 dashboard manual-close payload 中的合约"
+
+
 def test_execution_cfg_override_limit_buffers() -> None:
     _bootstrap_imports()
     import orchestrator_execution as oe  # noqa: E402
@@ -670,6 +722,7 @@ def main() -> None:
     test_realtime_iceberg_entry_keeps_pending_until_background_task_finishes()
     test_entry_allows_fourth_slot_but_blocks_fifth()
     test_execute_exit_put_uses_bid_size_in_dry_mode()
+    test_dashboard_manual_close_hydrates_contract_for_live_exit()
     test_execution_cfg_override_limit_buffers()
     test_entry_limit_price_never_crosses_ask_on_initial_quote()
     test_entry_requote_price_stays_below_live_ask()

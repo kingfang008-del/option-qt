@@ -34,16 +34,6 @@
         "5min": { "horizon": 3, "entry_threshold": 0.0025, "upper_threshold": 0.0025, "lower_threshold": -0.0025, "vol_multiplier": 2.0 }
       }
     },
-    "option_exec_label": {
-      "entry_delay_seconds": [60, 120, 300],
-      "holding_seconds": [300, 900, 1800],
-      "primary_entry_delay_seconds": 60,
-      "primary_seconds": 300,
-      "min_edge": 0.02,
-      "min_profit_buffer": 0.02,
-      "max_spread_pct": 0.10,
-      "max_quote_age_seconds": 90
-    },
     "pre_post_dropout_rate": 0.1,
     "expert_dropout_rate": 0.25,
     "backbone_dropout_rate": 0.3,

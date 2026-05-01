@@ -73,6 +73,124 @@ def resolve_db_path(args):
     return all_dbs[-1] if all_dbs else None
 
 
+def _pg_float_env(name: str, default_val: float) -> float:
+    try:
+        return float(os.environ.get(name, default_val))
+    except (TypeError, ValueError):
+        return float(default_val)
+
+
+def _pg_merge_asof_per_symbol(left, right, value_cols, *, tolerance=None):
+    left = left.copy()
+    if "_row_order" not in left.columns:
+        left["_row_order"] = np.arange(len(left), dtype=np.int64)
+    value_cols = [c for c in value_cols if c in right.columns]
+    if not value_cols or right.empty:
+        out = left.copy()
+        for col in value_cols:
+            out[col] = np.nan
+        return out.sort_values("_row_order").reset_index(drop=True)
+    right = (
+        right[["ts", "symbol"] + value_cols]
+        .dropna(subset=["ts", "symbol"])
+        .drop_duplicates(["ts", "symbol"], keep="last")
+    )
+    parts = []
+    for sym, left_g in left.groupby("symbol", sort=False):
+        left_g = left_g.sort_values("ts")
+        right_g = right[right["symbol"] == sym].sort_values("ts")[["ts"] + value_cols]
+        if right_g.empty:
+            merged = left_g.copy()
+            for col in value_cols:
+                merged[col] = np.nan
+        else:
+            merged = pd.merge_asof(left_g, right_g, on="ts", direction="backward", tolerance=tolerance)
+        parts.append(merged)
+    return pd.concat(parts, ignore_index=True).sort_values("_row_order").reset_index(drop=True)
+
+
+def load_merged_df_pgsql(date_str: str, symbols: list, pg_url: str):
+    """PG 日分区 dense 合并，产出列与 SQLite merge 后一致（供下方同一套 replay 使用）。"""
+    try:
+        import psycopg2
+    except ImportError as e:
+        logger.error("需要 psycopg2: %s", e)
+        return None
+
+    def _exists(cur, t):
+        cur.execute(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name=%s)", (t,)
+        )
+        return bool(cur.fetchone()[0])
+
+    def _cols(cur, t):
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name=%s", (t,)
+        )
+        return {r[0] for r in cur.fetchall()}
+
+    pa, pb, po = f"alpha_logs_{date_str}", f"market_bars_1s_{date_str}", f"option_snapshots_1s_{date_str}"
+    conn = psycopg2.connect(pg_url)
+    cur = conn.cursor()
+    for t in (pa, pb, po):
+        if not _exists(cur, t):
+            logger.error("PG 缺表: %s", t)
+            cur.close()
+            conn.close()
+            return None
+    ac = _cols(cur, pa)
+    sel = ["ts", "symbol", "alpha as alpha_score"]
+    if "vol_z" in ac:
+        sel.append("vol_z as fast_vol")
+    df_a = pd.read_sql(f"SELECT {', '.join(sel)} FROM {pa}", conn)
+    if "fast_vol" not in df_a.columns:
+        df_a["fast_vol"] = 0.0
+    df_s = pd.read_sql(f"SELECT ts, symbol, close, open, high, low, volume FROM {pb}", conn)
+    df_o = pd.read_sql(f"SELECT ts, symbol, buckets_json FROM {po}", conn)
+    cur.close()
+    conn.close()
+
+    for x in (df_a, df_s, df_o):
+        x["ts"] = x["ts"].astype(float)
+        x["symbol"] = x["symbol"].astype(str)
+
+    uts = sorted(df_s["ts"].unique())
+    if not uts:
+        return None
+    dix = (
+        df_s[df_s["symbol"].isin(["SPY", "QQQ"])]
+        .drop_duplicates(["ts", "symbol"], keep="last")
+        .pivot(index="ts", columns="symbol", values="close")
+        .reindex(uts)
+        .ffill()
+    )
+    roc = pd.DataFrame({"ts": uts})
+    for c in ("SPY", "QQQ"):
+        roc[f"{c.lower()}_roc_5min"] = dix[c].pct_change(periods=300).fillna(0.0).values if c in dix.columns else 0.0
+
+    if symbols:
+        df_a, df_s, df_o = [d[d["symbol"].isin(symbols)] for d in (df_a, df_s, df_o)]
+
+    base = pd.MultiIndex.from_product([uts, symbols], names=["ts", "symbol"]).to_frame(index=False)
+    base["_row_order"] = np.arange(len(base), dtype=np.int64)
+    ts_s, ts_o, ts_a = (
+        _pg_float_env("REPLAY_1S_STOCK_ASOF_TOLERANCE_SEC", 300.0),
+        _pg_float_env("REPLAY_1S_OPTION_ASOF_TOLERANCE_SEC", 60.0),
+        _pg_float_env("REPLAY_1S_ALPHA_ASOF_TOLERANCE_SEC", 120.0),
+    )
+    sc = [c for c in ["open", "high", "low", "close", "volume"] if c in df_s.columns]
+    dm = _pg_merge_asof_per_symbol(base, df_s, sc, tolerance=None if ts_s <= 0 else ts_s)
+    dm = dm.merge(roc, on="ts", how="left")
+    df_a = df_a.assign(alpha_label_ts=df_a["ts"], ts=df_a["ts"] + ALPHA_AVAILABLE_DELAY_SECONDS).sort_values("ts")
+    df_o = df_o.sort_values("ts")
+    dm = _pg_merge_asof_per_symbol(dm, df_o, ["buckets_json"], tolerance=None if ts_o <= 0 else ts_o)
+    dm = _pg_merge_asof_per_symbol(
+        dm, df_a, ["alpha_score", "fast_vol", "alpha_label_ts"],
+        tolerance=None if ts_a <= 0 else ts_a,
+    )
+    return dm.sort_values(["ts", "_row_order"]).reset_index(drop=True)
+
+
 def safe_col(group, col, default_val, dtype=np.float32):
     if col in group.columns:
         return group[col].fillna(default_val).values.astype(dtype)
@@ -89,7 +207,15 @@ def build_option_arrays(group):
 
     for row in group.itertuples():
         try:
-            bk = json.loads(row.buckets_json).get('buckets', [])
+            raw = getattr(row, "buckets_json", None)
+            if isinstance(raw, dict):
+                bk = raw.get("buckets", [])
+            elif isinstance(raw, str):
+                bk = json.loads(raw).get("buckets", []) if raw else []
+            elif raw is None or (isinstance(raw, float) and np.isnan(raw)):
+                bk = []
+            else:
+                bk = json.loads(str(raw)).get("buckets", [])
             p_p = float(bk[0][0]) if len(bk) > 0 and len(bk[0]) > 0 else 0.0
             c_p = float(bk[2][0]) if len(bk) > 2 and len(bk[2]) > 0 else 0.0
 
@@ -133,7 +259,7 @@ def build_replay_packet(group, ts_val, is_new_minute=False):
     return {
         'symbols': symbols_list,
         'ts': float(ts_val),
-        'stock_price': group['close'].values.astype(np.float32),
+        'stock_price': safe_col(group, 'close', 0.0),
         'fast_vol': safe_col(group, 'fast_vol', 0.0),
         'precalc_alpha': safe_col(group, 'alpha_score', 0.0),
         'alpha_label_ts': safe_col(group, 'alpha_label_ts', 0.0, dtype=np.float64),
@@ -177,6 +303,11 @@ async def main():
     parser.add_argument("--date", type=str, default="20260102")
     parser.add_argument("--symbol", type=str, default=None)
     parser.add_argument(
+        "--use-pgsql",
+        action="store_true",
+        help="从 PostgreSQL 日分区读数（连接串固定为 config.PG_DB_URL），其余回放逻辑与 SQLite 相同",
+    )
+    parser.add_argument(
         "--legacy-per-second-strategy",
         action="store_true",
         help="Debug only: run the old per-second process_batch loop. Default is synchronized minute-window mode.",
@@ -193,20 +324,22 @@ async def main():
     )
     args = parser.parse_args()
 
-    db_path = resolve_db_path(args)
-    if db_path is None:
-        logger.error(f"❌ Target Database not found. (Date: {args.date})")
-        return
+    from config import TARGET_SYMBOLS
 
-    logger.info(f"📂 Loading data directly from SQLite: {db_path}...")
+    symbols = [args.symbol] if args.symbol else TARGET_SYMBOLS
+
+    if not args.use_pgsql:
+        db_path = resolve_db_path(args)
+        if db_path is None:
+            logger.error(f"❌ Target Database not found. (Date: {args.date})")
+            return
+        logger.info(f"📂 Loading data directly from SQLite: {db_path}...")
 
     v8_root = Path(__file__).parent.parent
     config_paths = {
         'fast': str(v8_root / "daily_backtest" / "fast_feature.json"),
         'slow': str(v8_root / "daily_backtest" / "slow_feature.json")
     }
-    from config import TARGET_SYMBOLS
-    symbols = [args.symbol] if args.symbol else TARGET_SYMBOLS
 
     logger.info("🛠️ Building S2 dual engine (1s execution path)...")
     domain_auditor = None
@@ -259,55 +392,63 @@ async def main():
     signal_engine.mock_cash = mock_ibkr.initial_capital
     exec_engine.mock_cash = mock_ibkr.initial_capital
 
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    df_a = pd.read_sql("SELECT ts, symbol, alpha as alpha_score, vol_z as fast_vol FROM alpha_logs", conn)
-    df_s = pd.read_sql("SELECT ts, symbol, close, open, high, low, volume FROM market_bars_1s", conn)
-    df_o = pd.read_sql("SELECT ts, symbol, buckets_json FROM option_snapshots_1s", conn)
-    conn.close()
+    if args.use_pgsql:
+        logger.info("📂 Loading from PostgreSQL via config.PG_DB_URL (partition %s)...", args.date)
+        df = load_merged_df_pgsql(str(args.date), symbols, config.PG_DB_URL)
+        if df is None or df.empty:
+            logger.error("❌ PostgreSQL merged frame empty")
+            return
+    else:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        df_a = pd.read_sql("SELECT ts, symbol, alpha as alpha_score, vol_z as fast_vol FROM alpha_logs", conn)
+        df_s = pd.read_sql("SELECT ts, symbol, close, open, high, low, volume FROM market_bars_1s", conn)
+        df_o = pd.read_sql("SELECT ts, symbol, buckets_json FROM option_snapshots_1s", conn)
+        conn.close()
 
-    # 🚀 [NEW] Calculate Index ROCs from the full dataset before filtering
-    # Ensure ts is float for all calculations
-    df_s['ts'] = df_s['ts'].astype(float)
-    df_idx = df_s[df_s['symbol'].isin(['SPY', 'QQQ'])].pivot(index='ts', columns='symbol', values='close')
-    
-    # Prepare a ROC map for all unique timestamps
-    unique_ts = sorted(df_s['ts'].unique())
-    df_roc_map = pd.DataFrame(index=unique_ts)
-    for col in ['SPY', 'QQQ']:
-        if col in df_idx.columns:
-            # 5-minute ROC (1s bars = 300 periods)
-            df_roc_map[f'{col.lower()}_roc_5min'] = df_idx[col].pct_change(periods=300).fillna(0.0)
-        else:
-            df_roc_map[f'{col.lower()}_roc_5min'] = 0.0
-    
-    # Merge ROCs into df_s so they carry over after symbol filtering
-    df_s = df_s.merge(df_roc_map.reset_index().rename(columns={'index': 'ts'}), on='ts', how='left')
+        # 🚀 [NEW] Calculate Index ROCs from the full dataset before filtering
+        # Ensure ts is float for all calculations
+        df_s['ts'] = df_s['ts'].astype(float)
+        df_idx = df_s[df_s['symbol'].isin(['SPY', 'QQQ'])].pivot(index='ts', columns='symbol', values='close')
 
-    if symbols:
-        df_a = df_a[df_a['symbol'].isin(symbols)]
-        df_s = df_s[df_s['symbol'].isin(symbols)]
-        df_o = df_o[df_o['symbol'].isin(symbols)]
+        # Prepare a ROC map for all unique timestamps
+        unique_ts = sorted(df_s['ts'].unique())
+        df_roc_map = pd.DataFrame(index=unique_ts)
+        for col in ['SPY', 'QQQ']:
+            if col in df_idx.columns:
+                # 5-minute ROC (1s bars = 300 periods)
+                df_roc_map[f'{col.lower()}_roc_5min'] = df_idx[col].pct_change(periods=300).fillna(0.0)
+            else:
+                df_roc_map[f'{col.lower()}_roc_5min'] = 0.0
 
-    for df_tmp in [df_a, df_s, df_o]:
-        df_tmp['ts'] = df_tmp['ts'].astype(float)
-        df_tmp['symbol'] = df_tmp['symbol'].astype(str)
+        # Merge ROCs into df_s so they carry over after symbol filtering
+        df_s = df_s.merge(df_roc_map.reset_index().rename(columns={'index': 'ts'}), on='ts', how='left')
 
-    # alpha_logs 的 ts 是分钟标签时间（左对齐），但该分钟 alpha 只有到下一分钟边界才可见。
-    # 这里先把“可交易时间”右移 60s，再和 1s 行情做 backward merge，避免 lookahead。
-    df_a['alpha_label_ts'] = df_a['ts']
-    df_a['ts'] = df_a['ts'] + ALPHA_AVAILABLE_DELAY_SECONDS
-    df_a = df_a.sort_values('ts')
-    df_s = df_s.sort_values('ts')
-    df_o = df_o.sort_values('ts')
+        if symbols:
+            df_a = df_a[df_a['symbol'].isin(symbols)]
+            df_s = df_s[df_s['symbol'].isin(symbols)]
+            df_o = df_o[df_o['symbol'].isin(symbols)]
 
-    df_market = pd.merge_asof(df_s, df_o, on='ts', by='symbol', direction='backward', tolerance=2)
-    df = pd.merge_asof(df_market, df_a, on='ts', by='symbol', direction='backward', tolerance=120)
+        for df_tmp in [df_a, df_s, df_o]:
+            df_tmp['ts'] = df_tmp['ts'].astype(float)
+            df_tmp['symbol'] = df_tmp['symbol'].astype(str)
 
-    if df.empty:
-        logger.error("❌ Merged dataset is EMPTY! Check DB integrity.")
-        return
+        # alpha_logs 的 ts 是分钟标签时间（左对齐），但该分钟 alpha 只有到下一分钟边界才可见。
+        # 这里先把“可交易时间”右移 60s，再和 1s 行情做 backward merge，避免 lookahead。
+        df_a['alpha_label_ts'] = df_a['ts']
+        df_a['ts'] = df_a['ts'] + ALPHA_AVAILABLE_DELAY_SECONDS
+        df_a = df_a.sort_values('ts')
+        df_s = df_s.sort_values('ts')
+        df_o = df_o.sort_values('ts')
 
-    grouped = df.sort_values('ts', ascending=True).groupby('ts')
+        df_market = pd.merge_asof(df_s, df_o, on='ts', by='symbol', direction='backward', tolerance=2)
+        df = pd.merge_asof(df_market, df_a, on='ts', by='symbol', direction='backward', tolerance=120)
+
+        if df.empty:
+            logger.error("❌ Merged dataset is EMPTY! Check DB integrity.")
+            return
+
+    sort_by = ['ts', '_row_order'] if '_row_order' in df.columns else ['ts']
+    grouped = df.sort_values(sort_by, ascending=True).groupby('ts')
     unique_groups = df['ts'].nunique()
     expected_symbol_count = len(symbols)
     symbol_rows_per_tick = df.groupby('ts')['symbol'].nunique()

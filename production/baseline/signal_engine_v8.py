@@ -1048,7 +1048,7 @@ class SignalEngineV8:
 
         s_mock = {
             'stock_id': torch.from_numpy(batch['stock_id'].copy()).long().to(self.device) if 'stock_id' in batch else torch.zeros(len(symbols), dtype=torch.long).to(self.device),
-            'sector_id': torch.zeros(len(symbols), dtype=torch.long).to(self.device),
+            'sector_id': torch.from_numpy(batch['sector_id'].copy()).long().to(self.device) if 'sector_id' in batch else torch.zeros(len(symbols), dtype=torch.long).to(self.device),
             'day_of_week': torch.full((len(symbols),), ny_now.weekday(), dtype=torch.long).to(self.device),
             'hour': torch.full((len(symbols),), ny_now.hour, dtype=torch.long).to(self.device),
             'minute': torch.full((len(symbols),), ny_now.minute, dtype=torch.long).to(self.device)

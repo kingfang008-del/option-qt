@@ -1,0 +1,1088 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: transparent;
+      color: #e8eef8;
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      overflow: hidden;
+    }
+    #root {
+      position: relative;
+      width: 100%;
+      height: 620px;
+      background: #ffffff;
+      border: 1px solid rgba(31, 41, 55, 0.14);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    #layout {
+      display: flex;
+      flex-direction: row;
+      width: 100%;
+      height: 100%;
+      min-height: 0;
+    }
+    #chart-wrap {
+      position: relative;
+      flex: 1;
+      min-width: 0;
+      height: 100%;
+    }
+    #right-stack {
+      width: 212px;
+      flex-shrink: 0;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      box-sizing: border-box;
+      border-left: 1px solid rgba(31, 41, 55, 0.14);
+      min-height: 0;
+    }
+    #tradebar-host {
+      flex: 0 0 auto;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      padding: 6px 6px 8px;
+      box-sizing: border-box;
+      border-bottom: 1px solid rgba(31, 41, 55, 0.10);
+    }
+    #chart {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+    }
+    #leaders-dock {
+      display: none;
+      flex-direction: column;
+      flex: 1 1 auto;
+      min-height: 0;
+      width: 100%;
+      overflow: hidden auto;
+      padding: 8px 8px 10px;
+      box-sizing: border-box;
+      font-size: 10px;
+    }
+    #leaders-dock.ld-visible {
+      display: flex;
+    }
+    .ld-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      font-weight: 800;
+      font-size: 11px;
+      margin-bottom: 6px;
+    }
+    .ld-muted { font-weight: 600; opacity: 0.72; font-size: 10px; }
+    .ld-stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px;
+      margin-bottom: 8px;
+    }
+    .ld-stat {
+      border-radius: 5px;
+      padding: 4px 5px;
+      text-align: center;
+      background: rgba(31, 41, 55, 0.06);
+    }
+    .ld-stat .ld-lab {
+      display: block;
+      font-size: 9px;
+      opacity: 0.65;
+    }
+    .ld-stat .ld-val {
+      display: block;
+      font-weight: 800;
+      font-size: 11px;
+      margin-top: 1px;
+      font-variant-numeric: tabular-nums;
+    }
+    .ld-sec {
+      font-weight: 800;
+      font-size: 10px;
+      margin: 6px 0 3px;
+      opacity: 0.85;
+    }
+    .ld-hdr, .ld-row {
+      display: grid;
+      grid-template-columns: 1fr 0.72fr 0.72fr 0.62fr 0.55fr;
+      gap: 2px;
+      align-items: center;
+    }
+    .ld-hdr {
+      font-size: 9px;
+      opacity: 0.55;
+      padding: 0 2px 2px;
+    }
+    .ld-row {
+      font-size: 10px;
+      border-radius: 5px;
+      padding: 3px 4px;
+      margin-bottom: 2px;
+      border: 1px solid transparent;
+      transition: background-color 160ms ease, border-color 160ms ease;
+    }
+    .ld-row.long {
+      background: rgba(0, 204, 150, 0.09);
+      border-color: rgba(0, 204, 150, 0.2);
+    }
+    .ld-row.short {
+      background: rgba(239, 85, 59, 0.09);
+      border-color: rgba(239, 85, 59, 0.2);
+    }
+    .ld-sym { font-weight: 800; }
+    .ld-link {
+      color: inherit !important;
+      text-decoration: none !important;
+      cursor: pointer;
+    }
+    .ld-link:hover { text-decoration: underline !important; }
+    .ld-num { text-align: right; font-variant-numeric: tabular-nums; font-weight: 700; }
+    .ld-empty { opacity: 0.55; padding: 4px 2px; font-size: 10px; }
+    @keyframes ldFlashUp {
+      0% { background: rgba(0, 204, 150, 0.38); }
+      100% { background: rgba(0, 204, 150, 0.09); }
+    }
+    @keyframes ldFlashDown {
+      0% { background: rgba(239, 85, 59, 0.38); }
+      100% { background: rgba(239, 85, 59, 0.09); }
+    }
+    .ld-row.flash-up { animation: ldFlashUp 820ms ease-out; }
+    .ld-row.flash-down { animation: ldFlashDown 820ms ease-out; }
+    @keyframes ldStatPulse {
+      0% { filter: brightness(1.25); }
+      100% { filter: brightness(1); }
+    }
+    .ld-stat-flash { animation: ldStatPulse 600ms ease-out; }
+    #topbar {
+      position: absolute;
+      z-index: 5;
+      top: 10px;
+      left: 12px;
+      right: 12px;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      pointer-events: none;
+      gap: 10px;
+    }
+    #topbar-left { min-width: 0; flex: 1; }
+    .trade-hint {
+      font-size: 10px;
+      color: #667085;
+      font-weight: 500;
+      margin-top: 3px;
+      max-width: 52vw;
+      line-height: 1.35;
+    }
+    .symbol {
+      font-weight: 700;
+      letter-spacing: 0;
+      color: #1f2937;
+    }
+    .ohlc {
+      font-size: 12px;
+      color: #667085;
+    }
+    #pulse {
+      position: absolute;
+      z-index: 4;
+      width: 16px;
+      height: 16px;
+      border-radius: 999px;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      opacity: 0;
+      animation: breathe 1.55s ease-in-out infinite;
+      box-shadow: 0 0 0 0 currentColor;
+    }
+    @keyframes breathe {
+      0% { opacity: 0.20; box-shadow: 0 0 0 0 currentColor; }
+      55% { opacity: 0.72; box-shadow: 0 0 0 12px rgba(255,255,255,0); }
+      100% { opacity: 0.20; box-shadow: 0 0 0 0 rgba(255,255,255,0); }
+    }
+    #tradebar {
+      position: relative;
+      z-index: 2;
+      display: none;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 0;
+      pointer-events: auto;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .mny-toggle {
+      display: flex;
+      flex-direction: row;
+      width: 100%;
+      gap: 5px;
+      margin-bottom: 8px;
+      box-sizing: border-box;
+    }
+    .mny-btn {
+      flex: 1;
+      height: 26px;
+      border-radius: 5px;
+      border: 1px solid rgba(31, 41, 55, 0.14);
+      font-weight: 800;
+      font-size: 11px;
+      cursor: pointer;
+      background: rgba(31, 41, 55, 0.06);
+      color: inherit;
+    }
+    .mny-btn.mny-active {
+      background: rgba(76, 120, 168, 0.30);
+      border-color: rgba(76, 120, 168, 0.55);
+      opacity: 1;
+    }
+    .mny-btn.mny-idle {
+      opacity: 0.42;
+      filter: grayscale(0.35);
+    }
+    .trade-row-cards {
+      display: flex;
+      flex-direction: row;
+      flex-wrap: wrap;
+      justify-content: center;
+      align-items: stretch;
+      gap: 6px;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .trade-card {
+      flex: 1 1 88px;
+      min-width: 88px;
+      max-width: 100%;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 6px;
+      padding: 6px 7px;
+      backdrop-filter: blur(12px);
+    }
+    .call { background: rgba(239, 85, 59, 0.20); }
+    .put { background: rgba(0, 204, 150, 0.18); }
+    .held { background: rgba(132, 142, 158, 0.18); }
+    #tradebar .title {
+      font-size: 11px;
+      font-weight: 700;
+      margin-bottom: 3px;
+    }
+    #tradebar .strike-txt {
+      font-size: 10px;
+      font-weight: 700;
+      opacity: 0.88;
+      margin: 0 0 4px 0;
+      letter-spacing: 0;
+    }
+    #tradebar .quote {
+      font-size: 9px;
+      color: #667085;
+      margin-bottom: 5px;
+      white-space: nowrap;
+    }
+    #tradebar button {
+      width: 100%;
+      height: 26px;
+      border: 0;
+      border-radius: 6px;
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+      letter-spacing: 0;
+    }
+    button.call-btn { background: #ef553b; }
+    button.put-btn { background: #00a879; }
+    button.close-btn { background: #4c78a8; }
+    button:disabled {
+      background: #586071;
+      color: rgba(255, 255, 255, 0.62);
+      cursor: not-allowed;
+    }
+    #fallback {
+      display: none;
+      position: absolute;
+      inset: 0;
+      align-items: center;
+      justify-content: center;
+      color: rgba(232,238,248,0.7);
+      font-size: 13px;
+      padding: 20px;
+      text-align: center;
+      z-index: 20;
+      background: rgba(255,255,255,0.88);
+    }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div id="layout">
+      <div id="chart-wrap">
+        <div id="chart"></div>
+        <div id="topbar">
+          <div id="topbar-left">
+            <div class="symbol" id="symbol">-</div>
+            <div class="trade-hint" id="trade-hint">上方 ATM/OTM 切换 Call/Put 行权价与盘口；下单走对应 bucket 锁定合约。十字光标用于查看其它分钟 OHLC（美东 ET）。</div>
+          </div>
+          <div class="ohlc" id="ohlc">Move crosshair over candles</div>
+        </div>
+        <div id="pulse"></div>
+        <div id="fallback">Lightweight Charts failed to load. Check browser network access to unpkg.com.</div>
+      </div>
+      <div id="right-stack">
+        <div id="tradebar-host">
+          <div id="tradebar"></div>
+        </div>
+        <div id="leaders-dock" class="ld-panel">
+          <div class="ld-title"><span>Leaders</span><span id="ld-latest" class="ld-muted">--</span></div>
+        <div class="ld-stats">
+          <div class="ld-stat" id="ld-stat-regime-wrap"><span class="ld-lab">Regime</span><span id="ld-regime" class="ld-val">--</span></div>
+          <div class="ld-stat" id="ld-stat-breadth-wrap"><span class="ld-lab">Breadth</span><span id="ld-breadth" class="ld-val">--</span></div>
+          <div class="ld-stat" id="ld-stat-med-wrap"><span class="ld-lab">Med 5m</span><span id="ld-med" class="ld-val">--</span></div>
+          <div class="ld-stat" id="ld-stat-top3-wrap"><span class="ld-lab">Top3</span><span id="ld-top3" class="ld-val">--</span></div>
+        </div>
+        <div class="ld-sec">Long</div>
+        <div class="ld-hdr"><span>Sym</span><span class="ld-num">Sc</span><span class="ld-num">5m</span><span class="ld-num">α</span><span class="ld-num">Vz</span></div>
+        <div id="ld-long"></div>
+        <div class="ld-sec">Short</div>
+        <div class="ld-hdr"><span>Sym</span><span class="ld-num">Sc</span><span class="ld-num">5m</span><span class="ld-num">α</span><span class="ld-num">Vz</span></div>
+        <div id="ld-short"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function postStreamlitMessage(payload) {
+      window.parent.postMessage({ isStreamlitMessage: true, ...payload }, "*");
+    }
+
+    const Streamlit = {
+      setComponentReady: () => postStreamlitMessage({ type: "streamlit:componentReady", apiVersion: 1 }),
+      setFrameHeight: (height) => postStreamlitMessage({ type: "streamlit:setFrameHeight", height }),
+      setComponentValue: (value) => postStreamlitMessage({ type: "streamlit:setComponentValue", value }),
+    };
+
+    let chart = null;
+    let candleSeries = null;
+    let volumeSeries = null;
+    let currentArgs = {};
+    let bars = [];
+    let ws = null;
+    let wsUrl = "";
+    let leaderScoreCache = {};
+    let lastStatText = {};
+    /** DB / bars use Unix UTC seconds; axis & crosshair labels show US Eastern session clock. */
+    const NY_TZ = "America/New_York";
+    let lastTradebarContentKey = "";
+    let mnyMode = "atm";
+    let lastMnySymbol = "";
+
+    function formatNyFromUtcSec(utcSec, intlOpts) {
+      const sec = Number(utcSec);
+      if (!Number.isFinite(sec)) return "";
+      return new Intl.DateTimeFormat("en-US", { timeZone: NY_TZ, ...intlOpts }).format(new Date(sec * 1000));
+    }
+
+    function chartLocalizationTimeFormatter(time) {
+      if (time === null || time === undefined) return "";
+      if (typeof time === "number") {
+        return formatNyFromUtcSec(time, {
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+        });
+      }
+      if (typeof time === "object" && time.year != null) {
+        const m = String(time.month).padStart(2, "0");
+        const d = String(time.day).padStart(2, "0");
+        return `${m}/${d}/${time.year}`;
+      }
+      return String(time);
+    }
+
+    function chartTickMarkFormatter(time, _tickMarkType, _locale) {
+      if (typeof time === "number") {
+        const s = formatNyFromUtcSec(time, { hour: "2-digit", minute: "2-digit", hour12: false });
+        return s.length > 8 ? s.slice(0, 8) : s;
+      }
+      return null;
+    }
+
+    function chartWrapWidth() {
+      const el = document.getElementById("chart-wrap");
+      return Math.max(120, el ? el.clientWidth : 400);
+    }
+
+    function fmtPrice(v) {
+      const n = Number(v || 0);
+      return n > 0 ? n.toFixed(3) : "--";
+    }
+
+    function fmtStrike(quote) {
+      if (!quote || quote.strike === undefined || quote.strike === null) return "--";
+      const n = Number(quote.strike);
+      if (!Number.isFinite(n) || n <= 0) return "--";
+      return n.toFixed(2);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function fmtSigned(value, digits = 2) {
+      if (value === null || value === undefined || value === "") return "--";
+      const n = Number(value);
+      return Number.isFinite(n) ? `${n >= 0 ? "+" : ""}${n.toFixed(digits)}` : "--";
+    }
+
+    function fmtPct(value) {
+      if (value === null || value === undefined || value === "") return "--";
+      const n = Number(value);
+      return Number.isFinite(n) ? `${n >= 0 ? "+" : ""}${(n * 100).toFixed(2)}%` : "--";
+    }
+
+    function fmtStatPct(value, digits = 0) {
+      if (value === null || value === undefined || value === "") return "--";
+      const n = Number(value);
+      return Number.isFinite(n) ? `${(n * 100).toFixed(digits)}%` : "--";
+    }
+
+    function fmtLeaderTime(ts) {
+      const n = Number(ts || 0);
+      if (!Number.isFinite(n) || n <= 0) return "--";
+      return formatNyFromUtcSec(n, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+    }
+
+    function navigateMomentumSymbol(sym) {
+      const s = String(sym || "").trim().toUpperCase();
+      if (!s) return;
+      Streamlit.setComponentValue({
+        action: "pick_symbol",
+        symbol: s,
+        tag: "",
+        nonce: Date.now(),
+      });
+    }
+
+    function chartColors() {
+      const colors = currentArgs.colors || {};
+      return {
+        up: colors.up || "#00cc96",
+        down: colors.down || "#ef553b",
+      };
+    }
+
+    function chartTheme() {
+      const theme = currentArgs.theme || {};
+      return {
+        background: theme.background || "#f7f9fc",
+        panel: theme.panel || "#ffffff",
+        text: theme.text || "#1f2937",
+        muted: theme.muted || "#667085",
+        grid: theme.grid || "rgba(31,41,55,0.10)",
+        border: theme.border || "rgba(31,41,55,0.14)",
+      };
+    }
+
+    function applyDomTheme() {
+      const theme = chartTheme();
+      const root = document.getElementById("root");
+      root.style.background = theme.panel;
+      root.style.borderColor = theme.border;
+      document.getElementById("symbol").style.color = theme.text;
+      document.getElementById("ohlc").style.color = theme.muted;
+      const th = document.getElementById("trade-hint");
+      if (th) th.style.color = theme.muted;
+      const dock = document.getElementById("leaders-dock");
+      if (dock) {
+        dock.style.background = theme.panel;
+        dock.style.color = theme.text;
+      }
+      const rs = document.getElementById("right-stack");
+      if (rs) rs.style.borderLeftColor = theme.border;
+      const thost = document.getElementById("tradebar-host");
+      if (thost) {
+        thost.style.background = theme.panel;
+        thost.style.borderBottomColor = theme.border;
+      }
+    }
+
+    function flashStat(idWrap, nextText) {
+      const prev = lastStatText[idWrap];
+      lastStatText[idWrap] = nextText;
+      if (prev === undefined || prev === nextText) return;
+      const el = document.getElementById(idWrap);
+      if (!el) return;
+      el.classList.remove("ld-stat-flash");
+      void el.offsetWidth;
+      el.classList.add("ld-stat-flash");
+    }
+
+    function bucketTagForSide(side, mode) {
+      const suffix = mode === "otm" ? "OTM" : "ATM";
+      return side === "call" ? `CALL_${suffix}` : `PUT_${suffix}`;
+    }
+
+    function positionMatchesBucket(position, bucketTag) {
+      if (!position) return false;
+      const pt = String(position.tag || "").trim().toUpperCase();
+      return pt === String(bucketTag || "").trim().toUpperCase();
+    }
+
+    function mkCard(side, quote, position, bucketTag) {
+      const sideUpper = side === "call" ? "CALL" : "PUT";
+      const hasThis = positionMatchesBucket(position, bucketTag);
+      const hasOther = position && !hasThis;
+      const kindCls = side === "call" ? "call" : "put";
+      const cls = hasThis ? "held" : kindCls;
+      const disabled = hasOther || (!quote || !(Number(quote.mid) > 0));
+      const buttonText = hasThis ? `平仓 ${sideUpper}` : (hasOther ? "已有另一侧持仓" : `买入 ${sideUpper}`);
+      const buttonClass = hasThis ? "close-btn" : `${side === "call" ? "call" : "put"}-btn`;
+      const theme = chartTheme();
+      const strikeColor = escapeHtml(theme.text || "#1f2937");
+      const safeTag = escapeHtml(String(bucketTag || ""));
+      return `
+        <div class="trade-card ${cls}">
+          <div class="title">${sideUpper}</div>
+          <div class="strike-txt" style="color:${strikeColor};">行权 $${fmtStrike(quote)}</div>
+          <div class="quote">mid ${fmtPrice(quote && quote.mid)} · bid ${fmtPrice(quote && quote.bid)} · ask ${fmtPrice(quote && quote.ask)}</div>
+          <button type="button" class="${buttonClass}" data-action="${hasThis ? "close" : "buy"}" data-tag="${safeTag}" ${disabled ? "disabled" : ""}>${buttonText}</button>
+        </div>
+      `;
+    }
+
+    function emitAction(action, tag) {
+      Streamlit.setComponentValue({
+        action,
+        tag,
+        symbol: currentArgs.symbol || "",
+        nonce: Date.now(),
+      });
+    }
+
+    function buildLatestTradebarHtml() {
+      const tradebar = document.getElementById("tradebar");
+      if (!tradebar) return "";
+      if (currentArgs.readOnly) {
+        return `
+          <div class="trade-card held">
+            <div class="title">${escapeHtml(String(currentArgs.chartDate || "Historical"))} · Read Only</div>
+            <div class="quote">Historical chart mode disables order actions.</div>
+            <button disabled>历史回看</button>
+          </div>
+        `;
+      }
+      const quotes = currentArgs.quotes || {};
+      const mode = mnyMode === "otm" ? "otm" : "atm";
+      const cTag = bucketTagForSide("call", mode);
+      const pTag = bucketTagForSide("put", mode);
+      const qCall = quotes[cTag] || {};
+      const qPut = quotes[pTag] || {};
+      const pos = currentArgs.position || null;
+      return `
+        <div class="mny-toggle" role="tablist" aria-label="ATM or OTM">
+          <button type="button" class="mny-btn ${mode === "atm" ? "mny-active" : "mny-idle"}" data-mny="atm">ATM</button>
+          <button type="button" class="mny-btn ${mode === "otm" ? "mny-active" : "mny-idle"}" data-mny="otm">OTM</button>
+        </div>
+        <div class="trade-row-cards">
+          ${mkCard("call", qCall, pos, cTag)}
+          ${mkCard("put", qPut, pos, pTag)}
+        </div>
+      `;
+    }
+
+    function tradebarContentKey() {
+      const q = currentArgs.quotes || {};
+      const p = currentArgs.position || null;
+      const ro = Boolean(currentArgs.readOnly);
+      try {
+        return JSON.stringify({
+          ro,
+          cd: currentArgs.chartDate || "",
+          mny: mnyMode,
+          CALL_ATM: q.CALL_ATM || {},
+          CALL_OTM: q.CALL_OTM || {},
+          PUT_ATM: q.PUT_ATM || {},
+          PUT_OTM: q.PUT_OTM || {},
+          pos: p,
+        });
+      } catch (_e) {
+        return String(Math.random());
+      }
+    }
+
+    function refreshLatestTradebarInner() {
+      const tradebar = document.getElementById("tradebar");
+      if (!tradebar) return;
+      const key = tradebarContentKey();
+      if (key === lastTradebarContentKey && tradebar.innerHTML) return;
+      lastTradebarContentKey = key;
+      tradebar.innerHTML = buildLatestTradebarHtml();
+    }
+
+    function restoreOhlcLatestLine() {
+      if (!bars.length) return;
+      const last = bars[bars.length - 1];
+      const tl = formatNyFromUtcSec(last.time, { hour: "2-digit", minute: "2-digit", hour12: false });
+      document.getElementById("ohlc").textContent =
+        `${tl} ET · Latest O ${last.open.toFixed(2)} H ${last.high.toFixed(2)} L ${last.low.toFixed(2)} C ${last.close.toFixed(2)}`;
+    }
+
+    /** 最新收盘价呼吸灯；CALL/PUT 固定在右侧 #tradebar-host，不叠在 K 线上 */
+    function updateLatestAnchors() {
+      const pulse = document.getElementById("pulse");
+      const tradebar = document.getElementById("tradebar");
+      if (!chart || !candleSeries || !bars.length) {
+        pulse.style.opacity = 0;
+        if (tradebar) tradebar.style.display = "none";
+        syncRightStackLayout();
+        return;
+      }
+      const last = bars[bars.length - 1];
+      const x = chart.timeScale().timeToCoordinate(last.time);
+      const yClose = candleSeries.priceToCoordinate(last.close);
+      if (x == null || yClose == null) {
+        pulse.style.opacity = 0;
+      } else {
+        const colors = chartColors();
+        const up = Number(last.close) >= Number(last.open);
+        pulse.style.left = `${x}px`;
+        pulse.style.top = `${yClose}px`;
+        pulse.style.color = up ? colors.up : colors.down;
+        pulse.style.background = up ? `${colors.up}55` : `${colors.down}55`;
+        pulse.style.opacity = 1;
+      }
+      if (tradebar) {
+        tradebar.style.display = "flex";
+        refreshLatestTradebarInner();
+      }
+      syncRightStackLayout();
+    }
+
+    function syncRightStackLayout() {
+      const rs = document.getElementById("right-stack");
+      const dock = document.getElementById("leaders-dock");
+      const host = document.getElementById("tradebar-host");
+      const tradebar = document.getElementById("tradebar");
+      if (!rs) return;
+      const embed = dock && dock.classList.contains("ld-visible");
+      const tbVis = tradebar && tradebar.style.display === "flex";
+      rs.style.display = embed || tbVis ? "flex" : "none";
+      if (host) host.style.display = tbVis ? "flex" : "none";
+    }
+
+    function updateLatestBar(nextBar) {
+      if (!nextBar || !candleSeries || !volumeSeries) return;
+      const bar = {
+        time: Number(nextBar.time || nextBar.ts),
+        open: Number(nextBar.open),
+        high: Number(nextBar.high),
+        low: Number(nextBar.low),
+        close: Number(nextBar.close),
+        volume: Number(nextBar.volume || 0),
+      };
+      if (!bar.time || !Number.isFinite(bar.close)) return;
+      const last = bars[bars.length - 1];
+      const isNewCandle = !last || Number(last.time) !== Number(bar.time);
+      if (last && Number(last.time) === Number(bar.time)) {
+        bars[bars.length - 1] = bar;
+      } else {
+        bars.push(bar);
+      }
+      candleSeries.update(bar);
+      const colors = chartColors();
+      volumeSeries.update({
+        time: bar.time,
+        value: bar.volume,
+        color: bar.close >= bar.open ? `${colors.up}55` : `${colors.down}55`,
+      });
+      const tl = formatNyFromUtcSec(bar.time, { hour: "2-digit", minute: "2-digit", hour12: false });
+      document.getElementById("ohlc").textContent =
+        `${tl} ET · Latest O ${bar.open.toFixed(2)} H ${bar.high.toFixed(2)} L ${bar.low.toFixed(2)} C ${bar.close.toFixed(2)}`;
+      updateLatestAnchors();
+      if (isNewCandle && chart) {
+        try { chart.timeScale().scrollToRealTime(); } catch (_e) {}
+      }
+    }
+
+    function leaderRowHtml(row, side, compatFloat) {
+      const sym = String(row.symbol || "").trim().toUpperCase();
+      const score = Number(row.momentum_score);
+      const key = `${side}:${sym}`;
+      const previous = leaderScoreCache[key];
+      let flashClass = "";
+      if (Number.isFinite(score) && Number.isFinite(previous)) {
+        if (score > previous + 0.0001) flashClass = " flash-up";
+        if (score < previous - 0.0001) flashClass = " flash-down";
+      }
+      if (Number.isFinite(score)) leaderScoreCache[key] = score;
+      const safeSym = escapeHtml(sym);
+      const rowCls = compatFloat ? `float-row ${side}` : `ld-row ${side}`;
+      const symCell = compatFloat
+        ? `<a class="float-sym float-link" href="?momentum_symbol=${encodeURIComponent(sym)}" target="_self">${safeSym}</a>`
+        : `<a class="ld-sym ld-link" href="#" data-momentum-sym="${sym.replace(/"/g, "")}">${safeSym}</a>`;
+      const c1 = compatFloat ? "float-score" : "ld-num";
+      const c2 = compatFloat ? "float-cell" : "ld-num";
+      return [
+        `<div class="${rowCls}${flashClass}">`,
+        symCell,
+        `<div class="${c1}">${fmtSigned(row.momentum_score, 2)}</div>`,
+        `<div class="${c2}">${fmtPct(row.ret_5m)}</div>`,
+        `<div class="${c2}">${fmtSigned(row.alpha, 2)}</div>`,
+        `<div class="${c2}">${fmtSigned(row.vol_z, 1)}</div>`,
+        `</div>`,
+      ].join("");
+    }
+
+    function paintLeadersDock(leadersPayload) {
+      const dock = document.getElementById("leaders-dock");
+      if (!dock || !dock.classList.contains("ld-visible")) return;
+      const leaders = leadersPayload && leadersPayload.leaders ? leadersPayload.leaders : leadersPayload;
+      if (!leaders) return;
+      const stats = leaders.stats || {};
+      const latestEl = document.getElementById("ld-latest");
+      if (latestEl) latestEl.textContent = fmtLeaderTime(stats.latest_ts);
+      const regime = stats.regime || "N/A";
+      const br = fmtStatPct(stats.breadth_up_ratio, 0);
+      const med = fmtPct(stats.median_ret_5m);
+      const t3 = fmtSigned(stats.top3_strength, 2);
+      const rEl = document.getElementById("ld-regime");
+      if (rEl) { flashStat("ld-stat-regime-wrap", regime); rEl.textContent = regime; }
+      const bEl = document.getElementById("ld-breadth");
+      if (bEl) { flashStat("ld-stat-breadth-wrap", br); bEl.textContent = br; }
+      const mEl = document.getElementById("ld-med");
+      if (mEl) { flashStat("ld-stat-med-wrap", med); mEl.textContent = med; }
+      const tEl = document.getElementById("ld-top3");
+      if (tEl) { flashStat("ld-stat-top3-wrap", t3); tEl.textContent = t3; }
+      const longEl = document.getElementById("ld-long");
+      const shortEl = document.getElementById("ld-short");
+      const longRows = Array.isArray(leaders.long) ? leaders.long : [];
+      const shortRows = Array.isArray(leaders.short) ? leaders.short : [];
+      if (longEl) {
+        longEl.innerHTML = longRows.length
+          ? longRows.slice(0, 5).map((row) => leaderRowHtml(row, "long", false)).join("")
+          : "<div class='ld-empty'>暂无多头</div>";
+      }
+      if (shortEl) {
+        shortEl.innerHTML = shortRows.length
+          ? shortRows.slice(0, 5).map((row) => leaderRowHtml(row, "short", false)).join("")
+          : "<div class='ld-empty'>暂无空头</div>";
+      }
+    }
+
+    function updateParentMomentum(leadersPayload) {
+      const leaders = leadersPayload && leadersPayload.leaders ? leadersPayload.leaders : leadersPayload;
+      if (!leaders) return;
+      try {
+        const doc = window.parent && window.parent.document;
+        const panel = doc && doc.querySelector(".floating-momentum-panel");
+        if (!panel) return;
+        const stats = leaders.stats || {};
+        const latest = panel.querySelector(".float-latest");
+        if (latest) latest.textContent = fmtLeaderTime(stats.latest_ts);
+        const statMap = {
+          regime: stats.regime || "N/A",
+          breadth: fmtStatPct(stats.breadth_up_ratio, 0),
+          median_ret_5m: fmtPct(stats.median_ret_5m),
+          top3_strength: fmtSigned(stats.top3_strength, 2),
+        };
+        Object.entries(statMap).forEach(([name, value]) => {
+          const el = panel.querySelector(`[data-stat="${name}"]`);
+          if (el) el.textContent = value;
+        });
+        const longRows = panel.querySelector('.float-rows[data-side="long"]');
+        const shortRows = panel.querySelector('.float-rows[data-side="short"]');
+        if (longRows) {
+          const rows = Array.isArray(leaders.long) ? leaders.long : [];
+          longRows.innerHTML = rows.length ? rows.slice(0, 5).map((row) => leaderRowHtml(row, "long", true)).join("") : "<div class='float-empty'>暂无多头冠军</div>";
+        }
+        if (shortRows) {
+          const rows = Array.isArray(leaders.short) ? leaders.short : [];
+          shortRows.innerHTML = rows.length ? rows.slice(0, 5).map((row) => leaderRowHtml(row, "short", true)).join("") : "<div class='float-empty'>暂无空头冠军</div>";
+        }
+      } catch (_e) {}
+    }
+
+    function updateLeadersUi(leadersPayload) {
+      paintLeadersDock(leadersPayload);
+      updateParentMomentum(leadersPayload);
+    }
+
+    function bindLeadersDockClicks() {
+      const dock = document.getElementById("leaders-dock");
+      if (!dock || dock.dataset.bound === "1") return;
+      dock.dataset.bound = "1";
+      dock.addEventListener("click", (e) => {
+        const a = e.target.closest("a[data-momentum-sym]");
+        if (!a) return;
+        e.preventDefault();
+        navigateMomentumSymbol(a.getAttribute("data-momentum-sym"));
+      });
+    }
+
+    function connectWs(url) {
+      const nextUrl = String(url || "").trim();
+      if (nextUrl === wsUrl) return;
+      wsUrl = nextUrl;
+      if (ws) {
+        try { ws.close(); } catch (_e) {}
+        ws = null;
+      }
+      if (!wsUrl) return;
+      try {
+        ws = new WebSocket(wsUrl);
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.symbol && currentArgs.symbol && msg.type !== "leaders" && String(msg.symbol).toUpperCase() !== String(currentArgs.symbol).toUpperCase()) {
+              return;
+            }
+            if (msg.type === "snapshot") {
+              if (msg.bar) updateLatestBar(msg.bar);
+              if (msg.leaders) updateLeadersUi(msg.leaders);
+            } else if (msg.type === "leaders") {
+              updateLeadersUi(msg);
+            } else if (msg.bar) updateLatestBar(msg.bar);
+            else if (msg.type === "bar" || msg.close !== undefined) updateLatestBar(msg);
+            if (msg.quotes) currentArgs.quotes = msg.quotes;
+            if (msg.position !== undefined) currentArgs.position = msg.position;
+            if (msg.quotes || msg.position !== undefined) {
+              lastTradebarContentKey = "";
+              updateLatestAnchors();
+            }
+          } catch (_e) {}
+        };
+        ws.onclose = () => {
+          const reconnectUrl = wsUrl;
+          ws = null;
+          if (reconnectUrl) {
+            window.setTimeout(() => {
+              if (wsUrl === reconnectUrl && !ws) {
+                wsUrl = "";
+                connectWs(reconnectUrl);
+              }
+            }, 1500);
+          }
+        };
+        ws.onerror = () => {
+          try { ws.close(); } catch (_e) {}
+        };
+      } catch (_e) {
+        ws = null;
+      }
+    }
+
+    function initChart() {
+      if (!window.LightweightCharts) {
+        document.getElementById("fallback").style.display = "flex";
+        return false;
+      }
+      if (chart) return true;
+      const colors = chartColors();
+      const theme = chartTheme();
+      const hostEl = document.getElementById("tradebar-host");
+      if (hostEl && !hostEl.dataset.clickBound) {
+        hostEl.dataset.clickBound = "1";
+        hostEl.addEventListener("click", (e) => {
+          const mnyBtn = e.target.closest("button[data-mny]");
+          if (mnyBtn) {
+            const v = mnyBtn.getAttribute("data-mny");
+            if (v === "atm" || v === "otm") {
+              if (mnyMode !== v) {
+                mnyMode = v;
+                lastTradebarContentKey = "";
+                const tb = document.getElementById("tradebar");
+                if (tb) tb.innerHTML = buildLatestTradebarHtml();
+              }
+              e.stopPropagation();
+            }
+            return;
+          }
+          const btn = e.target.closest("button[data-action]");
+          if (!btn || btn.disabled) return;
+          e.stopPropagation();
+          emitAction(btn.dataset.action, btn.dataset.tag);
+        });
+      }
+      chart = LightweightCharts.createChart(document.getElementById("chart"), {
+        width: chartWrapWidth(),
+        height: 620,
+        layout: { background: { color: theme.panel }, textColor: theme.text },
+        localization: {
+          locale: "en-US",
+          timeFormatter: chartLocalizationTimeFormatter,
+        },
+        grid: {
+          vertLines: { color: theme.grid },
+          horzLines: { color: theme.grid },
+        },
+        crosshair: {
+          mode: LightweightCharts.CrosshairMode.Normal,
+          vertLine: { color: "rgba(232,238,248,0.35)", labelBackgroundColor: "#4c78a8" },
+          horzLine: { color: "rgba(232,238,248,0.25)", labelBackgroundColor: "#4c78a8" },
+        },
+        rightPriceScale: { borderColor: theme.border },
+        timeScale: {
+          borderColor: theme.border,
+          timeVisible: true,
+          secondsVisible: false,
+          tickMarkFormatter: chartTickMarkFormatter,
+        },
+      });
+      candleSeries = chart.addCandlestickSeries({
+        upColor: `${colors.up}bb`,
+        downColor: `${colors.down}bb`,
+        borderUpColor: colors.up,
+        borderDownColor: colors.down,
+        wickUpColor: colors.up,
+        wickDownColor: colors.down,
+        priceLineVisible: true,
+      });
+      volumeSeries = chart.addHistogramSeries({
+        priceFormat: { type: "volume" },
+        priceScaleId: "",
+        lastValueVisible: false,
+        priceLineVisible: false,
+      });
+      volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+      chart.subscribeCrosshairMove((param) => {
+        if (!param || !param.point || !param.time) {
+          restoreOhlcLatestLine();
+          return;
+        }
+        const bar = param.seriesData.get(candleSeries);
+        if (bar) {
+          const colors = chartColors();
+          const up = Number(bar.close) >= Number(bar.open);
+          const t = param.time;
+          const tLabel =
+            typeof t === "number"
+              ? formatNyFromUtcSec(t, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false })
+              : "";
+          const prefix = tLabel ? `<span style="opacity:0.85;margin-right:8px;">${tLabel} ET</span>` : "";
+          document.getElementById("ohlc").innerHTML =
+            `${prefix}<span style="color:${up ? colors.up : colors.down}">O ${Number(bar.open).toFixed(2)} H ${Number(bar.high).toFixed(2)} L ${Number(bar.low).toFixed(2)} C ${Number(bar.close).toFixed(2)}</span>`;
+        }
+      });
+      try {
+        chart.timeScale().subscribeVisibleTimeRangeChange(() => {
+          updateLatestAnchors();
+        });
+      } catch (_e) {}
+      window.addEventListener("resize", () => {
+        if (!chart) return;
+        chart.applyOptions({ width: chartWrapWidth() });
+        updateLatestAnchors();
+      });
+      return true;
+    }
+
+    function render(args) {
+      currentArgs = args || {};
+      const ns = String(currentArgs.symbol || "").trim().toUpperCase();
+      if (ns && ns !== lastMnySymbol) {
+        mnyMode = "atm";
+        lastMnySymbol = ns;
+      }
+      applyDomTheme();
+      const embed = Boolean(currentArgs.embedLiveLeaders);
+      const dock = document.getElementById("leaders-dock");
+      dock.classList.toggle("ld-visible", embed);
+      syncRightStackLayout();
+      bindLeadersDockClicks();
+      lastStatText = {};
+      if (embed) {
+        paintLeadersDock(currentArgs.initialLeaders || { long: [], short: [], stats: {} });
+      } else {
+        leaderScoreCache = {};
+      }
+      document.getElementById("symbol").textContent = `${currentArgs.symbol || ""} · 1m · ET`;
+      const hint = document.getElementById("trade-hint");
+      if (hint) {
+        hint.style.display = currentArgs.readOnly ? "none" : "block";
+      }
+      bars = (currentArgs.bars || []).map((b) => ({
+        time: Number(b.time),
+        open: Number(b.open),
+        high: Number(b.high),
+        low: Number(b.low),
+        close: Number(b.close),
+        volume: Number(b.volume || 0),
+      })).filter((b) => b.time && Number.isFinite(b.close));
+      if (!initChart()) return;
+      const colors = chartColors();
+      const theme = chartTheme();
+      chart.applyOptions({
+        width: chartWrapWidth(),
+        layout: { background: { color: theme.panel }, textColor: theme.text },
+        localization: {
+          locale: "en-US",
+          timeFormatter: chartLocalizationTimeFormatter,
+        },
+        grid: {
+          vertLines: { color: theme.grid },
+          horzLines: { color: theme.grid },
+        },
+        rightPriceScale: { borderColor: theme.border },
+        timeScale: {
+          borderColor: theme.border,
+          timeVisible: true,
+          secondsVisible: false,
+          tickMarkFormatter: chartTickMarkFormatter,
+        },
+      });
+      candleSeries.applyOptions({
+        upColor: `${colors.up}bb`,
+        downColor: `${colors.down}bb`,
+        borderUpColor: colors.up,
+        borderDownColor: colors.down,
+        wickUpColor: colors.up,
+        wickDownColor: colors.down,
+      });
+      candleSeries.setData(bars);
+      volumeSeries.setData(bars.map((b) => ({
+        time: b.time,
+        value: b.volume,
+        color: b.close >= b.open ? `${colors.up}55` : `${colors.down}55`,
+      })));
+      if (bars.length) {
+        chart.timeScale().fitContent();
+        const last = bars[bars.length - 1];
+        const tl = formatNyFromUtcSec(last.time, { hour: "2-digit", minute: "2-digit", hour12: false });
+        document.getElementById("ohlc").textContent =
+          `${tl} ET · Latest O ${last.open.toFixed(2)} H ${last.high.toFixed(2)} L ${last.low.toFixed(2)} C ${last.close.toFixed(2)}`;
+      }
+      lastTradebarContentKey = "";
+      updateLatestAnchors();
+      connectWs(currentArgs.readOnly ? "" : (currentArgs.websocketUrl || ""));
+      Streamlit.setFrameHeight(620);
+    }
+
+    window.addEventListener("message", (event) => {
+      if (event.data && event.data.type === "streamlit:render") {
+        render(event.data.args || {});
+      }
+    });
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight(620);
+  </script>
+</body>
+</html>

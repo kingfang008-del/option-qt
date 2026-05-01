@@ -24,7 +24,7 @@ sys.path.append(str(PROJECT_ROOT / "history_replay"))
 sys.path.append(str(PROJECT_ROOT / "baseline" / "DAO"))
 
 try:
-    from s4_run_historical_replay_pg_1s import build_option_arrays, safe_col
+    from s4_run_historical_replay_s2_1s import build_option_arrays, safe_col
     # S4 import overwrites os.environ, restore them immediately
     os.environ['RUN_MODE'] = 'LIVEREPLAY'
     os.environ['STRICT_LIQUIDITY_MODE'] = '2'

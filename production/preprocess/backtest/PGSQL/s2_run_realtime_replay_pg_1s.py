@@ -301,6 +301,8 @@ class BatchPostgresDriver1s:
                                 float(payload.get('iv', 0)),
                                 float(payload.get('price', 0)),
                                 float(payload.get('vol_z', 0)),
+                                float(payload.get('tradable_prob', 0)),
+                                float(payload.get('edge_score', 0)),
                             ))
                     except Exception:
                         pass

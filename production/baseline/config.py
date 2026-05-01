@@ -207,19 +207,42 @@ PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.
 
 TARGET_SYMBOLS =  [
     # --- Tier 1: 巨无霸 ---
-    'NVDA', 'AAPL', 'META', 'PLTR',   'UNH', 'AMZN', 'AMD', 'MSTR', 'QQQ',
-    # --- Tier 2: 核心蓝筹 ---
-    'NFLX', 'CRWV', 'AVGO', 'MSFT', 'HOOD', 'MU',  'GOOGL', 'WMT', 'COIN', 'SPY',
-    # --- Tier 3: 高流动性 --- 
-    'SMCI', 'ADBE', 'ORCL', 'NKE', 'XOM', 'INTC', 'DELL', 'IWM', 'GLD', 'VIXY'
+    'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'AMZN', 'AMD','NFLX','MSFT','GOOGL','MU','INTC',
+    'SPY', 'VIXY','QQQ',
 ]
 
 # ================= 交易与归一化白/黑名单 =================
 # 仅用于禁止交易，不影响行情订阅与特征计算
-NON_TRADABLE_SYMBOLS = ['SPY','QQQ', 'VIXY']
+NON_TRADABLE_SYMBOLS = ['SPY',  'VIXY']
 
 # 截面 Alpha 归一化时剔除的符号（避免指数成分污染）
-ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS = ['SPY', 'QQQ','VIXY']
+ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS = ['SPY',  'VIXY']
+
+# Alpha Z-Score 口径:
+#   cross_section = 全市场截面（当前默认）
+#   bucket        = beta/风格分桶截面
+#   rolling       = per-symbol rolling
+#   mixed         = 0.6 * rolling + 0.4 * bucket
+ALPHA_ZSCORE_MODE = os.environ.get("ALPHA_ZSCORE_MODE", "cross_section")
+ALPHA_ROLLING_WINDOW = int(os.environ.get("ALPHA_ROLLING_WINDOW", "120"))
+ALPHA_ROLLING_MIN_PERIODS = int(os.environ.get("ALPHA_ROLLING_MIN_PERIODS", "30"))
+ALPHA_BUCKET_MIN_SIZE = int(os.environ.get("ALPHA_BUCKET_MIN_SIZE", "3"))
+ALPHA_MIXED_SYMBOL_WEIGHT = float(os.environ.get("ALPHA_MIXED_SYMBOL_WEIGHT", "0.6"))
+ALPHA_MIXED_BUCKET_WEIGHT = float(os.environ.get("ALPHA_MIXED_BUCKET_WEIGHT", "0.4"))
+
+# 大科技持续拉升信号增益（默认关闭）
+MEGA_TECH_LIFT_GAIN_ENABLED = _env_flag("MEGA_TECH_LIFT_GAIN_ENABLED", False)
+MEGA_TECH_LIFT_SYMBOLS = os.environ.get(
+    "MEGA_TECH_LIFT_SYMBOLS",
+    "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO",
+).split(",")
+MEGA_TECH_LIFT_TOP_N = int(os.environ.get("MEGA_TECH_LIFT_TOP_N", "5"))
+MEGA_TECH_LIFT_MIN_TOP_DURATION = int(os.environ.get("MEGA_TECH_LIFT_MIN_TOP_DURATION", "5"))
+MEGA_TECH_LIFT_MIN_VOL_DURATION = int(os.environ.get("MEGA_TECH_LIFT_MIN_VOL_DURATION", "3"))
+MEGA_TECH_LIFT_VOL_Z_THRESHOLD = float(os.environ.get("MEGA_TECH_LIFT_VOL_Z_THRESHOLD", "0.5"))
+MEGA_TECH_LIFT_VOL_IMPULSE_THRESHOLD = float(os.environ.get("MEGA_TECH_LIFT_VOL_IMPULSE_THRESHOLD", "0.5"))
+MEGA_TECH_LIFT_GAIN = float(os.environ.get("MEGA_TECH_LIFT_GAIN", "0.25"))
+MEGA_TECH_LIFT_MAX_GAIN = float(os.environ.get("MEGA_TECH_LIFT_MAX_GAIN", "0.4"))
 
 # 指数趋势计算参考符号
 INDEX_TREND_SYMBOLS = ['SPY', 'QQQ']
@@ -261,8 +284,8 @@ def get_option_gate_profile() -> dict:
 
 # ================= 资金管理与风控 =================
 INITIAL_ACCOUNT         = 50000.0     # 初始资金 ($)
-MAX_POSITIONS           = 4           # 最大同时持仓数
-POSITION_RATIO          = 1.0 / 4.0   # 单标的最大仓位比例
+MAX_POSITIONS           = 3           # 最大同时持仓数
+POSITION_RATIO          = 1.0 / 3.0   # 单标的最大仓位比例
 MAX_TRADE_CAP           = 100000.0    # 单笔交易最大金额 ($)
 GLOBAL_EXPOSURE_LIMIT   = 0.90        # 全局风险敞口上限
 COMMISSION_PER_CONTRACT = 0.65        # 手续费 ($/手)
@@ -304,7 +327,8 @@ CORR_THRESHOLD = -0.1             # 反转相关性阈值
 # 可选值:
 # - V0: strategy_core_v0.py + strategy_config0.py
 # - V1: strategy_core_v1.py + strategy_config.py
-STRATEGY_CORE_VERSION = os.environ.get("STRATEGY_CORE_VERSION", "V0").strip().upper()
+# - TREND: strategy_core_trend.py + strategy_config0.py
+STRATEGY_CORE_VERSION = os.environ.get("STRATEGY_CORE_VERSION", "TREND").strip().upper()
 
 # ================= 订单执行 =================
 ORDER_TIMEOUT_SECONDS = 5          # 挂单超时

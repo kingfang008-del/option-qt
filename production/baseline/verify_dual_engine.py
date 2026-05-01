@@ -37,9 +37,27 @@ def safe_col(group, col, default_val, dtype=np.float32):
         return group[col].fillna(default_val).values.astype(dtype)
     return np.full(len(group), default_val, dtype=dtype)
 
+def load_alpha_logs(conn):
+    alpha_cols = pd.read_sql("PRAGMA table_info(alpha_logs)", conn)["name"].tolist()
+    select_cols = ["ts", "symbol", "alpha as alpha_score"]
+    if "vol_z" in alpha_cols:
+        select_cols.append("vol_z as fast_vol")
+    if "tradable_prob" in alpha_cols:
+        select_cols.append("tradable_prob")
+    if "edge_score" in alpha_cols:
+        select_cols.append("edge_score")
+    df_a = pd.read_sql(f"SELECT {', '.join(select_cols)} FROM alpha_logs", conn)
+    if "fast_vol" not in df_a.columns:
+        df_a["fast_vol"] = 0.0
+    if "tradable_prob" not in df_a.columns:
+        df_a["tradable_prob"] = 0.0
+    if "edge_score" not in df_a.columns:
+        df_a["edge_score"] = 0.0
+    return df_a
+
 def load_official_stable_data(db_path, target_symbols):
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    df_a = pd.read_sql(f"SELECT ts, symbol, alpha as alpha_score, vol_z as fast_vol FROM alpha_logs", conn)
+    df_a = load_alpha_logs(conn)
     df_s = pd.read_sql("SELECT ts, symbol, close, open, high, low, volume FROM market_bars_1m", conn)
     df_o = pd.read_sql("SELECT ts, symbol, buckets_json FROM option_snapshots_1m", conn)
     conn.close()
@@ -77,7 +95,7 @@ def build_stable_packet(ts_val, group, is_new_min):
         except:
             for arr in [put_prices, call_prices, put_ks, call_ks, put_ivs, call_ivs, put_bids, put_asks, call_bids, call_asks]: arr.append(0.0)
     packet = {
-        'symbols': symbols_list, 'ts': float(ts_val), 'stock_price': group['close'].values.astype(np.float32), 'fast_vol': safe_col(group, 'fast_vol', 0.0).astype(np.float32), 'precalc_alpha': safe_col(group, 'alpha_score', 0.0).astype(np.float32), 'is_new_minute': is_new_min, 'symbols_with_data': symbols_with_data, 'feed_put_price': np.array(put_prices, dtype=np.float32), 'feed_call_price': np.array(call_prices, dtype=np.float32), 'feed_put_k': np.array(put_ks, dtype=np.float32), 'feed_call_k': np.array(call_ks, dtype=np.float32), 'feed_put_iv': np.array(put_ivs, dtype=np.float32), 'feed_call_iv': np.array(call_ivs, dtype=np.float32), 'feed_put_bid': np.array(put_bids, dtype=np.float32), 'feed_put_ask': np.array(put_asks, dtype=np.float32), 'feed_call_bid': np.array(call_bids, dtype=np.float32), 'feed_call_ask': np.array(call_asks, dtype=np.float32), 'feed_put_vol': np.ones(len(group), dtype=np.float32), 'feed_call_vol': np.ones(len(group), dtype=np.float32), 'feed_call_bid_size': np.full(len(group), 100.0, dtype=np.float32), 'feed_call_ask_size': np.full(len(group), 100.0, dtype=np.float32), 'feed_put_bid_size': np.full(len(group), 100.0, dtype=np.float32), 'feed_put_ask_size': np.full(len(group), 100.0, dtype=np.float32), 'slow_1m': np.zeros((len(symbols_list), 30, 1), dtype=np.float32), 'feed_put_id': [""] * len(group), 'feed_call_id': [""] * len(group), 'spy_roc_5min': safe_col(group, 'spy_roc_5min', 0.0), 'qqq_roc_5min': safe_col(group, 'qqq_roc_5min', 0.0)
+        'symbols': symbols_list, 'ts': float(ts_val), 'stock_price': group['close'].values.astype(np.float32), 'fast_vol': safe_col(group, 'fast_vol', 0.0).astype(np.float32), 'precalc_alpha': safe_col(group, 'alpha_score', 0.0).astype(np.float32), 'tradable_prob': safe_col(group, 'tradable_prob', 0.0).astype(np.float32), 'edge_score': safe_col(group, 'edge_score', 0.0).astype(np.float32), 'is_new_minute': is_new_min, 'symbols_with_data': symbols_with_data, 'feed_put_price': np.array(put_prices, dtype=np.float32), 'feed_call_price': np.array(call_prices, dtype=np.float32), 'feed_put_k': np.array(put_ks, dtype=np.float32), 'feed_call_k': np.array(call_ks, dtype=np.float32), 'feed_put_iv': np.array(put_ivs, dtype=np.float32), 'feed_call_iv': np.array(call_ivs, dtype=np.float32), 'feed_put_bid': np.array(put_bids, dtype=np.float32), 'feed_put_ask': np.array(put_asks, dtype=np.float32), 'feed_call_bid': np.array(call_bids, dtype=np.float32), 'feed_call_ask': np.array(call_asks, dtype=np.float32), 'feed_put_vol': np.ones(len(group), dtype=np.float32), 'feed_call_vol': np.ones(len(group), dtype=np.float32), 'feed_call_bid_size': np.full(len(group), 100.0, dtype=np.float32), 'feed_call_ask_size': np.full(len(group), 100.0, dtype=np.float32), 'feed_put_bid_size': np.full(len(group), 100.0, dtype=np.float32), 'feed_put_ask_size': np.full(len(group), 100.0, dtype=np.float32), 'slow_1m': np.zeros((len(symbols_list), 30, 1), dtype=np.float32), 'feed_put_id': [""] * len(group), 'feed_call_id': [""] * len(group), 'spy_roc_5min': safe_col(group, 'spy_roc_5min', 0.0), 'qqq_roc_5min': safe_col(group, 'qqq_roc_5min', 0.0)
     }
     return packet
 

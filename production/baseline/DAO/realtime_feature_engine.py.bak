@@ -690,7 +690,7 @@ class RealTimeFeatureEngine:
 
         batch_res_1m = self.compute_batch_features(
             prices_bh, feat_idx_map, ready_syns, fast_feats, slow_feats_1m, 
-            option_snapshot=opts_bh, skip_scaling=skip_scaling, global_ctx=global_ctx,
+            option_snapshot=opts_bh, skip_scaling=skip_scaling, global_ctx=global_ctx
         )
 
         # --- B. 计算 5min 特征 (从 1min master timeline 派生) ---
@@ -730,7 +730,7 @@ class RealTimeFeatureEngine:
 
                 res_5m_raw = self.compute_batch_features(
                     prices_bh_5m, feat_idx_map_5m, ready_syns, [], slow_feats_5m,
-                    option_snapshot=opts_bh_5m, skip_scaling=skip_scaling, global_ctx=global_ctx,
+                    option_snapshot=opts_bh_5m, skip_scaling=skip_scaling, global_ctx=global_ctx
                 )
 
                 if res_5m_raw.get('slow_1m') is not None:
@@ -799,7 +799,7 @@ class RealTimeFeatureEngine:
                              slow_feats: List[str],
                              option_snapshot: Optional[torch.Tensor] = None,
                              skip_scaling: bool = False,
-                             global_ctx: Optional[Dict] = None) -> Dict[str, Dict]:
+                             global_ctx: Dict = {}) -> Dict[str, Dict]:
         
         B, L, _ = prices_bh.shape
         close = prices_bh[:, :, 0]
@@ -809,7 +809,6 @@ class RealTimeFeatureEngine:
         volume = prices_bh[:, :, 4]
         
         all_feats = list(set(fast_feats + slow_feats))
-        global_ctx = global_ctx or {}
         res = {}
 
         # 1. 提取 Pandas 预计算的特征
@@ -827,6 +826,18 @@ class RealTimeFeatureEngine:
             if torch.isnan(existing).any():
                 res[name] = torch.where(torch.isnan(existing), fallback, existing)
 
+        # [🆕 新增] 截面动量 (Cross-Sectional Momentum Z-Score)
+        # 必须在 Batch 层面计算，直接利用 res 中的 close_log_return
+        if 'cross_sect_mom_z' in all_feats:
+            log_ret = res.get('close_log_return', torch.zeros((B, L), device=self.device))
+            # 维度说明: log_ret [B, L]。我们要对 B (Symbol) 进行截面均值/标差计算。
+            if B > 1:
+                m = log_ret.mean(dim=0, keepdim=True) # [1, L]
+                s = log_ret.std(dim=0, keepdim=True)  # [1, L]
+                res['cross_sect_mom_z'] = (log_ret - m) / (s + self.epsilon)
+            else:
+                res['cross_sect_mom_z'] = torch.zeros_like(log_ret)
+        
         # 2. Batch Indicators (PyTorch 后端)
         if 'volume_log' in all_feats: 
             res['volume_log'] = torch.log1p(volume)
@@ -1035,7 +1046,7 @@ class RealTimeFeatureEngine:
         out['options_struc_term'] = torch.where((next_atm > 0.01) & (front_atm > 0.01), term_val, torch.tensor(0.0, device=self.device))
 
         return out
-
+        
     # ==========================================================================
     # 极致优化的算子库 (Operator Library) - 完整保留
     # ==========================================================================

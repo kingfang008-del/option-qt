@@ -39,7 +39,7 @@ BASE_ROOT = Path.home() / "train_data"
 STAGES = ["train", "val", "test"] 
 
 # 配置文件
-CONFIG_PATH = Path.home() / "notebook/train/feature_all.json"
+CONFIG_PATH = Path(os.environ.get("FEATURE_CONFIG", Path.home() / "notebook/train/feature_all.json"))
 
 # 窗口配置
 ROLLING_WINDOW = 2000  

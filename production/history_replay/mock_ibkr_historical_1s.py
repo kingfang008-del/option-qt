@@ -710,45 +710,148 @@ class MockIBKRHistorical:
         data = snapshot.get(symbol)
         return data.get('s', 0.0) if data else None
         
-    def _print_spread_stress_test_report(self, df_trades):
-        """[Premium] 全点差压力测试 (Spread Stress Test)
-        模拟最极端情况：在 Entry 时永远以 Ask 买入，Exit 时永远以 Bid 卖出。
-        """
-        stress_trades = []
-        for _, tr in df_trades.iterrows():
-            # 获取开仓时刻的盘口 (显式使用 best/spread)
-            entry_p = self._get_price_at_time(tr['symbol'], tr['entry_ts'], tr['opt_dir'], 'BUY', price_type='best')
-            # 获取平仓时刻的盘口 (显式使用 best/spread)
-            exit_p = self._get_price_at_time(tr['symbol'], tr['exit_ts'], tr['opt_dir'], 'SELL', price_type='best')
-            
-            # 如果盘口数据存在，使用最差执行价：买入用 Ask，卖出用 Bid
-            if entry_p and exit_p:
-                cost = entry_p * tr['qty'] * 100
-                proceeds = exit_p * tr['qty'] * 100
-                pnl = proceeds - cost
-                stress_trades.append({'date': tr['date'], 'pnl': pnl})
-            else:
-                # 缺失数据则沿用原 PnL
-                stress_trades.append({'date': tr['date'], 'pnl': tr['pnl']})
-                
-        df_stress = pd.DataFrame(stress_trades)
-        stress_rets = self._get_daily_returns(df_stress)
-        stress_sharpe = self._compute_sharpe(stress_rets)
-        
-        status = "💎 ROBUST" if stress_sharpe > 2.0 else "⚠️ FRAGILE"
-        
-        print("\n🔥 SPREAD STRESS TEST (Entry@Ask, Exit@Bid)")
-        print(f"{'Condition':<20} | {'Sharpe':<10} | {'Status':<10}")
-        print("-" * 50)
-        print(f"{'Standard (Mid/Last)':<20} | {self._compute_sharpe(self._get_daily_returns(df_trades)):>10.2f} | BASELINE")
-        print(f"{'Full Spread Stress':<20} | {stress_sharpe:>10.2f} | {status}")
-        print("-" * 50)
-        
-        if stress_sharpe > 2.0:
-            print("👑 ALPHA CONFIRMED: Strategy survives full spread impact.")
+    def _quote_snapshot_at_time(self, symbol, ts, opt_dir):
+        """Return option mid/bid/ask from the latest snapshot at or before ts."""
+        if not self.market_history:
+            return None
+        import bisect
+        times = [x[0] for x in self.market_history]
+        idx = bisect.bisect_right(times, ts) - 1
+        if idx < 0:
+            return None
+        idx = min(idx, len(self.market_history) - 1)
+        best_ts, snapshot = self.market_history[idx]
+        if abs(best_ts - ts) > 120:
+            return None
+        data = snapshot.get(symbol)
+        if not data:
+            return None
+        if opt_dir == 'CALL':
+            bid, ask, last = float(data.get('cb', 0.0)), float(data.get('ca', 0.0)), float(data.get('c', 0.0))
         else:
-            print("🚨 ALPHA RISK: Strategy may crumble under real-world slippage.")
+            bid, ask, last = float(data.get('pb', 0.0)), float(data.get('pa', 0.0)), float(data.get('p', 0.0))
+        if bid > 0.0 and ask > 0.0:
+            mid = (bid + ask) / 2.0
+        else:
+            mid = last
+        return {'bid': bid, 'ask': ask, 'mid': mid, 'last': last}
+
+    def _build_spread_stress_trades(self, df_trades, spread_fraction: float):
+        """Reprice trades by moving entry/exit from mid toward ask/bid by fraction."""
+        stress_trades = []
+        covered = 0
+        for _, tr in df_trades.iterrows():
+            entry_q = self._quote_snapshot_at_time(tr['symbol'], tr['entry_ts'], tr['opt_dir'])
+            exit_q = self._quote_snapshot_at_time(tr['symbol'], tr['exit_ts'], tr['opt_dir'])
+            if entry_q and exit_q and entry_q['bid'] > 0 and entry_q['ask'] > 0 and exit_q['bid'] > 0 and exit_q['ask'] > 0:
+                covered += 1
+                entry_p = entry_q['mid'] + max(0.0, entry_q['ask'] - entry_q['mid']) * spread_fraction
+                exit_p = exit_q['mid'] - max(0.0, exit_q['mid'] - exit_q['bid']) * spread_fraction
+                entry_commission = tr['qty'] * COMMISSION_PER_CONTRACT
+                exit_commission = tr['qty'] * COMMISSION_PER_CONTRACT
+                cost = entry_p * tr['qty'] * 100 + entry_commission
+                proceeds = exit_p * tr['qty'] * 100 - exit_commission
+                pnl = proceeds - cost
+                stress_trades.append({
+                    'date': tr['date'],
+                    'exit_ts': tr['exit_ts'],
+                    'pnl': pnl,
+                    'base_pnl': tr['pnl'],
+                    'reason': tr.get('reason', 'N/A'),
+                    'duration': tr.get('duration', 0.0),
+                })
+            else:
+                stress_trades.append({
+                    'date': tr['date'],
+                    'exit_ts': tr.get('exit_ts', 0.0),
+                    'pnl': tr['pnl'],
+                    'base_pnl': tr['pnl'],
+                    'reason': tr.get('reason', 'N/A'),
+                    'duration': tr.get('duration', 0.0),
+                })
+        return pd.DataFrame(stress_trades), covered
+
+    def _print_spread_stress_attribution(self, df_stress: pd.DataFrame, label: str):
+        if df_stress is None or df_stress.empty:
+            return
+        df = df_stress.copy()
+        df['reason_root'] = df['reason'].astype(str).str.split('|').str[0].str.split(':').str[0].str.slice(0, 28)
+        df['pnl_decay'] = df['pnl'] - df['base_pnl']
+        reason = (
+            df.groupby('reason_root')
+              .agg(
+                  trades=('pnl', 'size'),
+                  base_pnl=('base_pnl', 'sum'),
+                  stress_pnl=('pnl', 'sum'),
+                  decay=('pnl_decay', 'sum'),
+                  avg_duration=('duration', 'mean'),
+              )
+              .sort_values('decay')
+              .head(8)
+              .reset_index()
+        )
+        print(f"\n🧪 {label} stress attribution by exit reason")
+        print(
+            reason.round({
+                'base_pnl': 1,
+                'stress_pnl': 1,
+                'decay': 1,
+                'avg_duration': 2,
+            }).to_string(index=False)
+        )
+
+        bins = [-0.001, 1, 3, 5, 10, 30, 10_000]
+        labels = ['<=1m', '1-3m', '3-5m', '5-10m', '10-30m', '>30m']
+        df['duration_bucket'] = pd.cut(df['duration'].astype(float), bins=bins, labels=labels)
+        bucket = (
+            df.groupby('duration_bucket', observed=True)
+              .agg(
+                  trades=('pnl', 'size'),
+                  base_pnl=('base_pnl', 'sum'),
+                  stress_pnl=('pnl', 'sum'),
+                  decay=('pnl_decay', 'sum'),
+              )
+              .reset_index()
+        )
+        print(f"\n🧪 {label} stress attribution by holding time")
+        print(bucket.round({'base_pnl': 1, 'stress_pnl': 1, 'decay': 1}).to_string(index=False))
+
+    def _print_spread_stress_test_report(self, df_trades):
+        """Stress test incremental spread cost instead of treating full spread as baseline."""
+        base_pnl = float(df_trades['pnl'].sum()) if not df_trades.empty else 0.0
+        base_ret = base_pnl / self.initial_capital
+        base_sharpe = self._compute_sharpe(self._get_intraday_returns(df_trades), is_intraday=True)
+        
+        print("\n🔥 SPREAD STRESS TEST (Incremental Spread Cost)")
+        print(f"{'Condition':<20} | {'PnL($)':>10} | {'Return':>9} | {'Sharpe':>8} | {'Win':>7} | {'Status':<10}")
+        print("-" * 84)
+        print(f"{'Actual ledger':<20} | {base_pnl:>10.1f} | {base_ret:>8.2%} | {base_sharpe:>8.2f} | {(df_trades['pnl'] > 0).mean():>6.1%} | BASELINE")
+        coverage_msg = ""
+        attribution_df = None
+        attribution_label = ""
+        for label, frac in (("+25% spread", 0.25), ("+50% spread", 0.50), ("Full ask→bid", 1.00)):
+            df_stress, covered = self._build_spread_stress_trades(df_trades, frac)
+            stress_pnl = float(df_stress['pnl'].sum()) if not df_stress.empty else 0.0
+            stress_ret = stress_pnl / self.initial_capital
+            stress_sharpe = self._compute_sharpe(self._get_intraday_returns(df_stress), is_intraday=True)
+            stress_win_rate = (df_stress['pnl'] > 0).mean() if not df_stress.empty else 0.0
+            pnl_retained = stress_pnl / base_pnl if abs(base_pnl) > 1e-9 else 0.0
+            if frac < 1.0:
+                status = "✅ OK" if stress_pnl > 0 and pnl_retained >= 0.5 else "⚠️ SENSITIVE"
+            else:
+                status = "💎 ROBUST" if stress_pnl > 0 and pnl_retained >= 0.5 else "⚠️ WORST"
+            print(f"{label:<20} | {stress_pnl:>10.1f} | {stress_ret:>8.2%} | {stress_sharpe:>8.2f} | {stress_win_rate:>6.1%} | {status}")
+            if not coverage_msg:
+                coverage = covered / len(df_trades) if len(df_trades) else 0.0
+                coverage_msg = f"Coverage: {covered}/{len(df_trades)} ({coverage:.1%})"
+            if frac == 0.25:
+                attribution_df = df_stress
+                attribution_label = label
+        print("-" * 84)
+        print(coverage_msg or "Coverage: N/A")
+        print("💡 Use +25%/+50% as practical stress; Full ask→bid is a worst-case bound.")
         print("-" * 50)
+        self._print_spread_stress_attribution(attribution_df, attribution_label)
 
     def _print_liquidity_impact_report(self, df_trades):
         """[Premium] 流动性影响分析 (Liquidity Impact Analysis)

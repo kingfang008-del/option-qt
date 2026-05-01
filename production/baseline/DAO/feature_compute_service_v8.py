@@ -345,6 +345,8 @@ class FeatureComputeService:
         except Exception as e:
             logger.warning(f"❌ Failed to establish persistent PG connection: {e}")
             self.pg_conn = None
+
+        self._load_symbol_meta_from_pg()
         
         # Load Configs
         self.fast_feat_infos = self._load_json_info(config_paths['fast'])
@@ -427,6 +429,42 @@ class FeatureComputeService:
         self.HISTORY_LEN = 500
         # 🚀 [核心重构] 调用显式重置，确保初始化与重置逻辑合一
         self.reset_internal_memory()
+
+    def _load_symbol_meta_from_pg(self) -> None:
+        """
+        Align FCS static ids with S0/LMDB training samples.
+
+        S0 stores metadata from stocks_us.id / stocks_us.sector_id.  The TFT model
+        consumes those ids through static embeddings, so replay/live inference must
+        not use the transient TARGET_SYMBOLS array index as stock_id.
+        """
+        try:
+            if not self.symbols:
+                return
+            conn = self.pg_conn if self.pg_conn and not self.pg_conn.closed else psycopg2.connect(PG_DB_URL)
+            placeholders = ",".join(["%s"] * len(self.symbols))
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT symbol, id, sector_id FROM stocks_us WHERE symbol IN ({placeholders})",
+                    tuple(self.symbols),
+                )
+                rows = cur.fetchall()
+            if conn is not self.pg_conn:
+                conn.close()
+            if not rows:
+                logger.warning("⚠️ [FCS-Meta] stocks_us returned no rows; fallback to TARGET_SYMBOLS index ids.")
+                return
+            db_stock_ids = {str(sym): int(stock_id or 0) for sym, stock_id, _ in rows}
+            db_sector_ids = {str(sym): int(sector_id or 0) for sym, _, sector_id in rows}
+            missing = [s for s in self.symbols if s not in db_stock_ids]
+            self.stock_id_map.update(db_stock_ids)
+            self.sector_id_map.update(db_sector_ids)
+            logger.info(
+                f"✅ [FCS-Meta] Loaded DB stock/sector ids for {len(db_stock_ids)}/{len(self.symbols)} symbols; "
+                f"missing={missing[:5]}"
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ [FCS-Meta] Failed to load stocks_us ids; fallback to index ids: {e}")
 
     def reset_internal_memory(self):
         """🚀 [状态消磁] 物理抹除所有内部缓冲区，并由于由于初始化 SDS 4.0 状态机机机机"""
@@ -1411,7 +1449,7 @@ class FeatureComputeService:
                 batch_prices.append(self.latest_prices.get(sym, 0.0))
                 batch_volumes.append(0.0)
             
-            batch_stock_ids.append(b_idx)
+            batch_stock_ids.append(int(self.stock_id_map.get(sym, b_idx)))
             
             idx_spy = self.feat_name_to_idx.get('spy_roc_5min')
             batch_spy_rocs.append(raw_mat[b_idx, idx_spy] if idx_spy is not None else 0.0)
@@ -1545,7 +1583,7 @@ class FeatureComputeService:
             'stock_price': batch_prices,
             'stock_volume': np.array(batch_volumes), # 🚀 修复丢失的成交量
             'stock_id': np.array(batch_stock_ids),
-            'sector_id': np.zeros(len(batch_symbols)),
+            'sector_id': np.array([int(self.sector_id_map.get(sym, 0)) for sym in batch_symbols]),
             'fast_vol': np.array(batch_fast_vols),
             'vol_z_dict': vol_z_dict,
             'spy_roc_5min': np.array(batch_spy_rocs),

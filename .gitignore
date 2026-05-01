@@ -165,4 +165,7 @@ replay_0105_audit.txt
 replay_0108_audit.txt
 production/preprocess/backtest/tools/archive.zip
 *.zip
+
+# macOS Finder metadata (ignore in every directory)
 .DS_Store
+**/.DS_Store

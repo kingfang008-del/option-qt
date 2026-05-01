@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import json
 from typing import Any, Dict, Optional, Tuple
 
 import redis
@@ -191,3 +192,54 @@ def clear_runtime_trading_enabled(r=None, source: str = "dashboard_reset") -> No
         },
     )
     client.expire(key, 30 * 24 * 3600)
+
+
+def get_runtime_symbol_trade_exemptions(r=None) -> set[str]:
+    """Symbols paused from OMS strategy BUY/SELL by dashboard runtime control."""
+    try:
+        mapping = read_runtime_trading_controls(r=r)
+        raw = mapping.get("symbol_trade_exemptions")
+        if raw is None or str(raw).strip() == "":
+            return set()
+        data = json.loads(str(raw))
+        if not isinstance(data, list):
+            return set()
+        return {str(sym).strip().upper() for sym in data if str(sym).strip()}
+    except Exception:
+        return set()
+
+
+def is_runtime_symbol_trade_exempted(symbol: str, r=None) -> bool:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return False
+    return sym in get_runtime_symbol_trade_exemptions(r=r)
+
+
+def set_runtime_symbol_trade_exemption(
+    symbol: str,
+    paused: bool,
+    r=None,
+    source: str = "dashboard",
+) -> set[str]:
+    client = r or _redis_client()
+    sym = str(symbol or "").strip().upper()
+    current = get_runtime_symbol_trade_exemptions(r=client)
+    if sym:
+        if bool(paused):
+            current.add(sym)
+        else:
+            current.discard(sym)
+    ordered = sorted(current)
+    client.hset(
+        _namespaced_runtime_controls_key(),
+        mapping={
+            "symbol_trade_exemptions": json.dumps(ordered, separators=(",", ":")),
+            "updated_at": f"{time.time():.3f}",
+            "updated_by": str(source or "dashboard"),
+            "run_mode": RUN_MODE,
+            "state_namespace": OMS_STATE_NAMESPACE,
+        },
+    )
+    client.expire(_namespaced_runtime_controls_key(), 30 * 24 * 3600)
+    return set(ordered)

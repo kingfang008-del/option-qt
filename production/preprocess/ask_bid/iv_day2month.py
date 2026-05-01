@@ -90,9 +90,15 @@ def process_single_symbol(args):
                      merged_df['timestamp'] = merged_df['timestamp'].dt.tz_convert('America/New_York')
                 
                 # 排序并去重（防止极其偶发的重复）
-                # 注意：如果 df 特别大，这里可能会占用较多内存
-                merged_df.sort_values(by=['timestamp', 'bucket_id'], inplace=True)
-                merged_df.drop_duplicates(subset=['timestamp', 'bucket_id'], keep='last', inplace=True)
+                # 这里的输入已经是“每天锁定的 6 个 bucket 合约”，下游 options_locked_feature.py
+                # 也是按 timestamp+bucket_id 展平，因此月度合并必须保留这个口径。
+                if 'bucket_id' in merged_df.columns:
+                    merged_df.sort_values(by=['timestamp', 'bucket_id'], inplace=True)
+                    merged_df.drop_duplicates(subset=['timestamp', 'bucket_id'], keep='last', inplace=True)
+                else:
+                    print(f"[Warn] {symbol} {year_month}: 未找到 bucket_id，仅按 timestamp 去重")
+                    merged_df.sort_values(by=['timestamp'], inplace=True)
+                    merged_df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
                 
             if 'expiration_date' in merged_df.columns:
                 merged_df['expiration_date'] = pd.to_datetime(merged_df['expiration_date'])

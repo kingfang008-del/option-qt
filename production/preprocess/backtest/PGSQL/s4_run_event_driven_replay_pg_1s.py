@@ -352,6 +352,8 @@ def patch_trade_log_capture(engine, persist_svc):
                                 float(payload.get("iv", 0.0)),
                                 float(payload.get("price", 0.0)),
                                 float(payload.get("vol_z", 0.0)),
+                                float(payload.get("tradable_prob", 0.0)),
+                                float(payload.get("edge_score", 0.0)),
                             )
                         )
                     else:

@@ -77,6 +77,16 @@
         }
       }
     },
+    "option_exec_label": {
+      "entry_delay_seconds": [60, 120, 300],
+      "holding_seconds": [300, 900, 1800],
+      "primary_entry_delay_seconds": 60,
+      "primary_seconds": 300,
+      "min_edge": 0.02,
+      "min_profit_buffer": 0.02,
+      "max_spread_pct": 0.10,
+      "max_quote_age_seconds": 90
+    },
     "pre_post_dropout_rate": 0.15,
     "expert_dropout_rate": 0.25,
     "backbone_dropout_rate": 0.3,
@@ -183,24 +193,20 @@
     { "name": "vanna_flow", "type": "real", "calc": "leading", "use_for_anomaly": false }, 
      
      {"name": "vwap_diff_short", "type": "real", "calc": "vwap_diff_short", "resolution": "1min"},
-    {"name": "cross_sect_mom_z", "type": "real", "calc": "cross_sectional", "resolution": "1min"},
     {"name": "return_divergence", "type": "real", "calc": "zscore", "alpha_sign": -1, "resolution": "1min"},
 
 
-    { "name": "options_vw_iv", "type": "real", "calc": "options", "use_for_anomaly": false },
-    { "name": "options_vw_delta", "type": "real", "calc": "options", "use_for_anomaly": false },
-    { "name": "options_vw_gamma", "type": "real", "calc": "options", "use_for_anomaly": false },
-    { "name": "options_vw_vega", "type": "real", "calc": "options", "use_for_anomaly": false },
-    { "name": "options_vw_theta", "type": "real", "calc": "options", "use_for_anomaly": false },
-    { "name": "options_vw_vanna", "type": "real", "calc": "options", "use_for_anomaly": false },
-    { "name": "options_vw_charm", "type": "real", "calc": "options", "use_for_anomaly": false },
-    { "name": "options_pcr_volume", "type": "real", "calc": "options", "use_for_anomaly": false },
-    { "name": "options_flow_skew", "type": "real", "calc": "options", "use_for_anomaly": false },
-    { "name": "options_iv_momentum", "type": "real", "calc": "options", "use_for_anomaly": false },
-    { "name": "options_gamma_accel", "type": "real", "calc": "options", "use_for_anomaly": false },
-    { "name": "options_iv_divergence", "type": "real", "calc": "options", "use_for_anomaly": false },
-    { "name": "options_vw_spread", "type": "real", "calc": "options", "use_for_anomaly": false },
-    { "name": "options_vw_imbalance", "type": "real", "calc": "options", "use_for_anomaly": false },
+   
+    {"name": "options_vw_spread", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    {"name": "options_vw_imbalance", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    {"name": "options_vw_iv", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    {"name": "options_vw_gamma", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    {"name": "options_vw_vega", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    {"name": "options_pcr_volume", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    {"name": "options_iv_momentum", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    {"name": "options_iv_divergence", "type": "real", "calc": "options", "use_for_anomaly": false, "resolution": "1min"},
+    
+    
     { "name": "options_struc_atm_iv", "type": "real", "calc": "options", "use_for_anomaly": false },
     { "name": "options_struc_skew", "type": "real", "calc": "options", "use_for_anomaly": false },
     { "name": "options_struc_term", "type": "real", "calc": "options", "use_for_anomaly": false },

@@ -11,8 +11,8 @@ class StrategyConfig:
     # ================= 1. Capital Management =================
     # 默认沿用基准配置，V0 核心主要专注信号逻辑
     INITIAL_ACCOUNT: float = 50000.0
-    MAX_POSITIONS: int = 4
-    POSITION_RATIO: float = 0.25
+    MAX_POSITIONS: int = 3
+    POSITION_RATIO: float = 0.3
     MAX_TRADE_CAP: float = 150000.0
     GLOBAL_EXPOSURE_LIMIT: float = 0.90
     COMMISSION_PER_CONTRACT: float = 0.65
@@ -82,6 +82,48 @@ class StrategyConfig:
     ENTRY_PRIORITY_MIN_CONFIRMATIONS: int = 2
     # CALL/PUT 分池排序：避免强负 alpha PUT 与慢涨 CALL 在同一个 abs(alpha) 池里抢光入场名额。
     ENTRY_DIRECTION_SPLIT_POOL_ENABLED: bool = True
+
+    # ================= 4b. Trend Hunter Core =================
+    # 启用方式: STRATEGY_CORE_VERSION=TREND。该核心把 TFT 作为雷达/确认器，
+    # 主交易条件改为“大盘 + 个股 + MACD + 路径效率”的趋势状态。
+    TREND_CORE_ALLOW_SHORT: bool = True
+    TREND_CORE_BLOCK_VOLATILE_REGIME: bool = True
+    TREND_CORE_ALLOW_MIXED_REGIME: bool = True
+    TREND_CORE_MIN_ALPHA_ABS: float = 0.35
+    TREND_CORE_ALPHA_ALIGN_MIN_ABS: float = 0.80
+    TREND_CORE_MIN_INDEX_ROC: float = 0.00015
+    TREND_CORE_MIN_STOCK_ROC: float = 0.00050
+    TREND_CORE_MIN_SNAP_ROC: float = -0.00012
+    TREND_CORE_MIN_MACD_HIST: float = 0.011
+    TREND_CORE_WINDOW_MINS: int = 30
+    TREND_CORE_MIN_OBS: int = 16
+    TREND_CORE_MIN_NET: float = 0.0045
+    TREND_CORE_MIN_EFFICIENCY: float = 0.22
+    TREND_CORE_MIN_R2: float = 0.08
+    TREND_CORE_STRONG_NET: float = 0.010
+    TREND_CORE_SCORE_ALPHA_WEIGHT: float = 0.35
+    TREND_CORE_SCORE_TREND_WEIGHT: float = 1.00
+    TREND_CORE_SCORE_MOMENTUM_WEIGHT: float = 0.65
+
+    # Trend core exits: 入场可以等确认，出错必须快。ROI 口径沿用 OMS 当前可成交/公平价。
+    # 与 STOP_LOSS / ABSOLUTE_STOP_LOSS 在 strategy_core_trend 中取 min(更负) 合并，默认与 V0 一致。
+    TREND_EXIT_STOP_LOSS: float = -0.10
+    TREND_EXIT_ABSOLUTE_STOP_LOSS: float = -0.15
+    TREND_EXIT_STOCK_ADVERSE_ROC: float = 0.0035
+    TREND_EXIT_SNAP_BREAK: float = 0.00085
+    TREND_EXIT_MACD_BREAK: float = 0.007
+    TREND_EXIT_INDEX_BREAK_MIN_MINS: float = 1.0
+    TREND_EXIT_NO_PROGRESS_MINS: float = 3.0
+    TREND_EXIT_NO_PROGRESS_ROI: float = 0.00
+    TREND_EXIT_TIME_STOP_MINS: float = 15.0
+    TREND_EXIT_TIME_STOP_ROI: float = 0.05
+    TREND_EXIT_MAX_HOLD_MINS: float = 30.0
+    TREND_EXIT_PROTECT_TRIGGER: float = 0.10
+    TREND_EXIT_PROTECT_FLOOR: float = 0.035
+    # 峰值 ROI 达 trigger 后，若当前 ROI 低于 max_roi * keep 则平仓（与 V0 TRAILING_KEEP_RATIO 同语义）。
+    # keep=0.88：从峰值回撤约 12% 期权 ROI 才触发 trail 卖压，与下方 getattr 默认一致。
+    TREND_EXIT_TRAIL_TRIGGER: float = 0.18
+    TREND_EXIT_TRAIL_KEEP: float = 0.88
     
     MIN_TREND_ROC: float = 0.0001
     MAX_TREND_ROC: float = 0.0030
@@ -194,7 +236,10 @@ class StrategyConfig:
     # ================= 11. Profit Guards (Universal Ladder) =================
     # 旧版 V0 的第一档是 15% 才开始保利润，很多单到不了这里就被回撤吃掉。
     # 这里改成和 strategy_config.py 一致的 ladder 写法，并把第一档前移。
+    # TREND 中端入场、峰值往往不大：收紧 (trigger, floor) 间距，减少从峰值回吐过多才离场。
+    # 微利档：峰值曾 ≥5% 则当前净利跌破 2% 平仓（填补 5%～8% 峰值之间无阶梯空白）。
     LADDER_TIGHT: List[Tuple[float, float]] = field(default_factory=lambda: [
+        (0.05, 0.02),
         (0.08, 0.05),
         (0.12, 0.08),
         (0.20, 0.15),

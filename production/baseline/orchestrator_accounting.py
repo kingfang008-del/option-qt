@@ -4,6 +4,7 @@ import logging
 import os
 import pickle
 import asyncio
+import re
 from datetime import datetime
 from pytz import timezone
 from config import COMMISSION_PER_CONTRACT, COOLDOWN_MINUTES, STREAM_TRADE_LOG, TRADING_ENABLED, RUN_MODE
@@ -14,6 +15,19 @@ from utils import serialization_utils as ser
 from orchestrator_state_manager import infer_open_fill_confirmed
 
 logger = logging.getLogger("V8_Orchestrator.Accounting")
+
+
+def _infer_option_type_from_contract_id(contract_id: str) -> str:
+    text = str(contract_id or "").strip().upper()
+    if not text:
+        return ""
+    match = re.search(r"\d{6}([CP])\d{8}", text)
+    if not match:
+        match = re.search(r"\d{6}([CP])", text)
+    if not match:
+        return ""
+    return "call" if match.group(1) == "C" else "put"
+
 
 class OrchestratorAccounting:
     def __init__(self, orchestrator):
@@ -117,8 +131,9 @@ class OrchestratorAccounting:
         st.entry_slot_reserved = True
         st.entry_stock = stock_price
         st.entry_price = fill_price
+        st.last_opt_price = fill_price
         st.entry_ts = entry_ts
-        st.opt_type = 'call' if st.position == 1 else 'put'
+        st.opt_type = _infer_option_type_from_contract_id(getattr(st, 'contract_id', '') or '') or ('call' if st.position == 1 else 'put')
         st.entry_spy_roc = sig.get('meta', {}).get('spy_roc', 0.0)
         st.entry_index_trend = sig.get('meta', {}).get('index_trend', 0)
         st.entry_alpha_z = sig.get('meta', {}).get('alpha_z', 0.0)

@@ -41,7 +41,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--s4-csv",
         default=str(Path.home() / "quant_project" / "logs" / "replay_trades_s2_pg_1s.csv"),
-        help="s4_run_historical_replay_pg_1s.py 输出的 MockIBKR CSV",
+        help="S4 replay 输出的 MockIBKR CSV",
     )
     p.add_argument(
         "--oms-source",

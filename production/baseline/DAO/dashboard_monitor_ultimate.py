@@ -1,10 +1,13 @@
 import streamlit as st
+import streamlit.components.v1 as components
+import re
 import redis
 import json
 import pickle
 import sys
 import os
 import sqlite3
+import html as _html
 from pathlib import Path
 
 # [NEW] Add project root to sys.path to import utils
@@ -12,6 +15,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from utils import serialization_utils as ser
 import pandas as pd
 import numpy as np
+import math
 import time
 import random
 
@@ -26,6 +30,7 @@ import subprocess
 import shutil
 import shutil
 import sys
+from urllib.parse import quote
 
 # [Fix 1] 设置页面为宽屏模式 (必须在其他 st 命令前)
 st.set_page_config(page_title="V8 Ultimate Monitor", layout="wide", page_icon="📈")
@@ -66,6 +71,10 @@ REDIS_CFG['alpha_key_prefix'] = 'alpha_log'              # Redis List: alpha_log
 # 路径配置
 BASE_PROJECT_DIR = Path(__file__).parent.parent  # V8 dir
 SQLITE_DATA_DIR  = DB_DIR
+FUTU_KLINE_COMPONENT = components.declare_component(
+    "futu_kline",
+    path=str(Path(__file__).parent / "components" / "futu_kline"),
+)
  
 BACKTEST_ROOT    = DATA_DIR / "backtest"
 SCRIPT_DIR       = BASE_PROJECT_DIR / "daily_backtest"  # [Fix 3] S0/S5 脚本在此目录
@@ -744,6 +753,7 @@ def _get_bucket_quote_and_contract(symbol, tag):
     ask = float(row[9] or 0.0) if len(row) > 9 else 0.0
     last = float(row[0] or 0.0)
     mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 and ask >= bid else (last if last > 0 else 0.0)
+    strike = float(row[5] or 0.0) if len(row) > 5 else 0.0
     contract_txt = contracts[idx] if contracts and len(contracts) > idx else ""
     return {
         "bucket_idx": idx,
@@ -751,6 +761,7 @@ def _get_bucket_quote_and_contract(symbol, tag):
         "ask": ask,
         "last": last,
         "mid": mid,
+        "strike": strike,
         "contract_text": contract_txt,
     }
 
@@ -789,6 +800,93 @@ def _fetch_locked_contract_row(symbol, tag):
         }
     except Exception:
         return None
+
+
+def _connect_ibkr_with_fallback_global(ib, host='127.0.0.1', port=IBKR_PORT, preferred_client_ids=None):
+    """Connect a short-lived dashboard IBKR client while avoiding common clientId conflicts."""
+    if preferred_client_ids is None:
+        preferred_client_ids = [121, 122, 123, 124, 125]
+    tried = []
+    candidates = list(preferred_client_ids)
+    candidates.extend(random.sample(range(1200, 1500), k=5))
+    last_err = None
+    for cid in candidates:
+        tried.append(cid)
+        try:
+            if ib.isConnected():
+                ib.disconnect()
+            ib.connect(host, port, clientId=int(cid), timeout=4)
+            if ib.isConnected():
+                return True, int(cid), None
+        except Exception as e:
+            last_err = e
+            try:
+                if ib.isConnected():
+                    ib.disconnect()
+            except Exception:
+                pass
+    return False, None, f"{last_err} | tried={tried}"
+
+
+def place_dashboard_manual_atm_order(symbol, tag, qty, account=""):
+    """Buy the locked bucket contract from first-tab quick controls (ATM or OTM)."""
+    import ib_insync
+
+    sym = str(symbol or "").strip().upper()
+    tag = str(tag or "").strip().upper()
+    qty = int(qty or 0)
+    if not sym:
+        return False, "missing symbol"
+    if tag not in ("CALL_ATM", "CALL_OTM", "PUT_ATM", "PUT_OTM"):
+        return False, f"unsupported tag: {tag}"
+    if qty <= 0:
+        return False, "qty must be > 0"
+
+    lock_row = _fetch_locked_contract_row(sym, tag)
+    if not lock_row or not lock_row.get("conId"):
+        return False, f"No locked contract found for {sym} {tag} in contract_locks"
+
+    ib = ib_insync.IB()
+    try:
+        ok, client_id, err = _connect_ibkr_with_fallback_global(ib)
+        if not ok:
+            return False, f"IBKR connect failed: {err}"
+
+        contract = ib_insync.Contract()
+        contract.conId = int(lock_row["conId"])
+        contract.secType = "OPT"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+        contract.localSymbol = lock_row.get("localSymbol", "") or ""
+        if lock_row.get("tradingClass"):
+            contract.tradingClass = lock_row.get("tradingClass")
+        if lock_row.get("multiplier"):
+            contract.multiplier = str(lock_row.get("multiplier"))
+
+        ib.qualifyContracts(contract)
+        order = ib_insync.MarketOrder("BUY", int(qty))
+        if account:
+            order.account = account
+        trade = ib.placeOrder(contract, order)
+        ib.sleep(1.2)
+
+        status_text = ""
+        if trade is not None and getattr(trade, 'orderStatus', None) is not None:
+            status_text = str(getattr(trade.orderStatus, 'status', '') or '')
+        ok_status = status_text in {"Submitted", "PreSubmitted", "Filled", "PendingSubmit", "PendingCancel"}
+        return bool(ok_status), (
+            f"BUY {qty} {sym} {tag} "
+            f"(conId={lock_row['conId']}, local={lock_row.get('localSymbol', '')}) "
+            f"status={status_text or 'Unknown'} clientId={client_id} account={account or 'N/A'}"
+        )
+    except Exception as e:
+        return False, str(e)
+    finally:
+        try:
+            if ib.isConnected():
+                ib.disconnect()
+        except Exception:
+            pass
 
 
 def get_pg_health_status():
@@ -1008,6 +1106,176 @@ def load_today_sqlite_data(symbol):
             
     return pd.DataFrame()
 
+@st.cache_data(ttl=5)
+def load_intraday_stock_candles(symbol, query_date=None):
+    """Load one NY trading day's minute OHLCV bars for the first-tab candlestick."""
+    try:
+        conn = psycopg2.connect(PG_DB_URL)
+        query_date = query_date or datetime.now(NY_TZ).date()
+        start_dt = NY_TZ.localize(datetime.combine(query_date, dt_time(0, 0, 0)))
+        end_dt = start_dt + pd.Timedelta(days=1)
+        start_ts = int(start_dt.timestamp())
+        end_ts = int(end_dt.timestamp())
+        query = """
+            SELECT ts, open, high, low, close, volume
+            FROM market_bars_1m
+            WHERE symbol = %s AND ts >= %s AND ts < %s
+            ORDER BY ts ASC
+        """
+        df = pd.read_sql_query(query, conn, params=(symbol, start_ts, end_ts))
+        conn.close()
+        if not df.empty:
+            df['datetime'] = pd.to_datetime(df['ts'], unit='s', utc=True).dt.tz_convert(NY_TZ)
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            df = df.dropna(subset=['open', 'high', 'low', 'close'])
+        return df
+    except Exception as e:
+        print(f"Error loading intraday candles from PG: {e}")
+    return pd.DataFrame()
+
+
+def _bars_for_futu_component(df: pd.DataFrame):
+    if df.empty:
+        return []
+    rows = []
+    for _, row in df.iterrows():
+        try:
+            rows.append({
+                "time": int(float(row["ts"])),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "volume": float(row.get("volume", 0.0) or 0.0),
+            })
+        except Exception:
+            continue
+    return rows
+
+
+def _clean_leader_json_value(value):
+    """JSON-safe cell for futu_kline initialLeaders / WS parity."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, (np.floating, float)):
+        x = float(value)
+        if math.isnan(x) or math.isinf(x):
+            return None
+        return x
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    return value
+
+
+def leaders_payload_from_dataframes(long_df: pd.DataFrame, short_df: pd.DataFrame, stats: dict, max_rows: int = 5):
+    """Shape matches dashboard_ws_bridge `leaders` object for browser + WS."""
+    cols = ["symbol", "momentum_score", "ret_5m", "alpha", "vol_z"]
+
+    def rows(df: pd.DataFrame):
+        if df is None or df.empty:
+            return []
+        out = []
+        for item in df.head(max_rows).to_dict("records"):
+            row = {}
+            for col in cols:
+                if col == "symbol":
+                    row[col] = str(item.get(col) or "").strip().upper()
+                else:
+                    row[col] = _clean_leader_json_value(item.get(col))
+            out.append(row)
+        return out
+
+    st_out = stats or {}
+    latest_ts = st_out.get("latest_ts")
+    try:
+        latest_ts = int(latest_ts) if latest_ts is not None and not pd.isna(latest_ts) else 0
+    except Exception:
+        latest_ts = 0
+    return {
+        "long": rows(long_df),
+        "short": rows(short_df),
+        "stats": {
+            "regime": str(st_out.get("regime", "N/A") or "N/A"),
+            "breadth_up_ratio": float(st_out.get("breadth_up_ratio", 0.0) or 0.0),
+            "median_ret_5m": float(st_out.get("median_ret_5m", 0.0) or 0.0),
+            "top3_strength": float(st_out.get("top3_strength", 0.0) or 0.0),
+            "sample_size": int(st_out.get("sample_size", 0) or 0),
+            "latest_ts": latest_ts,
+        },
+    }
+
+
+def _kline_ws_url(symbol: str) -> str:
+    base = os.environ.get("DASHBOARD_KLINE_WS_URL", "").strip() or "ws://localhost:8765/ws"
+    if not base:
+        return ""
+    if "symbol=" in base:
+        return base
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}symbol={quote(str(symbol or '').upper())}"
+
+
+def render_futu_kline(
+    symbol: str,
+    df_candle: pd.DataFrame,
+    quotes: dict,
+    position: dict = None,
+    read_only: bool = False,
+    chart_date=None,
+    color_mode: str = "us",
+    theme_mode: str = "light",
+    websocket_url: str = "",
+    initial_leaders: dict | None = None,
+):
+    """Render the browser-side Lightweight Charts component."""
+    if color_mode == "cn":
+        colors = {"up": "#EF553B", "down": "#00CC96"}
+    else:
+        colors = {"up": "#00CC96", "down": "#EF553B"}
+    theme = (
+        {
+            "background": "#f7f9fc",
+            "panel": "#ffffff",
+            "text": "#1f2937",
+            "muted": "#667085",
+            "grid": "rgba(31,41,55,0.10)",
+            "border": "rgba(31,41,55,0.14)",
+        }
+        if theme_mode == "light"
+        else {
+            "background": "#0f141d",
+            "panel": "#0f141d",
+            "text": "#c9d2e3",
+            "muted": "rgba(232,238,248,0.74)",
+            "grid": "rgba(255,255,255,0.06)",
+            "border": "rgba(255,255,255,0.10)",
+        }
+    )
+    ws = "" if read_only else str(websocket_url or "")
+    embed = bool(ws) and not read_only
+    return FUTU_KLINE_COMPONENT(
+        symbol=str(symbol or "").upper(),
+        bars=_bars_for_futu_component(df_candle),
+        quotes=quotes or {},
+        position=position or None,
+        readOnly=bool(read_only),
+        chartDate=str(chart_date or ""),
+        colors=colors,
+        theme=theme,
+        websocketUrl=ws,
+        embedLiveLeaders=embed,
+        initialLeaders=initial_leaders if embed else None,
+        key=f"futu_kline_{symbol}_{chart_date or 'today'}_{color_mode}_{theme_mode}_{bool(websocket_url)}",
+        default=None,
+    )
+
+
 def load_trade_logs_for_chart(r, symbol):
     """加载特定标的的所有交易记录用于绘图"""
     try:
@@ -1064,8 +1332,8 @@ def format_option_matrix(buckets, contracts=None):
     return df
 
 
-def load_option_price_history(symbol):
-    """从 PostgreSQL option_snapshots_1m 加载期权价格历史 (用于 Tab 1 趋势图)
+def load_option_price_history(symbol, query_date=None):
+    """从 PostgreSQL option_snapshots_1m 加载指定日期期权价格历史 (用于 Tab 1 趋势图)
     
     Returns:
         dict: {bucket_index: [(datetime, price, iv), ...]}  — 每个桶的时序数据
@@ -1077,16 +1345,19 @@ def load_option_price_history(symbol):
     
     try:
         conn = psycopg2.connect(PG_DB_URL)
-        from datetime import timedelta
-        ts_3_days_ago = int((datetime.now(NY_TZ) - timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-        query = f"""
+        query_date = query_date or datetime.now(NY_TZ).date()
+        start_dt = NY_TZ.localize(datetime.combine(query_date, dt_time(0, 0, 0)))
+        end_dt = start_dt + pd.Timedelta(days=1)
+        start_ts = int(start_dt.timestamp())
+        end_ts = int(end_dt.timestamp())
+        query = """
             SELECT ts, buckets_json FROM option_snapshots_1m
-            WHERE symbol = '{symbol}'
-            AND ts >= {ts_3_days_ago}
+            WHERE symbol = %s
+            AND ts >= %s AND ts < %s
             ORDER BY ts ASC
         """
         cursor = conn.cursor()
-        cursor.execute(query)
+        cursor.execute(query, (symbol, start_ts, end_ts))
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
@@ -2011,57 +2282,218 @@ def load_momentum_leaderboard(max_symbols=40):
     except Exception:
         return pd.DataFrame(), pd.DataFrame(), {}
 
-def render_momentum_panel():
-    long_df, short_df, stats = load_momentum_leaderboard(max_symbols=5)
-    st.markdown("### 🏆 动能冠军 / 市场状态")
+def _fmt_float(value, fmt, default="--"):
+    try:
+        if pd.isna(value):
+            return default
+        return fmt.format(float(value))
+    except Exception:
+        return default
 
-    if not stats:
-        st.info("动能榜暂不可用，等待 market_bars_1m / alpha_logs 更新。")
+
+def _leader_rows_html(df: pd.DataFrame, side: str, max_rows: int = 5) -> str:
+    if df.empty:
+        return f"<div class='float-empty'>暂无{'多头' if side == 'long' else '空头'}冠军</div>"
+    rows = []
+    for _, row in df.head(max_rows).iterrows():
+        sym_raw = str(row.get('symbol', '') or '').strip().upper()
+        sym = _html.escape(sym_raw)
+        sym_href = f"?momentum_symbol={quote(sym_raw)}"
+        score = _fmt_float(row.get('momentum_score'), "{:+.2f}")
+        ret_5m = _fmt_float(row.get('ret_5m'), "{:+.2%}")
+        alpha = _fmt_float(row.get('alpha'), "{:+.2f}")
+        vol_z = _fmt_float(row.get('vol_z'), "{:+.1f}")
+        side_cls = "long" if side == "long" else "short"
+        rows.append(
+            f'<div class="float-row {side_cls}">'
+            f'<a class="float-sym float-link" href="{sym_href}" target="_self">{sym}</a>'
+            f'<div class="float-score">{score}</div>'
+            f'<div class="float-cell">{ret_5m}</div>'
+            f'<div class="float-cell">{alpha}</div>'
+            f'<div class="float-cell">{vol_z}</div>'
+            f'</div>'
+        )
+    return "\n".join(rows)
+
+
+def render_momentum_panel(skip_floating_when_ws: bool = False):
+    """Floating HTML leaderboard. When ``skip_floating_when_ws`` (Realtime WS UI), the
+    live list is rendered inside ``futu_kline`` to avoid iframe/parent DOM issues."""
+    if skip_floating_when_ws:
+        st.caption("动能榜：已并入「Market Feed」K 线组件右侧，随 WebSocket 增量刷新（无需整页 1s rerun）。")
         return
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Market Regime", stats.get('regime', 'N/A'))
-    c2.metric("Up Breadth", f"{stats.get('breadth_up_ratio', 0.0):.1%}")
-    c3.metric("Median 5m Return", f"{stats.get('median_ret_5m', 0.0):.2%}")
-    c4.metric("Top3 Strength", f"{stats.get('top3_strength', 0.0):.2f}")
+    long_df, short_df, stats = load_momentum_leaderboard(max_symbols=5)
 
-    left, right = st.columns(2)
-    with left:
-        st.caption("Top Long Leaders")
-        if long_df.empty:
-            st.info("暂无多头冠军")
-        else:
-            show_cols = ['symbol', 'momentum_score', 'ret_5m', 'ret_15m', 'alpha', 'vol_z']
-            disp = long_df[show_cols].copy()
-            st.dataframe(
-                disp.style.format({
-                    'momentum_score': '{:.2f}',
-                    'ret_5m': '{:.2%}',
-                    'ret_15m': '{:.2%}',
-                    'alpha': '{:.3f}',
-                    'vol_z': '{:.2f}',
-                }),
-                use_container_width=True,
-                hide_index=True
-            )
-    with right:
-        st.caption("Top Short Leaders")
-        if short_df.empty:
-            st.info("暂无空头冠军")
-        else:
-            show_cols = ['symbol', 'momentum_score', 'ret_5m', 'ret_15m', 'alpha', 'vol_z']
-            disp = short_df[show_cols].copy()
-            st.dataframe(
-                disp.style.format({
-                    'momentum_score': '{:.2f}',
-                    'ret_5m': '{:.2%}',
-                    'ret_15m': '{:.2%}',
-                    'alpha': '{:.3f}',
-                    'vol_z': '{:.2f}',
-                }),
-                use_container_width=True,
-                hide_index=True
-            )
+    if not stats:
+        st.markdown(
+            '<div class="floating-momentum-panel">'
+            '<div class="float-title">Momentum Leaders</div>'
+            '<div class="float-empty">等待 market_bars_1m / alpha_logs 更新</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    regime = _html.escape(str(stats.get('regime', 'N/A') or 'N/A'))
+    breadth = _fmt_float(stats.get('breadth_up_ratio', 0.0), "{:.0%}")
+    median_ret = _fmt_float(stats.get('median_ret_5m', 0.0), "{:+.2%}")
+    top3 = _fmt_float(stats.get('top3_strength', 0.0), "{:+.2f}")
+    latest_ts = int(stats.get('latest_ts', 0) or 0)
+    latest_txt = datetime.fromtimestamp(latest_ts, NY_TZ).strftime("%H:%M:%S") if latest_ts > 0 else "--"
+    long_rows = _leader_rows_html(long_df, "long")
+    short_rows = _leader_rows_html(short_df, "short")
+
+    floating_html = f"""
+<style>
+.floating-momentum-panel {{
+            position: fixed;
+            top: 86px;
+            right: 18px;
+            width: 390px;
+            max-height: calc(100vh - 112px);
+            overflow: auto;
+            z-index: 9998;
+            background: rgba(255,255,255,0.94);
+            color: #1f2937;
+            border: 1px solid rgba(31,41,55,0.14);
+            border-radius: 8px;
+            box-shadow: 0 12px 30px rgba(15,23,42,0.18);
+            backdrop-filter: blur(14px);
+            padding: 10px;
+}}
+.float-title {{
+            font-size: 13px;
+            font-weight: 800;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+}}
+.float-stats {{
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 6px;
+            margin-bottom: 9px;
+}}
+.float-stat {{
+            background: rgba(31,41,55,0.05);
+            border-radius: 6px;
+            padding: 6px;
+            text-align: center;
+}}
+.float-stat-label {{
+            font-size: 10px;
+            color: #667085;
+}}
+.float-stat-value {{
+            font-size: 12px;
+            font-weight: 800;
+            margin-top: 2px;
+}}
+.float-section-title {{
+            font-size: 11px;
+            font-weight: 800;
+            margin: 8px 0 5px 0;
+            color: #344054;
+}}
+.float-header, .float-row {{
+            display: grid;
+            grid-template-columns: 1.1fr 0.8fr 0.8fr 0.8fr 0.7fr;
+            gap: 6px;
+            align-items: center;
+}}
+.float-header {{
+            font-size: 10px;
+            color: #667085;
+            padding: 0 6px 4px 6px;
+}}
+.float-row {{
+            font-size: 11px;
+            border-radius: 6px;
+            padding: 5px 6px;
+            margin-bottom: 3px;
+            border: 1px solid transparent;
+            transition: background-color 160ms ease, border-color 160ms ease;
+}}
+.float-row.long {{
+            background: rgba(0, 204, 150, 0.08);
+            border-color: rgba(0, 204, 150, 0.18);
+}}
+.float-row.short {{
+            background: rgba(239, 85, 59, 0.08);
+            border-color: rgba(239, 85, 59, 0.18);
+}}
+.float-sym {{
+            font-weight: 800;
+}}
+.float-link {{
+            color: inherit !important;
+            text-decoration: none !important;
+            cursor: pointer;
+}}
+.float-link:hover {{
+            text-decoration: underline !important;
+}}
+.float-score {{
+            font-weight: 800;
+            text-align: right;
+}}
+.float-cell {{
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+}}
+.float-empty {{
+            font-size: 12px;
+            color: #667085;
+            padding: 8px;
+}}
+@keyframes floatFlashUp {{
+            0% {{ background: rgba(0,204,150,0.34); }}
+            100% {{ background: rgba(0,204,150,0.08); }}
+}}
+@keyframes floatFlashDown {{
+            0% {{ background: rgba(239,85,59,0.34); }}
+            100% {{ background: rgba(239,85,59,0.08); }}
+}}
+.float-row.flash-up {{
+            animation: floatFlashUp 850ms ease-out;
+}}
+.float-row.flash-down {{
+            animation: floatFlashDown 850ms ease-out;
+}}
+@media (max-width: 1100px) {{
+            .floating-momentum-panel {{
+                position: static;
+                width: auto;
+                max-height: none;
+                margin: 8px 0;
+            }}
+}}
+</style>
+<div class="floating-momentum-panel">
+<div class="float-title"><span>Momentum Leaders</span><span class="float-latest" style="color:#667085;font-weight:600;">{latest_txt}</span></div>
+<div class="float-stats">
+<div class="float-stat"><div class="float-stat-label">Regime</div><div class="float-stat-value" data-stat="regime">{regime}</div></div>
+<div class="float-stat"><div class="float-stat-label">Breadth</div><div class="float-stat-value" data-stat="breadth">{breadth}</div></div>
+<div class="float-stat"><div class="float-stat-label">Med 5m</div><div class="float-stat-value" data-stat="median_ret_5m">{median_ret}</div></div>
+<div class="float-stat"><div class="float-stat-label">Top3</div><div class="float-stat-value" data-stat="top3_strength">{top3}</div></div>
+</div>
+<div class="float-section-title">Top Long Leaders</div>
+<div class="float-header"><span>Sym</span><span>Score</span><span>5m</span><span>Alpha</span><span>VolZ</span></div>
+<div class="float-rows" data-side="long">
+{long_rows}
+</div>
+<div class="float-section-title">Top Short Leaders</div>
+<div class="float-header"><span>Sym</span><span>Score</span><span>5m</span><span>Alpha</span><span>VolZ</span></div>
+<div class="float-rows" data-side="short">
+{short_rows}
+</div>
+</div>
+"""
+    st.markdown(
+        floating_html,
+        unsafe_allow_html=True,
+    )
 
 def render_debug_inspector():
     """读取每日统一 DB 并可视化 debug_slow/fast 模型特征。"""
@@ -2264,8 +2696,64 @@ with st.sidebar:
     # --- Indices & Macro ---
         ]
     
-    symbol = st.selectbox("Symbol", symbols, index=1)
-    auto_refresh = st.checkbox("Auto Refresh (1s)", True)
+    _sym_ticker_re = re.compile(r"^[A-Z][A-Z0-9.\-]{0,14}$")
+
+    def _consume_momentum_symbol_param():
+        try:
+            raw_val = st.query_params.get("momentum_symbol", "")
+            if isinstance(raw_val, list):
+                raw_val = raw_val[0] if raw_val else ""
+            picked = str(raw_val or "").strip().upper()
+            if picked and _sym_ticker_re.fullmatch(picked):
+                st.session_state["sidebar_symbol"] = picked
+            try:
+                if "momentum_symbol" in st.query_params:
+                    del st.query_params["momentum_symbol"]
+            except Exception:
+                pass
+        except Exception:
+            try:
+                params = st.experimental_get_query_params()
+                vals = params.get("momentum_symbol", [])
+                picked = str(vals[0] if vals else "").strip().upper()
+                if picked and _sym_ticker_re.fullmatch(picked):
+                    st.session_state["sidebar_symbol"] = picked
+                    st.experimental_set_query_params()
+            except Exception:
+                pass
+
+    _consume_momentum_symbol_param()
+    # Chart pick_symbol fires after selectbox in the same run; cannot assign key "sidebar_symbol"
+    # then. Stash here and apply before the widget on the next rerun.
+    _pend_sym = st.session_state.pop("_pending_sidebar_symbol_from_chart", None)
+    if _pend_sym is not None:
+        _pp = str(_pend_sym or "").strip().upper()
+        if _pp and _sym_ticker_re.fullmatch(_pp):
+            st.session_state["sidebar_symbol"] = _pp
+    default_symbol = str(st.session_state.get("sidebar_symbol", "") or "").strip().upper() or symbols[1]
+    if not _sym_ticker_re.fullmatch(default_symbol):
+        default_symbol = symbols[1]
+    sym_opts = list(symbols)
+    if default_symbol not in sym_opts:
+        sym_opts = [default_symbol] + sym_opts
+    symbol = st.selectbox(
+        "Symbol",
+        sym_opts,
+        index=sym_opts.index(default_symbol),
+        key="sidebar_symbol",
+    )
+    realtime_ws_ui = st.checkbox(
+        "Realtime WS UI",
+        True,
+        help="Use the browser WebSocket bridge for K-line and momentum leader updates, avoiding full-page reruns.",
+    )
+    auto_refresh = st.checkbox(
+        "Auto Refresh (1s)",
+        value=not realtime_ws_ui,
+        disabled=realtime_ws_ui,
+    )
+    if realtime_ws_ui:
+        auto_refresh = False
     if st.button("Manual Refresh"): st.rerun()
     if RUN_MODE.startswith("REALTIME"):
         st.markdown("### Live Risk Controls")
@@ -2349,7 +2837,7 @@ _render_runtime_control_dialog()
 # --- Top: Topology ---
 status = SystemStatus(r, symbol)
 st.plotly_chart(draw_topology(status), use_container_width=True)
-render_momentum_panel()
+render_momentum_panel(skip_floating_when_ws=bool(realtime_ws_ui))
 
 if RUN_MODE.startswith("REALTIME"):
     top_live_trading_enabled, top_live_trading_meta = get_runtime_trading_enabled(
@@ -2426,6 +2914,261 @@ tab1, tab10, tab2, tab11, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab_sh, tab_
 
 # === Tab 1: 市场透视 ===
 with tab1:
+    today_ny = datetime.now(NY_TZ).date()
+    date_col, color_col, bg_col, mode_col = st.columns([1, 1, 1, 2])
+    with date_col:
+        tab1_date = st.date_input(
+            "Chart Date",
+            value=today_ny,
+            max_value=today_ny,
+            key=f"tab1_chart_date_{symbol}",
+        )
+    with color_col:
+        tab1_color_label = st.selectbox(
+            "Color Mode",
+            ["US: Green Up", "CN/Futu: Red Up"],
+            index=0,
+            key=f"tab1_color_mode_{symbol}",
+        )
+    tab1_color_mode = "cn" if tab1_color_label.startswith("CN") else "us"
+    up_color = "#EF553B" if tab1_color_mode == "cn" else "#00CC96"
+    down_color = "#00CC96" if tab1_color_mode == "cn" else "#EF553B"
+    with bg_col:
+        tab1_theme_label = st.selectbox(
+            "Background",
+            ["Light", "Dark"],
+            index=0,
+            key=f"tab1_theme_mode_{symbol}",
+        )
+    tab1_theme_mode = "dark" if tab1_theme_label == "Dark" else "light"
+    plot_bg = "#ffffff" if tab1_theme_mode == "light" else "rgba(0,0,0,0)"
+    paper_bg = "#ffffff" if tab1_theme_mode == "light" else "rgba(0,0,0,0)"
+    grid_color = "rgba(31,41,55,0.12)" if tab1_theme_mode == "light" else "#333"
+    font_color = "#1f2937" if tab1_theme_mode == "light" else None
+    is_live_chart_date = tab1_date == today_ny
+    with mode_col:
+        st.subheader(f"{symbol} {'Live' if is_live_chart_date else tab1_date.strftime('%Y-%m-%d')} Candles")
+        if not is_live_chart_date:
+            st.caption("Historical chart mode: order controls are disabled for this date.")
+
+    df_candle = load_intraday_stock_candles(symbol, tab1_date)
+    quick_positions, quick_meta = fetch_live_oms_positions(
+        max_age_sec=120.0,
+        allow_stale=False,
+        expected_modes=[RUN_MODE],
+        return_meta=True,
+    )
+    sym_pos = quick_positions.get(symbol, {}) if (is_live_chart_date and quick_meta.get("fresh")) else {}
+    quick_qty = st.number_input(
+        "Quick order quantity",
+        min_value=1,
+        max_value=100,
+        value=1,
+        step=1,
+        key=f"tab1_quick_qty_{symbol}",
+        disabled=not is_live_chart_date,
+    )
+    quick_account = st.text_input(
+        "Account override",
+        value="",
+        key=f"tab1_quick_account_{symbol}",
+        placeholder="optional",
+        disabled=not is_live_chart_date,
+    )
+    quote_map = (
+        {
+            "CALL_ATM": _get_bucket_quote_and_contract(symbol, "CALL_ATM") or {},
+            "CALL_OTM": _get_bucket_quote_and_contract(symbol, "CALL_OTM") or {},
+            "PUT_ATM": _get_bucket_quote_and_contract(symbol, "PUT_ATM") or {},
+            "PUT_OTM": _get_bucket_quote_and_contract(symbol, "PUT_OTM") or {},
+        }
+        if is_live_chart_date else {}
+    )
+
+    def _position_matches_tag(pos, tag):
+        if not pos:
+            return False
+        pos_tag = str(pos.get("tag", "") or "").strip().upper()
+        return pos_tag == str(tag or "").strip().upper()
+
+    use_plotly_fallback = st.checkbox("Use Plotly fallback", value=False, key=f"tab1_plotly_fallback_{symbol}")
+    if df_candle.empty:
+        st.info(f"No minute stock bars found for {symbol} on {tab1_date}.")
+    elif not use_plotly_fallback:
+        init_leaders = None
+        if is_live_chart_date and realtime_ws_ui:
+            ld_long, ld_short, ld_stats = load_momentum_leaderboard(max_symbols=5)
+            init_leaders = leaders_payload_from_dataframes(ld_long, ld_short, ld_stats, max_rows=5)
+        chart_event = render_futu_kline(
+            symbol,
+            df_candle,
+            quote_map if is_live_chart_date else {},
+            sym_pos if is_live_chart_date else None,
+            read_only=not is_live_chart_date,
+            chart_date=tab1_date,
+            color_mode=tab1_color_mode,
+            theme_mode=tab1_theme_mode,
+            websocket_url=_kline_ws_url(symbol) if (is_live_chart_date and realtime_ws_ui) else "",
+            initial_leaders=init_leaders,
+        )
+        if isinstance(chart_event, dict) and chart_event.get("nonce"):
+            action = str(chart_event.get("action", "") or "").lower()
+            if action == "pick_symbol":
+                pick = str(chart_event.get("symbol", "") or "").strip().upper()
+                ev = f"pick_symbol:{pick}:{chart_event.get('nonce')}"
+                if st.session_state.get("tab1_futu_last_event") != ev:
+                    st.session_state["tab1_futu_last_event"] = ev
+                    if pick and re.fullmatch(r"^[A-Z][A-Z0-9.\-]{0,14}$", pick):
+                        st.session_state["_pending_sidebar_symbol_from_chart"] = pick
+                        st.rerun()
+            else:
+                event_key = f"{chart_event.get('symbol')}:{chart_event.get('tag')}:{chart_event.get('action')}:{chart_event.get('nonce')}"
+                if not is_live_chart_date:
+                    st.warning("Historical chart mode is read-only; order action ignored.")
+                elif st.session_state.get("tab1_futu_last_event") != event_key:
+                    st.session_state["tab1_futu_last_event"] = event_key
+                    tag = str(chart_event.get("tag", "") or "").upper()
+                    side_label = "CALL" if str(tag).startswith("CALL") else "PUT"
+                    quote = quote_map.get(tag, {}) or {}
+                    if action == "close":
+                        pos_dir = int(
+                            sym_pos.get("position", 1 if str(tag).startswith("CALL") else -1)
+                            or (1 if str(tag).startswith("CALL") else -1)
+                        )
+                        qty_val = float(sym_pos.get("qty", 0.0) or 0.0)
+                        ref_price = float(quote.get("mid", 0.0) or sym_pos.get("last_opt_price", 0.0) or sym_pos.get("cost", 0.0) or 0.01)
+                        ok, msg = submit_oms_manual_close(
+                            symbol,
+                            pos_dir,
+                            qty_val,
+                            ref_price=ref_price,
+                            stock_price=float(sym_pos.get("stock", 0.0) or 0.0),
+                            contract_id=str(sym_pos.get("contract_id", "") or quote.get("contract_text", "") or ""),
+                        )
+                        if ok:
+                            st.success(f"{symbol} {side_label} close request sent: {msg}")
+                            st.rerun()
+                        else:
+                            st.error(f"{symbol} {side_label} close failed: {msg}")
+                    elif action == "buy":
+                        ok, msg = place_dashboard_manual_atm_order(
+                            symbol,
+                            tag,
+                            int(quick_qty),
+                            account=quick_account.strip(),
+                        )
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+        st.caption("右侧栏上方可切换 ATM/OTM，Call/Put 盘口与下单 tag 同步；十字光标用于查看其它分钟 OHLC。浏览器内实时更新。")
+    else:
+        fig_stock = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.03,
+            row_heights=[0.78, 0.22],
+        )
+        fig_stock.add_trace(
+            go.Candlestick(
+                x=df_candle['datetime'],
+                open=df_candle['open'],
+                high=df_candle['high'],
+                low=df_candle['low'],
+                close=df_candle['close'],
+                name=f"{symbol} 1m",
+                increasing=dict(line=dict(color=up_color, width=1.7), fillcolor=up_color),
+                decreasing=dict(line=dict(color=down_color, width=1.7), fillcolor=down_color),
+                whiskerwidth=0.45,
+            ),
+            row=1,
+            col=1,
+        )
+        vol_colors = np.where(df_candle['close'] >= df_candle['open'], up_color, down_color)
+        fig_stock.add_trace(
+            go.Bar(
+                x=df_candle['datetime'],
+                y=df_candle['volume'],
+                marker_color=vol_colors,
+                opacity=0.35,
+                name="Volume",
+            ),
+            row=2,
+            col=1,
+        )
+        fig_stock.update_layout(
+            height=560,
+            hovermode="x unified",
+            xaxis_rangeslider_visible=False,
+            margin=dict(l=10, r=10, t=20, b=10),
+            template=PLOTLY_THEME,
+            legend=dict(orientation="h", y=1.02),
+            plot_bgcolor=plot_bg,
+            paper_bgcolor=paper_bg,
+            font=dict(color=font_color) if font_color else None,
+        )
+        fig_stock.update_yaxes(title_text="Stock", row=1, col=1, showgrid=True, gridcolor=grid_color)
+        fig_stock.update_yaxes(title_text="Vol", row=2, col=1, showgrid=False)
+        st.plotly_chart(fig_stock, use_container_width=True)
+        quick_cols = st.columns(2)
+        for q_col, tag, side_label, tint in [
+            (quick_cols[0], "CALL_ATM", "CALL", "rgba(239,85,59,0.16)"),
+            (quick_cols[1], "PUT_ATM", "PUT", "rgba(0,204,150,0.14)"),
+        ]:
+            quote = quote_map.get(tag, {}) or {}
+            has_position = _position_matches_tag(sym_pos, tag)
+            has_other_position = bool(sym_pos) and not has_position
+            with q_col:
+                st.markdown(
+                    f"""
+                    <div style="border:1px solid rgba(255,255,255,0.18); background:{tint}; padding:10px 12px; border-radius:8px;">
+                        <div style="font-weight:700;">{side_label} ATM</div>
+                        <div style="opacity:0.88; font-size:13px;">mid ${float(quote.get('mid', 0.0) or 0.0):.3f} · bid ${float(quote.get('bid', 0.0) or 0.0):.3f} · ask ${float(quote.get('ask', 0.0) or 0.0):.3f}</div>
+                        <div style="opacity:0.62; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{quote.get('contract_text', '') or 'waiting for ATM contract'}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                if has_position:
+                    st.button(f"{side_label} 已持仓", key=f"tab1_{tag}_held_{symbol}", disabled=True, use_container_width=True)
+                    if st.button(f"平仓 {side_label}", key=f"tab1_close_{tag}_{symbol}", type="primary", use_container_width=True):
+                        pos_dir = int(sym_pos.get("position", 1 if tag == "CALL_ATM" else -1) or (1 if tag == "CALL_ATM" else -1))
+                        qty_val = float(sym_pos.get("qty", 0.0) or 0.0)
+                        ref_price = float(quote.get("mid", 0.0) or sym_pos.get("last_opt_price", 0.0) or sym_pos.get("cost", 0.0) or 0.01)
+                        ok, msg = submit_oms_manual_close(
+                            symbol,
+                            pos_dir,
+                            qty_val,
+                            ref_price=ref_price,
+                            stock_price=float(sym_pos.get("stock", 0.0) or 0.0),
+                            contract_id=str(sym_pos.get("contract_id", "") or quote.get("contract_text", "") or ""),
+                        )
+                        if ok:
+                            st.success(f"{symbol} {side_label} close request sent: {msg}")
+                            st.rerun()
+                        else:
+                            st.error(f"{symbol} {side_label} close failed: {msg}")
+                else:
+                    can_buy = float(quote.get("mid", 0.0) or 0.0) > 0.0
+                    if has_other_position:
+                        st.button(f"已有另一侧持仓", key=f"tab1_{tag}_other_held_{symbol}", disabled=True, use_container_width=True)
+                        continue
+                    if st.button(f"买入 {side_label}", key=f"tab1_buy_{tag}_{symbol}", disabled=not can_buy, type="secondary", use_container_width=True):
+                        ok, msg = place_dashboard_manual_atm_order(
+                            symbol,
+                            tag,
+                            int(quick_qty),
+                            account=quick_account.strip(),
+                        )
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+    st.divider()
     st.subheader("Option Chain Matrix")
     if status.src_data:
         # [Fix 4] 读取 contracts 字段 (来自 ibkr_connector 新增)
@@ -2475,7 +3218,7 @@ with tab1:
     st.divider()
     
     # 加载历史快照
-    bucket_history, hist_contracts = load_option_price_history(symbol)
+    bucket_history, hist_contracts = load_option_price_history(symbol, tab1_date)
     bucket_labels = ['Front P_ATM', 'Front P_OTM', 'Front C_ATM', 'Front C_OTM', 'Next P_ATM', 'Next C_ATM']
     
     # [Fix] Dropdown Selection
@@ -2488,7 +3231,13 @@ with tab1:
     with c_sel1:
         st.subheader(f"📉 Option Trends")
     with c_sel2:
-        selected_contract = st.selectbox("Select Filter", options, index=0, label_visibility="collapsed")
+        selected_contract = st.selectbox(
+            "Select Filter",
+            options,
+            index=0,
+            label_visibility="collapsed",
+            key=f"tab1_option_contract_filter_{symbol}_{tab1_date}",
+        )
 
     colors = ['#EF553B', '#FF6692', '#00CC96', '#19D3F3', '#AB63FA', '#FFA15A']
     
@@ -2551,7 +3300,7 @@ with tab1:
         c2.metric("Data Points", total_points)
         c3.metric("Trade Overlays", len(df_opt_trades) if not df_opt_trades.empty else 0)
     else:
-        st.info("⏳ No option price history yet — data accumulates after market open.")
+        st.info(f"⏳ No option price history found for {symbol} on {tab1_date}.")
 
 # === [Tab 10] 🏦 Positions & Orders ===
 with tab10:

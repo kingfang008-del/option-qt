@@ -20,8 +20,8 @@ TEST_DIR = Path.home() / "train_data/quote_features_test"
 
 # 定义训练集、验证集和测试集的时间范围 (左闭右闭)
 TRAIN_DATE_RANGE = ("2022-03-01", "2025-06-30") 
-VAL_DATE_RANGE = ("2025-07-01", "2025-12-31")
-TEST_DATE_RANGE = ("2026-01-01", "2026-03-18")
+VAL_DATE_RANGE = ("2025-07-01", "2026-02-28")
+TEST_DATE_RANGE = ("2026-03-01", "2026-03-18")
 
 # 使用的CPU核心数
 MAX_WORKERS = 32

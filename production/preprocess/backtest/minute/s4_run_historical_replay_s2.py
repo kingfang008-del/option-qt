@@ -75,6 +75,20 @@ def safe_col(group, col, default_val, dtype=np.float32):
     return np.full(len(group), default_val, dtype=dtype)
 
 
+def load_alpha_logs(conn):
+    alpha_cols = pd.read_sql("PRAGMA table_info(alpha_logs)", conn)["name"].tolist()
+    select_cols = ["ts", "symbol", "alpha as alpha_score"]
+    for col in ("vol_z", "event_prob", "tradable_prob", "edge_score"):
+        if col in alpha_cols:
+            alias = "fast_vol" if col == "vol_z" else col
+            select_cols.append(f"{col} as {alias}" if alias != col else col)
+    df_a = pd.read_sql(f"SELECT {', '.join(select_cols)} FROM alpha_logs", conn)
+    for col in ("fast_vol", "event_prob", "tradable_prob", "edge_score"):
+        if col not in df_a.columns:
+            df_a[col] = 0.0
+    return df_a
+
+
 async def main():
     print(f"!!! EXECUTING DETERMINISTIC BUS SCRIPT: {__file__} !!!")
     parser = argparse.ArgumentParser()
@@ -160,7 +174,7 @@ async def main():
     # 4. 直接从 SQLite 加载并对齐数据 (对标 plan_a_fine_tune.py)
     # ==========================================
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    df_a = pd.read_sql("SELECT ts, symbol, alpha as alpha_score, vol_z as fast_vol, event_prob FROM alpha_logs", conn)
+    df_a = load_alpha_logs(conn)
     df_s = pd.read_sql("SELECT ts, symbol, close, open, high, low, volume, spy_roc_5min, qqq_roc_5min FROM market_bars_1m", conn)
     df_o = pd.read_sql("SELECT ts, symbol, buckets_json FROM option_snapshots_1m", conn)
     conn.close()
@@ -256,6 +270,8 @@ async def main():
             'fast_vol': group['fast_vol'].values.astype(np.float32),
             'precalc_alpha': group['alpha_score'].values.astype(np.float32),
             'event_prob': safe_col(group, 'event_prob', 0.0),
+            'tradable_prob': safe_col(group, 'tradable_prob', 0.0),
+            'edge_score': safe_col(group, 'edge_score', 0.0),
             'spy_roc_5min': safe_col(group, 'spy_roc_5min', 0.0),
             'qqq_roc_5min': safe_col(group, 'qqq_roc_5min', 0.0),
             'is_new_minute': is_new_minute,

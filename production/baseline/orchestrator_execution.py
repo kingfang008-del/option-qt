@@ -28,6 +28,19 @@ from runtime_trading_controls import (
 logger = logging.getLogger("V8_Orchestrator.Execution")
 PURE_ALPHA_REPLAY = os.environ.get('PURE_ALPHA_REPLAY') == '1'
 
+
+def _infer_option_type_from_contract_id(contract_id: str) -> str:
+    text = str(contract_id or "").strip().upper()
+    if not text:
+        return ""
+    match = re.search(r"\d{6}([CP])\d{8}", text)
+    if not match:
+        match = re.search(r"\d{6}([CP])", text)
+    if not match:
+        return ""
+    return "call" if match.group(1) == "C" else "put"
+
+
 class OrchestratorExecution:
     URGENT_EXIT_REASON_TOKENS = (
         "HARD_STOP",
@@ -226,6 +239,30 @@ class OrchestratorExecution:
         except Exception:
             return bool(TRADING_ENABLED)
 
+    def _hydrate_exit_contract_from_signal(self, sym: str, st, sig: dict) -> None:
+        """Use trusted manual-close payload metadata to repair stale OMS state."""
+        meta = sig.get('meta', {}) if isinstance(sig, dict) else {}
+        if not isinstance(meta, dict):
+            return
+        contract_id = str(meta.get('contract_id', '') or sig.get('contract_id', '') or '').strip()
+        if not contract_id:
+            return
+
+        manual_close = bool(meta.get('manual_close')) or "DASHBOARD_FORCE_CLOSE" in str(sig.get('reason', '') or '').upper()
+        current_contract_id = str(getattr(st, 'contract_id', '') or '').strip()
+        if current_contract_id and not manual_close:
+            return
+
+        if current_contract_id != contract_id:
+            logger.warning(
+                f"🧩 [Exit Contract Hydrate] {sym} contract_id repaired from signal "
+                f"| old={current_contract_id or 'EMPTY'} | new={contract_id} | manual_close={manual_close}"
+            )
+        st.contract_id = contract_id
+        inferred_opt_type = _infer_option_type_from_contract_id(contract_id)
+        if inferred_opt_type:
+            st.opt_type = inferred_opt_type
+
     @staticmethod
     def _is_high_priority_pacing_reason(reason: str) -> bool:
         """[#7] exit/cancel/MKT fallback 享有优先级:
@@ -406,6 +443,58 @@ class OrchestratorExecution:
                 return 0.0
 
         return float(self._cfg_value('SLIPPAGE_PCT', 0.001))
+
+    def _realtime_dry_entry_fill_price(self, sym: str, sig: dict, fallback_price: float, curr_ts: float) -> float:
+        """Use fresh 1s execution quote for REALTIME_DRY fills, not stale ALPHA_FRAME price."""
+        try:
+            from config import IS_REALTIME_DRY as runtime_is_realtime_dry
+        except Exception:
+            runtime_is_realtime_dry = False
+        fallback = float(fallback_price or 0.0)
+        if not runtime_is_realtime_dry:
+            return fallback
+
+        freshness = getattr(self.orch, "_execution_quote_freshness", None)
+        if freshness is None:
+            return fallback
+        try:
+            is_fresh, lag, wall_lag, quote = freshness(sym, curr_ts)
+        except Exception:
+            return fallback
+        if not is_fresh or not quote:
+            logger.warning(
+                f"🧪 [REALTIME_DRY Fill] {sym} no fresh 1s quote, fallback ALPHA_FRAME price={fallback:.4f}"
+            )
+            return fallback
+
+        opt_type = _infer_option_type_from_contract_id((sig.get('meta') or {}).get('contract_id', '') or sig.get('contract_id', ''))
+        if not opt_type:
+            opt_type = 'call' if int(sig.get('dir', 0) or 0) == 1 else 'put'
+        price_key = 'call_price' if opt_type == 'call' else 'put_price'
+        bid_key = 'call_bid' if opt_type == 'call' else 'put_bid'
+        ask_key = 'call_ask' if opt_type == 'call' else 'put_ask'
+        quote_price = float(quote.get(price_key, 0.0) or 0.0)
+        quote_bid = float(quote.get(bid_key, 0.0) or 0.0)
+        quote_ask = float(quote.get(ask_key, 0.0) or 0.0)
+        if quote_price <= 0.01:
+            return fallback
+
+        sig['price'] = quote_price
+        sig['market_price'] = quote_price
+        meta = dict(sig.get('meta', {}) or {})
+        meta['bid'] = quote_bid
+        meta['ask'] = quote_ask
+        meta['realtime_dry_fill_source'] = 'fresh_1s_execution_quote'
+        meta['realtime_dry_quote_lag_sec'] = float(lag)
+        meta['realtime_dry_quote_wall_lag_sec'] = float(wall_lag)
+        sig['meta'] = meta
+        if fallback > 0.01 and abs(quote_price - fallback) / fallback > 0.03:
+            logger.warning(
+                f"🧪 [REALTIME_DRY Fill] {sym} replace stale entry price "
+                f"{fallback:.4f} -> fresh_1s {quote_price:.4f} "
+                f"| bid={quote_bid:.4f} ask={quote_ask:.4f} lag={lag:.2f}s wall={wall_lag:.2f}s"
+            )
+        return quote_price
 
     # ------------------------------------------------------------------
     # [🛡️ IBKR Connection Guard]
@@ -985,7 +1074,7 @@ class OrchestratorExecution:
         # 🚀 [对齐对冲] 如果处于强制确定性模式，即使是 realtime 也必须禁用冰山，对齐 S4 Atomic Fill
         is_deterministic = config.is_forced_deterministic(self.orch.r)
         entry_contract_id = str(sig.get('meta', {}).get('contract_id', getattr(st, 'contract_id', '') or '') or '')
-        if chunks > 1 and self.orch.mode == 'realtime' and not DISABLE_ICEBERG and not SYNC_EXECUTION and not is_deterministic:
+        if chunks > 1 and self.orch.mode == 'realtime' and not IS_REALTIME_DRY and not DISABLE_ICEBERG and not SYNC_EXECUTION and not is_deterministic:
             # 关键: 冰山路径也先占用 position slot（上方已赋值并过 HardCap 复核），
             # 避免跨进程同步提前清 pending 时出现 "slot 瞬间丢失" 而超开仓。
             st._async_entry_order_active = True
@@ -1024,7 +1113,7 @@ class OrchestratorExecution:
                 ny_now = datetime.fromtimestamp(curr_ts, tz=timezone('America/New_York'))
                 st.expiry_date = ny_now + timedelta(days=7)
 
-        st.opt_type = 'call' if st.position == 1 else 'put'
+        st.opt_type = _infer_option_type_from_contract_id(getattr(st, 'contract_id', '') or '') or ('call' if st.position == 1 else 'put')
         st.entry_ts = curr_ts
         # [🛡️ Defensive] 赋值即强转, 防止 sig.meta 里混入 dict/非数字 (历史曾出现)
         # 污染 st.entry_spy_roc → 进而触发 strategy.check_exit 的 TypeError 把整批
@@ -1260,7 +1349,12 @@ class OrchestratorExecution:
                         except Exception:
                             runtime_is_realtime_dry = False
                         if runtime_is_realtime_dry:
-                            simulated_fill_price = float(fill_price or limit_price or 0.0)
+                            simulated_fill_price = self._realtime_dry_entry_fill_price(
+                                sym,
+                                sig,
+                                float(fill_price or limit_price or 0.0),
+                                curr_ts,
+                            )
                         else:
                             slippage_entry_pct = self._effective_slippage_pct('entry')
                             simulated_fill_price = float(limit_price * (1 + slippage_entry_pct))
@@ -1311,6 +1405,7 @@ class OrchestratorExecution:
         logger.info(f"🚪 [Exit 准入] {sym} | 信号: {sig.get('reason')} | 持仓: {st.position} | 数量: {st.qty} | Pending: {st.is_pending}")
         
         # 🛡️ 移除此处重复的 is_pending 检查，该逻辑已统一上移至 ExecutionEngineV8 处理。
+        self._hydrate_exit_contract_from_signal(sym, st, sig)
         
         bid = sig.get('bid', 0.0)
         ask = sig.get('ask', 0.0)
@@ -1578,7 +1673,7 @@ class OrchestratorExecution:
                 st.qty = total_qty_filled
                 st.entry_stock = stock_price
                 st.entry_price = (total_actual_cost / total_qty_filled) / 100.0
-                st.opt_type = 'call' if st.position == 1 else 'put'
+                st.opt_type = _infer_option_type_from_contract_id(getattr(st, 'contract_id', '') or '') or ('call' if st.position == 1 else 'put')
                 st.entry_ts = curr_ts
                 # [🛡️ Defensive] 同上方 _execute_entry 的保护: 赋值即强转, 拒绝 dict.
                 _meta2 = sig.get('meta', {}) or {}
