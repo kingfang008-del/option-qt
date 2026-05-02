@@ -3,12 +3,18 @@
 Lightweight WebSocket bridge for dashboard live UI.
 
 The Streamlit page still owns initial rendering and order actions. This bridge
-only pushes market bars and momentum leaders so the browser can animate without
-rerunning the whole app every second.
+pushes minute bars, momentum leaders, underlying option quotes, and chart-symbol
+position hints (derived from intraday helpers) so the browser updates without
+rerun-based polling. Full-portfolio metrics / holdings live under **Trade Log**
+and optional ``GET /api/intraday`` (below), not duplicated in each WS frame.
 
 Run (default ``ws://127.0.0.1:8765/ws``)::
 
     python production/baseline/DAO/dashboard_ws_bridge.py
+
+REST (CORS ``*``, optional debugging or external tooling)::
+
+    GET /api/intraday?symbol=SPY
 
 In ``dashboard_monitor_ultimate.py``, enable sidebar **Realtime WS UI** and set
 ``DASHBOARD_KLINE_WS_URL`` if the bridge is not on localhost (optional; default
@@ -31,6 +37,7 @@ import psycopg2
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from config import PG_DB_URL  # noqa: E402
+from dashboard_intraday_snap import augment_intraday_for_chart, build_intraday_snapshot  # noqa: E402
 
 
 warnings.filterwarnings(
@@ -207,13 +214,36 @@ def fetch_momentum_leaders(max_symbols: int = 5, ttl_sec: float = 2.5) -> dict:
     return payload
 
 
+def build_intraday_public_payload(chart_symbol: str) -> dict:
+    """Portfolio + chart-symbol quotes/position, JSON-safe values (no Redis/PG internals)."""
+    chart_symbol = str(chart_symbol or "").strip().upper()
+    base_snap = build_intraday_snapshot()
+    snap = augment_intraday_for_chart(base_snap, chart_symbol)
+    intra = {k: v for k, v in snap.items() if k != "positions_by_symbol"}
+    return json.loads(json.dumps(intra, allow_nan=False))
+
+
 def build_snapshot(symbol: str, max_leaders: int) -> dict:
-    return {
+    sym_upper = str(symbol or "").strip().upper()
+    base = {
         "type": "snapshot",
-        "symbol": str(symbol or "").strip().upper(),
-        "bar": fetch_latest_bar(symbol),
+        "symbol": sym_upper,
+        "bar": fetch_latest_bar(sym_upper),
         "leaders": fetch_momentum_leaders(max_symbols=max_leaders),
     }
+    if not sym_upper:
+        return base
+
+    intra = build_intraday_public_payload(sym_upper)
+    base["quotes"] = intra.get("quotes") or {}
+    base["position"] = intra.get("chart_position")
+
+    try:
+        return json.loads(json.dumps(base, allow_nan=False))
+    except (TypeError, ValueError):
+        base.pop("quotes", None)
+        base.pop("position", None)
+        return base
 
 
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -249,12 +279,39 @@ async def health_handler(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "service": "dashboard_ws_bridge"})
 
 
+def _cors_intraday(resp: web.Response) -> web.Response:
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Max-Age"] = "86400"
+    return resp
+
+
+async def intraday_options_handler(_request: web.Request) -> web.Response:
+    return _cors_intraday(web.Response(status=204))
+
+
+async def intraday_api_handler(request: web.Request) -> web.Response:
+    sym_upper = str(request.query.get("symbol", "") or "").strip().upper()
+    if not sym_upper:
+        return _cors_intraday(web.json_response({"error": "missing symbol"}, status=400))
+    try:
+        payload = {"type": "intraday_public", "intraday": build_intraday_public_payload(sym_upper)}
+        return _cors_intraday(web.json_response(payload))
+    except Exception as exc:
+        return _cors_intraday(
+            web.json_response({"intraday": {"error": str(exc)}}, status=500)
+        )
+
+
 def make_app(interval: float, max_leaders: int) -> web.Application:
     app = web.Application()
     app["interval"] = interval
     app["max_leaders"] = max_leaders
     app.router.add_get("/", health_handler)
     app.router.add_get("/ws", ws_handler)
+    app.router.add_options("/api/intraday", intraday_options_handler)
+    app.router.add_get("/api/intraday", intraday_api_handler)
     return app
 
 

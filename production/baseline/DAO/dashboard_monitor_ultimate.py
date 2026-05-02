@@ -45,7 +45,7 @@ from config import (
     AUTO_TRADING_CAPITAL_RATIO, MANUAL_TRADING_CAPITAL_RATIO, MANUAL_ORDER_ALLOC_RATIO,
     COMMISSION_PER_CONTRACT,
     STREAM_ORCH_SIGNAL, GROUP_OMS, GROUP_ORCH, RUN_MODE, OMS_STATE_NAMESPACE,
-    LIVE_TRADING_CAPITAL_LIMIT, TRADING_ENABLED,
+    LIVE_TRADING_CAPITAL_LIMIT, TRADING_ENABLED, TRADE_OPTION_MONEYNESS,
 )
 from dashboard_cash_utils import (
     parse_oms_ledger_hash,
@@ -458,6 +458,101 @@ def get_ibkr_connector_status(rds):
         return {}
     except Exception:
         return {}
+
+
+def _build_quick_order_route_status(rds):
+    """Build a concise operator-facing status for first-tab manual OMS orders."""
+    mode = _normalize_trade_mode(RUN_MODE) or str(RUN_MODE or "").upper()
+    trading_enabled, trading_meta = get_runtime_trading_enabled(
+        default_value=TRADING_ENABLED,
+        r=rds,
+        return_meta=True,
+    )
+    conn_status = get_ibkr_connector_status(rds)
+    connected = bool(conn_status.get("connected", False))
+    ts_val = float(conn_status.get("ts", 0.0) or 0.0)
+    age_sec = max(0.0, time.time() - ts_val) if ts_val > 0 else 9999.0
+    fresh_connected = bool(connected and age_sec <= 5.0)
+    state = str(conn_status.get("state", "NO_HEARTBEAT") or "NO_HEARTBEAT")
+    host = conn_status.get("host", "127.0.0.1")
+    port = conn_status.get("port", IBKR_PORT)
+    client_id = conn_status.get("client_id", "N/A")
+    last_error = str(conn_status.get("last_error", "") or "")
+    source = trading_meta.get("source", "config")
+    updater = trading_meta.get("updated_by") or "config"
+
+    if mode == "REALTIME_DRY":
+        level = "info" if fresh_connected or not conn_status else "warning"
+        title = "REALTIME_DRY 空跑链路"
+        detail = (
+            "Call/Put 开仓和平仓会提交到 OMS (`execution_engine_v8.py`)；"
+            "OMS 走模拟成交/记账，不会向 IBKR 发真实订单。"
+        )
+    elif mode == "REALTIME":
+        if trading_enabled and fresh_connected:
+            level = "success"
+            title = "REALTIME 实盘下单链路已就绪"
+            detail = "请求会进入 OMS，并由 execution_engine_v8.py 通过 IBKR Gateway 提交真实订单。"
+        elif trading_enabled:
+            level = "error"
+            title = "REALTIME 实盘链路：IBKR Gateway 未连接或心跳过期"
+            detail = "Dashboard 到 OMS 的请求链路正常，但真实订单可能在 OMS/IBKR 提交阶段失败。"
+        else:
+            level = "warning"
+            title = "REALTIME 进程，Live Trading 未武装"
+            detail = "请求会进入 OMS；当前不会发真实订单，适合做链路和记账验证。"
+    else:
+        level = "info"
+        title = f"{mode or 'UNKNOWN'} 链路"
+        detail = "当前不是 REALTIME/REALTIME_DRY，页面下单控件仅用于链路检查。"
+
+    ibkr_detail = (
+        f"IBKR: {state} | connected={fresh_connected} | {host}:{port} "
+        f"| clientId={client_id} | heartbeat_age={age_sec:.1f}s"
+    )
+    if last_error:
+        ibkr_detail += f" | last_error={last_error[:160]}"
+    return {
+        "level": level,
+        "title": title,
+        "detail": detail,
+        "mode": mode,
+        "trading_enabled": bool(trading_enabled),
+        "trading_source": source,
+        "trading_updater": updater,
+        "ibkr_detail": ibkr_detail,
+        "fresh_connected": fresh_connected,
+    }
+
+
+def _render_quick_order_route_status(status):
+    title = status.get("title", "OMS 链路")
+    detail = status.get("detail", "")
+    if status.get("level") == "success":
+        st.success(f"{title}: {detail}")
+    elif status.get("level") == "error":
+        st.error(f"{title}: {detail}")
+    elif status.get("level") == "warning":
+        st.warning(f"{title}: {detail}")
+    else:
+        st.info(f"{title}: {detail}")
+    st.caption(
+        f"route: Dashboard -> Redis `{STREAM_ORCH_SIGNAL}` -> OMS execution_engine_v8 "
+        f"| live_trading={status.get('trading_enabled')} "
+        f"(source={status.get('trading_source')}, by={status.get('trading_updater')})"
+    )
+    st.caption(status.get("ibkr_detail", "IBKR: unknown"))
+
+
+def _quick_order_message_prefix(route_status):
+    mode = route_status.get("mode") or RUN_MODE
+    if mode == "REALTIME_DRY":
+        return "[REALTIME_DRY 空跑 / OMS]"
+    if mode == "REALTIME" and route_status.get("trading_enabled"):
+        return "[REALTIME 实盘 / OMS]"
+    if mode == "REALTIME":
+        return "[REALTIME 未武装 / OMS]"
+    return f"[{mode} / OMS]"
     
 def _parse_account_metrics(account_values):
     """从 IB accountValues 提取净值/可用资金（USD）。"""
@@ -659,6 +754,78 @@ def submit_oms_manual_close(symbol: str, position: int, qty: float, ref_price: f
         return False, str(e)
 
 
+def submit_oms_manual_open(symbol: str, tag: str, qty: int, ref_price: float = 0.0, stock_price: float = 0.0):
+    """Send a first-tab manual open request to OMS, reusing ExecutionEngine's BUY path."""
+    sym = str(symbol or "").strip().upper()
+    tag = str(tag or "").strip().upper()
+    qty = int(qty or 0)
+    if not sym:
+        return False, "missing symbol"
+    if tag not in ("CALL_ATM", "CALL_OTM", "PUT_ATM", "PUT_OTM"):
+        return False, f"unsupported tag: {tag}"
+    if qty <= 0:
+        return False, "qty must be > 0"
+
+    quote = _get_bucket_quote_and_contract(sym, tag) or {}
+    lock_row = _fetch_locked_contract_row(sym, tag) or {}
+    price = float(ref_price or quote.get("mid", 0.0) or quote.get("ask", 0.0) or quote.get("last", 0.0) or 0.0)
+    if price <= 0.01:
+        return False, f"No valid option quote for {sym} {tag}"
+
+    contract_id = (
+        str(quote.get("contract_text", "") or "").strip()
+        or str(lock_row.get("localSymbol", "") or "").strip()
+        or (str(lock_row.get("conId")) if lock_row.get("conId") else "")
+    )
+    direction = 1 if tag.startswith("CALL") else -1
+    try:
+        r_cmd = redis.Redis(**{k: v for k, v in REDIS_CFG.items() if k in ['host', 'port', 'db']}, decode_responses=False)
+        now_ts = time.time()
+        request_id = f"dashboard-open-{sym}-{tag}-{int(now_ts * 1000)}"
+        bid = float(quote.get("bid", 0.0) or 0.0)
+        ask = float(quote.get("ask", 0.0) or 0.0)
+        payload = {
+            "source": "dashboard_manual_open",
+            "action": "BUY",
+            "ts": now_ts,
+            "symbol": sym,
+            "stock_price": float(stock_price or 0.0),
+            "batch_idx": -1,
+            "frame_id": request_id,
+            "sig": {
+                "action": "BUY",
+                "dir": direction,
+                "tag": tag,
+                "price": max(price, 0.01),
+                "market_price": max(price, 0.01),
+                "bid": bid,
+                "ask": ask,
+                "bid_size": float(quote.get("bid_size", 0.0) or 0.0),
+                "ask_size": float(quote.get("ask_size", 0.0) or 0.0),
+                "reason": f"DASHBOARD_MANUAL_OPEN:{request_id}",
+                "meta": {
+                    "manual_open": True,
+                    "request_id": request_id,
+                    "requested_qty": int(qty),
+                    "contract_id": contract_id,
+                    "strike": float(quote.get("strike", 0.0) or lock_row.get("strike", 0.0) or 0.0),
+                    "iv": float(quote.get("iv", 0.0) or 0.0),
+                    "bid": bid,
+                    "ask": ask,
+                    "bid_size": float(quote.get("bid_size", 0.0) or 0.0),
+                    "ask_size": float(quote.get("ask_size", 0.0) or 0.0),
+                    "alpha_z": float(direction),
+                    "spy_roc": 0.0,
+                    "index_trend": direction,
+                },
+            },
+        }
+        r_cmd.xadd(STREAM_ORCH_SIGNAL, {"data": ser.pack(payload)}, maxlen=10000)
+        return True, request_id
+    except Exception as e:
+        return False, str(e)
+
+
 def fetch_live_pending_orders():
     rows = []
     try:
@@ -751,17 +918,23 @@ def _get_bucket_quote_and_contract(symbol, tag):
         return None
     bid = float(row[8] or 0.0) if len(row) > 8 else 0.0
     ask = float(row[9] or 0.0) if len(row) > 9 else 0.0
+    bid_size = float(row[10] or 0.0) if len(row) > 10 else 0.0
+    ask_size = float(row[11] or 0.0) if len(row) > 11 else 0.0
     last = float(row[0] or 0.0)
     mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 and ask >= bid else (last if last > 0 else 0.0)
     strike = float(row[5] or 0.0) if len(row) > 5 else 0.0
+    iv = float(row[7] or 0.0) if len(row) > 7 else 0.0
     contract_txt = contracts[idx] if contracts and len(contracts) > idx else ""
     return {
         "bucket_idx": idx,
         "bid": bid,
         "ask": ask,
+        "bid_size": bid_size,
+        "ask_size": ask_size,
         "last": last,
         "mid": mid,
         "strike": strike,
+        "iv": iv,
         "contract_text": contract_txt,
     }
 
@@ -828,9 +1001,8 @@ def _connect_ibkr_with_fallback_global(ib, host='127.0.0.1', port=IBKR_PORT, pre
     return False, None, f"{last_err} | tried={tried}"
 
 
-def place_dashboard_manual_atm_order(symbol, tag, qty, account=""):
-    """Buy the locked bucket contract from first-tab quick controls (ATM or OTM)."""
-    import ib_insync
+def place_dashboard_manual_atm_order(symbol, tag, qty, account="", stock_price=0.0):
+    """Submit first-tab quick BUY controls through OMS instead of direct IBKR."""
 
     sym = str(symbol or "").strip().upper()
     tag = str(tag or "").strip().upper()
@@ -841,52 +1013,18 @@ def place_dashboard_manual_atm_order(symbol, tag, qty, account=""):
         return False, f"unsupported tag: {tag}"
     if qty <= 0:
         return False, "qty must be > 0"
-
-    lock_row = _fetch_locked_contract_row(sym, tag)
-    if not lock_row or not lock_row.get("conId"):
-        return False, f"No locked contract found for {sym} {tag} in contract_locks"
-
-    ib = ib_insync.IB()
-    try:
-        ok, client_id, err = _connect_ibkr_with_fallback_global(ib)
-        if not ok:
-            return False, f"IBKR connect failed: {err}"
-
-        contract = ib_insync.Contract()
-        contract.conId = int(lock_row["conId"])
-        contract.secType = "OPT"
-        contract.exchange = "SMART"
-        contract.currency = "USD"
-        contract.localSymbol = lock_row.get("localSymbol", "") or ""
-        if lock_row.get("tradingClass"):
-            contract.tradingClass = lock_row.get("tradingClass")
-        if lock_row.get("multiplier"):
-            contract.multiplier = str(lock_row.get("multiplier"))
-
-        ib.qualifyContracts(contract)
-        order = ib_insync.MarketOrder("BUY", int(qty))
-        if account:
-            order.account = account
-        trade = ib.placeOrder(contract, order)
-        ib.sleep(1.2)
-
-        status_text = ""
-        if trade is not None and getattr(trade, 'orderStatus', None) is not None:
-            status_text = str(getattr(trade.orderStatus, 'status', '') or '')
-        ok_status = status_text in {"Submitted", "PreSubmitted", "Filled", "PendingSubmit", "PendingCancel"}
-        return bool(ok_status), (
-            f"BUY {qty} {sym} {tag} "
-            f"(conId={lock_row['conId']}, local={lock_row.get('localSymbol', '')}) "
-            f"status={status_text or 'Unknown'} clientId={client_id} account={account or 'N/A'}"
-        )
-    except Exception as e:
-        return False, str(e)
-    finally:
-        try:
-            if ib.isConnected():
-                ib.disconnect()
-        except Exception:
-            pass
+    quote = _get_bucket_quote_and_contract(sym, tag) or {}
+    ok, msg = submit_oms_manual_open(
+        sym,
+        tag,
+        qty,
+        ref_price=float(quote.get("mid", 0.0) or quote.get("ask", 0.0) or quote.get("last", 0.0) or 0.0),
+        stock_price=float(stock_price or 0.0),
+    )
+    if ok:
+        acct_note = f" | account override ignored by OMS: {account.strip()}" if str(account or "").strip() else ""
+        return True, f"{sym} {tag} BUY request sent to OMS: {msg}{acct_note}"
+    return False, msg
 
 
 def get_pg_health_status():
@@ -1232,6 +1370,7 @@ def render_futu_kline(
     theme_mode: str = "light",
     websocket_url: str = "",
     initial_leaders: dict | None = None,
+    default_moneyness: str = "ATM",
 ):
     """Render the browser-side Lightweight Charts component."""
     if color_mode == "cn":
@@ -1271,6 +1410,7 @@ def render_futu_kline(
         websocketUrl=ws,
         embedLiveLeaders=embed,
         initialLeaders=initial_leaders if embed else None,
+        defaultMoneyness=str(default_moneyness or "ATM").strip().upper(),
         key=f"futu_kline_{symbol}_{chart_date or 'today'}_{color_mode}_{theme_mode}_{bool(websocket_url)}",
         default=None,
     )
@@ -2895,6 +3035,324 @@ if c4.button(f"🔍 Orch: {status.warmup['Orch']}%", help="Click to view Alpha L
 
 st.divider()
 
+
+def _load_trade_snapshot_context(query_date):
+    current_mode = _normalize_trade_mode(RUN_MODE)
+    target_table = 'trade_logs' if current_mode == 'REALTIME' else 'trade_logs_backtest'
+    secondary_table = 'trade_logs_backtest' if target_table == 'trade_logs' else 'trade_logs'
+    start_dt = datetime.combine(query_date, dt_time(0, 0, 0))
+    start_ts = int(NY_TZ.localize(start_dt).timestamp())
+    end_ts = start_ts + 86400
+    ctx = {
+        "mode": current_mode,
+        "df_all": pd.DataFrame(),
+        "open_positions": {},
+        "closed_pnl": 0.0,
+        "wins": 0,
+        "losses": 0,
+        "captions": [],
+        "error": "",
+    }
+    try:
+        conn = psycopg2.connect(PG_DB_URL)
+        frames = []
+        for table in (target_table, secondary_table):
+            try:
+                df_part = pd.read_sql(f"SELECT * FROM {table} WHERE ts >= {start_ts} AND ts < {end_ts}", conn)
+                if not df_part.empty:
+                    df_part["source_table"] = table
+                    frames.append(df_part)
+            except Exception:
+                continue
+        conn.close()
+    except Exception as e:
+        ctx["error"] = str(e)
+        return ctx
+    if not frames:
+        if current_mode.startswith("REALTIME"):
+            live_positions, live_meta = fetch_live_oms_positions(
+                max_age_sec=120.0,
+                allow_stale=False,
+                expected_modes=[RUN_MODE],
+                return_meta=True,
+            )
+            if live_meta.get("fresh"):
+                ctx["open_positions"] = live_positions
+                skipped = int(live_meta.get("skipped_unconfirmed", 0) or 0)
+                if skipped:
+                    ctx["captions"].append(f"Current positions use `oms:live_positions`; ignored unconfirmed pending: {skipped}")
+            else:
+                ctx["captions"].append("OMS live position projection is stale/unavailable.")
+        return ctx
+    df_all = pd.concat(frames, ignore_index=True).drop_duplicates(
+        subset=['ts', 'symbol', 'action', 'qty', 'price'],
+        keep='last',
+    ).sort_values(by='ts', ascending=True)
+
+    def parse_val(row, key, default=np.nan):
+        try:
+            return json.loads(row).get(key, default)
+        except Exception:
+            return default
+
+    def extract_note(row, key):
+        try:
+            return json.loads(json.loads(row).get('strategy_note', '{}')).get(key, '')
+        except Exception:
+            return ''
+
+    for k in [
+        'pnl', 'roi', 'stock_price', 'entry_stock', 'mode', 'account_cash',
+        'alpha_label_ts', 'alpha_available_ts', 'order_submit_ts', 'fill_ts',
+        'alpha_to_submit_ms', 'submit_to_fill_ms', 'alpha_to_fill_ms',
+        'fill_duration', 'fill_ratio'
+    ]:
+        df_all[k] = df_all['details_json'].apply(lambda r, kk=k: parse_val(r, kk))
+    df_all['alpha'] = df_all['details_json'].apply(lambda r: extract_note(r, 'alpha'))
+    df_all['reason'] = df_all['details_json'].apply(lambda r: extract_note(r, 'reason'))
+    df_all['tag'] = df_all['details_json'].apply(lambda r: extract_note(r, 'tag'))
+    mode_mask = _build_trade_mode_mask(df_all, current_mode)
+    dropped = int((~mode_mask).sum())
+    df_all = df_all[mode_mask].copy()
+    if dropped > 0:
+        ctx["captions"].append(f"Mode filter dropped {dropped} rows not matching `{current_mode}`.")
+    if df_all.empty:
+        if current_mode.startswith("REALTIME"):
+            live_positions, live_meta = fetch_live_oms_positions(
+                max_age_sec=120.0,
+                allow_stale=False,
+                expected_modes=[RUN_MODE],
+                return_meta=True,
+            )
+            if live_meta.get("fresh"):
+                ctx["open_positions"] = live_positions
+            else:
+                ctx["captions"].append("OMS live position projection is stale/unavailable.")
+        return ctx
+
+    open_positions = {}
+    closed_pnl = 0.0
+    wins, losses = 0, 0
+    for _, row in df_all.iterrows():
+        sym = row['symbol']
+        qty = float(row.get('qty', 0) or 0)
+        price = float(row.get('price', 0) or 0)
+        action = row.get('action', '')
+        tag = row.get('tag', '')
+        if action == 'OPEN':
+            if sym not in open_positions:
+                open_positions[sym] = {'qty': 0, 'cost': 0.0, 'tag': tag}
+            old_qty = open_positions[sym]['qty']
+            old_cost = open_positions[sym]['cost']
+            new_qty = old_qty + qty
+            open_positions[sym]['cost'] = (old_qty * old_cost + qty * price) / new_qty if new_qty > 0 else 0
+            open_positions[sym]['qty'] = new_qty
+            if tag:
+                open_positions[sym]['tag'] = tag
+        elif action == 'CLOSE':
+            if sym in open_positions:
+                open_positions[sym]['qty'] -= qty
+                if open_positions[sym]['qty'] <= 0:
+                    del open_positions[sym]
+            pnl_val = float(row.get('pnl', 0) if pd.notna(row.get('pnl')) else 0)
+            closed_pnl += pnl_val
+            if pnl_val > 0:
+                wins += 1
+            elif pnl_val < 0:
+                losses += 1
+
+    if current_mode.startswith("REALTIME"):
+        live_positions, live_meta = fetch_live_oms_positions(
+            max_age_sec=120.0,
+            allow_stale=False,
+            expected_modes=[RUN_MODE],
+            return_meta=True,
+        )
+        if live_meta.get("fresh"):
+            log_positions = dict(open_positions)
+            stale_log_symbols = sorted(set(log_positions) - set(live_positions))
+            broker_only_symbols = sorted(set(live_positions) - set(log_positions))
+            for sym, pos in live_positions.items():
+                log_pos = log_positions.get(sym, {})
+                if not pos.get('tag') and log_pos.get('tag'):
+                    pos['tag'] = log_pos.get('tag', '')
+                if pos.get('cost', 0.0) <= 0 and float(log_pos.get('cost', 0.0) or 0.0) > 0:
+                    pos['cost'] = float(log_pos.get('cost', 0.0) or 0.0)
+            open_positions = live_positions
+            skipped = int(live_meta.get("skipped_unconfirmed", 0) or 0)
+            if stale_log_symbols or broker_only_symbols or skipped:
+                parts = []
+                if stale_log_symbols:
+                    parts.append(f"dropped stale log-only: {', '.join(stale_log_symbols[:6])}")
+                if broker_only_symbols:
+                    parts.append(f"adopted OMS live-only: {', '.join(broker_only_symbols[:6])}")
+                if skipped:
+                    parts.append(f"ignored unconfirmed pending: {skipped}")
+                ctx["captions"].append("Current positions use `oms:live_positions` in realtime; " + " | ".join(parts))
+        else:
+            ctx["captions"].append("OMS live position projection is stale/unavailable; falling back to trade-log reconstruction.")
+    ctx.update({
+        "df_all": df_all,
+        "open_positions": open_positions,
+        "closed_pnl": closed_pnl,
+        "wins": wins,
+        "losses": losses,
+    })
+    return ctx
+
+
+@st.fragment(run_every=3)
+def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
+    ctx = _load_trade_snapshot_context(query_date)
+    if ctx.get("error"):
+        st.error(f"Trade snapshot error: {ctx['error']}")
+        return
+    df_all = ctx["df_all"]
+    open_positions = ctx["open_positions"]
+    for caption in ctx.get("captions", []):
+        st.caption(caption)
+
+    live_cash, live_cash_source = fetch_live_oms_cash(
+        max_age_sec=120.0,
+        allow_stale=False,
+        return_source=True,
+        expected_modes=[RUN_MODE],
+    )
+    log_cash = None
+    if not df_all.empty and 'account_cash' in df_all.columns:
+        cash_series = pd.to_numeric(df_all['account_cash'], errors='coerce').dropna()
+        if not cash_series.empty:
+            log_cash = float(cash_series.iloc[-1])
+    display_cash, cash_source = select_remaining_cash(
+        live_cash=live_cash,
+        live_cash_source=live_cash_source,
+        log_cash=log_cash,
+        latest_cash=fetch_latest_mock_cash(),
+        run_mode=RUN_MODE,
+    )
+
+    rows = []
+    unrealized_pnl = 0.0
+    total_market_value = 0.0
+    for sym, pos in open_positions.items():
+        tag = str(pos.get('tag', '') or '').strip().upper()
+        if tag not in TAG_TO_INDEX:
+            opt_type = str(pos.get('opt_type', '') or '').strip().lower()
+            direction = int(pos.get('position', 0) or 0)
+            tag = 'CALL_ATM' if opt_type == 'call' or direction == 1 else ('PUT_ATM' if opt_type == 'put' or direction == -1 else '')
+        quote = _get_bucket_quote_and_contract(sym, tag) or {}
+        live_price = float(quote.get("mid", 0.0) or pos.get("last_opt_price", 0.0) or pos.get("cost", 0.0) or 0.0)
+        cost = float(pos.get("cost", 0.0) or 0.0)
+        qty = float(pos.get("qty", 0.0) or 0.0)
+        paper_pnl = (live_price - cost) * qty * 100
+        market_value = live_price * qty * 100
+        roi_pct = ((live_price / cost) - 1) * 100 if cost > 0 else 0.0
+        pos['paper_pnl'] = paper_pnl
+        pos['roi_pct'] = roi_pct
+        unrealized_pnl += paper_pnl
+        total_market_value += market_value
+        rows.append((sym, tag, qty, cost, live_price, market_value, paper_pnl, roi_pct, pos))
+
+    st.write("##### 📈 Intraday Performance")
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Realized PnL (Closed)", f"${float(ctx['closed_pnl']):.2f}")
+    m2.metric("Unrealized PnL (Open)", f"${unrealized_pnl:.2f}")
+    m3.metric("Total Market Value", f"${total_market_value:,.0f}")
+    m4.metric("Remaining Cash", f"${display_cash:,.2f}")
+    m4.caption(f"source: {cash_source}")
+    win_rate = (ctx["wins"] / (ctx["wins"] + ctx["losses"]) * 100) if (ctx["wins"] + ctx["losses"]) > 0 else 0
+    m5.metric("Win Rate", f"{win_rate:.1f}%", f"{ctx['wins']}W / {ctx['losses']}L")
+    m6.metric("Open Positions", f"{len(open_positions)} Symbols")
+
+    if rows:
+        show_close = bool(ctx["mode"].startswith("REALTIME") and open_positions)
+        with st.container(border=True):
+            close_enabled = False
+            if show_close:
+                close_route_status = _build_quick_order_route_status(r)
+                _render_quick_order_route_status(close_route_status)
+                close_msg_prefix = _quick_order_message_prefix(close_route_status)
+                confirm_close = st.text_input(
+                    "Type `CLOSE` to enable manual close buttons (Quick Close 列)",
+                    key=f"{key_prefix}_manual_close_confirm",
+                    type="password",
+                )
+                close_enabled = confirm_close.strip().upper() == "CLOSE"
+                st.caption("右侧 `请求平仓` 通过 OMS 复用 execution_engine_v8 的 SELL 链路。")
+            else:
+                close_msg_prefix = _quick_order_message_prefix(_build_quick_order_route_status(r))
+            ratios = [1.0, 1.0, 0.7, 0.9, 0.9, 1.1, 1.1, 0.9, 1.3] if show_close else [1.0, 1.0, 0.7, 0.9, 0.9, 1.1, 1.1, 0.9]
+            headers = st.columns(ratios)
+            labels = ["**Symbol**", "**Tag**", "**Qty**", "**Cost**", "**Live**", "**MV ($)**", "**Paper PnL ($)**", "**ROI (%)**"]
+            if show_close:
+                labels.append("**Action**")
+            for col, label in zip(headers, labels):
+                col.markdown(label)
+            st.divider()
+            for sym, tag, qty, cost, live_price, mv, pnl, roi_pct, pos in rows:
+                cols = st.columns(ratios)
+                pnl_color = "#00CC96" if pnl > 0 else ("#EF553B" if pnl < 0 else "#AAAAAA")
+                roi_color = "#00CC96" if roi_pct > 0 else ("#EF553B" if roi_pct < 0 else "#AAAAAA")
+                cols[0].markdown(f"**{sym}**")
+                cols[1].write(tag)
+                cols[2].write(f"{qty:.0f}")
+                cols[3].write(f"${cost:.2f}")
+                cols[4].write(f"${live_price:.2f}")
+                cols[5].write(f"${mv:,.0f}")
+                cols[6].markdown(f"<span style='color:{pnl_color}'>${pnl:,.2f}</span>", unsafe_allow_html=True)
+                cols[7].markdown(f"<span style='color:{roi_color}'>{roi_pct:+.2f}%</span>", unsafe_allow_html=True)
+                if show_close:
+                    pos_dir = int(pos.get("position", 0) or (1 if str(tag).startswith("CALL") else -1))
+                    qty_val = float(pos.get("qty", 0.0) or 0.0)
+                    if cols[8].button(
+                        "请求平仓",
+                        key=f"{key_prefix}_oms_manual_close_{sym}",
+                        disabled=(not close_enabled) or pos_dir == 0 or qty_val <= 0,
+                        type="primary" if close_enabled else "secondary",
+                        use_container_width=True,
+                    ):
+                        ok, msg = submit_oms_manual_close(
+                            sym,
+                            pos_dir,
+                            qty_val,
+                            ref_price=float(live_price or pos.get("last_opt_price", 0.0) or pos.get("cost", 0.0) or 0.01),
+                            stock_price=float(pos.get("stock", 0.0) or 0.0),
+                            contract_id=str(pos.get("contract_id", "") or ""),
+                        )
+                        if ok:
+                            st.success(f"{close_msg_prefix} {sym} manual close request sent to OMS: {msg}")
+                            st.rerun()
+                        else:
+                            st.error(f"{close_msg_prefix} {sym} manual close request failed: {msg}")
+    else:
+        st.info("No open positions for current mode/date.")
+
+    st.write("##### 🕒 Recent Trade Logs")
+    if df_all.empty:
+        st.info(f"No trades executed on {query_date}.")
+        return
+    df_trade = df_all.sort_values(by='ts', ascending=False).head(100).copy()
+    df_trade['time'] = pd.to_datetime(df_trade['ts'], unit='s', utc=True).dt.tz_convert(NY_TZ).dt.strftime('%Y-%m-%d %H:%M:%S')
+    df_trade['paper_pnl'] = np.nan
+    df_trade['paper_roi'] = np.nan
+    for idx, row in df_trade.iterrows():
+        if row.get('action') == 'OPEN' and row.get('symbol') in open_positions:
+            sym = row['symbol']
+            df_trade.at[idx, 'paper_pnl'] = open_positions[sym].get('paper_pnl', 0.0)
+            df_trade.at[idx, 'paper_roi'] = open_positions[sym].get('roi_pct', 0.0) / 100.0
+    display_cols = ['time', 'symbol', 'tag', 'action', 'qty', 'fill_duration', 'fill_ratio', 'account_cash', 'price', 'paper_pnl', 'paper_roi', 'pnl', 'roi', 'stock_price', 'entry_stock', 'mode', 'alpha', 'reason']
+    final_cols = [c for c in display_cols if c in df_trade.columns]
+    st.dataframe(
+        df_trade[final_cols].style.applymap(
+            lambda x: 'color: #00CC96' if x == 'OPEN' else ('color: #EF553B' if x == 'CLOSE' else ''), subset=['action']
+        ).applymap(
+            lambda x: 'color: #00CC96' if pd.notna(x) and x > 0 else ('color: #EF553B' if pd.notna(x) and x < 0 else ''),
+            subset=[c for c in ['paper_pnl', 'paper_roi', 'pnl', 'roi'] if c in final_cols]
+        ),
+        use_container_width=True,
+    )
+
+
 # --- Main: Tabs ---
 tab1, tab10, tab2, tab11, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab_sh, tab_gates = st.tabs([
     "📈 Market Feed", 
@@ -2952,6 +3410,12 @@ with tab1:
             st.caption("Historical chart mode: order controls are disabled for this date.")
 
     df_candle = load_intraday_stock_candles(symbol, tab1_date)
+    tab1_latest_stock_price = 0.0
+    try:
+        if not df_candle.empty and 'close' in df_candle.columns:
+            tab1_latest_stock_price = float(df_candle['close'].iloc[-1] or 0.0)
+    except Exception:
+        tab1_latest_stock_price = 0.0
     quick_positions, quick_meta = fetch_live_oms_positions(
         max_age_sec=120.0,
         allow_stale=False,
@@ -2975,6 +3439,12 @@ with tab1:
         placeholder="optional",
         disabled=not is_live_chart_date,
     )
+    quick_route_status = _build_quick_order_route_status(r)
+    if is_live_chart_date:
+        _render_quick_order_route_status(quick_route_status)
+    else:
+        st.info("Historical chart mode: 下单控件禁用，不会提交 OMS 请求。")
+    quick_msg_prefix = _quick_order_message_prefix(quick_route_status)
     quote_map = (
         {
             "CALL_ATM": _get_bucket_quote_and_contract(symbol, "CALL_ATM") or {},
@@ -3010,6 +3480,7 @@ with tab1:
             theme_mode=tab1_theme_mode,
             websocket_url=_kline_ws_url(symbol) if (is_live_chart_date and realtime_ws_ui) else "",
             initial_leaders=init_leaders,
+            default_moneyness=TRADE_OPTION_MONEYNESS,
         )
         if isinstance(chart_event, dict) and chart_event.get("nonce"):
             action = str(chart_event.get("action", "") or "").lower()
@@ -3046,22 +3517,24 @@ with tab1:
                             contract_id=str(sym_pos.get("contract_id", "") or quote.get("contract_text", "") or ""),
                         )
                         if ok:
-                            st.success(f"{symbol} {side_label} close request sent: {msg}")
+                            st.success(f"{quick_msg_prefix} {symbol} {side_label} close request sent: {msg}")
                             st.rerun()
                         else:
-                            st.error(f"{symbol} {side_label} close failed: {msg}")
+                            st.error(f"{quick_msg_prefix} {symbol} {side_label} close failed: {msg}")
                     elif action == "buy":
+                        event_qty = int(chart_event.get("qty") or quick_qty)
                         ok, msg = place_dashboard_manual_atm_order(
                             symbol,
                             tag,
-                            int(quick_qty),
+                            event_qty,
                             account=quick_account.strip(),
+                            stock_price=tab1_latest_stock_price,
                         )
                         if ok:
-                            st.success(msg)
+                            st.success(f"{quick_msg_prefix} {msg}")
                             st.rerun()
                         else:
-                            st.error(msg)
+                            st.error(f"{quick_msg_prefix} {msg}")
         st.caption("右侧栏上方可切换 ATM/OTM，Call/Put 盘口与下单 tag 同步；十字光标用于查看其它分钟 OHLC。浏览器内实时更新。")
     else:
         fig_stock = make_subplots(
@@ -3112,10 +3585,21 @@ with tab1:
         fig_stock.update_yaxes(title_text="Stock", row=1, col=1, showgrid=True, gridcolor=grid_color)
         fig_stock.update_yaxes(title_text="Vol", row=2, col=1, showgrid=False)
         st.plotly_chart(fig_stock, use_container_width=True)
+        cfg_mny = str(TRADE_OPTION_MONEYNESS or "ATM").strip().upper()
+        fallback_mny = st.radio(
+            "Option bucket",
+            ["ATM", "OTM"],
+            index=0 if cfg_mny != "OTM" else 1,
+            key=f"tab1_fallback_moneyness_{symbol}",
+            horizontal=True,
+            disabled=not is_live_chart_date,
+            help="同步决定下方 Call/Put 手动下单使用 CALL_ATM/PUT_ATM 还是 CALL_OTM/PUT_OTM。",
+        )
+        fallback_mny = "OTM" if str(fallback_mny).upper() == "OTM" else "ATM"
         quick_cols = st.columns(2)
         for q_col, tag, side_label, tint in [
-            (quick_cols[0], "CALL_ATM", "CALL", "rgba(239,85,59,0.16)"),
-            (quick_cols[1], "PUT_ATM", "PUT", "rgba(0,204,150,0.14)"),
+            (quick_cols[0], f"CALL_{fallback_mny}", "CALL", "rgba(239,85,59,0.16)"),
+            (quick_cols[1], f"PUT_{fallback_mny}", "PUT", "rgba(0,204,150,0.14)"),
         ]:
             quote = quote_map.get(tag, {}) or {}
             has_position = _position_matches_tag(sym_pos, tag)
@@ -3124,9 +3608,9 @@ with tab1:
                 st.markdown(
                     f"""
                     <div style="border:1px solid rgba(255,255,255,0.18); background:{tint}; padding:10px 12px; border-radius:8px;">
-                        <div style="font-weight:700;">{side_label} ATM</div>
+                        <div style="font-weight:700;">{side_label} {fallback_mny}</div>
                         <div style="opacity:0.88; font-size:13px;">mid ${float(quote.get('mid', 0.0) or 0.0):.3f} · bid ${float(quote.get('bid', 0.0) or 0.0):.3f} · ask ${float(quote.get('ask', 0.0) or 0.0):.3f}</div>
-                        <div style="opacity:0.62; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{quote.get('contract_text', '') or 'waiting for ATM contract'}</div>
+                        <div style="opacity:0.62; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{quote.get('contract_text', '') or f'waiting for {fallback_mny} contract'}</div>
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -3134,7 +3618,7 @@ with tab1:
                 if has_position:
                     st.button(f"{side_label} 已持仓", key=f"tab1_{tag}_held_{symbol}", disabled=True, use_container_width=True)
                     if st.button(f"平仓 {side_label}", key=f"tab1_close_{tag}_{symbol}", type="primary", use_container_width=True):
-                        pos_dir = int(sym_pos.get("position", 1 if tag == "CALL_ATM" else -1) or (1 if tag == "CALL_ATM" else -1))
+                        pos_dir = int(sym_pos.get("position", 1 if str(tag).startswith("CALL") else -1) or (1 if str(tag).startswith("CALL") else -1))
                         qty_val = float(sym_pos.get("qty", 0.0) or 0.0)
                         ref_price = float(quote.get("mid", 0.0) or sym_pos.get("last_opt_price", 0.0) or sym_pos.get("cost", 0.0) or 0.01)
                         ok, msg = submit_oms_manual_close(
@@ -3146,10 +3630,10 @@ with tab1:
                             contract_id=str(sym_pos.get("contract_id", "") or quote.get("contract_text", "") or ""),
                         )
                         if ok:
-                            st.success(f"{symbol} {side_label} close request sent: {msg}")
+                            st.success(f"{quick_msg_prefix} {symbol} {side_label} close request sent: {msg}")
                             st.rerun()
                         else:
-                            st.error(f"{symbol} {side_label} close failed: {msg}")
+                            st.error(f"{quick_msg_prefix} {symbol} {side_label} close failed: {msg}")
                 else:
                     can_buy = float(quote.get("mid", 0.0) or 0.0) > 0.0
                     if has_other_position:
@@ -3161,12 +3645,17 @@ with tab1:
                             tag,
                             int(quick_qty),
                             account=quick_account.strip(),
+                            stock_price=tab1_latest_stock_price,
                         )
                         if ok:
-                            st.success(msg)
+                            st.success(f"{quick_msg_prefix} {msg}")
                             st.rerun()
                         else:
-                            st.error(msg)
+                            st.error(f"{quick_msg_prefix} {msg}")
+
+    st.divider()
+    st.subheader("Live Positions & Recent Trades")
+    _render_trade_snapshot_tables(tab1_date, key_prefix=f"tab1_{symbol}_{tab1_date}")
 
     st.divider()
     st.subheader("Option Chain Matrix")
@@ -4623,36 +5112,7 @@ with tab5:
                                         else:
                                             st.error(f"{sym} manual close request failed: {msg}")
 
-                _live_price_card(open_positions, closed_pnl, wins, losses)
-                st.divider()
-
-                # ✅ 5. 渲染最新 100 条流水日志
-                st.write("##### 🕒 Recent Trade Logs")
-                df_trade = df_all.sort_values(by='ts', ascending=False).head(100).copy()
-                df_trade['time'] = pd.to_datetime(df_trade['ts'], unit='s', utc=True).dt.tz_convert(NY_TZ).dt.strftime('%Y-%m-%d %H:%M:%S')
-                
-                # OPEN 日志是审计事件，pnl/roi 应保持为空；当前浮盈单独展示为
-                # paper_pnl/paper_roi，避免误读成“开仓瞬间继承了上一笔涨幅”。
-                df_trade['paper_pnl'] = np.nan
-                df_trade['paper_roi'] = np.nan
-                for idx, row in df_trade.iterrows():
-                    if row.get('action') == 'OPEN' and row.get('symbol') in open_positions:
-                        sym = row['symbol']
-                        df_trade.at[idx, 'paper_pnl'] = open_positions[sym].get('paper_pnl', 0.0)
-                        df_trade.at[idx, 'paper_roi'] = open_positions[sym].get('roi_pct', 0.0) / 100.0
-                        
-                display_cols = ['time', 'symbol', 'action', 'qty', 'fill_duration', 'fill_ratio', 'account_cash', 'price', 'paper_pnl', 'paper_roi', 'pnl', 'roi', 'stock_price', 'entry_stock', 'mode', 'alpha', 'reason']
-                final_cols = [c for c in display_cols if c in df_trade.columns]
-                
-                st.dataframe(
-                    df_trade[final_cols].style.applymap(
-                        lambda x: 'color: #00CC96' if x == 'OPEN' else ('color: #EF553B' if x == 'CLOSE' else ''), subset=['action']
-                    ).applymap(
-                        lambda x: 'color: #00CC96' if pd.notna(x) and x > 0 else ('color: #EF553B' if pd.notna(x) and x < 0 else ''),
-                        subset=[c for c in ['paper_pnl', 'paper_roi', 'pnl', 'roi'] if c in final_cols]
-                    ),
-                    use_container_width=True
-                )
+                st.caption("实时持仓表和最近交易记录已移动到第一个 tab 的 K 线下方；Trade Log 保留执行质量和缺失交易分析。")
 
                 # ✅ [New] 渲染 "缺失交易" (有信号但没成交)
                 st.divider()

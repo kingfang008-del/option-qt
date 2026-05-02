@@ -18,17 +18,20 @@
     #root {
       position: relative;
       width: 100%;
-      height: 620px;
+      min-height: 620px;
       background: #ffffff;
       border: 1px solid rgba(31, 41, 55, 0.14);
       border-radius: 8px;
       overflow: hidden;
+      display: flex;
+      flex-direction: column;
     }
     #layout {
       display: flex;
       flex-direction: row;
       width: 100%;
-      height: 100%;
+      height: 620px;
+      flex: 0 0 620px;
       min-height: 0;
     }
     #chart-wrap {
@@ -52,7 +55,7 @@
       display: flex;
       flex-direction: column;
       align-items: stretch;
-      padding: 6px 6px 8px;
+      padding: 4px 6px 6px;
       box-sizing: border-box;
       border-bottom: 1px solid rgba(31, 41, 55, 0.10);
     }
@@ -228,7 +231,7 @@
       flex-direction: row;
       width: 100%;
       gap: 5px;
-      margin-bottom: 8px;
+      margin: 0 0 6px 0;
       box-sizing: border-box;
     }
     .mny-btn {
@@ -291,7 +294,7 @@
       margin-bottom: 5px;
       white-space: nowrap;
     }
-    #tradebar button {
+    #tradebar button:not(.notional-step) {
       width: 100%;
       height: 26px;
       border: 0;
@@ -309,6 +312,53 @@
       color: rgba(255, 255, 255, 0.62);
       cursor: not-allowed;
     }
+    .notional-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-wrap: nowrap;
+      gap: 4px;
+      width: 100%;
+      margin: 0 0 5px 0;
+      padding: 0;
+      box-sizing: border-box;
+      flex: 0 0 auto;
+      min-height: 28px;
+      max-height: 28px;
+      line-height: 1;
+      white-space: nowrap;
+    }
+    .notional-lab { font-size: 10px; font-weight: 700; opacity: 0.78; }
+    .notional-val {
+      flex: 0 1 auto;
+      min-width: 0;
+      max-width: 100%;
+      text-align: center;
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+      font-size: 14px;
+      line-height: 28px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    button.notional-step {
+      flex: 0 0 auto;
+      width: 26px;
+      min-width: 26px;
+      max-width: 26px;
+      height: 26px;
+      padding: 0;
+      border-radius: 5px;
+      border: 1px solid rgba(31,41,55,0.18);
+      background: rgba(31,41,55,0.06);
+      cursor: pointer;
+      font-weight: 800;
+      font-size: 15px;
+      line-height: 1;
+      color: inherit;
+      box-sizing: border-box;
+    }
+    button.notional-step:active { filter: brightness(0.95); }
     #fallback {
       display: none;
       position: absolute;
@@ -332,7 +382,7 @@
         <div id="topbar">
           <div id="topbar-left">
             <div class="symbol" id="symbol">-</div>
-            <div class="trade-hint" id="trade-hint">上方 ATM/OTM 切换 Call/Put 行权价与盘口；下单走对应 bucket 锁定合约。十字光标用于查看其它分钟 OHLC（美东 ET）。</div>
+            <div class="trade-hint" id="trade-hint">右上侧 ATM/OTM 正上方单行：− 金额 +；买入入队 OMS（步长 ±1000 存在 session）。十字光标可查其它分钟 OHLC（ET）。</div>
           </div>
           <div class="ohlc" id="ohlc">Move crosshair over candles</div>
         </div>
@@ -387,6 +437,87 @@
     let lastTradebarContentKey = "";
     let mnyMode = "atm";
     let lastMnySymbol = "";
+    let manualNotionalUsd = 5000;
+    let manualNotionalStep = 1000;
+
+    function notionalStorageKeyAmt() {
+      const s = String(currentArgs.symbol || "").trim().toUpperCase();
+      return s ? `dash_kline_notional_v1:${s}` : "dash_kline_notional_v1:default";
+    }
+
+    function notionalStorageKeyStep() {
+      const s = String(currentArgs.symbol || "").trim().toUpperCase();
+      return s ? `dash_kline_step_v1:${s}` : "dash_kline_step_v1:default";
+    }
+
+    function loadPersistedNotional() {
+      try {
+        const raw = sessionStorage.getItem(notionalStorageKeyAmt());
+        const n = raw != null ? parseFloat(raw) : NaN;
+        if (Number.isFinite(n) && n >= 100 && n <= 1_000_000) manualNotionalUsd = n;
+        else manualNotionalUsd = 5000;
+      } catch (_e) {
+        manualNotionalUsd = 5000;
+      }
+    }
+
+    function loadPersistedStep() {
+      try {
+        const raw = sessionStorage.getItem(notionalStorageKeyStep());
+        const n = raw != null ? parseFloat(raw) : NaN;
+        if (Number.isFinite(n) && n >= 50 && n <= 500000) manualNotionalStep = Math.round(n);
+        else manualNotionalStep = 1000;
+      } catch (_e) {
+        manualNotionalStep = 1000;
+      }
+    }
+
+    function persistNotional() {
+      try {
+        sessionStorage.setItem(notionalStorageKeyAmt(), String(Math.round(manualNotionalUsd)));
+      } catch (_e) {}
+    }
+
+    function persistStepValue(v) {
+      try {
+        const n = Number(v);
+        if (Number.isFinite(n) && n >= 50 && n <= 500000) {
+          manualNotionalStep = Math.round(n);
+          sessionStorage.setItem(notionalStorageKeyStep(), String(manualNotionalStep));
+        }
+      } catch (_e) {}
+    }
+
+    function currentStepFromDom() {
+      const n = Number(manualNotionalStep);
+      if (Number.isFinite(n) && n >= 50 && n <= 500000) return Math.round(n);
+      return 1000;
+    }
+
+    function syncNotionalLabel() {
+      const el = document.getElementById("notional-val");
+      if (el) el.textContent = `${Math.round(manualNotionalUsd)}`;
+    }
+
+    function applyNotionalDir(dirSign) {
+      const step = currentStepFromDom();
+      const d = Number(dirSign) >= 0 ? step : -step;
+      manualNotionalUsd = Math.min(2_000_000, Math.max(100, Math.round(manualNotionalUsd + d)));
+      persistNotional();
+      syncNotionalLabel();
+      lastTradebarContentKey = "";
+    }
+
+
+    function syncRootFrameHeight() {
+      try {
+        const root = document.getElementById("root");
+        const h = root ? Math.ceil(root.getBoundingClientRect().height) : 620;
+        Streamlit.setFrameHeight(Math.max(640, h + 8));
+      } catch (_e) {
+        Streamlit.setFrameHeight(640);
+      }
+    }
 
     function formatNyFromUtcSec(utcSec, intlOpts) {
       const sec = Number(utcSec);
@@ -578,6 +709,25 @@
       });
     }
 
+    function emitBuy(tag) {
+      const t = String(tag || "").trim().toUpperCase();
+      const qs = currentArgs.quotes || {};
+      const q = qs[t] || {};
+      const mid = Number(q.mid);
+      const mult = 100;
+      let qty = 1;
+      if (Number.isFinite(mid) && mid > 0 && Number.isFinite(manualNotionalUsd) && manualNotionalUsd > 0)
+        qty = Math.max(1, Math.floor(manualNotionalUsd / (mid * mult)));
+      Streamlit.setComponentValue({
+        action: "buy",
+        tag: t,
+        symbol: currentArgs.symbol || "",
+        qty,
+        notionalUsd: Math.round(manualNotionalUsd),
+        nonce: Date.now(),
+      });
+    }
+
     function buildLatestTradebarHtml() {
       const tradebar = document.getElementById("tradebar");
       if (!tradebar) return "";
@@ -598,6 +748,11 @@
       const qPut = quotes[pTag] || {};
       const pos = currentArgs.position || null;
       return `
+        <div class="notional-row" title="步长沿用上次设置（右侧栏会话内）；默认 ±1000">
+          <button type="button" class="notional-step" data-notional-dir="-1">−</button>
+          <span class="notional-val" id="notional-val">${Math.round(manualNotionalUsd)}</span>
+          <button type="button" class="notional-step" data-notional-dir="1">+</button>
+        </div>
         <div class="mny-toggle" role="tablist" aria-label="ATM or OTM">
           <button type="button" class="mny-btn ${mode === "atm" ? "mny-active" : "mny-idle"}" data-mny="atm">ATM</button>
           <button type="button" class="mny-btn ${mode === "otm" ? "mny-active" : "mny-idle"}" data-mny="otm">OTM</button>
@@ -617,6 +772,7 @@
         return JSON.stringify({
           ro,
           cd: currentArgs.chartDate || "",
+          dm: currentArgs.defaultMoneyness || "",
           mny: mnyMode,
           CALL_ATM: q.CALL_ATM || {},
           CALL_OTM: q.CALL_OTM || {},
@@ -636,6 +792,7 @@
       if (key === lastTradebarContentKey && tradebar.innerHTML) return;
       lastTradebarContentKey = key;
       tradebar.innerHTML = buildLatestTradebarHtml();
+      syncNotionalLabel();
     }
 
     function restoreOhlcLatestLine() {
@@ -902,6 +1059,14 @@
       if (hostEl && !hostEl.dataset.clickBound) {
         hostEl.dataset.clickBound = "1";
         hostEl.addEventListener("click", (e) => {
+          const dirBtn = e.target.closest("button[data-notional-dir]");
+          if (dirBtn && !currentArgs.readOnly) {
+            const dirRaw = dirBtn.getAttribute("data-notional-dir");
+            const dirSign = dirRaw === "1" ? 1 : -1;
+            applyNotionalDir(dirSign);
+            e.stopPropagation();
+            return;
+          }
           const mnyBtn = e.target.closest("button[data-mny]");
           if (mnyBtn) {
             const v = mnyBtn.getAttribute("data-mny");
@@ -910,7 +1075,10 @@
                 mnyMode = v;
                 lastTradebarContentKey = "";
                 const tb = document.getElementById("tradebar");
-                if (tb) tb.innerHTML = buildLatestTradebarHtml();
+                if (tb) {
+                  tb.innerHTML = buildLatestTradebarHtml();
+                  syncNotionalLabel();
+                }
               }
               e.stopPropagation();
             }
@@ -919,7 +1087,9 @@
           const btn = e.target.closest("button[data-action]");
           if (!btn || btn.disabled) return;
           e.stopPropagation();
-          emitAction(btn.dataset.action, btn.dataset.tag);
+          const act = String(btn.dataset.action || "").toLowerCase();
+          if (act === "buy") emitBuy(btn.dataset.tag);
+          else emitAction(act, btn.dataset.tag);
         });
       }
       chart = LightweightCharts.createChart(document.getElementById("chart"), {
@@ -999,9 +1169,13 @@
       currentArgs = args || {};
       const ns = String(currentArgs.symbol || "").trim().toUpperCase();
       if (ns && ns !== lastMnySymbol) {
-        mnyMode = "atm";
+        const defaultMny = String(currentArgs.defaultMoneyness || "ATM").trim().toLowerCase();
+        mnyMode = defaultMny === "otm" ? "otm" : "atm";
         lastMnySymbol = ns;
       }
+      loadPersistedNotional();
+      loadPersistedStep();
+      syncNotionalLabel();
       applyDomTheme();
       const embed = Boolean(currentArgs.embedLiveLeaders);
       const dock = document.getElementById("leaders-dock");
@@ -1073,7 +1247,7 @@
       lastTradebarContentKey = "";
       updateLatestAnchors();
       connectWs(currentArgs.readOnly ? "" : (currentArgs.websocketUrl || ""));
-      Streamlit.setFrameHeight(620);
+      syncRootFrameHeight();
     }
 
     window.addEventListener("message", (event) => {
@@ -1082,7 +1256,7 @@
       }
     });
     Streamlit.setComponentReady();
-    Streamlit.setFrameHeight(620);
+    syncRootFrameHeight();
   </script>
 </body>
 </html>

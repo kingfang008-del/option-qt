@@ -133,6 +133,7 @@ class OrchestratorAccounting:
         st.entry_price = fill_price
         st.last_opt_price = fill_price
         st.entry_ts = entry_ts
+        st.option_tag = str(sig.get('tag', '') or '').strip().upper()
         st.opt_type = _infer_option_type_from_contract_id(getattr(st, 'contract_id', '') or '') or ('call' if st.position == 1 else 'put')
         st.entry_spy_roc = sig.get('meta', {}).get('spy_roc', 0.0)
         st.entry_index_trend = sig.get('meta', {}).get('index_trend', 0)
@@ -260,6 +261,7 @@ class OrchestratorAccounting:
             st.entry_slot_reserved = False
             st.entry_price = 0.0
             st.entry_ts = 0.0
+            st.option_tag = ""
             st.max_roi = 0.0
             st.open_fill_confirmed = False
             try:
@@ -273,6 +275,9 @@ class OrchestratorAccounting:
         
         # 🚀 [Bug2 修复] 优先使用传入的 original_position，因为共享内存下 st.position 可能已被 SE 清零
         pos_for_accounting = original_position if original_position is not None else st.position
+        option_tag = str(getattr(st, 'option_tag', '') or '').strip().upper()
+        if option_tag not in {'CALL_ATM', 'CALL_OTM', 'PUT_ATM', 'PUT_OTM'}:
+            option_tag = 'CALL_ATM' if int(pos_for_accounting or 0) == 1 else ('PUT_ATM' if int(pos_for_accounting or 0) == -1 else '')
         
         commission = filled_qty * COMMISSION_PER_CONTRACT
         proceeds = fill_price * filled_qty * 100 - commission
@@ -340,7 +345,7 @@ class OrchestratorAccounting:
             'symbol': sym, 'action': 'CLOSE', 'side': 'SELL',
             'qty': filled_qty, 'price': fill_price, 'stock_price': stock_price,
             'entry_stock': st.entry_stock, 'pnl': pnl, 'roi': roi,
-            'strategy_note': json.dumps({'reason': reason, 'duration': (safe_now_ts - st.entry_ts)/60}),
+            'strategy_note': json.dumps({'tag': option_tag, 'reason': reason, 'duration': (safe_now_ts - st.entry_ts)/60}),
             'fill_duration': round(duration, 1), 'fill_ratio': round(ratio, 2), 'mode': self.orch.mode.upper()
         })
         
@@ -382,6 +387,7 @@ class OrchestratorAccounting:
             st.entry_price = 0.0
             st.entry_ts = 0.0
             st.max_roi = 0.0
+            st.option_tag = ""
             st.open_fill_confirmed = False
             st.pending_exit_retry_reason = ""
             st.pending_exit_retry_count = 0

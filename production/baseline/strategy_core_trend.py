@@ -20,6 +20,7 @@ from typing import Dict, List
 from strategy_config0 import StrategyConfig
 from strategy_core_v0 import GATE_REGISTRY, StrategyCoreV0
 from strategy_exit_rails import merged_trend_v0_option_stop_floors
+from config import option_bucket_tag, option_legacy_tag
 
 
 logger = logging.getLogger("StrategyCore")
@@ -228,8 +229,8 @@ class StrategyCoreTrend(StrategyCoreV0):
         return {
             "action": "BUY",
             "dir": direction,
-            "tag": "CALL_ATM" if direction > 0 else "PUT_ATM",
-            "legacy_tag": "opt_8" if direction > 0 else "opt_0",
+            "tag": option_bucket_tag(direction),
+            "legacy_tag": option_legacy_tag(direction),
             "score": float(detail["score"]),
             "reason": (
                 f"TREND_HUNTER|dir:{direction}|A:{alpha_val:.2f}|"

@@ -11,8 +11,8 @@ class StrategyConfig:
     # ================= 1. Capital Management =================
     # 默认沿用基准配置，V0 核心主要专注信号逻辑
     INITIAL_ACCOUNT: float = 50000.0
-    MAX_POSITIONS: int = 3
-    POSITION_RATIO: float = 0.3
+    MAX_POSITIONS: int = 2
+    POSITION_RATIO: float = 0.5
     MAX_TRADE_CAP: float = 150000.0
     GLOBAL_EXPOSURE_LIMIT: float = 0.90
     COMMISSION_PER_CONTRACT: float = 0.65
@@ -21,14 +21,14 @@ class StrategyConfig:
     # V0 逻辑: 9:45 开始，15:30 禁入，15:40 离场
     START_TIME: str = "09:45:00"
     NO_ENTRY_TIME: str = "15:30:00"
-    CLOSE_TIME: str = "15:40:00"
+    CLOSE_TIME: str = "15:50:00"
     
     START_HOUR: int = 9
-    START_MINUTE: int = 45           
+    START_MINUTE: int = 45
     NO_ENTRY_HOUR: int = 15
-    NO_ENTRY_MINUTE: int = 40
+    NO_ENTRY_MINUTE: int = 30
     CLOSE_HOUR: int = 15
-    CLOSE_MINUTE: int = 45           
+    CLOSE_MINUTE: int = 50
     
     # ================= 3. Entry Thresholds =================
     # V0 逻辑: VOL_MIN 为 -1 (更宽松)，ALPHA_ENTRY 为 0.85
@@ -92,12 +92,12 @@ class StrategyConfig:
     TREND_CORE_MIN_ALPHA_ABS: float = 0.35
     TREND_CORE_ALPHA_ALIGN_MIN_ABS: float = 0.80
     TREND_CORE_MIN_INDEX_ROC: float = 0.00015
-    TREND_CORE_MIN_STOCK_ROC: float = 0.00050
+    TREND_CORE_MIN_STOCK_ROC: float = 0.00045
     TREND_CORE_MIN_SNAP_ROC: float = -0.00012
-    TREND_CORE_MIN_MACD_HIST: float = 0.011
+    TREND_CORE_MIN_MACD_HIST: float = 0.010
     TREND_CORE_WINDOW_MINS: int = 30
     TREND_CORE_MIN_OBS: int = 16
-    TREND_CORE_MIN_NET: float = 0.0045
+    TREND_CORE_MIN_NET: float = 0.0040
     TREND_CORE_MIN_EFFICIENCY: float = 0.22
     TREND_CORE_MIN_R2: float = 0.08
     TREND_CORE_STRONG_NET: float = 0.010
@@ -109,21 +109,21 @@ class StrategyConfig:
     # 与 STOP_LOSS / ABSOLUTE_STOP_LOSS 在 strategy_core_trend 中取 min(更负) 合并，默认与 V0 一致。
     TREND_EXIT_STOP_LOSS: float = -0.10
     TREND_EXIT_ABSOLUTE_STOP_LOSS: float = -0.15
-    TREND_EXIT_STOCK_ADVERSE_ROC: float = 0.0035
-    TREND_EXIT_SNAP_BREAK: float = 0.00085
-    TREND_EXIT_MACD_BREAK: float = 0.007
+    TREND_EXIT_STOCK_ADVERSE_ROC: float = 0.0040
+    TREND_EXIT_SNAP_BREAK: float = 0.0010
+    TREND_EXIT_MACD_BREAK: float = 0.010
     TREND_EXIT_INDEX_BREAK_MIN_MINS: float = 1.0
     TREND_EXIT_NO_PROGRESS_MINS: float = 3.0
     TREND_EXIT_NO_PROGRESS_ROI: float = 0.00
     TREND_EXIT_TIME_STOP_MINS: float = 15.0
     TREND_EXIT_TIME_STOP_ROI: float = 0.05
     TREND_EXIT_MAX_HOLD_MINS: float = 30.0
-    TREND_EXIT_PROTECT_TRIGGER: float = 0.10
-    TREND_EXIT_PROTECT_FLOOR: float = 0.035
+    TREND_EXIT_PROTECT_TRIGGER: float = 0.12
+    TREND_EXIT_PROTECT_FLOOR: float = 0.04
     # 峰值 ROI 达 trigger 后，若当前 ROI 低于 max_roi * keep 则平仓（与 V0 TRAILING_KEEP_RATIO 同语义）。
     # keep=0.88：从峰值回撤约 12% 期权 ROI 才触发 trail 卖压，与下方 getattr 默认一致。
-    TREND_EXIT_TRAIL_TRIGGER: float = 0.18
-    TREND_EXIT_TRAIL_KEEP: float = 0.88
+    TREND_EXIT_TRAIL_TRIGGER: float = 0.22
+    TREND_EXIT_TRAIL_KEEP: float = 0.80
     
     MIN_TREND_ROC: float = 0.0001
     MAX_TREND_ROC: float = 0.0030

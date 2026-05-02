@@ -16,7 +16,8 @@ from config import (
     DISABLE_ICEBERG, SYNC_EXECUTION, BACKTEST_1S_DISABLE_ICEBERG,
     BACKTEST_1S_STRICT_EXECUTION,
     ENTRY_MAX_REQUOTE_SLIPPAGE_PCT, ENTRY_REQUOTE_STEP_CAP_PCT, AUTO_TRADING_CAPITAL_RATIO,
-    LIVE_TRADING_CAPITAL_LIMIT, IS_REALTIME_DRY,
+    MANUAL_TRADING_CAPITAL_RATIO, MANUAL_ORDER_ALLOC_RATIO,
+    LIVE_TRADING_CAPITAL_LIMIT, IS_REALTIME_DRY, PURE_ALPHA_REPLAY,
 )
 from entry_risk_rules import get_entry_min_option_price
 from liquidity_rules import LiquidityRiskManager
@@ -26,7 +27,6 @@ from runtime_trading_controls import (
 )
 
 logger = logging.getLogger("V8_Orchestrator.Execution")
-PURE_ALPHA_REPLAY = os.environ.get('PURE_ALPHA_REPLAY') == '1'
 
 
 def _infer_option_type_from_contract_id(contract_id: str) -> str:
@@ -684,6 +684,7 @@ class OrchestratorExecution:
         st.entry_stock = 0.0
         st.entry_price = 0.0
         st.entry_ts = 0.0
+        st.option_tag = ""
         st.max_roi = 0.0
         st.locked_cash = 0.0
         st.entry_slot_reserved = False
@@ -904,16 +905,18 @@ class OrchestratorExecution:
         global_exposure_limit = max(0.0, min(1.0, float(self._cfg_value('GLOBAL_EXPOSURE_LIMIT', GLOBAL_EXPOSURE_LIMIT))))
         max_trade_cap = float(self._cfg_value('MAX_TRADE_CAP', MAX_TRADE_CAP))
         commission_per_contract = float(self._cfg_value('COMMISSION_PER_CONTRACT', COMMISSION_PER_CONTRACT))
-        auto_cap_ratio = float(self._cfg_value('AUTO_TRADING_CAPITAL_RATIO', AUTO_TRADING_CAPITAL_RATIO))
-        auto_cap_ratio = max(0.0, min(1.0, auto_cap_ratio))
-        if auto_cap_ratio <= 0.0:
-            logger.warning(f"✋ [风控拒单 - {sym}] AUTO_TRADING_CAPITAL_RATIO=0，自动交易资金池已关闭。")
-            self._release_entry_pending(st)
-            return
-        if position_ratio <= 0.0:
-            logger.warning(f"✋ [风控拒单 - {sym}] POSITION_RATIO=0，单标的仓位分配为 0。")
-            self._release_entry_pending(st)
-            return
+        manual_open = bool((sig.get('meta') or {}).get('manual_open'))
+        if not manual_open:
+            auto_cap_ratio = float(self._cfg_value('AUTO_TRADING_CAPITAL_RATIO', AUTO_TRADING_CAPITAL_RATIO))
+            auto_cap_ratio = max(0.0, min(1.0, auto_cap_ratio))
+            if auto_cap_ratio <= 0.0:
+                logger.warning(f"✋ [风控拒单 - {sym}] AUTO_TRADING_CAPITAL_RATIO=0，自动交易资金池已关闭。")
+                self._release_entry_pending(st)
+                return
+            if position_ratio <= 0.0:
+                logger.warning(f"✋ [风控拒单 - {sym}] POSITION_RATIO=0，单标的仓位分配为 0。")
+                self._release_entry_pending(st)
+                return
 
         if self.orch.mode == 'realtime' and hasattr(self.orch, '_apply_live_trading_capital_limit'):
             try:
@@ -923,18 +926,31 @@ class OrchestratorExecution:
 
         available_cash_for_new_entries = max(0.0, float(self.orch.mock_cash or 0.0) - pending_locked_cash_by_bot)
         bot_total_capital = self.orch.mock_cash + position_exposure_by_bot
-        # 自动策略只允许使用自动资金池；手动池由 Dashboard 等人工触发通道使用。
-        auto_pool_capital = bot_total_capital * auto_cap_ratio
         runtime_live_cap = float(
             get_runtime_live_trading_capital_limit(
                 default_value=LIVE_TRADING_CAPITAL_LIMIT,
                 r=getattr(self.orch, 'r', None),
             ) or 0.0
         )
-        if self.orch.mode == 'realtime' and not IS_REALTIME_DRY and runtime_live_cap > 0.0:
-            auto_pool_capital = min(auto_pool_capital, runtime_live_cap)
-        raw_alloc = auto_pool_capital * position_ratio
-        max_exposure = auto_pool_capital * global_exposure_limit
+        if manual_open:
+            mcr = float(self._cfg_value('MANUAL_TRADING_CAPITAL_RATIO', MANUAL_TRADING_CAPITAL_RATIO))
+            mor = float(self._cfg_value('MANUAL_ORDER_ALLOC_RATIO', MANUAL_ORDER_ALLOC_RATIO))
+            mcr = max(0.0, min(1.0, mcr))
+            mor = max(0.01, min(1.0, mor))
+            manual_pool = bot_total_capital * mcr if mcr >= 1e-12 else bot_total_capital
+            if self.orch.mode == 'realtime' and not IS_REALTIME_DRY and runtime_live_cap > 0.0:
+                manual_pool = min(manual_pool, runtime_live_cap)
+            raw_alloc = manual_pool * mor
+            max_exposure = manual_pool * global_exposure_limit
+            auto_pool_capital = manual_pool
+        else:
+            auto_cap_ratio = float(self._cfg_value('AUTO_TRADING_CAPITAL_RATIO', AUTO_TRADING_CAPITAL_RATIO))
+            auto_cap_ratio = max(0.0, min(1.0, auto_cap_ratio))
+            auto_pool_capital = bot_total_capital * auto_cap_ratio
+            if self.orch.mode == 'realtime' and not IS_REALTIME_DRY and runtime_live_cap > 0.0:
+                auto_pool_capital = min(auto_pool_capital, runtime_live_cap)
+            raw_alloc = auto_pool_capital * position_ratio
+            max_exposure = auto_pool_capital * global_exposure_limit
         remaining_quota = max(0.0, max_exposure - locked_cash_by_bot)
         final_alloc = min(raw_alloc, remaining_quota, available_cash_for_new_entries, max_trade_cap)
         
@@ -1020,7 +1036,15 @@ class OrchestratorExecution:
 
         cost_per_contract = (fill_price * 100) + commission_per_contract
         target_qty = int(final_alloc // cost_per_contract)
-        
+        _meta_req = sig.get('meta') or {}
+        if bool(_meta_req.get('manual_open')):
+            try:
+                rq = int(_meta_req.get('requested_qty', 0) or 0)
+            except (TypeError, ValueError):
+                rq = 0
+            if rq >= 1:
+                target_qty = min(rq, target_qty)
+
         if target_qty < 1:
             logger.warning(
                 f"🚫 [Entry EarlyReturn] {sym} blocked: target_qty<1 "
@@ -1055,6 +1079,7 @@ class OrchestratorExecution:
         st.qty = target_qty
         st.entry_stock = stock_price
         st.entry_price = fill_price
+        st.option_tag = str(sig.get('tag', '') or '').strip().upper()
 
         # Final invariant check: never allow > MAX_POSITIONS to persist.
         hard_slots_after = self._count_active_slots(include_pending=True, exclude_sym="")
@@ -1673,6 +1698,7 @@ class OrchestratorExecution:
                 st.qty = total_qty_filled
                 st.entry_stock = stock_price
                 st.entry_price = (total_actual_cost / total_qty_filled) / 100.0
+                st.option_tag = str(sig.get('tag', '') or '').strip().upper()
                 st.opt_type = _infer_option_type_from_contract_id(getattr(st, 'contract_id', '') or '') or ('call' if st.position == 1 else 'put')
                 st.entry_ts = curr_ts
                 # [🛡️ Defensive] 同上方 _execute_entry 的保护: 赋值即强转, 拒绝 dict.

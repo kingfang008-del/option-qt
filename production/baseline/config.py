@@ -51,6 +51,14 @@ IS_BACKTEST   = (RUN_MODE == 'BACKTEST')
 IS_REALTIME_DRY = (RUN_MODE == 'REALTIME_DRY')
 IS_SIMULATED  = IS_BACKTEST
 
+# ================= Alpha Replay / 排序模式 =================
+# True:
+#   候选排序更偏纯 alpha，并放宽部分 IV 缺失保护，适合当前 TREND 实盘/回测保持一致。
+# False:
+#   排序会纳入 IV penalty，期权数据缺失时更保守。
+PURE_ALPHA_REPLAY = _env_flag("PURE_ALPHA_REPLAY", True)
+os.environ.setdefault("PURE_ALPHA_REPLAY", "1" if PURE_ALPHA_REPLAY else "0")
+
 # 全局交易开关:
 # - 仿真模式 (BACKTEST): 强制 False
 # - 实盘 Dry 模式 (REALTIME_DRY): 强制 False
@@ -196,20 +204,20 @@ PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.
 
 # ================= 核心交易标的 =================
 # GS 先注释掉，生产的时候再恢复，因为秒级回测数据里没有 GS 的期权数据，可能会导致回测失败
-# TARGET_SYMBOLS =  [
-#     # --- Tier 1: 巨无霸 ---
-#     'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'UNH', 'AMZN', 'AMD', 'MSTR', 'QQQ',
-#     # --- Tier 2: 核心蓝筹 ---
-#     'NFLX', 'CRWV', 'AVGO', 'MSFT', 'HOOD', 'MU',  'GOOGL', 'WMT', 'COIN', 'SPY',
-#     # --- Tier 3: 高流动性 --- 
-#     'SMCI', 'ADBE', 'ORCL', 'NKE', 'XOM', 'INTC', 'DELL', 'IWM', 'GLD', 'VIXY'
-# ]
-
 TARGET_SYMBOLS =  [
     # --- Tier 1: 巨无霸 ---
-    'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'AMZN', 'AMD','NFLX','MSFT','GOOGL','MU','INTC',
-    'SPY', 'VIXY','QQQ',
+    'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'UNH', 'AMZN', 'AMD', 'MSTR', 'QQQ',
+    # --- Tier 2: 核心蓝筹 ---
+    'NFLX', 'CRWV', 'AVGO', 'MSFT', 'HOOD', 'MU',  'GOOGL', 'WMT', 'COIN', 'SPY',
+    # --- Tier 3: 高流动性 --- 
+    'SMCI', 'ADBE', 'ORCL', 'NKE', 'XOM', 'INTC', 'DELL', 'IWM', 'GLD', 'VIXY'
 ]
+
+# TARGET_SYMBOLS =  [
+#     # --- Tier 1: 巨无霸 ---
+#     'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'AMZN', 'AMD','NFLX','MSFT','GOOGL','MU','INTC',
+#     'SPY', 'VIXY','QQQ',
+# ]
 
 # ================= 交易与归一化白/黑名单 =================
 # 仅用于禁止交易，不影响行情订阅与特征计算
@@ -382,6 +390,31 @@ BUCKET_SPECS = {
     'NEXT_CALL_ATM': {'delta':  0.50, 'bucket_idx': 5},
 }
 TAG_TO_INDEX = {k: v['bucket_idx'] for k, v in BUCKET_SPECS.items()}
+
+# 策略默认交易的期权档位。ATM 为当前生产默认；OTM 便于 S4 对照测试进攻性/成本差异。
+TRADE_OPTION_MONEYNESS = os.environ.get(
+    "TRADE_OPTION_MONEYNESS",
+    os.environ.get("OPTION_MONEYNESS", "ATM"),
+).strip().upper()
+if TRADE_OPTION_MONEYNESS not in {"ATM", "OTM"}:
+    raise ValueError("TRADE_OPTION_MONEYNESS must be ATM or OTM")
+
+_OPTION_LEGACY_TAG = {
+    "PUT_ATM": "opt_0",
+    "PUT_OTM": "opt_4",
+    "CALL_ATM": "opt_8",
+    "CALL_OTM": "opt_12",
+}
+
+def option_bucket_tag(direction: int, moneyness: str = None) -> str:
+    side = "CALL" if int(direction or 0) >= 0 else "PUT"
+    money = str(moneyness or TRADE_OPTION_MONEYNESS or "ATM").strip().upper()
+    if money not in {"ATM", "OTM"}:
+        money = "ATM"
+    return f"{side}_{money}"
+
+def option_legacy_tag(direction: int, moneyness: str = None) -> str:
+    return _OPTION_LEGACY_TAG.get(option_bucket_tag(direction, moneyness), "opt_8" if int(direction or 0) >= 0 else "opt_0")
 
 def get_synced_funds(real_balance: float = None) -> float:
     """

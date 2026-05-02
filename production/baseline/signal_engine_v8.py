@@ -86,6 +86,7 @@ from config import (
     IS_BACKTEST,
     IS_SIMULATED,
     REALTIME_ALLOW_WARMUP_BYPASS,
+    PURE_ALPHA_REPLAY,
 )
 
 from trading_tft_stock_embed import AdvancedAlphaNet
@@ -94,7 +95,6 @@ from trading_tft_stock_embed import AdvancedAlphaNet
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [V8_Orch] - %(levelname)s - %(message)s')
 logger = logging.getLogger("V8_SignalEngine")
-PURE_ALPHA_REPLAY = os.environ.get('PURE_ALPHA_REPLAY') == '1'
 
 # [Fix] 显式添加 FileHandler 确保写入文件
 from config import LOG_DIR
@@ -723,8 +723,9 @@ class SignalEngineV8:
             if buckets is None or len(buckets) == 0: return res
 
 
-            idx_c = TAG_TO_INDEX.get('CALL_ATM')
-            idx_p = TAG_TO_INDEX.get('PUT_ATM')
+            from config import option_bucket_tag
+            idx_c = TAG_TO_INDEX.get(option_bucket_tag(1))
+            idx_p = TAG_TO_INDEX.get(option_bucket_tag(-1))
 
             if idx_c is None or idx_p is None:
                 logger.error(f"标签映射失败! sym={sym}")

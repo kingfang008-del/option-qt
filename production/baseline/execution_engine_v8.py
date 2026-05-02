@@ -94,6 +94,7 @@ from config import (
     OMS_ALLOW_EOD_EXIT_ON_STALE,
     OMS_STATE_NAMESPACE,
     LIVE_TRADING_CAPITAL_LIMIT,
+    PURE_ALPHA_REPLAY,
 )
 from runtime_trading_controls import get_runtime_live_trading_capital_limit
 
@@ -103,7 +104,6 @@ from runtime_trading_controls import get_runtime_live_trading_capital_limit
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [V8_Orch] - %(levelname)s - %(message)s')
 logger = logging.getLogger("V8_ExecutionEngine")
-PURE_ALPHA_REPLAY = os.environ.get('PURE_ALPHA_REPLAY') == '1'
 
 # [Fix] 显式添加 FileHandler 确保写入文件
 from config import LOG_DIR
@@ -249,6 +249,7 @@ class SymbolState:
         self.max_roi = -1.0
         self.cooldown_until = 0.0
         self.contract_id = None
+        self.option_tag = ""
         self.latest_call_id = "" 
         self.latest_put_id = ""  
         self.is_pending = False
@@ -263,6 +264,9 @@ class SymbolState:
         self.pending_exit_retry_count = 0
         self.pending_exit_retry_first_ts = 0.0
         self.pending_exit_retry_last_ts = 0.0
+        self.second_exit_streak_reason = ""
+        self.second_exit_streak_count = 0
+        self.second_exit_last_ts = 0.0
 
         self.prev_macd_hist = 0.0
         
@@ -327,6 +331,7 @@ class SymbolState:
             'max_roi': self.max_roi,
             'cooldown_until': self.cooldown_until,
             'contract_id': self.contract_id,
+            'option_tag': self.option_tag,
             'strike_price': self.strike_price,
             'expiry_date': self.expiry_date.isoformat() if self.expiry_date else None,
             'last_valid_iv': self.last_valid_iv,
@@ -341,6 +346,9 @@ class SymbolState:
             'pending_exit_retry_count': int(self.pending_exit_retry_count),
             'pending_exit_retry_first_ts': float(self.pending_exit_retry_first_ts),
             'pending_exit_retry_last_ts': float(self.pending_exit_retry_last_ts),
+            'second_exit_streak_reason': self.second_exit_streak_reason,
+            'second_exit_streak_count': int(self.second_exit_streak_count),
+            'second_exit_last_ts': float(self.second_exit_last_ts),
 
             # [新增] 历史数据 Buffer 持久化
             'prices': list(self.prices),
@@ -376,6 +384,7 @@ class SymbolState:
         self.max_roi = data.get('max_roi', -1.0)
         self.cooldown_until = data.get('cooldown_until', 0.0)
         self.contract_id = data.get('contract_id')
+        self.option_tag = str(data.get('option_tag', data.get('tag', '')) or '').strip().upper()
         self.strike_price = data.get('strike_price', 0.0)
         
         ex_str = data.get('expiry_date')
@@ -402,6 +411,9 @@ class SymbolState:
         self.pending_exit_retry_count = _coerce_int(data.get('pending_exit_retry_count', 0))
         self.pending_exit_retry_first_ts = _coerce_float(data.get('pending_exit_retry_first_ts', 0.0))
         self.pending_exit_retry_last_ts = _coerce_float(data.get('pending_exit_retry_last_ts', 0.0))
+        self.second_exit_streak_reason = str(data.get('second_exit_streak_reason', '') or '')
+        self.second_exit_streak_count = _coerce_int(data.get('second_exit_streak_count', 0))
+        self.second_exit_last_ts = _coerce_float(data.get('second_exit_last_ts', 0.0))
         
         # [新增] 恢复 Buffer
         if 'prices' in data: self.prices = deque(data['prices'], maxlen=self.prices.maxlen)
@@ -1009,9 +1021,9 @@ class ExecutionEngineV8:
         }
         
         try:
-            from config import TAG_TO_INDEX
-            idx_p = TAG_TO_INDEX.get('PUT_ATM', 0)
-            idx_c = TAG_TO_INDEX.get('CALL_ATM', 2)
+            from config import TAG_TO_INDEX, option_bucket_tag
+            idx_p = TAG_TO_INDEX.get(option_bucket_tag(-1), 0)
+            idx_c = TAG_TO_INDEX.get(option_bucket_tag(1), 2)
         except Exception:
             idx_p, idx_c = 0, 2
 
@@ -1091,26 +1103,190 @@ class ExecutionEngineV8:
                 except Exception as e:
                     logger.warning(f"[DomainShadow] execution_quote hook failed for {sym}: {e}")
 
-            # Hard boundary: seconds-level quotes are execution-only. They must
-            # not mutate StrategyCore state (last_opt_price/max_roi/bid/ask),
-            # otherwise real-time and 1s replay will diverge from the 1m S4
-            # strategy baseline. Strategy state mutates only on ALPHA_FRAME;
-            # cash/positions mutate only after fills.
-            #
-            # Exception (realtime only):
-            # To keep ladder/trailing exits effective, we maintain peak ROI from
-            # seconds quotes for active positions. This does not generate signals
-            # on seconds; it only preserves true intraminute max_roi so minute
-            # exit checks don't lose peak information.
-            if self.mode == 'realtime':
-                st = self.states.get(sym)
-                if st is not None and int(getattr(st, 'position', 0) or 0) != 0:
-                    entry_p = float(getattr(st, 'entry_price', 0.0) or 0.0)
-                    if entry_p > 0.01:
-                        px = c_mid if int(st.position) == 1 else p_mid
-                        if px > 0.01:
-                            roi_now = (px - entry_p) / entry_p
-                            st.max_roi = max(float(getattr(st, 'max_roi', -1.0) or -1.0), roi_now)
+            # Seconds quotes remain execution-layer facts, but active-position
+            # peak ROI must be mode-neutral. Otherwise backtest cannot validate
+            # the same profit-protection path used by realtime.
+            st = self.states.get(sym)
+            if st is not None and int(getattr(st, 'position', 0) or 0) != 0:
+                entry_p = float(getattr(st, 'entry_price', 0.0) or 0.0)
+                if entry_p > 0.01:
+                    px = c_mid if int(st.position) == 1 else p_mid
+                    if px > 0.01:
+                        roi_now = (px - entry_p) / entry_p
+                        st.max_roi = max(float(getattr(st, 'max_roi', -1.0) or -1.0), roi_now)
+
+    def _second_quote_for_symbol(self, sym: str) -> dict:
+        return dict(self.latest_execution_quote_by_symbol.get(sym) or {})
+
+    def _reset_second_exit_streak(self, st) -> None:
+        st.second_exit_streak_reason = ""
+        st.second_exit_streak_count = 0
+        st.second_exit_last_ts = 0.0
+
+    def _confirm_second_exit_streak(self, st, reason: str, curr_ts: float, threshold: int) -> bool:
+        threshold = max(1, int(threshold or 1))
+        reason_key = str(reason or "")
+        last_ts = float(getattr(st, 'second_exit_last_ts', 0.0) or 0.0)
+        same_reason = reason_key == str(getattr(st, 'second_exit_streak_reason', '') or '')
+        continuous = last_ts <= 0.0 or abs(float(curr_ts or 0.0) - last_ts) <= 2.5
+        if same_reason and continuous:
+            st.second_exit_streak_count = int(getattr(st, 'second_exit_streak_count', 0) or 0) + 1
+        else:
+            st.second_exit_streak_reason = reason_key
+            st.second_exit_streak_count = 1
+        st.second_exit_last_ts = float(curr_ts or 0.0)
+        return int(st.second_exit_streak_count) >= threshold
+
+    def _build_second_dynamic_exit_signal(self, sym: str, st, quote: dict, curr_ts: float) -> Optional[Dict[str, Any]]:
+        side = int(getattr(st, 'position', 0) or 0)
+        if side == 0 or bool(getattr(st, 'is_pending', False)):
+            self._reset_second_exit_streak(st)
+            return None
+
+        entry_p = float(getattr(st, 'entry_price', 0.0) or 0.0)
+        if entry_p <= 0.01:
+            self._reset_second_exit_streak(st)
+            return None
+
+        if side == 1:
+            curr_p = float(quote.get('call_price', 0.0) or 0.0)
+            bid = float(quote.get('call_bid', 0.0) or 0.0)
+            ask = float(quote.get('call_ask', 0.0) or 0.0)
+        else:
+            curr_p = float(quote.get('put_price', 0.0) or 0.0)
+            bid = float(quote.get('put_bid', 0.0) or 0.0)
+            ask = float(quote.get('put_ask', 0.0) or 0.0)
+
+        if curr_p <= 0.01 or bid <= 0.01 or ask <= 0.01 or ask < bid:
+            self._reset_second_exit_streak(st)
+            return None
+
+        spread_pct = (ask - bid) / max(curr_p, 0.01)
+        max_exit_spread = float(getattr(self.cfg, 'MAX_SPREAD_PCT_EXIT', 0.20) or 0.20)
+        if spread_pct > max_exit_spread:
+            self._reset_second_exit_streak(st)
+            return None
+
+        roi = (curr_p - entry_p) / entry_p
+        st.max_roi = max(float(getattr(st, 'max_roi', -1.0) or -1.0), roi)
+        max_roi = float(getattr(st, 'max_roi', roi) or roi)
+        held_mins = self._calc_trading_minutes(float(getattr(st, 'entry_ts', 0.0) or 0.0), curr_ts)
+
+        reason = ""
+        # EOD still belongs to the fast path because stale holdings are worse
+        # than giving the minute loop one more chance near the close.
+        try:
+            ny_now = datetime.fromtimestamp(float(curr_ts), timezone('America/New_York'))
+            close_h = int(getattr(self.cfg, 'CLOSE_HOUR', 15) or 15)
+            close_m = int(getattr(self.cfg, 'CLOSE_MINUTE', 40) or 40)
+            if ny_now.time() >= dt_time(close_h, close_m):
+                reason = f"TIGHT_1S_EOD_CLEAR:{held_mins:.1f}m"
+        except Exception:
+            reason = ""
+
+        if not reason and held_mins >= 1.0:
+            ladder = list(getattr(self.cfg, 'LADDER_TIGHT', []) or [])
+            if held_mins < 3.0:
+                # During the opening minutes of a position, only protect
+                # meaningful profits; tiny early gains are too spread-sensitive.
+                ladder = [(trigger, floor) for trigger, floor in ladder if float(trigger) >= 0.08]
+            for trigger, floor in sorted(ladder, reverse=True):
+                trigger = float(trigger)
+                floor = float(floor)
+                if max_roi >= trigger:
+                    if roi < floor:
+                        reason = (
+                            f"TIGHT_1S_STEP_PROT:{max_roi:.1%}->{roi:.1%}"
+                            f"|T:{trigger:.2f}|held={held_mins:.1f}m"
+                        )
+                    break
+
+        if not reason and held_mins >= 3.0:
+            flash_trigger = float(getattr(self.cfg, 'FLASH_PROTECT_TRIGGER', 0.05) or 0.05)
+            flash_exit = float(getattr(self.cfg, 'FLASH_PROTECT_EXIT', 0.02) or 0.02)
+            if max_roi >= flash_trigger and roi <= flash_exit:
+                reason = f"TIGHT_1S_FLASH_PROT:{max_roi:.1%}->{roi:.1%}|held={held_mins:.1f}m"
+
+        if not reason and held_mins >= 3.0:
+            abs_stop = float(getattr(self.cfg, 'ABSOLUTE_STOP_LOSS', -0.15) or -0.15)
+            soft_stop = float(getattr(self.cfg, 'STOP_LOSS', -0.10) or -0.10)
+            if roi <= abs_stop:
+                candidate = f"TIGHT_1S_ABS_STOP:{roi:.1%}|held={held_mins:.1f}m"
+                if self._confirm_second_exit_streak(st, "TIGHT_1S_ABS_STOP", curr_ts, threshold=2):
+                    reason = candidate
+            elif roi <= soft_stop:
+                candidate = f"TIGHT_1S_STOP:{roi:.1%}|held={held_mins:.1f}m"
+                if self._confirm_second_exit_streak(st, "TIGHT_1S_STOP", curr_ts, threshold=3):
+                    reason = candidate
+            else:
+                self._reset_second_exit_streak(st)
+        elif reason:
+            self._reset_second_exit_streak(st)
+        else:
+            self._reset_second_exit_streak(st)
+
+        if not reason:
+            return None
+
+        return {
+            'action': 'SELL',
+            'dir': side,
+            'target_side': side,
+            'reason': reason,
+            'price': curr_p,
+            'market_price': curr_p,
+            'bid': bid,
+            'ask': ask,
+            'meta': {
+                'source': 'second_dynamic_exit',
+                'roi': roi,
+                'max_roi': max_roi,
+                'held_mins': held_mins,
+                'spread_pct': spread_pct,
+                'bid': bid,
+                'ask': ask,
+            },
+        }
+
+    async def _evaluate_second_dynamic_exits(self, curr_ts: float):
+        for sym, st in self.states.items():
+            if int(getattr(st, 'position', 0) or 0) == 0:
+                continue
+            quote = self._second_quote_for_symbol(sym)
+            if not quote:
+                continue
+            try:
+                quote_ts = float(quote.get('ts', 0.0) or 0.0)
+            except Exception:
+                quote_ts = 0.0
+            if quote_ts > 0 and curr_ts > 0 and abs(float(curr_ts) - quote_ts) > max(2.5, float(OMS_MAX_QUOTE_STALE_SEC)):
+                continue
+            exit_sig = self._build_second_dynamic_exit_signal(sym, st, quote, curr_ts)
+            if not exit_sig:
+                continue
+            if self._should_block_strategy_on_stale_quote(
+                sym,
+                curr_ts,
+                'SELL',
+                reason=exit_sig.get('reason', ''),
+                frame_has_quote=False,
+            ):
+                continue
+            stock_price = float(quote.get('stock_price', getattr(st, 'last_price', 0.0)) or 0.0)
+            logger.warning(
+                f"⚡ [OMS 1s Dynamic Exit] {sym} | {exit_sig.get('reason')} "
+                f"| px={float(exit_sig.get('price', 0.0) or 0.0):.4f}"
+            )
+            await self._submit_strategy_order(
+                'SELL',
+                sym,
+                exit_sig,
+                stock_price,
+                curr_ts,
+                -1,
+                frame_id=f"1s:{int(float(curr_ts or 0.0))}",
+                allow_delay_queue=False,
+            )
 
     def _refresh_signal_from_execution_quote(self, payload: dict):
         """Refresh execution price fields from latest 1s quote before order handling."""
@@ -1258,6 +1434,7 @@ class ExecutionEngineV8:
         ts = float(market_packet.get('ts', 0.0) or 0.0)
         self._cache_execution_market_packet(market_packet)
         self._record_market_for_replay(market_packet)
+        await self._evaluate_second_dynamic_exits(ts)
         await self.process_trade_signal({'action': 'SYNC', 'ts': ts, 'payload': {}})
         await self.drain_trade_signal_queue()
 
@@ -1828,7 +2005,17 @@ class ExecutionEngineV8:
                 logger.warning(f"⚠️ [OMS Gate Trace Pub] failed: {e}")
                 self._gate_pub_err_logged = True
 
-    async def _submit_strategy_order(self, action, sym, sig, stock_price, curr_ts, batch_idx, frame_id=None):
+    async def _submit_strategy_order(
+        self,
+        action,
+        sym,
+        sig,
+        stock_price,
+        curr_ts,
+        batch_idx,
+        frame_id=None,
+        allow_delay_queue=True,
+    ):
         payload = {
             'ts': curr_ts,
             'symbol': sym,
@@ -1840,7 +2027,7 @@ class ExecutionEngineV8:
             'source': 'oms_strategy_v8',
             'prices': {sym: getattr(self.states.get(sym), 'last_opt_price', 0.0)},
         }
-        await self._handle_trade_signal(payload, allow_delay_queue=True)
+        await self._handle_trade_signal(payload, allow_delay_queue=allow_delay_queue)
 
     def _trade_signal_key(self, payload: dict) -> str:
         """Build a deterministic dedupe key for BUY/SELL handling."""
@@ -2597,7 +2784,10 @@ class ExecutionEngineV8:
             # pending BUY 仍会占用 entry slot，但应通过 pending_orders 展示，不能污染持仓表。
             if pos != 0 and qty > 0 and open_fill_confirmed:
                 opt_type = str(getattr(st, 'opt_type', '') or '').lower()
-                tag = 'CALL_ATM' if (pos == 1 or opt_type == 'call') else ('PUT_ATM' if (pos == -1 or opt_type == 'put') else '')
+                raw_tag = str(getattr(st, 'option_tag', '') or '').strip().upper()
+                if raw_tag not in {'CALL_ATM', 'CALL_OTM', 'PUT_ATM', 'PUT_OTM'}:
+                    raw_tag = 'CALL_ATM' if (pos == 1 or opt_type == 'call') else ('PUT_ATM' if (pos == -1 or opt_type == 'put') else '')
+                tag = raw_tag
                 active_states[sym] = json.dumps({
                     'projection_only': True,
                     'pos': st.position,

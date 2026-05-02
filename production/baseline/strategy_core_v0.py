@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Tuple
     
-from config import TARGET_SYMBOLS
+from config import TARGET_SYMBOLS, option_bucket_tag, option_legacy_tag
 from entry_risk_rules import evaluate_entry_liquidity
 from strategy_config0 import StrategyConfig
 
@@ -339,8 +339,8 @@ class StrategyCoreV0:
         return {
             'action': 'BUY',
             'dir': 1,
-            'tag': 'CALL_ATM',
-            'legacy_tag': 'opt_8',
+            'tag': option_bucket_tag(1),
+            'legacy_tag': option_legacy_tag(1),
             'score': abs(alpha_val),
             'reason': f"CH_B_SLOW|A:{alpha_val:.2f}(Th:{self.cfg.SLOW_BULL_ALPHA_THRESHOLD:.1f})|V:{vol_z:.1f}"
         }
@@ -390,8 +390,8 @@ class StrategyCoreV0:
         return {
             'action': 'BUY',
             'dir': action,
-            'tag': 'CALL_ATM' if action == 1 else 'PUT_ATM',
-            'legacy_tag': 'opt_8' if action == 1 else 'opt_0',
+            'tag': option_bucket_tag(action),
+            'legacy_tag': option_legacy_tag(action),
             'score': abs(alpha_val),
             'reason': f"CH_A_MOM|A:{alpha_val:.2f}(Th:{dynamic_threshold:.1f})|V:{vol_z:.1f}"
         }

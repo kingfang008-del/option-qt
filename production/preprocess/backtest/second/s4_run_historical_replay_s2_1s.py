@@ -5,7 +5,6 @@ import os
 
 os.environ['RUN_MODE'] = 'BACKTEST'
 os.environ['DUAL_CONVERGE_TO_SINGLE'] = '1'
-os.environ['PURE_ALPHA_REPLAY'] = '1'
 
 import asyncio
 import time
@@ -37,6 +36,7 @@ print(f"🔍 [Import Trace] Using MockIBKR from: {mock_ibkr_historical_1s.__file
 import config
 import signal_engine_v8
 import execution_engine_v8
+from config import TAG_TO_INDEX, option_bucket_tag
 try:
     from Domain import ReplaySemanticAuditor
 except Exception:  # pragma: no cover
@@ -204,6 +204,8 @@ def build_option_arrays(group):
     put_bids, put_asks = [], []
     call_bids, call_asks = [], []
     symbols_with_data = set()
+    put_idx = TAG_TO_INDEX.get(option_bucket_tag(-1), 0)
+    call_idx = TAG_TO_INDEX.get(option_bucket_tag(1), 2)
 
     for row in group.itertuples():
         try:
@@ -216,25 +218,30 @@ def build_option_arrays(group):
                 bk = []
             else:
                 bk = json.loads(str(raw)).get("buckets", [])
-            p_p = float(bk[0][0]) if len(bk) > 0 and len(bk[0]) > 0 else 0.0
-            c_p = float(bk[2][0]) if len(bk) > 2 and len(bk[2]) > 0 else 0.0
+            p_bk = bk[put_idx] if len(bk) > put_idx else []
+            c_bk = bk[call_idx] if len(bk) > call_idx else []
+            p_p = float(p_bk[0]) if len(p_bk) > 0 else 0.0
+            c_p = float(c_bk[0]) if len(c_bk) > 0 else 0.0
 
             put_prices.append(p_p)
-            put_ks.append(float(bk[0][5]) if len(bk) > 0 and len(bk[0]) > 5 else 0.0)
-            put_ivs.append(float(bk[0][7]) if len(bk) > 0 and len(bk[0]) > 7 else 0.0)
-            put_bids.append(float(bk[0][8]) if len(bk) > 0 and len(bk[0]) > 8 else 0.0)
-            put_asks.append(float(bk[0][9]) if len(bk) > 0 and len(bk[0]) > 9 else 0.0)
+            put_ks.append(float(p_bk[5]) if len(p_bk) > 5 else 0.0)
+            put_ivs.append(float(p_bk[7]) if len(p_bk) > 7 else 0.0)
+            put_bids.append(float(p_bk[8]) if len(p_bk) > 8 else 0.0)
+            put_asks.append(float(p_bk[9]) if len(p_bk) > 9 else 0.0)
 
             call_prices.append(c_p)
-            call_ks.append(float(bk[2][5]) if len(bk) > 2 and len(bk[2]) > 5 else 0.0)
-            call_ivs.append(float(bk[2][7]) if len(bk) > 2 and len(bk[2]) > 7 else 0.0)
-            call_bids.append(float(bk[2][8]) if len(bk) > 2 and len(bk[2]) > 8 else 0.0)
-            call_asks.append(float(bk[2][9]) if len(bk) > 2 and len(bk[2]) > 9 else 0.0)
+            call_ks.append(float(c_bk[5]) if len(c_bk) > 5 else 0.0)
+            call_ivs.append(float(c_bk[7]) if len(c_bk) > 7 else 0.0)
+            call_bids.append(float(c_bk[8]) if len(c_bk) > 8 else 0.0)
+            call_asks.append(float(c_bk[9]) if len(c_bk) > 9 else 0.0)
 
             if p_p > 0.01 or c_p > 0.01:
                 symbols_with_data.add(row.symbol)
         except Exception:
-            for arr in [put_prices, call_prices, put_ks, call_ks, put_ivs, call_ivs, put_bids, put_asks, call_bids, call_asks]:
+            for arr in [
+                put_prices, call_prices, put_ks, call_ks, put_ivs, call_ivs,
+                put_bids, put_asks, call_bids, call_asks,
+            ]:
                 arr.append(0.0)
 
     return {
