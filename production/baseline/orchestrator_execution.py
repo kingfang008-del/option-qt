@@ -69,6 +69,30 @@ class OrchestratorExecution:
         # [#7] warning 节流: 同一 reason 30s 内最多打一条。
         self._ibkr_pacing_warn_log = {}
 
+    @staticmethod
+    def _manual_exit_protect_key(symbol: str, contract_id: str = "") -> str:
+        sym = str(symbol or "").strip().upper()
+        cid = str(contract_id or "").strip()
+        return f"{sym}|{cid}" if cid else sym
+
+    def _is_manual_exit_protected(self, sym: str, st) -> bool:
+        try:
+            rds = getattr(self.orch, 'r', None)
+            if rds is None:
+                return False
+            contract_id = str(getattr(st, 'contract_id', '') or '').strip()
+            keys = [self._manual_exit_protect_key(sym, contract_id), str(sym or '').strip().upper()]
+            for key in keys:
+                raw = rds.hget("oms:manual_exit_protect", key)
+                if raw is None:
+                    continue
+                val = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                if val.strip().lower() in {"1", "true", "yes", "manual"}:
+                    return True
+            return False
+        except Exception:
+            return False
+
     def _cash_set(self, value: float, reason: str, sym: str = ""):
         logger.critical(
             f"🚫 [CashInvariant] blocked execution-layer cash set | "
@@ -685,6 +709,10 @@ class OrchestratorExecution:
         st.entry_price = 0.0
         st.entry_ts = 0.0
         st.option_tag = ""
+        st.entry_fill_spread_frac = None
+        st.entry_fill_spread_pct = None
+        st.entry_fill_bid = 0.0
+        st.entry_fill_ask = 0.0
         st.max_roi = 0.0
         st.locked_cash = 0.0
         st.entry_slot_reserved = False
@@ -1232,6 +1260,7 @@ class OrchestratorExecution:
                 timing_fields=timing_fields,
                 mode_override='BACKTEST',
                 note_suffix=f"|liq_chunks={liq_chunks}|liq_reason={liq_reason}",
+                execution_meta=sig.get('meta', {}),
             )
             # 🚀 [修复 3] 执行完毕后立刻释放 pending 锁，形成完美闭环！
             st.is_pending = False
@@ -1399,6 +1428,7 @@ class OrchestratorExecution:
                             ratio=1.0,
                             timing_fields=timing_fields,
                             mode_override=config.RUN_MODE,
+                            execution_meta=sig.get('meta', {}),
                         )
                     else:
                         logger.error(f"❌ [实盘异常] {sym} 订单被拒！回退资金。")
@@ -1423,6 +1453,14 @@ class OrchestratorExecution:
         # --- [Ghost Plan B: 退出点差保护] ---
         # 强制至少持仓 60 秒，防止因为开仓后的剧烈波动（或点差洗盘）立即被止损/触发平仓数据噪音
         is_urgent = self._is_urgent_exit_reason(sig.get('reason', ''))
+        meta = sig.get('meta') or {}
+        is_manual_close = bool(meta.get('manual_close')) or "DASHBOARD_FORCE_CLOSE" in str(sig.get('reason', '') or '').upper()
+        if self._is_manual_exit_protected(sym, st) and not is_manual_close:
+            logger.warning(
+                f"🧷 [Manual Protect] {sym} contract={getattr(st, 'contract_id', '') or ''} "
+                f"skip auto exit reason={sig.get('reason')}"
+            )
+            return
         if not is_urgent and curr_ts - st.entry_ts < 60:
             logger.warning(f"🛡️ [Ghost B] {sym} 处于平仓保护期 (已持仓 {curr_ts - st.entry_ts:.1f}s < 60s)，忽略该信号。")
             return
@@ -1469,7 +1507,11 @@ class OrchestratorExecution:
                 original_position = sig.get('original_position', st.position)
                 
                 logger.info(f"📊 [Exit 记账-Backtest] {sym} | 结算价: {final_price} | 成交量: {actual_fill_qty} | 原始方向: {original_position}")
-                self.orch.accounting._process_exit_accounting(sym, st, actual_fill_qty, final_price, stock_price, curr_ts, reason, 0.0, 1.0, original_position=original_position)
+                self.orch.accounting._process_exit_accounting(
+                    sym, st, actual_fill_qty, final_price, stock_price, curr_ts, reason, 0.0, 1.0,
+                    original_position=original_position,
+                    execution_meta={'bid': bid, 'ask': ask},
+                )
                 
                 contract = type('MockContract', (), {'symbol': sym, 'localSymbol': st.contract_id, 'tag': 'EXIT', 'secType': 'OPT'})()
                 if hasattr(self.orch.ibkr, 'place_option_order'):
@@ -1502,7 +1544,11 @@ class OrchestratorExecution:
                     
                     slippage_exit_pct = self._effective_slippage_pct('exit')
                     simulated_exit_price = max(round(raw_price * (1 - slippage_exit_pct), 2), 0.01)
-                    self.orch.accounting._process_exit_accounting(sym, st, actual_fill_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0, original_position=original_position)
+                    self.orch.accounting._process_exit_accounting(
+                        sym, st, actual_fill_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0,
+                        original_position=original_position,
+                        execution_meta={'bid': bid, 'ask': ask},
+                    )
                 else:
                     order_key = self._make_pending_order_key(sym, "CLOSE", getattr(st, 'contract_id', ''), curr_ts)
                     self._upsert_pending_order(order_key, {
@@ -1723,6 +1769,7 @@ class OrchestratorExecution:
                     sym, st, total_qty_filled, st.entry_price, stock_price, fill_ts, sig,
                     duration=fill_ts - iceberg_start_time, ratio=(total_qty_filled / target_total_qty),
                     mode_override='REALTIME', note_suffix=f"|GHOST_A_{chunks}",
+                    execution_meta=sig.get('meta', {}),
                 )
                 self._upsert_pending_order(order_key, {
                     'symbol': sym,
@@ -1833,6 +1880,8 @@ class OrchestratorExecution:
             remaining_qty = int(expected_qty)
             current_trade = trade
             current_limit_price = float(limit_price)
+            last_fill_bid = float(sig.get('meta', {}).get('bid', 0.0) or 0.0)
+            last_fill_ask = float(sig.get('meta', {}).get('ask', 0.0) or 0.0)
             entry_ref_price = float(sig.get('price', limit_price) or limit_price or 0.0)
             cap_price = self._entry_requote_cap_price(entry_ref_price)
 
@@ -1847,6 +1896,10 @@ class OrchestratorExecution:
 
                 filled_qty = int(current_trade.orderStatus.filled)
                 avg_fill_price = float(current_trade.orderStatus.avgFillPrice) if current_trade.orderStatus.avgFillPrice else float(current_limit_price)
+                if filled_qty > 0:
+                    live_bid, live_ask = self._try_get_live_option_quote(real_contract)
+                    if live_bid > 0.0 and live_ask >= live_bid:
+                        last_fill_bid, last_fill_ask = live_bid, live_ask
                 broker_status = str(getattr(current_trade.orderStatus, 'status', '') or '')
                 self._upsert_pending_order(order_key, {
                     'symbol': sym,
@@ -1888,6 +1941,10 @@ class OrchestratorExecution:
                         await self._await_cancel_settle(current_trade, cancel_settle_seconds)
                     filled_qty = int(current_trade.orderStatus.filled)
                     avg_fill_price = float(current_trade.orderStatus.avgFillPrice) if current_trade.orderStatus.avgFillPrice else float(current_limit_price)
+                    if filled_qty > 0:
+                        live_bid, live_ask = self._try_get_live_option_quote(real_contract)
+                        if live_bid > 0.0 and live_ask >= live_bid:
+                            last_fill_bid, last_fill_ask = live_bid, live_ask
 
                 total_filled_qty += filled_qty
                 total_actual_cost += filled_qty * avg_fill_price * 100
@@ -2000,6 +2057,7 @@ class OrchestratorExecution:
                     ratio=ratio,
                     timing_fields=timing_fields,
                     mode_override='REALTIME',
+                    execution_meta={'bid': last_fill_bid, 'ask': last_fill_ask},
                 )
                 self._upsert_pending_order(order_key, {
                     'symbol': sym,
@@ -2237,6 +2295,7 @@ class OrchestratorExecution:
                             reason,
                             time.time() - start_time,
                             fill_ratio,
+                            execution_meta={'bid': bid, 'ask': ask},
                         )
                         if remaining_qty > 0 and int(getattr(st, 'position', 0) or 0) != 0:
                             self._arm_unfilled_exit_retry(sym, st, f"{reason}|MKT_UNFILLED_REMAINDER", curr_ts)
@@ -2319,7 +2378,10 @@ class OrchestratorExecution:
                         })
                     else:
                         simulated_exit_price = max(round(base_price * (1 - slippage_exit_pct), 2), 0.01)
-                        self.orch.accounting._process_exit_accounting(sym, st, total_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0)
+                        self.orch.accounting._process_exit_accounting(
+                            sym, st, total_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0,
+                            execution_meta={'bid': bid, 'ask': ask},
+                        )
                         self._clear_unfilled_exit_retry(st, "simulated_exit_filled")
                         self._upsert_pending_order(order_key, {
                             'symbol': sym,
@@ -2418,7 +2480,10 @@ class OrchestratorExecution:
                     self._arm_unfilled_exit_retry(sym, st, f"{reason}|IBKR_NOT_CONNECTED", curr_ts)
                     return
                 simulated_exit_price = max(round(limit_sell_price * (1 - slippage_exit_pct), 2), 0.01)
-                self.orch.accounting._process_exit_accounting(sym, st, total_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0)
+                self.orch.accounting._process_exit_accounting(
+                    sym, st, total_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0,
+                    execution_meta={'bid': bid, 'ask': ask},
+                )
                 self._clear_unfilled_exit_retry(st, "simulated_exit_filled")
                 return
             self._upsert_pending_order(order_key, {
@@ -2657,6 +2722,7 @@ class OrchestratorExecution:
                     reason,
                     time.time() - start_time,
                     fill_ratio,
+                    execution_meta={'bid': bid, 'ask': ask},
                 )
                 if remaining_qty > 0 and int(getattr(st, 'position', 0) or 0) != 0:
                     self._arm_unfilled_exit_retry(sym, st, f"{reason}|UNFILLED_REMAINDER", curr_ts)

@@ -85,6 +85,39 @@ class OrchestratorAccounting:
             clean_data[key] = val
         return json.dumps(clean_data)
 
+    @staticmethod
+    def _fill_spread_metrics(side: str, fill_price: float, bid: float = 0.0, ask: float = 0.0) -> dict:
+        """Measure where the fill landed inside the displayed bid/ask spread.
+
+        BUY: 0%=bid, 50%=mid, 100%=ask.
+        SELL: 0%=ask, 50%=mid, 100%=bid.
+        Values outside 0..100 are useful: negative means price improvement,
+        >100 means worse than the displayed opposite side.
+        """
+        try:
+            fill = float(fill_price or 0.0)
+            b = float(bid or 0.0)
+            a = float(ask or 0.0)
+        except Exception:
+            return {}
+        if fill <= 0.0 or b <= 0.0 or a <= 0.0 or a < b or abs(a - b) < 1e-9:
+            return {}
+        spread = a - b
+        if str(side or "").upper() == "BUY":
+            frac = (fill - b) / spread
+        else:
+            frac = (a - fill) / spread
+        mid = (a + b) / 2.0
+        return {
+            "fill_bid": b,
+            "fill_ask": a,
+            "fill_mid": mid,
+            "fill_spread": spread,
+            "fill_spread_frac": frac,
+            "fill_spread_pct": frac * 100.0,
+            "fill_vs_mid": fill - mid,
+        }
+
     def _emit_trade_log(self, payload):
         """发送交易日志到 Redis Stream供 Dashboard 展示"""
         try:
@@ -117,6 +150,7 @@ class OrchestratorAccounting:
         timing_fields=None,
         mode_override=None,
         note_suffix="",
+        execution_meta=None,
     ):
         """统一处理 OPEN 成交后的状态回写与日志落库。"""
         if filled_qty <= 0:
@@ -140,6 +174,10 @@ class OrchestratorAccounting:
         st.entry_alpha_z = sig.get('meta', {}).get('alpha_z', 0.0)
         st.entry_iv = sig.get('meta', {}).get('iv', st.last_valid_iv)
         st.max_roi = 0.0
+        st.entry_fill_spread_frac = None
+        st.entry_fill_spread_pct = None
+        st.entry_fill_bid = 0.0
+        st.entry_fill_ask = 0.0
 
         # 🚀 [Defensive] 确保特征是浮点数而非字典/对象
         def _get_float(val):
@@ -157,6 +195,31 @@ class OrchestratorAccounting:
         reason = sig.get('reason', '')
         if note_suffix:
             reason = f"{reason}{note_suffix}"
+        execution_meta = execution_meta if isinstance(execution_meta, dict) else {}
+        meta_for_fill = dict(sig.get('meta', {}) or {})
+        meta_for_fill.update({k: v for k, v in execution_meta.items() if v not in (None, "")})
+        spread_metrics = self._fill_spread_metrics(
+            'BUY',
+            fill_price,
+            bid=meta_for_fill.get('bid', 0.0),
+            ask=meta_for_fill.get('ask', 0.0),
+        )
+        if spread_metrics:
+            st.entry_fill_spread_frac = spread_metrics.get('fill_spread_frac')
+            st.entry_fill_spread_pct = spread_metrics.get('fill_spread_pct')
+            st.entry_fill_bid = spread_metrics.get('fill_bid', 0.0)
+            st.entry_fill_ask = spread_metrics.get('fill_ask', 0.0)
+        manual_exit_protect = bool(meta_for_fill.get('manual_exit_protect', False))
+        if bool(meta_for_fill.get('manual_open', False)):
+            try:
+                contract_id = str(getattr(st, 'contract_id', '') or '').strip()
+                protect_key = f"{str(sym or '').strip().upper()}|{contract_id}" if contract_id else str(sym or '').strip().upper()
+                if manual_exit_protect:
+                    self.orch.r.hset("oms:manual_exit_protect", protect_key, "1")
+                else:
+                    self.orch.r.hdel("oms:manual_exit_protect", protect_key)
+            except Exception as e:
+                logger.debug(f"[Accounting] manual exit protect update skipped: {e}")
 
         self._emit_trade_log({
             'ts': entry_ts,
@@ -166,11 +229,14 @@ class OrchestratorAccounting:
             'qty': filled_qty,
             'price': fill_price,
             'stock_price': stock_price,
+            **spread_metrics,
             **timing_fields,
             'strategy_note': self._safe_json_dumps({
                 'tag': sig.get('tag'),
                 'reason': reason,
                 'iv': getattr(st, 'last_valid_iv', 0.0),
+                'manual_exit_protect': manual_exit_protect,
+                **spread_metrics,
                 **timing_fields,
             }),
             'fill_duration': round(duration, 1),
@@ -219,7 +285,7 @@ class OrchestratorAccounting:
         except Exception as e:
             logger.warning(f"⚠️ [Circuit Breaker Broadcast] failed: {e}")
 
-    def _process_exit_accounting(self, sym, st, filled_qty, fill_price, stock_price, curr_ts, reason, duration, ratio, original_position=None):
+    def _process_exit_accounting(self, sym, st, filled_qty, fill_price, stock_price, curr_ts, reason, duration, ratio, original_position=None, execution_meta=None):
         """[核心新增] 统一财务清算中心：只有发生物理成交才碰钱、算盈亏、写日志"""
         if filled_qty <= 0: return
         state_row = {
@@ -262,6 +328,10 @@ class OrchestratorAccounting:
             st.entry_price = 0.0
             st.entry_ts = 0.0
             st.option_tag = ""
+            st.entry_fill_spread_frac = None
+            st.entry_fill_spread_pct = None
+            st.entry_fill_bid = 0.0
+            st.entry_fill_ask = 0.0
             st.max_roi = 0.0
             st.open_fill_confirmed = False
             try:
@@ -310,6 +380,13 @@ class OrchestratorAccounting:
             if pnl > 0: self.orch.stats_counter_trend_short_win_count += 1
             
         roi = (fill_price - st.entry_price) / st.entry_price if st.entry_price > 0 else 0.0
+        execution_meta = execution_meta if isinstance(execution_meta, dict) else {}
+        spread_metrics = self._fill_spread_metrics(
+            'SELL',
+            fill_price,
+            bid=execution_meta.get('bid', 0.0),
+            ask=execution_meta.get('ask', 0.0),
+        )
 
         # 👇 [🔥 核心路由：获取安全的时间戳]
         is_simulated = self.orch.mode == 'backtest'
@@ -345,7 +422,8 @@ class OrchestratorAccounting:
             'symbol': sym, 'action': 'CLOSE', 'side': 'SELL',
             'qty': filled_qty, 'price': fill_price, 'stock_price': stock_price,
             'entry_stock': st.entry_stock, 'pnl': pnl, 'roi': roi,
-            'strategy_note': json.dumps({'tag': option_tag, 'reason': reason, 'duration': (safe_now_ts - st.entry_ts)/60}),
+            **spread_metrics,
+            'strategy_note': json.dumps({'tag': option_tag, 'reason': reason, 'duration': (safe_now_ts - st.entry_ts)/60, **spread_metrics}),
             'fill_duration': round(duration, 1), 'fill_ratio': round(ratio, 2), 'mode': self.orch.mode.upper()
         })
         
@@ -388,6 +466,10 @@ class OrchestratorAccounting:
             st.entry_ts = 0.0
             st.max_roi = 0.0
             st.option_tag = ""
+            st.entry_fill_spread_frac = None
+            st.entry_fill_spread_pct = None
+            st.entry_fill_bid = 0.0
+            st.entry_fill_ask = 0.0
             st.open_fill_confirmed = False
             st.pending_exit_retry_reason = ""
             st.pending_exit_retry_count = 0

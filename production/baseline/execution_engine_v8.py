@@ -250,6 +250,10 @@ class SymbolState:
         self.cooldown_until = 0.0
         self.contract_id = None
         self.option_tag = ""
+        self.entry_fill_spread_frac = None
+        self.entry_fill_spread_pct = None
+        self.entry_fill_bid = 0.0
+        self.entry_fill_ask = 0.0
         self.latest_call_id = "" 
         self.latest_put_id = ""  
         self.is_pending = False
@@ -332,6 +336,10 @@ class SymbolState:
             'cooldown_until': self.cooldown_until,
             'contract_id': self.contract_id,
             'option_tag': self.option_tag,
+            'entry_fill_spread_frac': self.entry_fill_spread_frac,
+            'entry_fill_spread_pct': self.entry_fill_spread_pct,
+            'entry_fill_bid': self.entry_fill_bid,
+            'entry_fill_ask': self.entry_fill_ask,
             'strike_price': self.strike_price,
             'expiry_date': self.expiry_date.isoformat() if self.expiry_date else None,
             'last_valid_iv': self.last_valid_iv,
@@ -385,6 +393,10 @@ class SymbolState:
         self.cooldown_until = data.get('cooldown_until', 0.0)
         self.contract_id = data.get('contract_id')
         self.option_tag = str(data.get('option_tag', data.get('tag', '')) or '').strip().upper()
+        self.entry_fill_spread_frac = data.get('entry_fill_spread_frac')
+        self.entry_fill_spread_pct = data.get('entry_fill_spread_pct')
+        self.entry_fill_bid = _coerce_float(data.get('entry_fill_bid', 0.0))
+        self.entry_fill_ask = _coerce_float(data.get('entry_fill_ask', 0.0))
         self.strike_price = data.get('strike_price', 0.0)
         
         ex_str = data.get('expiry_date')
@@ -2802,6 +2814,10 @@ class ExecutionEngineV8:
                     'contract_id': getattr(st, 'contract_id', '') or '',
                     'opt_type': opt_type,
                     'tag': tag,
+                    'entry_fill_spread_frac': getattr(st, 'entry_fill_spread_frac', None),
+                    'entry_fill_spread_pct': getattr(st, 'entry_fill_spread_pct', None),
+                    'entry_fill_bid': getattr(st, 'entry_fill_bid', 0.0),
+                    'entry_fill_ask': getattr(st, 'entry_fill_ask', 0.0),
                     'last_opt_price': getattr(st, 'last_opt_price', 0.0),
                     'max_roi': getattr(st, 'max_roi', 0.0),
                     'is_pending': st.is_pending,

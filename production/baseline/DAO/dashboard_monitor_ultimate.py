@@ -67,6 +67,7 @@ REDIS_CFG['raw_stream']       = STREAM_FUSED_MARKET      # 'fused_market_stream'
 REDIS_CFG['inference_stream'] = STREAM_INFERENCE          # 'unified_inference_stream'
 REDIS_CFG['trade_log']        = STREAM_TRADE_LOG          # 'trade_log_stream'
 REDIS_CFG['alpha_key_prefix'] = 'alpha_log'              # Redis List: alpha_log:{symbol}
+OMS_MANUAL_EXIT_PROTECT_HASH = "oms:manual_exit_protect"
 
 # 路径配置
 BASE_PROJECT_DIR = Path(__file__).parent.parent  # V8 dir
@@ -553,6 +554,38 @@ def _quick_order_message_prefix(route_status):
     if mode == "REALTIME":
         return "[REALTIME 未武装 / OMS]"
     return f"[{mode} / OMS]"
+
+
+def _manual_exit_protect_key(symbol: str, contract_id: str = "") -> str:
+    sym = str(symbol or "").strip().upper()
+    cid = str(contract_id or "").strip()
+    return f"{sym}|{cid}" if cid else sym
+
+
+def fetch_manual_exit_protect(symbol: str, contract_id: str = "", default: bool = False) -> bool:
+    try:
+        rds = redis.Redis(**{k: v for k, v in REDIS_CFG.items() if k in ['host', 'port', 'db']}, decode_responses=True)
+        key = _manual_exit_protect_key(symbol, contract_id)
+        val = rds.hget(OMS_MANUAL_EXIT_PROTECT_HASH, key)
+        if val is None and contract_id:
+            val = rds.hget(OMS_MANUAL_EXIT_PROTECT_HASH, str(symbol or "").strip().upper())
+        if val is None:
+            return bool(default)
+        return str(val).strip().lower() in {"1", "true", "yes", "manual"}
+    except Exception:
+        return bool(default)
+
+
+def set_manual_exit_protect(symbol: str, contract_id: str = "", enabled: bool = False) -> None:
+    try:
+        rds = redis.Redis(**{k: v for k, v in REDIS_CFG.items() if k in ['host', 'port', 'db']}, decode_responses=True)
+        key = _manual_exit_protect_key(symbol, contract_id)
+        if enabled:
+            rds.hset(OMS_MANUAL_EXIT_PROTECT_HASH, key, "1")
+        else:
+            rds.hdel(OMS_MANUAL_EXIT_PROTECT_HASH, key)
+    except Exception:
+        pass
     
 def _parse_account_metrics(account_values):
     """从 IB accountValues 提取净值/可用资金（USD）。"""
@@ -697,6 +730,9 @@ def fetch_live_oms_positions(
                     'opt_type': opt_type,
                     'contract_id': str(state.get("contract_id", "") or ""),
                     'last_opt_price': float(state.get("last_opt_price", 0.0) or 0.0),
+                    'entry_fill_spread_pct': pd.to_numeric(state.get("entry_fill_spread_pct", np.nan), errors='coerce'),
+                    'entry_fill_bid': float(state.get("entry_fill_bid", 0.0) or 0.0),
+                    'entry_fill_ask': float(state.get("entry_fill_ask", 0.0) or 0.0),
                     'entry_ts': float(state.get("entry_ts", 0.0) or 0.0),
                     'source': 'OMS live',
                 }
@@ -707,12 +743,13 @@ def fetch_live_oms_positions(
     return (positions, meta) if return_meta else positions
 
 
-def submit_oms_manual_close(symbol: str, position: int, qty: float, ref_price: float, stock_price: float = 0.0, contract_id: str = ""):
+def submit_oms_manual_close(symbol: str, position: int, qty: float, ref_price: float, stock_price: float = 0.0, contract_id: str = "", tag: str = ""):
     """Send a manual close request to OMS, reusing ExecutionEngine's SELL path."""
     sym = str(symbol or "").strip().upper()
     pos = int(position or 0)
     qty = float(qty or 0.0)
     ref_price = float(ref_price or 0.0)
+    tag = str(tag or "").strip().upper()
     if not sym:
         return False, "missing symbol"
     if pos == 0 or qty <= 0:
@@ -721,6 +758,16 @@ def submit_oms_manual_close(symbol: str, position: int, qty: float, ref_price: f
         r_cmd = redis.Redis(**{k: v for k, v in REDIS_CFG.items() if k in ['host', 'port', 'db']}, decode_responses=False)
         now_ts = time.time()
         request_id = f"dashboard-close-{sym}-{int(now_ts * 1000)}"
+        quote = _get_bucket_quote_and_contract(sym, tag) if tag in TAG_TO_INDEX else {}
+        quote = quote or {}
+        latest_mid = float(quote.get("mid", 0.0) or 0.0)
+        latest_bid = float(quote.get("bid", 0.0) or 0.0)
+        latest_ask = float(quote.get("ask", 0.0) or 0.0)
+        latest_ref = float(latest_mid or ref_price or quote.get("last", 0.0) or 0.01)
+        latest_contract_id = (
+            str(contract_id or "").strip()
+            or str(quote.get("contract_text", "") or "").strip()
+        )
         payload = {
             "source": "dashboard_manual_close",
             "action": "SELL",
@@ -734,17 +781,21 @@ def submit_oms_manual_close(symbol: str, position: int, qty: float, ref_price: f
                 "dir": pos,
                 "target_side": pos,
                 "original_position": pos,
-                "price": max(ref_price, 0.01),
-                "market_price": max(ref_price, 0.01),
-                "bid": 0.0,
-                "ask": 0.0,
-                "bid_size": qty,
-                "ask_size": qty,
+                "tag": tag,
+                "price": max(latest_ref, 0.01),
+                "market_price": max(latest_ref, 0.01),
+                "bid": latest_bid,
+                "ask": latest_ask,
+                "bid_size": float(quote.get("bid_size", 0.0) or qty),
+                "ask_size": float(quote.get("ask_size", 0.0) or qty),
                 "reason": f"DASHBOARD_FORCE_CLOSE:{request_id}",
                 "meta": {
-                    "contract_id": str(contract_id or ""),
+                    "tag": tag,
+                    "contract_id": latest_contract_id,
                     "manual_close": True,
                     "request_id": request_id,
+                    "bid": latest_bid,
+                    "ask": latest_ask,
                 },
             },
         }
@@ -754,7 +805,7 @@ def submit_oms_manual_close(symbol: str, position: int, qty: float, ref_price: f
         return False, str(e)
 
 
-def submit_oms_manual_open(symbol: str, tag: str, qty: int, ref_price: float = 0.0, stock_price: float = 0.0):
+def submit_oms_manual_open(symbol: str, tag: str, qty: int, ref_price: float = 0.0, stock_price: float = 0.0, manual_exit_protect: bool = False):
     """Send a first-tab manual open request to OMS, reusing ExecutionEngine's BUY path."""
     sym = str(symbol or "").strip().upper()
     tag = str(tag or "").strip().upper()
@@ -805,6 +856,7 @@ def submit_oms_manual_open(symbol: str, tag: str, qty: int, ref_price: float = 0
                 "reason": f"DASHBOARD_MANUAL_OPEN:{request_id}",
                 "meta": {
                     "manual_open": True,
+                    "manual_exit_protect": bool(manual_exit_protect),
                     "request_id": request_id,
                     "requested_qty": int(qty),
                     "contract_id": contract_id,
@@ -1001,7 +1053,7 @@ def _connect_ibkr_with_fallback_global(ib, host='127.0.0.1', port=IBKR_PORT, pre
     return False, None, f"{last_err} | tried={tried}"
 
 
-def place_dashboard_manual_atm_order(symbol, tag, qty, account="", stock_price=0.0):
+def place_dashboard_manual_atm_order(symbol, tag, qty, account="", stock_price=0.0, manual_exit_protect=False):
     """Submit first-tab quick BUY controls through OMS instead of direct IBKR."""
 
     sym = str(symbol or "").strip().upper()
@@ -1020,10 +1072,12 @@ def place_dashboard_manual_atm_order(symbol, tag, qty, account="", stock_price=0
         qty,
         ref_price=float(quote.get("mid", 0.0) or quote.get("ask", 0.0) or quote.get("last", 0.0) or 0.0),
         stock_price=float(stock_price or 0.0),
+        manual_exit_protect=bool(manual_exit_protect),
     )
     if ok:
         acct_note = f" | account override ignored by OMS: {account.strip()}" if str(account or "").strip() else ""
-        return True, f"{sym} {tag} BUY request sent to OMS: {msg}{acct_note}"
+        protect_note = " | manual-protected" if manual_exit_protect else ""
+        return True, f"{sym} {tag} BUY request sent to OMS: {msg}{protect_note}{acct_note}"
     return False, msg
 
 
@@ -3105,7 +3159,9 @@ def _load_trade_snapshot_context(query_date):
         'pnl', 'roi', 'stock_price', 'entry_stock', 'mode', 'account_cash',
         'alpha_label_ts', 'alpha_available_ts', 'order_submit_ts', 'fill_ts',
         'alpha_to_submit_ms', 'submit_to_fill_ms', 'alpha_to_fill_ms',
-        'fill_duration', 'fill_ratio'
+        'fill_duration', 'fill_ratio',
+        'fill_bid', 'fill_ask', 'fill_mid', 'fill_spread', 'fill_spread_frac',
+        'fill_spread_pct', 'fill_vs_mid',
     ]:
         df_all[k] = df_all['details_json'].apply(lambda r, kk=k: parse_val(r, kk))
     df_all['alpha'] = df_all['details_json'].apply(lambda r: extract_note(r, 'alpha'))
@@ -3141,7 +3197,7 @@ def _load_trade_snapshot_context(query_date):
         tag = row.get('tag', '')
         if action == 'OPEN':
             if sym not in open_positions:
-                open_positions[sym] = {'qty': 0, 'cost': 0.0, 'tag': tag}
+                open_positions[sym] = {'qty': 0, 'cost': 0.0, 'tag': tag, 'entry_fill_spread_pct': np.nan}
             old_qty = open_positions[sym]['qty']
             old_cost = open_positions[sym]['cost']
             new_qty = old_qty + qty
@@ -3149,6 +3205,9 @@ def _load_trade_snapshot_context(query_date):
             open_positions[sym]['qty'] = new_qty
             if tag:
                 open_positions[sym]['tag'] = tag
+            spread_pct = row.get('fill_spread_pct', np.nan)
+            if pd.notna(spread_pct):
+                open_positions[sym]['entry_fill_spread_pct'] = float(spread_pct)
         elif action == 'CLOSE':
             if sym in open_positions:
                 open_positions[sym]['qty'] -= qty
@@ -3174,10 +3233,13 @@ def _load_trade_snapshot_context(query_date):
             broker_only_symbols = sorted(set(live_positions) - set(log_positions))
             for sym, pos in live_positions.items():
                 log_pos = log_positions.get(sym, {})
+                pos['log_open_missing'] = sym not in log_positions
                 if not pos.get('tag') and log_pos.get('tag'):
                     pos['tag'] = log_pos.get('tag', '')
                 if pos.get('cost', 0.0) <= 0 and float(log_pos.get('cost', 0.0) or 0.0) > 0:
                     pos['cost'] = float(log_pos.get('cost', 0.0) or 0.0)
+                if pd.isna(pos.get('entry_fill_spread_pct', np.nan)) and pd.notna(log_pos.get('entry_fill_spread_pct', np.nan)):
+                    pos['entry_fill_spread_pct'] = float(log_pos.get('entry_fill_spread_pct'))
             open_positions = live_positions
             skipped = int(live_meta.get("skipped_unconfirmed", 0) or 0)
             if stale_log_symbols or broker_only_symbols or skipped:
@@ -3230,6 +3292,23 @@ def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
         latest_cash=fetch_latest_mock_cash(),
         run_mode=RUN_MODE,
     )
+    live_trading_enabled, live_trading_meta = get_runtime_trading_enabled(
+        default_value=TRADING_ENABLED,
+        r=r,
+        return_meta=True,
+    )
+    live_cap, live_cap_meta = get_runtime_live_trading_capital_limit(
+        default_value=LIVE_TRADING_CAPITAL_LIMIT,
+        r=r,
+        return_meta=True,
+    )
+    live_cap = float(live_cap or 0.0)
+    effective_display_cash = float(display_cash or 0.0)
+    cash_cap_caption = f"source: {cash_source}"
+    if str(ctx.get("mode", "") or "").upper() == "REALTIME" and live_cap > 0.0:
+        cap_remaining = max(0.0, live_cap - _calc_auto_open_notional_from_redis(r))
+        effective_display_cash = min(effective_display_cash, cap_remaining)
+        cash_cap_caption = f"source: {cash_source} | cap remaining ${cap_remaining:,.0f} of ${live_cap:,.0f}"
 
     rows = []
     unrealized_pnl = 0.0
@@ -3251,18 +3330,48 @@ def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
         pos['roi_pct'] = roi_pct
         unrealized_pnl += paper_pnl
         total_market_value += market_value
-        rows.append((sym, tag, qty, cost, live_price, market_value, paper_pnl, roi_pct, pos))
+        entry_spread_pct = pd.to_numeric(pos.get("entry_fill_spread_pct", np.nan), errors='coerce')
+        rows.append((sym, tag, qty, cost, live_price, market_value, paper_pnl, roi_pct, entry_spread_pct, pos))
 
     st.write("##### 📈 Intraday Performance")
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Realized PnL (Closed)", f"${float(ctx['closed_pnl']):.2f}")
     m2.metric("Unrealized PnL (Open)", f"${unrealized_pnl:.2f}")
     m3.metric("Total Market Value", f"${total_market_value:,.0f}")
-    m4.metric("Remaining Cash", f"${display_cash:,.2f}")
-    m4.caption(f"source: {cash_source}")
+    m4.metric("Remaining Cash", f"${effective_display_cash:,.2f}")
+    m4.caption(cash_cap_caption)
     win_rate = (ctx["wins"] / (ctx["wins"] + ctx["losses"]) * 100) if (ctx["wins"] + ctx["losses"]) > 0 else 0
     m5.metric("Win Rate", f"{win_rate:.1f}%", f"{ctx['wins']}W / {ctx['losses']}L")
     m6.metric("Open Positions", f"{len(open_positions)} Symbols")
+
+    broker_net_liq, broker_avail = fetch_live_broker_balance()
+    broker_cols = st.columns(4)
+    broker_cols[0].metric(
+        "Broker Balance",
+        f"${broker_net_liq:,.2f}" if broker_net_liq is not None and broker_net_liq > 0 else "N/A",
+    )
+    broker_cols[0].caption(
+        f"available: ${broker_avail:,.2f}" if broker_avail is not None and broker_avail > 0 else "available: N/A"
+    )
+    broker_cols[1].metric(
+        "OMS Cash Ledger",
+        f"${live_cash:,.2f}" if live_cash is not None else f"${display_cash:,.2f}",
+    )
+    broker_cols[1].caption(f"source: {live_cash_source or cash_source}")
+    broker_cols[2].metric(
+        "Live Trading Cap",
+        f"${live_cap:,.2f}" if live_cap > 0 else "Unlimited",
+    )
+    broker_cols[2].caption(
+        f"source: {live_cap_meta.get('source', 'config')}" if live_cap > 0 else "cap disabled"
+    )
+    broker_cols[3].metric(
+        "Live Trading",
+        "ARMED" if live_trading_enabled else "DISARMED",
+    )
+    broker_cols[3].caption(
+        f"source: {live_trading_meta.get('source', 'config')} | by: {live_trading_meta.get('updated_by') or 'config'}"
+    )
 
     if rows:
         show_close = bool(ctx["mode"].startswith("REALTIME") and open_positions)
@@ -3281,30 +3390,43 @@ def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
                 st.caption("右侧 `请求平仓` 通过 OMS 复用 execution_engine_v8 的 SELL 链路。")
             else:
                 close_msg_prefix = _quick_order_message_prefix(_build_quick_order_route_status(r))
-            ratios = [1.0, 1.0, 0.7, 0.9, 0.9, 1.1, 1.1, 0.9, 1.3] if show_close else [1.0, 1.0, 0.7, 0.9, 0.9, 1.1, 1.1, 0.9]
+            ratios = [0.8, 1.0, 1.0, 0.7, 0.9, 0.9, 1.0, 1.1, 1.1, 0.9, 1.3] if show_close else [0.8, 1.0, 1.0, 0.7, 0.9, 0.9, 1.0, 1.1, 1.1, 0.9]
             headers = st.columns(ratios)
-            labels = ["**Symbol**", "**Tag**", "**Qty**", "**Cost**", "**Live**", "**MV ($)**", "**Paper PnL ($)**", "**ROI (%)**"]
+            labels = ["**手动**", "**Symbol**", "**Tag**", "**Qty**", "**Cost**", "**Live**", "**Entry Spread**", "**MV ($)**", "**Paper PnL ($)**", "**ROI (%)**"]
             if show_close:
                 labels.append("**Action**")
             for col, label in zip(headers, labels):
                 col.markdown(label)
             st.divider()
-            for sym, tag, qty, cost, live_price, mv, pnl, roi_pct, pos in rows:
+            for sym, tag, qty, cost, live_price, mv, pnl, roi_pct, entry_spread_pct, pos in rows:
                 cols = st.columns(ratios)
                 pnl_color = "#00CC96" if pnl > 0 else ("#EF553B" if pnl < 0 else "#AAAAAA")
                 roi_color = "#00CC96" if roi_pct > 0 else ("#EF553B" if roi_pct < 0 else "#AAAAAA")
-                cols[0].markdown(f"**{sym}**")
-                cols[1].write(tag)
-                cols[2].write(f"{qty:.0f}")
-                cols[3].write(f"${cost:.2f}")
-                cols[4].write(f"${live_price:.2f}")
-                cols[5].write(f"${mv:,.0f}")
-                cols[6].markdown(f"<span style='color:{pnl_color}'>${pnl:,.2f}</span>", unsafe_allow_html=True)
-                cols[7].markdown(f"<span style='color:{roi_color}'>{roi_pct:+.2f}%</span>", unsafe_allow_html=True)
+                spread_text = f"{entry_spread_pct:+.1f}%" if pd.notna(entry_spread_pct) else "N/A"
+                contract_id = str(pos.get("contract_id", "") or "")
+                protect_default = bool(pos.get("log_open_missing", False))
+                protect_key = f"{key_prefix}_manual_protect_{sym}_{abs(hash(contract_id))}"
+                protected = cols[0].checkbox(
+                    "手动",
+                    value=fetch_manual_exit_protect(sym, contract_id, default=protect_default),
+                    key=protect_key,
+                    help="勾选后禁止策略自动平仓；仍可点击右侧“请求平仓”手动退出。",
+                    label_visibility="collapsed",
+                )
+                set_manual_exit_protect(sym, contract_id, protected)
+                cols[1].markdown(f"**{sym}**")
+                cols[2].write(tag)
+                cols[3].write(f"{qty:.0f}")
+                cols[4].write(f"${cost:.2f}")
+                cols[5].write(f"${live_price:.2f}")
+                cols[6].write(spread_text)
+                cols[7].write(f"${mv:,.0f}")
+                cols[8].markdown(f"<span style='color:{pnl_color}'>${pnl:,.2f}</span>", unsafe_allow_html=True)
+                cols[9].markdown(f"<span style='color:{roi_color}'>{roi_pct:+.2f}%</span>", unsafe_allow_html=True)
                 if show_close:
                     pos_dir = int(pos.get("position", 0) or (1 if str(tag).startswith("CALL") else -1))
                     qty_val = float(pos.get("qty", 0.0) or 0.0)
-                    if cols[8].button(
+                    if cols[10].button(
                         "请求平仓",
                         key=f"{key_prefix}_oms_manual_close_{sym}",
                         disabled=(not close_enabled) or pos_dir == 0 or qty_val <= 0,
@@ -3318,6 +3440,7 @@ def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
                             ref_price=float(live_price or pos.get("last_opt_price", 0.0) or pos.get("cost", 0.0) or 0.01),
                             stock_price=float(pos.get("stock", 0.0) or 0.0),
                             contract_id=str(pos.get("contract_id", "") or ""),
+                            tag=tag,
                         )
                         if ok:
                             st.success(f"{close_msg_prefix} {sym} manual close request sent to OMS: {msg}")
@@ -3340,7 +3463,7 @@ def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
             sym = row['symbol']
             df_trade.at[idx, 'paper_pnl'] = open_positions[sym].get('paper_pnl', 0.0)
             df_trade.at[idx, 'paper_roi'] = open_positions[sym].get('roi_pct', 0.0) / 100.0
-    display_cols = ['time', 'symbol', 'tag', 'action', 'qty', 'fill_duration', 'fill_ratio', 'account_cash', 'price', 'paper_pnl', 'paper_roi', 'pnl', 'roi', 'stock_price', 'entry_stock', 'mode', 'alpha', 'reason']
+    display_cols = ['time', 'symbol', 'tag', 'action', 'qty', 'fill_spread_pct', 'fill_bid', 'fill_ask', 'fill_duration', 'fill_ratio', 'account_cash', 'price', 'paper_pnl', 'paper_roi', 'pnl', 'roi', 'stock_price', 'entry_stock', 'mode', 'alpha', 'reason']
     final_cols = [c for c in display_cols if c in df_trade.columns]
     st.dataframe(
         df_trade[final_cols].style.applymap(
@@ -3373,7 +3496,7 @@ tab1, tab10, tab2, tab11, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab_sh, tab_
 # === Tab 1: 市场透视 ===
 with tab1:
     today_ny = datetime.now(NY_TZ).date()
-    date_col, color_col, bg_col, mode_col = st.columns([1, 1, 1, 2])
+    date_col, color_col, bg_col, qty_col, account_col, mode_col = st.columns([1, 1, 1, 1, 1.4, 2])
     with date_col:
         tab1_date = st.date_input(
             "Chart Date",
@@ -3399,11 +3522,29 @@ with tab1:
             key=f"tab1_theme_mode_{symbol}",
         )
     tab1_theme_mode = "dark" if tab1_theme_label == "Dark" else "light"
+    is_live_chart_date = tab1_date == today_ny
+    with qty_col:
+        quick_qty = st.number_input(
+            "Quick order quantity",
+            min_value=1,
+            max_value=100,
+            value=1,
+            step=1,
+            key=f"tab1_quick_qty_{symbol}",
+            disabled=not is_live_chart_date,
+        )
+    with account_col:
+        quick_account = st.text_input(
+            "Account override",
+            value="",
+            key=f"tab1_quick_account_{symbol}",
+            placeholder="optional",
+            disabled=not is_live_chart_date,
+        )
     plot_bg = "#ffffff" if tab1_theme_mode == "light" else "rgba(0,0,0,0)"
     paper_bg = "#ffffff" if tab1_theme_mode == "light" else "rgba(0,0,0,0)"
     grid_color = "rgba(31,41,55,0.12)" if tab1_theme_mode == "light" else "#333"
     font_color = "#1f2937" if tab1_theme_mode == "light" else None
-    is_live_chart_date = tab1_date == today_ny
     with mode_col:
         st.subheader(f"{symbol} {'Live' if is_live_chart_date else tab1_date.strftime('%Y-%m-%d')} Candles")
         if not is_live_chart_date:
@@ -3423,22 +3564,6 @@ with tab1:
         return_meta=True,
     )
     sym_pos = quick_positions.get(symbol, {}) if (is_live_chart_date and quick_meta.get("fresh")) else {}
-    quick_qty = st.number_input(
-        "Quick order quantity",
-        min_value=1,
-        max_value=100,
-        value=1,
-        step=1,
-        key=f"tab1_quick_qty_{symbol}",
-        disabled=not is_live_chart_date,
-    )
-    quick_account = st.text_input(
-        "Account override",
-        value="",
-        key=f"tab1_quick_account_{symbol}",
-        placeholder="optional",
-        disabled=not is_live_chart_date,
-    )
     quick_route_status = _build_quick_order_route_status(r)
     if is_live_chart_date:
         _render_quick_order_route_status(quick_route_status)
@@ -3498,37 +3623,42 @@ with tab1:
                     st.warning("Historical chart mode is read-only; order action ignored.")
                 elif st.session_state.get("tab1_futu_last_event") != event_key:
                     st.session_state["tab1_futu_last_event"] = event_key
+                    event_symbol = str(chart_event.get("symbol", "") or symbol).strip().upper()
                     tag = str(chart_event.get("tag", "") or "").upper()
                     side_label = "CALL" if str(tag).startswith("CALL") else "PUT"
-                    quote = quote_map.get(tag, {}) or {}
+                    quote = _get_bucket_quote_and_contract(event_symbol, tag) or quote_map.get(tag, {}) or {}
+                    event_pos = quick_positions.get(event_symbol, {}) if quick_meta.get("fresh") else {}
                     if action == "close":
                         pos_dir = int(
-                            sym_pos.get("position", 1 if str(tag).startswith("CALL") else -1)
+                            event_pos.get("position", 1 if str(tag).startswith("CALL") else -1)
                             or (1 if str(tag).startswith("CALL") else -1)
                         )
-                        qty_val = float(sym_pos.get("qty", 0.0) or 0.0)
-                        ref_price = float(quote.get("mid", 0.0) or sym_pos.get("last_opt_price", 0.0) or sym_pos.get("cost", 0.0) or 0.01)
+                        qty_val = float(event_pos.get("qty", 0.0) or 0.0)
+                        ref_price = float(quote.get("mid", 0.0) or event_pos.get("last_opt_price", 0.0) or event_pos.get("cost", 0.0) or 0.01)
                         ok, msg = submit_oms_manual_close(
-                            symbol,
+                            event_symbol,
                             pos_dir,
                             qty_val,
                             ref_price=ref_price,
-                            stock_price=float(sym_pos.get("stock", 0.0) or 0.0),
-                            contract_id=str(sym_pos.get("contract_id", "") or quote.get("contract_text", "") or ""),
+                            stock_price=float(event_pos.get("stock", 0.0) or tab1_latest_stock_price or 0.0),
+                            contract_id=str(event_pos.get("contract_id", "") or quote.get("contract_text", "") or ""),
+                            tag=tag,
                         )
                         if ok:
-                            st.success(f"{quick_msg_prefix} {symbol} {side_label} close request sent: {msg}")
+                            st.success(f"{quick_msg_prefix} {event_symbol} {side_label} close request sent: {msg}")
                             st.rerun()
                         else:
-                            st.error(f"{quick_msg_prefix} {symbol} {side_label} close failed: {msg}")
+                            st.error(f"{quick_msg_prefix} {event_symbol} {side_label} close failed: {msg}")
                     elif action == "buy":
                         event_qty = int(chart_event.get("qty") or quick_qty)
+                        manual_protect = bool(chart_event.get("manualProtect", False))
                         ok, msg = place_dashboard_manual_atm_order(
-                            symbol,
+                            event_symbol,
                             tag,
                             event_qty,
                             account=quick_account.strip(),
                             stock_price=tab1_latest_stock_price,
+                            manual_exit_protect=manual_protect,
                         )
                         if ok:
                             st.success(f"{quick_msg_prefix} {msg}")
@@ -3628,6 +3758,7 @@ with tab1:
                             ref_price=ref_price,
                             stock_price=float(sym_pos.get("stock", 0.0) or 0.0),
                             contract_id=str(sym_pos.get("contract_id", "") or quote.get("contract_text", "") or ""),
+                            tag=tag,
                         )
                         if ok:
                             st.success(f"{quick_msg_prefix} {symbol} {side_label} close request sent: {msg}")
@@ -3639,6 +3770,12 @@ with tab1:
                     if has_other_position:
                         st.button(f"已有另一侧持仓", key=f"tab1_{tag}_other_held_{symbol}", disabled=True, use_container_width=True)
                         continue
+                    fallback_manual_protect = st.checkbox(
+                        "手动",
+                        value=False,
+                        key=f"tab1_manual_protect_{tag}_{symbol}",
+                        help="勾选后开仓成交即加入手动保护，策略自动退出会跳过；平仓按钮仍会卖出。",
+                    )
                     if st.button(f"买入 {side_label}", key=f"tab1_buy_{tag}_{symbol}", disabled=not can_buy, type="secondary", use_container_width=True):
                         ok, msg = place_dashboard_manual_atm_order(
                             symbol,
@@ -3646,6 +3783,7 @@ with tab1:
                             int(quick_qty),
                             account=quick_account.strip(),
                             stock_price=tab1_latest_stock_price,
+                            manual_exit_protect=fallback_manual_protect,
                         )
                         if ok:
                             st.success(f"{quick_msg_prefix} {msg}")
@@ -5105,6 +5243,7 @@ with tab5:
                                             ref_price=ref_price,
                                             stock_price=float(pos.get("stock", 0.0) or 0.0),
                                             contract_id=str(pos.get("contract_id", "") or ""),
+                                            tag=str(row.get('Tag', '') or pos.get('tag', '') or ''),
                                         )
                                         if ok:
                                             st.success(f"{sym} manual close request sent to OMS: {msg}")

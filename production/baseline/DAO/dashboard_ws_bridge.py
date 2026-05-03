@@ -114,6 +114,45 @@ def fetch_latest_bar(symbol: str) -> dict | None:
     }
 
 
+def fetch_intraday_bars(symbol: str, max_rows: int = 1200) -> list[dict]:
+    sym_upper = str(symbol or "").strip().upper()
+    if not sym_upper:
+        return []
+    today = datetime.now(NY_TZ).date()
+    start_dt = NY_TZ.localize(datetime.combine(today, dt_time(0, 0, 0)))
+    end_dt = start_dt + pd.Timedelta(days=1)
+    start_ts = int(start_dt.timestamp())
+    end_ts = int(end_dt.timestamp())
+    sql = """
+        SELECT ts, open, high, low, close, volume
+        FROM market_bars_1m
+        WHERE symbol = %s AND ts >= %s AND ts < %s
+        ORDER BY ts ASC
+        LIMIT %s
+    """
+    try:
+        with psycopg2.connect(PG_DB_URL) as conn:
+            df = pd.read_sql_query(sql, conn, params=(sym_upper, start_ts, end_ts, int(max_rows)))
+    except Exception:
+        return []
+    if df.empty:
+        return []
+    rows = []
+    for item in df.to_dict("records"):
+        try:
+            rows.append({
+                "time": int(item.get("ts") or 0),
+                "open": float(item.get("open") or 0.0),
+                "high": float(item.get("high") or 0.0),
+                "low": float(item.get("low") or 0.0),
+                "close": float(item.get("close") or 0.0),
+                "volume": float(item.get("volume") or 0.0),
+            })
+        except Exception:
+            continue
+    return rows
+
+
 def fetch_momentum_leaders(max_symbols: int = 5, ttl_sec: float = 2.5) -> dict:
     now = time.time()
     if now < float(_LEADER_CACHE["expires_at"]):
@@ -304,6 +343,24 @@ async def intraday_api_handler(request: web.Request) -> web.Response:
         )
 
 
+async def chart_api_handler(request: web.Request) -> web.Response:
+    sym_upper = str(request.query.get("symbol", "") or "").strip().upper()
+    if not sym_upper:
+        return _cors_intraday(web.json_response({"error": "missing symbol"}, status=400))
+    try:
+        intra = build_intraday_public_payload(sym_upper)
+        payload = {
+            "type": "chart",
+            "symbol": sym_upper,
+            "bars": fetch_intraday_bars(sym_upper),
+            "quotes": intra.get("quotes") or {},
+            "position": intra.get("chart_position"),
+        }
+        return _cors_intraday(web.json_response(payload))
+    except Exception as exc:
+        return _cors_intraday(web.json_response({"error": str(exc)}, status=500))
+
+
 def make_app(interval: float, max_leaders: int) -> web.Application:
     app = web.Application()
     app["interval"] = interval
@@ -312,6 +369,8 @@ def make_app(interval: float, max_leaders: int) -> web.Application:
     app.router.add_get("/ws", ws_handler)
     app.router.add_options("/api/intraday", intraday_options_handler)
     app.router.add_get("/api/intraday", intraday_api_handler)
+    app.router.add_options("/api/chart", intraday_options_handler)
+    app.router.add_get("/api/chart", chart_api_handler)
     return app
 
 
