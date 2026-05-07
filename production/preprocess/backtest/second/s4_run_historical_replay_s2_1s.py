@@ -573,6 +573,7 @@ async def main():
 
         # [Step A] 用 ExecutionWindow 把 alpha_frame + 60 秒 quotes 打包成一等契约,
         # OMS 通过 execute_window() 单入口编排 "分钟边界一次 + 秒级循环"。
+        # 秒级 tight-exit 与实盘 fused 路径共用 ExecutionEngineV8._oms_execution_quote_tick（勿在脚本侧复制逻辑）。
         # 行为应 bit-identical 于之前三行散调用 (cache_minute + execute_phase).
         exec_window = ExecutionWindow.from_packets(
             minute_ts=int(minute_ts),

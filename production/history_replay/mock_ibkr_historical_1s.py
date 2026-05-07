@@ -10,6 +10,8 @@ from config import (
     EXECUTION_DELAY_SECONDS,
     BACKTEST_1S_DISABLE_DELAY,
     BACKTEST_1S_DISABLE_POSTHOC_REPRICE,
+    BACKTEST_OPT_FILL_SPREAD_FRAC,
+    BACKTEST_OPT_SNAP_FILLS_TO_QUOTE,
 )
 
 logger = logging.getLogger("MockIBKR_Hist")
@@ -38,6 +40,14 @@ class MockIBKRHistorical:
             if self.execution_delay_seconds > 0
             else f"{self.execution_delay_bars} bar(s)"
         )
+        self.opt_fill_spread_frac = float(BACKTEST_OPT_FILL_SPREAD_FRAC)
+        self.snap_fills_to_quote = bool(BACKTEST_OPT_SNAP_FILLS_TO_QUOTE)
+        if self.opt_fill_spread_frac != 0.5 or self.snap_fills_to_quote:
+            logger.info(
+                "📐 [MockIBKR-1s] opt_fill_spread_frac=%.3f (BUY: bid→ask, SELL: ask→bid; 0.5=mid) | snap_fills_to_quote=%s",
+                self.opt_fill_spread_frac,
+                self.snap_fills_to_quote,
+            )
         self.ib = self._create_mock_ib()
 
 
@@ -151,6 +161,26 @@ class MockIBKRHistorical:
         except Exception as e:
             logger.error(f"Error recording market data: {e}")
 
+    @staticmethod
+    def _spread_interpolate_fill(bid: float, ask: float, action: str, frac: float):
+        """BUY: bid + frac*(ask-bid). SELL (平多): ask - frac*(ask-bid). frac=0.5 → mid."""
+        try:
+            b = float(bid)
+            a = float(ask)
+            f = float(frac)
+        except (TypeError, ValueError):
+            return None
+        if b <= 0.0 or a <= 0.0 or a < b:
+            return None
+        spr = a - b
+        if spr < 1e-12:
+            return (a + b) / 2.0
+        act = str(action or "").upper()
+        if act == "BUY":
+            return b + f * spr
+        # SELL
+        return a - f * spr
+
     def _get_price_at_time(self, symbol, ts, opt_dir, action, price_type='mid'):
         """在行情历史中寻找最接近指定时间戳的价格
         price_type: 'mid' (优先 (Bid+Ask)/2), 'best' (Bid/Ask 优先), 'last' (纯 Close)
@@ -177,15 +207,20 @@ class MockIBKRHistorical:
         if not data:
             return None
             
-        # 1. 如果显式要求 mid
+        # 1. 如果显式要求 mid（实为可配置 spread 插值：默认 0.5=几何中价）
         if price_type == 'mid':
+            frac = getattr(self, "opt_fill_spread_frac", 0.5)
             if opt_dir == 'CALL':
                 if data['cb'] > 0 and data['ca'] > 0:
-                    return (data['cb'] + data['ca']) / 2.0
+                    px = self._spread_interpolate_fill(data['cb'], data['ca'], action, frac)
+                    if px is not None:
+                        return float(px)
                 return data['c']
             else:
                 if data['pb'] > 0 and data['pa'] > 0:
-                    return (data['pb'] + data['pa']) / 2.0
+                    px = self._spread_interpolate_fill(data['pb'], data['pa'], action, frac)
+                    if px is not None:
+                        return float(px)
                 return data['p']
 
         # 2. 如果显式要求 best (原先的逻辑)
@@ -223,11 +258,18 @@ class MockIBKRHistorical:
             return None
 
         if price_type == 'mid':
+            frac = getattr(self, "opt_fill_spread_frac", 0.5)
             if opt_dir == 'CALL':
-                if data['cb'] > 0 and data['ca'] > 0: return (data['cb'] + data['ca']) / 2.0
+                if data['cb'] > 0 and data['ca'] > 0:
+                    px = self._spread_interpolate_fill(data['cb'], data['ca'], action, frac)
+                    if px is not None:
+                        return float(px)
                 return data['c']
             else:
-                if data['pb'] > 0 and data['pa'] > 0: return (data['pb'] + data['pa']) / 2.0
+                if data['pb'] > 0 and data['pa'] > 0:
+                    px = self._spread_interpolate_fill(data['pb'], data['pa'], action, frac)
+                    if px is not None:
+                        return float(px)
                 return data['p']
             
         if opt_dir == 'CALL':
@@ -266,20 +308,44 @@ class MockIBKRHistorical:
                         delay_bars = getattr(self, 'execution_delay_bars', 0)
                         delay_secs = getattr(self, 'execution_delay_seconds', 0)
 
-                        if not self.disable_posthoc_reprice:
+                        use_snap = getattr(self, "snap_fills_to_quote", False)
+                        repr_allowed = not self.disable_posthoc_reprice
+
+                        if use_snap:
+                            if repr_allowed and delay_bars > 0:
+                                snap_e = self._get_price_at_bar_offset(
+                                    sym, buy_od['ts'], opt_dir, 'BUY', delay_bars, price_type='mid'
+                                )
+                                snap_x = self._get_price_at_bar_offset(
+                                    sym, od['ts'], opt_dir, 'SELL', delay_bars, price_type='mid'
+                                )
+                            else:
+                                entry_ts_q = float(buy_od['ts'])
+                                exit_ts_q = float(od['ts'])
+                                if repr_allowed and delay_secs > 0:
+                                    entry_ts_q += float(delay_secs)
+                                    exit_ts_q += float(delay_secs)
+                                snap_e = self._get_price_at_time(sym, entry_ts_q, opt_dir, 'BUY')
+                                snap_x = self._get_price_at_time(sym, exit_ts_q, opt_dir, 'SELL')
+                            if snap_e is not None and snap_e > 0.01:
+                                entry_price = float(snap_e)
+                            if snap_x is not None and snap_x > 0.01:
+                                exit_price = float(snap_x)
+                        elif repr_allowed:
                             if delay_secs > 0:
                                 delayed_entry = self._get_price_at_time(sym, buy_od['ts'] + delay_secs, opt_dir, 'BUY')
                                 delayed_exit = self._get_price_at_time(sym, od['ts'] + delay_secs, opt_dir, 'SELL')
+                                if delayed_entry is not None and delayed_entry > 0.01:
+                                    entry_price = delayed_entry
+                                if delayed_exit is not None and delayed_exit > 0.01:
+                                    exit_price = delayed_exit
                             elif delay_bars > 0:
                                 delayed_entry = self._get_price_at_bar_offset(sym, buy_od['ts'], opt_dir, 'BUY', delay_bars, price_type='mid')
                                 delayed_exit = self._get_price_at_bar_offset(sym, od['ts'], opt_dir, 'SELL', delay_bars, price_type='mid')
-                            else:
-                                delayed_entry, delayed_exit = None, None
-
-                            if delayed_entry is not None and delayed_entry > 0.01:
-                                entry_price = delayed_entry
-                            if delayed_exit is not None and delayed_exit > 0.01:
-                                exit_price = delayed_exit
+                                if delayed_entry is not None and delayed_entry > 0.01:
+                                    entry_price = delayed_entry
+                                if delayed_exit is not None and delayed_exit > 0.01:
+                                    exit_price = delayed_exit
 
                         entry_commission = match_qty * COMMISSION_PER_CONTRACT
                         exit_commission = match_qty * COMMISSION_PER_CONTRACT

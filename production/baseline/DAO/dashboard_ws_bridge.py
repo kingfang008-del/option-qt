@@ -8,13 +8,14 @@ position hints (derived from intraday helpers) so the browser updates without
 rerun-based polling. Full-portfolio metrics / holdings live under **Trade Log**
 and optional ``GET /api/intraday`` (below), not duplicated in each WS frame.
 
-Run (default ``ws://127.0.0.1:8765/ws``)::
+Run (default ``ws://127.0.0.1:8765/ws``; server binds ``0.0.0.0:8765`` so LAN browsers can connect)::
 
     python production/baseline/DAO/dashboard_ws_bridge.py
 
 REST (CORS ``*``, optional debugging or external tooling)::
 
     GET /api/intraday?symbol=SPY
+    GET /api/latest_bar?symbol=SPY
 
 In ``dashboard_monitor_ultimate.py``, enable sidebar **Realtime WS UI** and set
 ``DASHBOARD_KLINE_WS_URL`` if the bridge is not on localhost (optional; default
@@ -37,7 +38,12 @@ import psycopg2
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from config import PG_DB_URL  # noqa: E402
-from dashboard_intraday_snap import augment_intraday_for_chart, build_intraday_snapshot  # noqa: E402
+from dashboard_intraday_snap import (  # noqa: E402
+    augment_intraday_for_chart,
+    build_intraday_snapshot,
+    build_iv_spike_markers_for_symbol,
+    ny_intraday_epoch_bounds,
+)
 
 
 warnings.filterwarnings(
@@ -46,6 +52,8 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
+
+_IV_MARKER_CACHE: dict[str, dict] = {}
 
 _LEADER_CACHE = {
     "expires_at": 0.0,
@@ -118,11 +126,7 @@ def fetch_intraday_bars(symbol: str, max_rows: int = 1200) -> list[dict]:
     sym_upper = str(symbol or "").strip().upper()
     if not sym_upper:
         return []
-    today = datetime.now(NY_TZ).date()
-    start_dt = NY_TZ.localize(datetime.combine(today, dt_time(0, 0, 0)))
-    end_dt = start_dt + pd.Timedelta(days=1)
-    start_ts = int(start_dt.timestamp())
-    end_ts = int(end_dt.timestamp())
+    start_ts, end_ts = ny_intraday_epoch_bounds()
     sql = """
         SELECT ts, open, high, low, close, volume
         FROM market_bars_1m
@@ -151,6 +155,22 @@ def fetch_intraday_bars(symbol: str, max_rows: int = 1200) -> list[dict]:
         except Exception:
             continue
     return rows
+
+
+def cached_iv_markers(symbol: str) -> list[dict]:
+    """PG 衍生 IV 标点（分钟快照）；缓存以降低 WS 每秒轮询开销。"""
+    sym_upper = str(symbol or "").strip().upper()
+    if not sym_upper:
+        return []
+    latest = fetch_latest_bar(sym_upper)
+    lt = int(latest["time"]) if latest else 0
+    now = time.time()
+    hit = _IV_MARKER_CACHE.get(sym_upper)
+    if hit and int(hit.get("last_bar_ts") or 0) == lt and now - float(hit.get("t", 0)) < 45.0:
+        return list(hit.get("markers") or [])
+    markers = build_iv_spike_markers_for_symbol(sym_upper)
+    _IV_MARKER_CACHE[sym_upper] = {"last_bar_ts": lt, "t": now, "markers": markers}
+    return markers
 
 
 def fetch_momentum_leaders(max_symbols: int = 5, ttl_sec: float = 2.5) -> dict:
@@ -276,12 +296,14 @@ def build_snapshot(symbol: str, max_leaders: int) -> dict:
     intra = build_intraday_public_payload(sym_upper)
     base["quotes"] = intra.get("quotes") or {}
     base["position"] = intra.get("chart_position")
+    base["ivMarkers"] = cached_iv_markers(sym_upper)
 
     try:
         return json.loads(json.dumps(base, allow_nan=False))
     except (TypeError, ValueError):
         base.pop("quotes", None)
         base.pop("position", None)
+        base.pop("ivMarkers", None)
         return base
 
 
@@ -355,7 +377,21 @@ async def chart_api_handler(request: web.Request) -> web.Response:
             "bars": fetch_intraday_bars(sym_upper),
             "quotes": intra.get("quotes") or {},
             "position": intra.get("chart_position"),
+            "ivMarkers": cached_iv_markers(sym_upper),
         }
+        return _cors_intraday(web.json_response(payload))
+    except Exception as exc:
+        return _cors_intraday(web.json_response({"error": str(exc)}, status=500))
+
+
+async def latest_bar_api_handler(request: web.Request) -> web.Response:
+    """浏览器 WS 不可用时的轻量轮询：仅返回最后一根 1m K 线。"""
+    sym_upper = str(request.query.get("symbol", "") or "").strip().upper()
+    if not sym_upper:
+        return _cors_intraday(web.json_response({"error": "missing symbol"}, status=400))
+    try:
+        bar = await asyncio.to_thread(fetch_latest_bar, sym_upper)
+        payload = {"symbol": sym_upper, "bar": bar}
         return _cors_intraday(web.json_response(payload))
     except Exception as exc:
         return _cors_intraday(web.json_response({"error": str(exc)}, status=500))
@@ -371,12 +407,18 @@ def make_app(interval: float, max_leaders: int) -> web.Application:
     app.router.add_get("/api/intraday", intraday_api_handler)
     app.router.add_options("/api/chart", intraday_options_handler)
     app.router.add_get("/api/chart", chart_api_handler)
+    app.router.add_options("/api/latest_bar", intraday_options_handler)
+    app.router.add_get("/api/latest_bar", latest_bar_api_handler)
     return app
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Dashboard WebSocket bridge")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Bind address (use 127.0.0.1 for local-only)",
+    )
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--max-leaders", type=int, default=5)

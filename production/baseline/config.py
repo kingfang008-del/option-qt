@@ -40,7 +40,7 @@ FEATURE_SERVICE_STATE_FILE = CACHE_DIR / "feature_service_state.pkl"
 # - 'BACKTEST'      : 极速回测 (模拟)
 # 通过环境变量隔离，确保所有子进程对当前环境的认知绝对一致
 # 默认使用 REALTIME_DRY，防止未显式设置 RUN_MODE 时误入可成交路径。
-RUN_MODE = os.environ.get("RUN_MODE", "REALTIME").upper()
+RUN_MODE = os.environ.get("RUN_MODE", "REALTIME_DRY").upper()
 _LEGACY_STREAM_REPLAY_MODE = "LIVE" + "REPLAY"
 if RUN_MODE == _LEGACY_STREAM_REPLAY_MODE:
     RUN_MODE = "BACKTEST"
@@ -94,6 +94,15 @@ OMS_BLOCK_ENTRY_ON_STALE = _env_flag("OMS_BLOCK_ENTRY_ON_STALE", True)
 OMS_BLOCK_EXIT_ON_STALE = _env_flag("OMS_BLOCK_EXIT_ON_STALE", True)
 # 允许 EOD 类平仓在陈旧行情下放行(默认关闭, 更保守)。
 OMS_ALLOW_EOD_EXIT_ON_STALE = _env_flag("OMS_ALLOW_EOD_EXIT_ON_STALE", False)
+
+# OMS 开仓：一批 ALPHA_FRAME / items 至少要有多少个标的才允许排序建仓（与实盘截面一致）。
+# 历史上 BACKTEST 曾放宽为 1，会导致 S4 与实盘门禁不一致；默认始终为 10。
+# 仅本地单元测试或小样本脚本可在 import config 之前 export OMS_ENTRY_MIN_BATCH_SYMBOLS=1。
+_oms_min_syms_raw = os.environ.get("OMS_ENTRY_MIN_BATCH_SYMBOLS", "10").strip()
+try:
+    OMS_ENTRY_MIN_BATCH_SYMBOLS = max(1, int(_oms_min_syms_raw))
+except ValueError:
+    OMS_ENTRY_MIN_BATCH_SYMBOLS = 10
 
 def is_forced_deterministic(r=None) -> bool:
     """
@@ -204,20 +213,23 @@ PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.
 
 # ================= 核心交易标的 =================
 # GS 先注释掉，生产的时候再恢复，因为秒级回测数据里没有 GS 的期权数据，可能会导致回测失败
-TARGET_SYMBOLS =  [
-    # --- Tier 1: 巨无霸 ---
-    'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'UNH', 'AMZN', 'AMD', 'MSTR', 'QQQ',
-    # --- Tier 2: 核心蓝筹 ---
-    'NFLX', 'CRWV', 'AVGO', 'MSFT', 'HOOD', 'MU',  'GOOGL', 'WMT', 'COIN', 'SPY',
-    # --- Tier 3: 高流动性 --- 
-    'SMCI', 'ADBE', 'ORCL', 'NKE', 'XOM', 'INTC', 'DELL', 'IWM', 'GLD', 'VIXY'
-]
-
 # TARGET_SYMBOLS =  [
 #     # --- Tier 1: 巨无霸 ---
-#     'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'AMZN', 'AMD','NFLX','MSFT','GOOGL','MU','INTC',
-#     'SPY', 'VIXY','QQQ',
+#     'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'UNH', 'AMZN', 'AMD', 'MSTR', 'QQQ',
+#     # --- Tier 2: 核心蓝筹 ---
+#     'NFLX', 'CRWV', 'AVGO', 'MSFT', 'HOOD', 'MU',  'GOOGL', 'WMT', 'COIN', 'SPY',
+#     # --- Tier 3: 高流动性 --- 
+#     'SMCI', 'ADBE', 'ORCL', 'NKE', 'XOM', 'INTC', 'DELL', 'IWM', 'GLD', 'VIXY'
 # ]
+
+TARGET_SYMBOLS =  [
+     # --- Tier 1: 巨无霸 ---
+    'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'AMZN', 'AMD', 'MSTR', 'QQQ',
+    # --- Tier 2: 核心蓝筹 ---
+    'NFLX',   'AVGO', 'MSFT', 'HOOD', 'MU',  'GOOGL',  'COIN', 'SPY',
+    # --- Tier 3: 高流动性 --- 
+    'SMCI', 'ADBE', 'ORCL',   'INTC',   'VIXY'
+]
 
 # ================= 交易与归一化白/黑名单 =================
 # 仅用于禁止交易，不影响行情订阅与特征计算
@@ -336,7 +348,7 @@ CORR_THRESHOLD = -0.1             # 反转相关性阈值
 # - V0: strategy_core_v0.py + strategy_config0.py
 # - V1: strategy_core_v1.py + strategy_config.py
 # - TREND: strategy_core_trend.py + strategy_config0.py
-STRATEGY_CORE_VERSION = os.environ.get("STRATEGY_CORE_VERSION", "TREND").strip().upper()
+STRATEGY_CORE_VERSION = os.environ.get("STRATEGY_CORE_VERSION", "V0").strip().upper()
 
 # ================= 订单执行 =================
 ORDER_TIMEOUT_SECONDS = 5          # 挂单超时
@@ -368,6 +380,17 @@ BACKTEST_1S_DISABLE_ICEBERG = _env_flag(
     "BACKTEST_1S_DISABLE_ICEBERG",
     (BACKTEST_1S_GENTLE_EXECUTION or BACKTEST_1S_STRICT_EXECUTION),
 )
+# MockIBKR 1s / S4：期权“理论成交”在 bid–ask 之间的位置（与 Accounting `fill_spread_pct` 语义一致）。
+# BUY: 0=Bid, 0.5=Mid, 1.0=Ask；SELL（平多）: 0=Ask, 0.5=Mid, 1.0=Bid。
+# 例：试探更保守买方成交价 → BACKTEST_OPT_FILL_SPREAD_FRAC=0.75
+try:
+    _bf = float(os.environ.get("BACKTEST_OPT_FILL_SPREAD_FRAC", "0.5"))
+except (TypeError, ValueError):
+    _bf = 0.5
+BACKTEST_OPT_FILL_SPREAD_FRAC = min(1.0, max(0.0, _bf))
+# 温和模式下默认用后录订单价不重算；设为 1 则在 _match_trades 按当时盘口与 FRAC 重标进出价（便于做点差敏感度实验）。
+BACKTEST_OPT_SNAP_FILLS_TO_QUOTE = _env_flag("BACKTEST_OPT_SNAP_FILLS_TO_QUOTE", False)
+
 # OMS 延迟执行: 保持特征/标签时间不变，仅把真正下单延后 N 根 1min bar。
 # 默认只延迟 BUY，避免把风控平仓也一起拖后；如有需要可通过环境变量扩展到 SELL。
 OMS_SIGNAL_DELAY_BARS = EXECUTION_DELAY_BARS
@@ -376,6 +399,10 @@ OMS_SIGNAL_DELAY_ACTIONS = tuple(
     for a in os.environ.get("OMS_SIGNAL_DELAY_ACTIONS", "BUY").split(",")
     if a.strip()
 )
+
+# 策略自动开仓（ALPHA_FRAME → 策略 BUY）；关闭后仅保留 Dashboard 手动/K 线图开仓等路径。
+# 实盘可由 Dashboard 写入 Redis meta:strategy_auto_entry 覆盖（OMS 优先读 Redis）。
+STRATEGY_AUTO_ENTRY_ENABLED = _env_flag("STRATEGY_AUTO_ENTRY_ENABLED", True)
 
 # ================= Dashboard 配置 =================
 DASHBOARD_REFRESH_RATE = 1.0

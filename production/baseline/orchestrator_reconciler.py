@@ -4,7 +4,8 @@ import json
 import time
 import os
 import math
-from config import TRADING_ENABLED
+import psycopg2
+from config import TRADING_ENABLED, PG_DB_URL
 from runtime_trading_controls import get_runtime_trading_enabled
 from orchestrator_state_manager import infer_open_fill_confirmed
 
@@ -81,12 +82,138 @@ class OrchestratorReconciler:
             except Exception as e:
                 logger.error(f"❌ [Reconciler] 对账过程发生异常: {e}", exc_info=True)
 
+    async def _publish_broker_opt_legs_snapshot(self, real_positions):
+        """按合约拆分 OPT 持仓写入 Redis，供 Dashboard 区分同一标的多个行权价。"""
+        legs = {}
+        try:
+            for pos in real_positions or []:
+                contract = getattr(pos, "contract", None)
+                sec_type = str(getattr(contract, "secType", "") or "").upper()
+                if sec_type != "OPT":
+                    continue
+                sym = str(getattr(contract, "symbol", "") or "").strip().upper()
+                try:
+                    con_id = int(getattr(contract, "conId", 0) or 0)
+                except Exception:
+                    con_id = 0
+                qty_signed = float(getattr(pos, "position", 0) or 0.0)
+                if not sym or con_id <= 0 or abs(qty_signed) < 1e-9:
+                    continue
+                try:
+                    multiplier = float(getattr(contract, "multiplier", 100) or 100.0)
+                except Exception:
+                    multiplier = 100.0
+                multiplier = multiplier if multiplier > 0 else 100.0
+                avg_cost = float(getattr(pos, "avgCost", 0.0) or 0.0)
+                # IBKR avgCost：通常已是「每合约」的平均成本（美元），合约名义已含 multiplier；
+                # 每股期权权利金 = avgCost / multiplier。勿再除以持仓合约数，否则 qty>1 时会压低成本、ROI 虚高。
+                premium = (
+                    abs(avg_cost) / multiplier if abs(avg_cost) > 0 and multiplier > 0 else 0.0
+                )
+                right = str(getattr(contract, "right", "") or "")
+                opt_type = "call" if right.upper() == "C" else ("put" if right.upper() == "P" else "")
+                key = f"{sym}|{con_id}"
+                legs[key] = json.dumps(
+                    {
+                        "underlying": sym,
+                        "conId": con_id,
+                        "position": 1 if qty_signed > 0 else -1,
+                        "qty": abs(qty_signed),
+                        "entry_price": float(premium) if math.isfinite(premium) else 0.0,
+                        "avgCost": avg_cost,
+                        "localSymbol": str(getattr(contract, "localSymbol", "") or ""),
+                        "strike": float(getattr(contract, "strike", 0.0) or 0.0),
+                        "right": right,
+                        "expiry": str(getattr(contract, "lastTradeDateOrContractMonth", "") or ""),
+                        "opt_type": opt_type,
+                        "ts": time.time(),
+                    },
+                    separators=(",", ":"),
+                )
+            rds = getattr(self.orch, "r", None)
+            if not rds:
+                return
+            pipe = rds.pipeline()
+            pipe.delete("oms:broker_opt_legs")
+            if legs:
+                pipe.hset("oms:broker_opt_legs", mapping=legs)
+                pipe.expire("oms:broker_opt_legs", 240)
+            pipe.execute()
+        except Exception as e:
+            logger.warning(f"⚠️ [Reconciler] broker OPT legs Redis snapshot failed: {e}")
+
+    def _sync_position_subscription_contracts_pg(self, real_positions):
+        """将当前 OPT 持仓同步到 PG，供 IB Connector 订阅当日 lock 之外的实仓合约。"""
+        try:
+            conn = psycopg2.connect(PG_DB_URL)
+            c = conn.cursor()
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS oms_position_subscription_contracts (
+                        con_id BIGINT PRIMARY KEY,
+                        underlying TEXT NOT NULL,
+                        expiry TEXT NOT NULL,
+                        strike DOUBLE PRECISION NOT NULL,
+                        p_right TEXT NOT NULL,
+                        multiplier TEXT,
+                        local_symbol TEXT,
+                        trading_class TEXT,
+                        position_qty DOUBLE PRECISION DEFAULT 0,
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    )"""
+            )
+            current_ids = []
+            for pos in real_positions or []:
+                contract = getattr(pos, "contract", None)
+                sec_type = str(getattr(contract, "secType", "") or "").upper()
+                if sec_type != "OPT":
+                    continue
+                sym_raw = str(getattr(contract, "symbol", "") or "").strip().upper()
+                sym = sym_raw.replace(" ", ".") if "BRK" in sym_raw else sym_raw
+                try:
+                    con_id = int(getattr(contract, "conId", 0) or 0)
+                except Exception:
+                    con_id = 0
+                qty_signed = float(getattr(pos, "position", 0) or 0.0)
+                if not sym or con_id <= 0 or abs(qty_signed) < 1e-9:
+                    continue
+                expiry = str(getattr(contract, "lastTradeDateOrContractMonth", "") or "")
+                strike = float(getattr(contract, "strike", 0.0) or 0.0)
+                right = str(getattr(contract, "right", "") or "")
+                mult = str(getattr(contract, "multiplier", "100") or "100")
+                ls = str(getattr(contract, "localSymbol", "") or "")
+                tc = str(getattr(contract, "tradingClass", "") or "")
+                c.execute(
+                    """INSERT INTO oms_position_subscription_contracts
+                    (con_id, underlying, expiry, strike, p_right, multiplier, local_symbol, trading_class, position_qty, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                    ON CONFLICT (con_id) DO UPDATE SET
+                    underlying=EXCLUDED.underlying, expiry=EXCLUDED.expiry, strike=EXCLUDED.strike,
+                    p_right=EXCLUDED.p_right, multiplier=EXCLUDED.multiplier,
+                    local_symbol=EXCLUDED.local_symbol, trading_class=EXCLUDED.trading_class,
+                    position_qty=EXCLUDED.position_qty, updated_at=NOW()""",
+                    (con_id, sym, expiry, strike, right, mult, ls, tc, qty_signed),
+                )
+                current_ids.append(con_id)
+            if current_ids:
+                c.execute(
+                    "DELETE FROM oms_position_subscription_contracts WHERE con_id NOT IN %s",
+                    (tuple(current_ids),),
+                )
+            else:
+                c.execute("DELETE FROM oms_position_subscription_contracts")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"⚠️ [Reconciler] sync position_subscription PG failed: {e}")
+
     async def _perform_reconciliation(self):
         # 1. 获取券商底层真实仓位 (Ground Truth)
         # ib.positions() 会返回当前账户的所有持仓列表
         # 注意：在异步环境下，ib.positions() 是即时返回缓存的，实际由内部独立连接维护同步
         real_positions = self.orch.ibkr.ib.positions()
-        
+        await self._publish_broker_opt_legs_snapshot(real_positions)
+        self._sync_position_subscription_contracts_pg(real_positions)
+
         # 2. 统计真实持仓 (仅对齐策略相关的 OPT 仓位；股票仓位不能污染期权策略账本)
         broker_state = {}
         broker_avg_price = {}

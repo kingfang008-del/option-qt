@@ -46,6 +46,7 @@ from config import (
     COMMISSION_PER_CONTRACT,
     STREAM_ORCH_SIGNAL, GROUP_OMS, GROUP_ORCH, RUN_MODE, OMS_STATE_NAMESPACE,
     LIVE_TRADING_CAPITAL_LIMIT, TRADING_ENABLED, TRADE_OPTION_MONEYNESS,
+    STRATEGY_AUTO_ENTRY_ENABLED,
 )
 from dashboard_cash_utils import (
     parse_oms_ledger_hash,
@@ -59,7 +60,7 @@ from runtime_trading_controls import (
     set_runtime_live_trading_capital_limit,
     set_runtime_trading_enabled,
 )
-from orchestrator_order_state import namespaced_pending_orders_key
+from dashboard_intraday_snap import build_iv_spike_markers_for_symbol
 
 # [Fix 1] 补全 Dashboard 所需的 Redis Key 映射
 REDIS_CFG['hash_snapshot']    = HASH_OPTION_SNAPSHOT     # 'live_option_snapshot'
@@ -68,6 +69,7 @@ REDIS_CFG['inference_stream'] = STREAM_INFERENCE          # 'unified_inference_s
 REDIS_CFG['trade_log']        = STREAM_TRADE_LOG          # 'trade_log_stream'
 REDIS_CFG['alpha_key_prefix'] = 'alpha_log'              # Redis List: alpha_log:{symbol}
 OMS_MANUAL_EXIT_PROTECT_HASH = "oms:manual_exit_protect"
+META_STRATEGY_AUTO_ENTRY_HASH = "meta:strategy_auto_entry"
 
 # 路径配置
 BASE_PROJECT_DIR = Path(__file__).parent.parent  # V8 dir
@@ -319,9 +321,9 @@ if not SLOW_FEAT_NAMES:
 IC_WINDOW = 30      # 滚动 IC 窗口
 FORWARD_PERIOD = 5  # 预测未来 5min 收益
 
-# 样式美化与主题切换
+# 样式美化与主题切换（默认浅色）
 if 'theme' not in st.session_state:
-    st.session_state['theme'] = 'dark'
+    st.session_state['theme'] = 'light'
 
 theme_col1, theme_col2 = st.sidebar.columns([1, 2])
 theme_col1.write("🎨 Theme:")
@@ -543,6 +545,10 @@ def _render_quick_order_route_status(status):
         f"(source={status.get('trading_source')}, by={status.get('trading_updater')})"
     )
     st.caption(status.get("ibkr_detail", "IBKR: unknown"))
+    st.caption(
+        "图表右侧「买入 Call/Put」会先弹出确认框：时段优先 Redis meta:global_gates；"
+        "若引擎未刷新则用美东即时时钟与 strategy_config 推算。取消则不发送请求。"
+    )
 
 
 def _quick_order_message_prefix(route_status):
@@ -554,6 +560,146 @@ def _quick_order_message_prefix(route_status):
     if mode == "REALTIME":
         return "[REALTIME 未武装 / OMS]"
     return f"[{mode} / OMS]"
+
+
+def _redis_hash_str_map(raw) -> dict:
+    out = {}
+    for k, v in (raw or {}).items():
+        ks = k.decode("utf-8", errors="ignore") if isinstance(k, bytes) else str(k)
+        vs = v.decode("utf-8", errors="ignore") if isinstance(v, bytes) else str(v)
+        out[ks] = vs
+    return out
+
+
+def _load_session_thresholds_from_redis_or_defaults(rds) -> dict:
+    from strategy_config0 import StrategyConfig
+
+    dft = StrategyConfig()
+    th = {
+        "START_HOUR": int(dft.START_HOUR),
+        "START_MINUTE": int(dft.START_MINUTE),
+        "NO_ENTRY_HOUR": int(dft.NO_ENTRY_HOUR),
+        "NO_ENTRY_MINUTE": int(dft.NO_ENTRY_MINUTE),
+        "CLOSE_HOUR": int(dft.CLOSE_HOUR),
+        "CLOSE_MINUTE": int(dft.CLOSE_MINUTE),
+    }
+    try:
+        cfg = _redis_hash_str_map(rds.hgetall("meta:strategy_config"))
+        for key in list(th.keys()):
+            if key in cfg:
+                try:
+                    th[key] = int(float(cfg[key]))
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        pass
+    return th
+
+
+def _ny_session_from_clock(t: dt_time, th: dict) -> str:
+    sh, sm = th["START_HOUR"], th["START_MINUTE"]
+    nh, nm = th["NO_ENTRY_HOUR"], th["NO_ENTRY_MINUTE"]
+    ch, cm = th["CLOSE_HOUR"], th["CLOSE_MINUTE"]
+    if t.hour < sh or (t.hour == sh and t.minute < sm):
+        return "pre_open"
+    if (t.hour == ch and t.minute >= cm) or t.hour > ch:
+        return "close_forced"
+    if (t.hour == nh and t.minute >= nm) or t.hour > nh:
+        return "no_entry"
+    return "entry_open"
+
+
+def fetch_order_session_hint_for_manual_buy(rds) -> dict:
+    """门禁提示：优先 Redis meta:global_gates；若无快照则用美东时钟 + meta:strategy_config（缺省用 StrategyConfig0）推算。"""
+    th = _load_session_thresholds_from_redis_or_defaults(rds)
+    open_at_d = f"{th['START_HOUR']:02d}:{th['START_MINUTE']:02d}"
+    no_ent_d = f"{th['NO_ENTRY_HOUR']:02d}:{th['NO_ENTRY_MINUTE']:02d}"
+    close_at_d = f"{th['CLOSE_HOUR']:02d}:{th['CLOSE_MINUTE']:02d}"
+
+    ny_now = datetime.now(NY_TZ)
+    now_local = ny_now.strftime("%H:%M:%S")
+    local_session = _ny_session_from_clock(ny_now.time(), th)
+
+    gg = {}
+    try:
+        gg = _redis_hash_str_map(rds.hgetall("meta:global_gates"))
+    except Exception:
+        gg = {}
+
+    redis_session = str(gg.get("session") or "").strip()
+    redis_now = str(gg.get("now_ny") or "").strip()
+    use_redis_session = redis_session in {"entry_open", "pre_open", "no_entry", "close_forced"}
+
+    session = redis_session if use_redis_session else local_session
+    now_ny = redis_now if redis_now else now_local
+    session_source = "redis" if use_redis_session else "dashboard_et"
+
+    open_at = gg.get("session_open_at") or open_at_d
+    no_ent = gg.get("session_no_entry_at") or no_ent_d
+    close_at = gg.get("session_close_at") or close_at_d
+    schedule_line = f"新开仓起始 {open_at} ET · 新开截止 {no_ent} ET · 收盘参考 {close_at} ET"
+
+    zh_map = {
+        "entry_open": "可开仓时段",
+        "pre_open": "盘前 / 未到开仓点",
+        "no_entry": "新开仓已截止（禁入）",
+        "close_forced": "收盘平仓窗口",
+        "unknown": "门禁未知",
+    }
+    emoji_map = {
+        "entry_open": "🟢",
+        "pre_open": "🌙",
+        "no_entry": "🟡",
+        "close_forced": "🔴",
+        "unknown": "❓",
+    }
+    emoji = emoji_map.get(session, "❓")
+    session_zh_label = zh_map.get(session, session)
+    clock_hint = (
+        "门禁快照：Redis meta:global_gates。"
+        if session_source == "redis"
+        else "门禁快照不可用；会话由美国东部当前时钟与 meta:strategy_config（或 StrategyConfig0 默认）推算。"
+    )
+
+    if session == "entry_open":
+        within = True
+        detail_zh = (
+            "当前为美东允许新开仓的时钟区间。"
+            f"{clock_hint} 手动买单仍会经 OMS / IBKR 校验。"
+        )
+    elif session == "pre_open":
+        within = False
+        detail_zh = (
+            "当前为美东盘前或未到晚盘起始时间 — 自动策略通常不开仓。"
+            "若在盘前下单，IBKR 限价单常会停留在挂单队列直至开盘；请在 IBKR TWS / 网关面板核对挂单。"
+            f" {clock_hint}"
+        )
+    elif session == "no_entry":
+        within = False
+        detail_zh = "已过当日新开仓截止时间。" + clock_hint
+    elif session == "close_forced":
+        within = False
+        detail_zh = "已进入收盘相关平仓窗口；新开仓风险极高。" + clock_hint
+    else:
+        within = None
+        detail_zh = "无法归类会话；请以时间与时间表为准。" + clock_hint
+
+    cb_active = str(gg.get("cb_active") or "0").strip() == "1"
+    cb_note = ""
+    if cb_active:
+        cb_note = "⚠️ 全局熔断生效中：OMS 可能拦截买入，请先查看 Tab 🧬 门禁。"
+
+    return {
+        "session": session,
+        "session_zh": f"{emoji} {session_zh_label}",
+        "within_entry_window": within,
+        "schedule_line": schedule_line,
+        "now_ny": now_ny,
+        "detail_zh": detail_zh,
+        "cb_active": cb_active,
+        "cb_note": cb_note,
+        "session_source": session_source,
+    }
 
 
 def _manual_exit_protect_key(symbol: str, contract_id: str = "") -> str:
@@ -586,7 +732,43 @@ def set_manual_exit_protect(symbol: str, contract_id: str = "", enabled: bool = 
             rds.hdel(OMS_MANUAL_EXIT_PROTECT_HASH, key)
     except Exception:
         pass
-    
+
+
+def fetch_strategy_auto_entry_enabled(rds) -> bool:
+    """读取策略自动开仓开关：Redis 字段缺失时沿用 config STRATEGY_AUTO_ENTRY_ENABLED。"""
+    base = bool(STRATEGY_AUTO_ENTRY_ENABLED)
+    if rds is None:
+        return base
+    try:
+        raw = rds.hget(META_STRATEGY_AUTO_ENTRY_HASH, "enabled")
+        if raw is None:
+            return base
+        val = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        val = val.strip().lower()
+        if val in ("", "inherit", "default"):
+            return base
+        return val in ("1", "true", "yes", "on")
+    except Exception:
+        return base
+
+
+def set_strategy_auto_entry_enabled(rds, enabled: bool) -> None:
+    """写入策略自动开仓开关，OMS 实盘下一轮 ALPHA_FRAME 即生效。"""
+    if rds is None:
+        return
+    try:
+        rds.hset(
+            META_STRATEGY_AUTO_ENTRY_HASH,
+            mapping={
+                "enabled": "1" if enabled else "0",
+                "updated_at": str(time.time()),
+            },
+        )
+        rds.expire(META_STRATEGY_AUTO_ENTRY_HASH, 7 * 24 * 3600)
+    except Exception:
+        pass
+
+
 def _parse_account_metrics(account_values):
     """从 IB accountValues 提取净值/可用资金（USD）。"""
     out = {
@@ -635,6 +817,170 @@ def _calc_auto_open_notional_from_redis(rds):
     except Exception:
         return 0.0
     return float(total)
+
+
+OMS_BROKER_OPT_LEGS_KEY = "oms:broker_opt_legs"
+
+
+def _reconcile_broker_vs_oms_option_premium_per_share(
+    broker_px: float, oms_cost: float, leg_qty: float = 0.0
+) -> float:
+    """IBKR avgCost→entry_price 与 OMS 成交 entry_price 口径不一致时用 OMS 修正。
+
+    - 常见低估：每股权利金被多除了一次持仓合约数（例如 11.19 vs 3.73×3）；用 ``broker_px * qty ≈ oms`` 识别。
+    - 其余悬殊仍用倍数阈值（略低于 4×，以便覆盖≈3×且无量纲匹配的边角）。
+    """
+    bc = float(broker_px or 0.0)
+    oc = float(oms_cost or 0.0)
+    if not (math.isfinite(bc) and bc > 0):
+        return oc if (math.isfinite(oc) and oc > 0) else bc
+    if not (math.isfinite(oc) and oc > 0):
+        return bc
+    qa = abs(float(leg_qty or 0.0))
+    if qa >= 2.0:
+        scaled = bc * qa
+        tol = max(0.05, 0.02 * oc)
+        if abs(scaled - oc) <= tol:
+            return oc
+    if oc > bc * 3.0:
+        return oc
+    if bc > oc * 4.0:
+        return bc
+    return bc
+
+
+def fetch_broker_opt_legs_from_redis():
+    """IBKR 对账器写入的按合约拆分期权持仓（同一标的多个行权价各占一行）。"""
+    legs = {}
+    try:
+        rds = redis.Redis(**{k: v for k, v in REDIS_CFG.items() if k in ["host", "port", "db"]}, decode_responses=False)
+        raw_map = rds.hgetall(OMS_BROKER_OPT_LEGS_KEY) or {}
+        for raw_k, raw_v in raw_map.items():
+            try:
+                k = raw_k.decode("utf-8", errors="ignore") if isinstance(raw_k, (bytes, bytearray)) else str(raw_k)
+                txt = raw_v.decode("utf-8", errors="ignore") if isinstance(raw_v, (bytes, bytearray)) else str(raw_v)
+                data = json.loads(txt)
+                if str(data.get("underlying", "") or "").strip():
+                    legs[k] = data
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return legs
+
+
+def merge_oms_positions_with_broker_opt_legs(oms_positions: dict, broker_legs: dict) -> dict:
+    """以券商合约为行主键展开；用 OMS 行匹配补充 tag / 价差等元数据。"""
+    if not broker_legs:
+        return dict(oms_positions or {})
+    merged = {}
+    oms_by_under = {}
+    for pk, p in (oms_positions or {}).items():
+        und = str(p.get("symbol") or "").strip().upper()
+        if not und:
+            pks = pk.decode("utf-8", errors="ignore") if isinstance(pk, (bytes, bytearray)) else str(pk)
+            und = pks.split("|", 1)[0].strip().upper()
+        oms_by_under.setdefault(und, []).append((pk, p))
+
+    def _match_tokens(op: dict) -> str:
+        return "|".join(
+            [
+                str(op.get("contract_id") or ""),
+                str(op.get("contract_con_id") or ""),
+            ]
+        ).upper()
+
+    for leg_key, leg in broker_legs.items():
+        und = str(leg.get("underlying") or "").strip().upper()
+        try:
+            con_id = int(leg.get("conId") or 0)
+        except Exception:
+            con_id = 0
+        local_sym = str(leg.get("localSymbol") or "").strip()
+        qty = float(leg.get("qty") or 0)
+        pos_dir = int(leg.get("position") or 0)
+        entry_px = float(leg.get("entry_price") or 0.0)
+        matched = None
+        candidates = oms_by_under.get(und, [])
+        for _pk, op in candidates:
+            tok = _match_tokens(op)
+            if con_id and str(con_id) in tok:
+                matched = op
+                break
+            try:
+                if con_id and int(op.get("contract_con_id") or 0) == con_id:
+                    matched = op
+                    break
+            except Exception:
+                pass
+            loc = local_sym.upper()
+            if loc and loc in tok:
+                matched = op
+                break
+        if matched is None and len(candidates) == 1:
+            matched = candidates[0][1]
+        tag = str((matched or {}).get("tag") or "").strip().upper()
+        if not tag:
+            ot = str(leg.get("opt_type") or "").lower()
+            tag = "CALL_ATM" if ot == "call" else ("PUT_ATM" if ot == "put" else "")
+        cid_disp = local_sym or (str(con_id) if con_id else "")
+        _esp_raw = pd.to_numeric((matched or {}).get("entry_fill_spread_pct", np.nan), errors="coerce")
+        try:
+            _esp_f = float(_esp_raw)
+        except (TypeError, ValueError):
+            _esp_f = float("nan")
+        _esp_out = _esp_f if pd.notna(_esp_raw) and math.isfinite(_esp_f) else None
+        oms_cost = float((matched or {}).get("cost") or 0.0)
+        merged_cost = _reconcile_broker_vs_oms_option_premium_per_share(entry_px, oms_cost, qty)
+        if not (np.isfinite(merged_cost) and merged_cost > 0):
+            merged_cost = oms_cost if (np.isfinite(oms_cost) and oms_cost > 0) else entry_px
+        merged[leg_key] = {
+            "symbol": und,
+            "position": pos_dir,
+            "qty": qty,
+            "cost": merged_cost,
+            "stock": float((matched or {}).get("stock") or 0.0),
+            "tag": tag,
+            "opt_type": str(leg.get("opt_type") or ""),
+            "contract_id": cid_disp,
+            "contract_con_id": con_id,
+            "last_opt_price": float((matched or {}).get("last_opt_price") or 0.0),
+            "entry_fill_spread_pct": _esp_out,
+            "entry_fill_bid": float((matched or {}).get("entry_fill_bid") or 0.0),
+            "entry_fill_ask": float((matched or {}).get("entry_fill_ask") or 0.0),
+            "entry_ts": float((matched or {}).get("entry_ts") or 0.0),
+            "source": "broker_leg",
+        }
+    return merged
+
+
+def finalize_realtime_positions_for_dashboard(oms_positions: dict, current_mode: str) -> dict:
+    """REALTIME 下优先用 IB 按合约快照展开多腿；否则沿用 OMS Redis 投影。"""
+    if not str(current_mode or "").upper().startswith("REALTIME"):
+        return dict(oms_positions or {})
+    legs = fetch_broker_opt_legs_from_redis()
+    if legs:
+        return merge_oms_positions_with_broker_opt_legs(oms_positions or {}, legs)
+    return dict(oms_positions or {})
+
+
+def lookup_oms_position_for_underlying(positions_map: dict, underlying: str) -> dict:
+    """解析 `oms:live_positions` 行：field 可能是标的或 `标的|合约标识`。"""
+    u = str(underlying or "").strip().upper()
+    if not u or not positions_map:
+        return {}
+    hit = positions_map.get(u)
+    if hit:
+        return hit
+    for pk, p in positions_map.items():
+        psym = str(p.get("symbol") or "").strip().upper()
+        if psym == u:
+            return p
+        pks = pk.decode("utf-8", errors="ignore") if isinstance(pk, (bytes, bytearray)) else str(pk)
+        if pks.split("|", 1)[0].strip().upper() == u:
+            return p
+    return {}
+
 
 def _build_manual_capital_snapshot(total_equity, ib_portfolio, rds):
     """
@@ -709,6 +1055,12 @@ def fetch_live_oms_positions(
                 sym = raw_sym.decode("utf-8", errors="ignore") if isinstance(raw_sym, (bytes, bytearray)) else str(raw_sym)
                 if sym == "____SYSTEM_CASH____":
                     continue
+                field_key = sym
+                underlying_sym = (
+                    field_key.split("|", 1)[0].strip().upper()
+                    if "|" in field_key
+                    else field_key.strip().upper()
+                )
                 txt = raw_val.decode("utf-8", errors="ignore") if isinstance(raw_val, (bytes, bytearray)) else str(raw_val)
                 state = json.loads(txt)
                 pos = int(state.get("position", state.get("pos", 0)) or 0)
@@ -721,20 +1073,29 @@ def fetch_live_oms_positions(
                     meta["skipped_unconfirmed"] += 1
                     continue
                 opt_type = str(state.get("opt_type", "") or "").strip().lower()
-                positions[sym] = {
-                    'position': pos,
-                    'qty': qty,
-                    'cost': cost if np.isfinite(cost) and cost > 0 else 0.0,
-                    'stock': stock if np.isfinite(stock) and stock > 0 else 0.0,
-                    'tag': _valid_bucket_tag(state.get("tag", "")),
-                    'opt_type': opt_type,
-                    'contract_id': str(state.get("contract_id", "") or ""),
-                    'last_opt_price': float(state.get("last_opt_price", 0.0) or 0.0),
-                    'entry_fill_spread_pct': pd.to_numeric(state.get("entry_fill_spread_pct", np.nan), errors='coerce'),
-                    'entry_fill_bid': float(state.get("entry_fill_bid", 0.0) or 0.0),
-                    'entry_fill_ask': float(state.get("entry_fill_ask", 0.0) or 0.0),
-                    'entry_ts': float(state.get("entry_ts", 0.0) or 0.0),
-                    'source': 'OMS live',
+                cid_str = str(state.get("contract_id", "") or "").strip()
+                contract_con_id = 0
+                try:
+                    if cid_str.isdigit():
+                        contract_con_id = int(cid_str)
+                except Exception:
+                    contract_con_id = 0
+                positions[field_key] = {
+                    "symbol": underlying_sym,
+                    "position": pos,
+                    "qty": qty,
+                    "cost": cost if np.isfinite(cost) and cost > 0 else 0.0,
+                    "stock": stock if np.isfinite(stock) and stock > 0 else 0.0,
+                    "tag": _valid_bucket_tag(state.get("tag", "")),
+                    "opt_type": opt_type,
+                    "contract_id": cid_str,
+                    "contract_con_id": contract_con_id,
+                    "last_opt_price": float(state.get("last_opt_price", 0.0) or 0.0),
+                    "entry_fill_spread_pct": pd.to_numeric(state.get("entry_fill_spread_pct", np.nan), errors="coerce"),
+                    "entry_fill_bid": float(state.get("entry_fill_bid", 0.0) or 0.0),
+                    "entry_fill_ask": float(state.get("entry_fill_ask", 0.0) or 0.0),
+                    "entry_ts": float(state.get("entry_ts", 0.0) or 0.0),
+                    "source": "OMS live",
                 }
             except Exception:
                 continue
@@ -878,47 +1239,11 @@ def submit_oms_manual_open(symbol: str, tag: str, qty: int, ref_price: float = 0
         return False, str(e)
 
 
-def fetch_live_pending_orders():
-    rows = []
-    try:
-        r = redis.Redis(**{k: v for k, v in REDIS_CFG.items() if k in ['host', 'port', 'db']}, decode_responses=False)
-        raw_map = r.hgetall(namespaced_pending_orders_key(OMS_STATE_NAMESPACE)) or {}
-        for raw_key, raw_val in raw_map.items():
-            try:
-                order_key = raw_key.decode("utf-8", errors="ignore") if isinstance(raw_key, (bytes, bytearray)) else str(raw_key)
-                txt = raw_val.decode("utf-8", errors="ignore") if isinstance(raw_val, (bytes, bytearray)) else str(raw_val)
-                payload = json.loads(txt)
-                rows.append({
-                    "order_key": order_key,
-                    "symbol": str(payload.get("symbol", "") or ""),
-                    "contract_id": str(payload.get("contract_id", "") or ""),
-                    "intent": str(payload.get("intent", "") or ""),
-                    "side": str(payload.get("side", "") or ""),
-                    "status": str(payload.get("status", "") or ""),
-                    "target_qty": int(payload.get("target_qty", 0) or 0),
-                    "filled_qty": int(payload.get("filled_qty", 0) or 0),
-                    "remaining_qty": int(payload.get("remaining_qty", 0) or 0),
-                    "limit_price": float(payload.get("limit_price", 0.0) or 0.0),
-                    "retry_count": int(payload.get("retry_count", 0) or 0),
-                    "reserved_cash": float(payload.get("reserved_cash", 0.0) or 0.0),
-                    "slot_reserved": bool(payload.get("slot_reserved", False)),
-                    "broker_status": str(payload.get("broker_status", "") or ""),
-                    "updated_at": float(payload.get("last_update_ts", 0.0) or 0.0),
-                    "reason": str(payload.get("reason", "") or ""),
-                })
-            except Exception:
-                continue
-    except Exception:
-        return pd.DataFrame()
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    if "updated_at" in df.columns:
-        df["updated_at_ny"] = pd.to_datetime(df["updated_at"], unit="s", errors="coerce", utc=True).dt.tz_convert(NY_TZ)
-    return df.sort_values(["updated_at", "symbol"], ascending=[False, True], na_position="last")
-
 def _fetch_latest_option_snapshot(symbol):
-    """读取某 symbol 最新 buckets/contracts 快照（优先 Redis，失败回退 PG）。"""
+    """读取某 symbol 最新 buckets/contracts 快照（优先 Redis，失败回退 PG）。
+    Returns:
+        buckets, contracts, extra_buckets, extra_contracts  （extras 可为空列表）
+    """
     # Redis 优先（实时）
     try:
         rds = get_redis_client()
@@ -927,13 +1252,20 @@ def _fetch_latest_option_snapshot(symbol):
             if raw:
                 snap = ser.unpack(raw)
                 if isinstance(snap, dict):
-                    return snap.get("buckets", []), snap.get("contracts", [])
+                    eb = snap.get("extra_buckets") or []
+                    ec = snap.get("extra_contracts") or []
+                    return (
+                        snap.get("buckets", []),
+                        snap.get("contracts", []),
+                        eb if isinstance(eb, list) else [],
+                        ec if isinstance(ec, list) else [],
+                    )
                 if isinstance(snap, list):
-                    return snap, []
+                    return snap, [], [], []
     except Exception:
         pass
 
-    # PG 回退（近似最新）
+    # PG 回退（近似最新；通常不含 extra）
     try:
         conn = psycopg2.connect(PG_DB_URL)
         c = conn.cursor()
@@ -948,24 +1280,107 @@ def _fetch_latest_option_snapshot(symbol):
             if isinstance(snap, str):
                 snap = json.loads(snap)
             if isinstance(snap, dict):
-                return snap.get("buckets", []), snap.get("contracts", [])
+                eb = snap.get("extra_buckets") or snap.get("option_extra_buckets") or []
+                ec = snap.get("extra_contracts") or snap.get("option_extra_contracts") or []
+                return (
+                    snap.get("buckets", []),
+                    snap.get("contracts", []),
+                    eb if isinstance(eb, list) else [],
+                    ec if isinstance(ec, list) else [],
+                )
             if isinstance(snap, list):
-                return snap, []
+                return snap, [], [], []
     except Exception:
         pass
-    return [], []
+    return [], [], [], []
 
-def _get_bucket_quote_and_contract(symbol, tag):
-    """
-    返回指定 symbol + bucket(tag) 的实时 quote 与合约标识。
-    """
-    idx = TAG_TO_INDEX.get(tag, -1)
-    if idx < 0:
+def _norm_occ_opt_symbol(s: str) -> str:
+    """Normalize OCC/localSymbol for loose equality (ignore spaces)."""
+    return re.sub(r"\s+", "", str(s or "").strip().upper())
+
+
+_OCC_TAIL_RE = re.compile(r"\d{6}[CP]\d{8}", re.IGNORECASE)
+
+
+def _occ_tail_key(norm: str) -> str | None:
+    """期权 OCC 尾部：YYMMDD + C|P + 8 位行权价（与 root 写法无关），用于唯一对齐持仓与链上行。"""
+    if not norm:
         return None
-    buckets, contracts = _fetch_latest_option_snapshot(symbol)
-    if not buckets or len(buckets) <= idx:
+    u = norm.upper().strip()
+    m = _OCC_TAIL_RE.search(u)
+    return m.group(0).upper() if m else None
+
+
+def _occ_contract_equivalent(a: str, b: str) -> bool:
+    """持仓合约标识与快照 contract 字符串是否同一张期权（禁止仅靠子串误匹配）。"""
+    na = _norm_occ_opt_symbol(a)
+    nb = _norm_occ_opt_symbol(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    ta, tb = _occ_tail_key(na), _occ_tail_key(nb)
+    return bool(ta and tb and ta == tb)
+
+
+def _occ_strike_usd_from_tail_key(tail: str | None) -> float | None:
+    """OCC 尾部最后 8 位为 strike*1000（美元价位）。"""
+    if not tail or len(tail) < 9:
         return None
-    row = buckets[idx]
+    dig = tail[-8:]
+    try:
+        return int(dig, 10) / 1000.0
+    except ValueError:
+        return None
+
+
+def _bucket_strike_matches_occ_tail(row_strike: float, occ_tail: str | None) -> bool:
+    """防止 contracts[] 与 buckets[] 错位：字符串对上但 bid/mid 实为另一行。"""
+    exp = _occ_strike_usd_from_tail_key(occ_tail)
+    if exp is None:
+        return True
+    rk = float(row_strike or 0.0)
+    if rk <= 0:
+        return False
+    tol = max(0.05, abs(exp) * 0.002)
+    return abs(exp - rk) <= tol
+
+
+def _sanitize_option_mid_vs_holdings(mid: float, pos: dict) -> float:
+    """链上 mid 与持仓成本严重背离时，优先信 OMS last_opt / 成本（常见于快照错行）。"""
+    cost = float(pos.get("cost") or 0.0)
+    last_opt = float(pos.get("last_opt_price") or 0.0)
+    if mid <= 0 or cost <= 1e-9:
+        return mid
+    r = mid / cost
+    # 开仓瞬间不该相对成本跳跃数倍；实盘大盈亏留给盘中逐步演化（若有真实暴涨可再放宽上沿）
+    if 0.42 <= r <= 2.35:
+        return mid
+    if last_opt > 0 and (0.35 * cost) <= last_opt <= (3.0 * cost):
+        return last_opt
+    return cost
+
+
+def _finalize_live_quote_dict(q: dict, pos: dict) -> dict:
+    """对来自 Redis/PG 链的报价做最后一道持仓一致性修正。"""
+    if not q:
+        return q
+    src = str(q.get("quote_source") or "")
+    if any(x in src for x in ("fallback", "mismatch", "no_chain")):
+        return q
+    mid = float(q.get("mid") or 0.0)
+    mid2 = _sanitize_option_mid_vs_holdings(mid, pos)
+    if abs(mid2 - mid) <= 1e-9:
+        return q
+    out = dict(q)
+    out["mid"] = mid2
+    out["last"] = mid2
+    out["quote_source"] = src + "+mid_vs_cost_sanity"
+    return out
+
+
+def _bucket_row_to_quote(row, contracts, idx):
+    """Parse one buckets_json row + parallel contracts[idx] into a quote dict."""
     if not isinstance(row, (list, tuple)) or len(row) < 10:
         return None
     bid = float(row[8] or 0.0) if len(row) > 8 else 0.0
@@ -973,7 +1388,11 @@ def _get_bucket_quote_and_contract(symbol, tag):
     bid_size = float(row[10] or 0.0) if len(row) > 10 else 0.0
     ask_size = float(row[11] or 0.0) if len(row) > 11 else 0.0
     last = float(row[0] or 0.0)
-    mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 and ask >= bid else (last if last > 0 else 0.0)
+    mid = (
+        (bid + ask) / 2.0
+        if bid > 0 and ask > 0 and ask >= bid
+        else (last if last > 0 else 0.0)
+    )
     strike = float(row[5] or 0.0) if len(row) > 5 else 0.0
     iv = float(row[7] or 0.0) if len(row) > 7 else 0.0
     contract_txt = contracts[idx] if contracts and len(contracts) > idx else ""
@@ -988,7 +1407,132 @@ def _get_bucket_quote_and_contract(symbol, tag):
         "strike": strike,
         "iv": iv,
         "contract_text": contract_txt,
+        "quote_source": "chain_contract_match",
     }
+
+
+def _get_quote_for_contract_local(symbol: str, local_symbol: str, con_id: int = 0):
+    """If snapshots include this contract row, return its bid/mid/ask — not the ATM bucket."""
+    ls_n = _norm_occ_opt_symbol(local_symbol)
+    ls_tail = _occ_tail_key(ls_n)
+    if not ls_n and not ls_tail:
+        return None
+    buckets, contracts, eb, ec = _fetch_latest_option_snapshot(symbol)
+    if not buckets or not contracts:
+        return None
+    for idx, ct in enumerate(contracts):
+        if idx >= len(buckets):
+            break
+        ct_n = _norm_occ_opt_symbol(ct)
+        if not ct_n:
+            continue
+        same = ls_n == ct_n if ls_n else False
+        if not same and ls_tail and _occ_tail_key(ct_n) == ls_tail:
+            same = True
+        if not same and ls_n and ct_n:
+            same = _occ_contract_equivalent(ls_n, ct_n)
+        if same:
+            q = _bucket_row_to_quote(buckets[idx], contracts, idx)
+            if not q:
+                continue
+            if ls_tail and not _bucket_strike_matches_occ_tail(float(q.get("strike") or 0.0), ls_tail):
+                continue
+            q["quote_source"] = "chain_contract_match"
+            return q
+    for idx, ct in enumerate(ec or []):
+        if idx >= len(eb or []):
+            break
+        ct_n = _norm_occ_opt_symbol(ct)
+        if not ct_n:
+            continue
+        same = ls_n == ct_n if ls_n else False
+        if not same and ls_tail and _occ_tail_key(ct_n) == ls_tail:
+            same = True
+        if not same and ls_n and ct_n:
+            same = _occ_contract_equivalent(ls_n, ct_n)
+        if same:
+            q = _bucket_row_to_quote(eb[idx], ec, idx)
+            if not q:
+                continue
+            if ls_tail and not _bucket_strike_matches_occ_tail(float(q.get("strike") or 0.0), ls_tail):
+                continue
+            q["quote_source"] = "chain_contract_match_extra"
+            return q
+    return None
+
+
+def _get_live_quote_for_position(underlying: str, tag: str, pos: dict) -> dict:
+    """Never use ATM/tag bucket mid unless bucket row is the same contract as the held leg."""
+    u = str(underlying or "").strip().upper()
+    tag = str(tag or "").strip().upper()
+    cid = str(pos.get("contract_id") or "").strip()
+    con_id = int(pos.get("contract_con_id") or 0)
+    q = _get_quote_for_contract_local(u, cid, con_id) if cid else None
+    if q:
+        mid = float(q.get("mid") or 0.0)
+        if mid <= 0:
+            last = float(q.get("last") or 0.0)
+            if last > 0:
+                q = dict(q)
+                q["mid"] = last
+            else:
+                fb = float(pos.get("last_opt_price") or 0.0) or float(pos.get("cost") or 0.0)
+                if fb > 0:
+                    q = dict(q)
+                    q["mid"] = fb
+                    q["quote_source"] = str(q.get("quote_source") or "") + "+premkt_hold_fallback"
+        if float(q.get("mid") or 0.0) > 0:
+            return _finalize_live_quote_dict(q, pos)
+
+    q_b = _get_bucket_quote_and_contract(u, tag) or {}
+    btxt_raw = str(q_b.get("contract_text") or "").strip()
+    ctxt = _norm_occ_opt_symbol(cid)
+
+    def _hold_px_fallback() -> float:
+        return float(pos.get("last_opt_price") or 0.0) or float(pos.get("cost") or 0.0)
+
+    # 已持有明确合约：bucket(tag 常为 CALL_ATM) 往往是另一行权价；contract_text 为空时也不能相信 mid。
+    if ctxt:
+        if not btxt_raw or not _occ_contract_equivalent(cid, btxt_raw):
+            fb = _hold_px_fallback()
+            return {
+                "bid": 0.0,
+                "ask": 0.0,
+                "last": fb,
+                "mid": fb if fb > 0 else 0.0,
+                "contract_text": cid or btxt_raw,
+                "quote_source": "bucket_contract_mismatch_fallback",
+            }
+
+    mid_b = float(q_b.get("mid") or 0.0)
+    if mid_b > 0:
+        return _finalize_live_quote_dict(q_b, pos)
+    fb = _hold_px_fallback()
+    return {
+        "bid": 0.0,
+        "ask": 0.0,
+        "last": fb,
+        "mid": fb if fb > 0 else 0.0,
+        "contract_text": cid,
+        "quote_source": "no_chain_quote_fallback",
+    }
+
+
+def _get_bucket_quote_and_contract(symbol, tag):
+    """
+    返回指定 symbol + bucket(tag) 的实时 quote 与合约标识。
+    """
+    idx = TAG_TO_INDEX.get(tag, -1)
+    if idx < 0:
+        return None
+    buckets, contracts, _, _ = _fetch_latest_option_snapshot(symbol)
+    if not buckets or len(buckets) <= idx:
+        return None
+    row = buckets[idx]
+    q = _bucket_row_to_quote(row, contracts, idx)
+    if q is not None:
+        q.setdefault("quote_source", "bucket_tag")
+    return q
 
 def _fetch_locked_contract_row(symbol, tag):
     """
@@ -1027,30 +1571,16 @@ def _fetch_locked_contract_row(symbol, tag):
         return None
 
 
-def _connect_ibkr_with_fallback_global(ib, host='127.0.0.1', port=IBKR_PORT, preferred_client_ids=None):
-    """Connect a short-lived dashboard IBKR client while avoiding common clientId conflicts."""
-    if preferred_client_ids is None:
-        preferred_client_ids = [121, 122, 123, 124, 125]
-    tried = []
-    candidates = list(preferred_client_ids)
-    candidates.extend(random.sample(range(1200, 1500), k=5))
-    last_err = None
-    for cid in candidates:
-        tried.append(cid)
-        try:
-            if ib.isConnected():
-                ib.disconnect()
-            ib.connect(host, port, clientId=int(cid), timeout=4)
-            if ib.isConnected():
-                return True, int(cid), None
-        except Exception as e:
-            last_err = e
-            try:
-                if ib.isConnected():
-                    ib.disconnect()
-            except Exception:
-                pass
-    return False, None, f"{last_err} | tried={tried}"
+def _ensure_asyncio_loop_for_ib_insync_import():
+    """eventkit（ib_insync 依赖）在 import 时会取 asyncio loop；Streamlit ScriptRunner 线程默认没有。"""
+    import asyncio
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("loop is closed")
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 def place_dashboard_manual_atm_order(symbol, tag, qty, account="", stock_price=0.0, manual_exit_protect=False):
@@ -1360,9 +1890,29 @@ def _clean_leader_json_value(value):
         if math.isnan(x) or math.isinf(x):
             return None
         return x
+    if isinstance(value, bool):
+        return value
     if isinstance(value, (np.integer, int)):
         return int(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.generic):
+        try:
+            return _clean_leader_json_value(value.item())
+        except Exception:
+            return None
     return value
+
+
+def _json_sanitize_streamlit(obj):
+    """递归去除 NaN/Inf/pd.NA；传给 declare_component 的数据必须可被 strict JSON.parse。"""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return {str(k): _json_sanitize_streamlit(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_sanitize_streamlit(v) for v in obj]
+    return _clean_leader_json_value(obj)
 
 
 def leaders_payload_from_dataframes(long_df: pd.DataFrame, short_df: pd.DataFrame, stats: dict, max_rows: int = 5):
@@ -1425,6 +1975,7 @@ def render_futu_kline(
     websocket_url: str = "",
     initial_leaders: dict | None = None,
     default_moneyness: str = "ATM",
+    order_session: dict | None = None,
 ):
     """Render the browser-side Lightweight Charts component."""
     if color_mode == "cn":
@@ -1452,19 +2003,35 @@ def render_futu_kline(
     )
     ws = "" if read_only else str(websocket_url or "")
     embed = bool(ws) and not read_only
+    iv_markers = []
+    try:
+        if df_candle is not None and not getattr(df_candle, "empty", True) and "ts" in df_candle.columns:
+            ts_series = pd.to_numeric(df_candle["ts"], errors="coerce").dropna()
+            if not ts_series.empty:
+                start_ts = int(ts_series.min())
+                end_ts = int(ts_series.max()) + 180
+                iv_markers = build_iv_spike_markers_for_symbol(
+                    symbol,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                )
+    except Exception:
+        iv_markers = []
     return FUTU_KLINE_COMPONENT(
         symbol=str(symbol or "").upper(),
-        bars=_bars_for_futu_component(df_candle),
-        quotes=quotes or {},
-        position=position or None,
+        bars=_json_sanitize_streamlit(_bars_for_futu_component(df_candle)),
+        quotes=_json_sanitize_streamlit(quotes or {}),
+        position=_json_sanitize_streamlit(position) if position else None,
         readOnly=bool(read_only),
         chartDate=str(chart_date or ""),
         colors=colors,
         theme=theme,
         websocketUrl=ws,
         embedLiveLeaders=embed,
-        initialLeaders=initial_leaders if embed else None,
+        initialLeaders=_json_sanitize_streamlit(initial_leaders) if initial_leaders else None,
         defaultMoneyness=str(default_moneyness or "ATM").strip().upper(),
+        ivMarkers=_json_sanitize_streamlit(iv_markers),
+        orderSession=_json_sanitize_streamlit(order_session or {}),
         key=f"futu_kline_{symbol}_{chart_date or 'today'}_{color_mode}_{theme_mode}_{bool(websocket_url)}",
         default=None,
     )
@@ -1677,7 +2244,6 @@ def load_option_quote_quality(symbol, limit=240):
         return summary, pd.DataFrame()
 
 
-@st.cache_data(ttl=30)
 def _normalize_trade_mode(value) -> str:
     mode = str(value or "").strip().upper()
     return mode if mode in {"REALTIME", "REALTIME_DRY", "BACKTEST", "SHADOW"} else ""
@@ -2939,15 +3505,16 @@ with st.sidebar:
     realtime_ws_ui = st.checkbox(
         "Realtime WS UI",
         True,
-        help="Use the browser WebSocket bridge for K-line and momentum leader updates, avoiding full-page reruns.",
+        help="K 线由浏览器连接 dashboard_ws_bridge（默认 ws://当前页主机:8765/ws）。"
+        "请在本机运行 DAO/dashboard_ws_bridge.py。"
+        "与下方 Auto Refresh 同时开启时整页仍会 rerun，K 线自定义组件状态可能被重置；持仓/成交已放到独立 tab。",
     )
     auto_refresh = st.checkbox(
         "Auto Refresh (1s)",
-        value=not realtime_ws_ui,
-        disabled=realtime_ws_ui,
+        value=True,
+        help="每秒整页 rerun（默认开启）。请求平仓等操作建议在同一交互回合完成；"
+        "若 K 线与 WS 频频重置可先关掉此项仅用手动刷新。",
     )
-    if realtime_ws_ui:
-        auto_refresh = False
     if st.button("Manual Refresh"): st.rerun()
     if RUN_MODE.startswith("REALTIME"):
         st.markdown("### Live Risk Controls")
@@ -3130,13 +3697,18 @@ def _load_trade_snapshot_context(query_date):
                 expected_modes=[RUN_MODE],
                 return_meta=True,
             )
-            if live_meta.get("fresh"):
-                ctx["open_positions"] = live_positions
-                skipped = int(live_meta.get("skipped_unconfirmed", 0) or 0)
-                if skipped:
-                    ctx["captions"].append(f"Current positions use `oms:live_positions`; ignored unconfirmed pending: {skipped}")
-            else:
-                ctx["captions"].append("OMS live position projection is stale/unavailable.")
+            ctx["open_positions"] = finalize_realtime_positions_for_dashboard(live_positions, current_mode)
+            skipped = int(live_meta.get("skipped_unconfirmed", 0) or 0)
+            if skipped:
+                ctx["captions"].append(
+                    f"Current positions use `oms:live_positions` / broker legs; ignored unconfirmed pending: {skipped}"
+                )
+            if not ctx["open_positions"]:
+                ctx["captions"].append("OMS live position projection is stale/unavailable and no broker OPT legs found.")
+            elif not live_meta.get("fresh"):
+                ctx["captions"].append(
+                    "OMS ledger heartbeat stale; open rows may include IBKR `oms:broker_opt_legs` per-contract snapshot."
+                )
         return ctx
     df_all = pd.concat(frames, ignore_index=True).drop_duplicates(
         subset=['ts', 'symbol', 'action', 'qty', 'price'],
@@ -3180,9 +3752,8 @@ def _load_trade_snapshot_context(query_date):
                 expected_modes=[RUN_MODE],
                 return_meta=True,
             )
-            if live_meta.get("fresh"):
-                ctx["open_positions"] = live_positions
-            else:
+            ctx["open_positions"] = finalize_realtime_positions_for_dashboard(live_positions, current_mode)
+            if not ctx["open_positions"] and not live_meta.get("fresh"):
                 ctx["captions"].append("OMS live position projection is stale/unavailable.")
         return ctx
 
@@ -3229,18 +3800,26 @@ def _load_trade_snapshot_context(query_date):
         )
         if live_meta.get("fresh"):
             log_positions = dict(open_positions)
-            stale_log_symbols = sorted(set(log_positions) - set(live_positions))
-            broker_only_symbols = sorted(set(live_positions) - set(log_positions))
-            for sym, pos in live_positions.items():
-                log_pos = log_positions.get(sym, {})
-                pos['log_open_missing'] = sym not in log_positions
-                if not pos.get('tag') and log_pos.get('tag'):
-                    pos['tag'] = log_pos.get('tag', '')
-                if pos.get('cost', 0.0) <= 0 and float(log_pos.get('cost', 0.0) or 0.0) > 0:
-                    pos['cost'] = float(log_pos.get('cost', 0.0) or 0.0)
-                if pd.isna(pos.get('entry_fill_spread_pct', np.nan)) and pd.notna(log_pos.get('entry_fill_spread_pct', np.nan)):
-                    pos['entry_fill_spread_pct'] = float(log_pos.get('entry_fill_spread_pct'))
-            open_positions = live_positions
+            live_under = set()
+            for pk, pos in live_positions.items():
+                und = str(pos.get("symbol") or "").strip().upper()
+                if not und:
+                    pks = pk.decode("utf-8", errors="ignore") if isinstance(pk, (bytes, bytearray)) else str(pk)
+                    und = pks.split("|", 1)[0].strip().upper()
+                live_under.add(und)
+                log_pos = log_positions.get(und, {})
+                pos["log_open_missing"] = und not in log_positions
+                if not pos.get("tag") and log_pos.get("tag"):
+                    pos["tag"] = log_pos.get("tag", "")
+                if pos.get("cost", 0.0) <= 0 and float(log_pos.get("cost", 0.0) or 0.0) > 0:
+                    pos["cost"] = float(log_pos.get("cost", 0.0) or 0.0)
+                if pd.isna(pos.get("entry_fill_spread_pct", np.nan)) and pd.notna(
+                    log_pos.get("entry_fill_spread_pct", np.nan)
+                ):
+                    pos["entry_fill_spread_pct"] = float(log_pos.get("entry_fill_spread_pct"))
+            stale_log_symbols = sorted(set(log_positions.keys()) - live_under)
+            broker_only_symbols = sorted(live_under - set(log_positions.keys()))
+            open_positions = finalize_realtime_positions_for_dashboard(live_positions, current_mode)
             skipped = int(live_meta.get("skipped_unconfirmed", 0) or 0)
             if stale_log_symbols or broker_only_symbols or skipped:
                 parts = []
@@ -3250,9 +3829,16 @@ def _load_trade_snapshot_context(query_date):
                     parts.append(f"adopted OMS live-only: {', '.join(broker_only_symbols[:6])}")
                 if skipped:
                     parts.append(f"ignored unconfirmed pending: {skipped}")
-                ctx["captions"].append("Current positions use `oms:live_positions` in realtime; " + " | ".join(parts))
+                ctx["captions"].append(
+                    "Current positions use `oms:live_positions` + IBKR contract legs when present; "
+                    + " | ".join(parts)
+                )
         else:
-            ctx["captions"].append("OMS live position projection is stale/unavailable; falling back to trade-log reconstruction.")
+            ctx["captions"].append(
+                "OMS live position projection is stale/unavailable; falling back to trade-log reconstruction "
+                "and IBKR per-contract snapshot when present."
+            )
+            open_positions = finalize_realtime_positions_for_dashboard(open_positions, current_mode)
     ctx.update({
         "df_all": df_all,
         "open_positions": open_positions,
@@ -3263,7 +3849,6 @@ def _load_trade_snapshot_context(query_date):
     return ctx
 
 
-@st.fragment(run_every=3)
 def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
     ctx = _load_trade_snapshot_context(query_date)
     if ctx.get("error"):
@@ -3303,23 +3888,28 @@ def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
         return_meta=True,
     )
     live_cap = float(live_cap or 0.0)
-    effective_display_cash = float(display_cash or 0.0)
+    oms_display_cash = float(display_cash or 0.0)
     cash_cap_caption = f"source: {cash_source}"
-    if str(ctx.get("mode", "") or "").upper() == "REALTIME" and live_cap > 0.0:
-        cap_remaining = max(0.0, live_cap - _calc_auto_open_notional_from_redis(r))
-        effective_display_cash = min(effective_display_cash, cap_remaining)
-        cash_cap_caption = f"source: {cash_source} | cap remaining ${cap_remaining:,.0f} of ${live_cap:,.0f}"
 
     rows = []
     unrealized_pnl = 0.0
     total_market_value = 0.0
-    for sym, pos in open_positions.items():
+    total_entry_deployed = 0.0
+    for pos_key, pos in open_positions.items():
+        underlying = str(pos.get("symbol") or "").strip().upper()
+        if not underlying:
+            pks = (
+                pos_key.decode("utf-8", errors="ignore")
+                if isinstance(pos_key, (bytes, bytearray))
+                else str(pos_key)
+            )
+            underlying = pks.split("|", 1)[0].strip().upper()
         tag = str(pos.get('tag', '') or '').strip().upper()
         if tag not in TAG_TO_INDEX:
             opt_type = str(pos.get('opt_type', '') or '').strip().lower()
             direction = int(pos.get('position', 0) or 0)
             tag = 'CALL_ATM' if opt_type == 'call' or direction == 1 else ('PUT_ATM' if opt_type == 'put' or direction == -1 else '')
-        quote = _get_bucket_quote_and_contract(sym, tag) or {}
+        quote = _get_live_quote_for_position(underlying, tag, pos)
         live_price = float(quote.get("mid", 0.0) or pos.get("last_opt_price", 0.0) or pos.get("cost", 0.0) or 0.0)
         cost = float(pos.get("cost", 0.0) or 0.0)
         qty = float(pos.get("qty", 0.0) or 0.0)
@@ -3330,19 +3920,29 @@ def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
         pos['roi_pct'] = roi_pct
         unrealized_pnl += paper_pnl
         total_market_value += market_value
+        total_entry_deployed += cost * qty * 100
         entry_spread_pct = pd.to_numeric(pos.get("entry_fill_spread_pct", np.nan), errors='coerce')
-        rows.append((sym, tag, qty, cost, live_price, market_value, paper_pnl, roi_pct, entry_spread_pct, pos))
+        rows.append((underlying, tag, qty, cost, live_price, market_value, paper_pnl, roi_pct, entry_spread_pct, pos))
+
+    if live_cap > 0.0:
+        remaining_for_metric = max(0.0, live_cap - total_entry_deployed)
+        cash_cap_caption = (
+            f"${live_cap:,.0f} cap − ${total_entry_deployed:,.0f} 开仓占用 "
+            f"| OMS ledger ${oms_display_cash:,.2f} ({cash_source})"
+        )
+    else:
+        remaining_for_metric = oms_display_cash
 
     st.write("##### 📈 Intraday Performance")
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Realized PnL (Closed)", f"${float(ctx['closed_pnl']):.2f}")
     m2.metric("Unrealized PnL (Open)", f"${unrealized_pnl:.2f}")
     m3.metric("Total Market Value", f"${total_market_value:,.0f}")
-    m4.metric("Remaining Cash", f"${effective_display_cash:,.2f}")
+    m4.metric("Remaining Cash", f"${remaining_for_metric:,.2f}")
     m4.caption(cash_cap_caption)
     win_rate = (ctx["wins"] / (ctx["wins"] + ctx["losses"]) * 100) if (ctx["wins"] + ctx["losses"]) > 0 else 0
     m5.metric("Win Rate", f"{win_rate:.1f}%", f"{ctx['wins']}W / {ctx['losses']}L")
-    m6.metric("Open Positions", f"{len(open_positions)} Symbols")
+    m6.metric("Open Positions", f"{len(open_positions)}")
 
     broker_net_liq, broker_avail = fetch_live_broker_balance()
     broker_cols = st.columns(4)
@@ -3388,6 +3988,8 @@ def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
                 )
                 close_enabled = confirm_close.strip().upper() == "CLOSE"
                 st.caption("右侧 `请求平仓` 通过 OMS 复用 execution_engine_v8 的 SELL 链路。")
+                if not close_enabled:
+                    st.info("请先在上方的密码框中输入 **`CLOSE`**（全大写），「请求平仓」按钮才会启用。")
             else:
                 close_msg_prefix = _quick_order_message_prefix(_build_quick_order_route_status(r))
             ratios = [0.8, 1.0, 1.0, 0.7, 0.9, 0.9, 1.0, 1.1, 1.1, 0.9, 1.3] if show_close else [0.8, 1.0, 1.0, 0.7, 0.9, 0.9, 1.0, 1.1, 1.1, 0.9]
@@ -3398,24 +4000,30 @@ def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
             for col, label in zip(headers, labels):
                 col.markdown(label)
             st.divider()
-            for sym, tag, qty, cost, live_price, mv, pnl, roi_pct, entry_spread_pct, pos in rows:
+            for underlying, tag, qty, cost, live_price, mv, pnl, roi_pct, entry_spread_pct, pos in rows:
                 cols = st.columns(ratios)
                 pnl_color = "#00CC96" if pnl > 0 else ("#EF553B" if pnl < 0 else "#AAAAAA")
                 roi_color = "#00CC96" if roi_pct > 0 else ("#EF553B" if roi_pct < 0 else "#AAAAAA")
                 spread_text = f"{entry_spread_pct:+.1f}%" if pd.notna(entry_spread_pct) else "N/A"
                 contract_id = str(pos.get("contract_id", "") or "")
+                tag_show = (
+                    f"{tag} · {contract_id}"
+                    if (tag and contract_id)
+                    else (tag or contract_id or "—")
+                )
+                row_key_suffix = str(pos.get("contract_con_id") or "").strip() or str(abs(hash(contract_id)))
                 protect_default = bool(pos.get("log_open_missing", False))
-                protect_key = f"{key_prefix}_manual_protect_{sym}_{abs(hash(contract_id))}"
+                protect_key = f"{key_prefix}_manual_protect_{underlying}_{row_key_suffix}"
                 protected = cols[0].checkbox(
                     "手动",
-                    value=fetch_manual_exit_protect(sym, contract_id, default=protect_default),
+                    value=fetch_manual_exit_protect(underlying, contract_id, default=protect_default),
                     key=protect_key,
                     help="勾选后禁止策略自动平仓；仍可点击右侧“请求平仓”手动退出。",
                     label_visibility="collapsed",
                 )
-                set_manual_exit_protect(sym, contract_id, protected)
-                cols[1].markdown(f"**{sym}**")
-                cols[2].write(tag)
+                set_manual_exit_protect(underlying, contract_id, protected)
+                cols[1].markdown(f"**{underlying}**")
+                cols[2].write(tag_show)
                 cols[3].write(f"{qty:.0f}")
                 cols[4].write(f"${cost:.2f}")
                 cols[5].write(f"${live_price:.2f}")
@@ -3424,17 +4032,23 @@ def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
                 cols[8].markdown(f"<span style='color:{pnl_color}'>${pnl:,.2f}</span>", unsafe_allow_html=True)
                 cols[9].markdown(f"<span style='color:{roi_color}'>{roi_pct:+.2f}%</span>", unsafe_allow_html=True)
                 if show_close:
-                    pos_dir = int(pos.get("position", 0) or (1 if str(tag).startswith("CALL") else -1))
+                    tag_eff = str(tag or "").strip().upper()
+                    pos_dir = int(pos.get("position", 0) or 0)
+                    if pos_dir == 0:
+                        if tag_eff.startswith("CALL"):
+                            pos_dir = 1
+                        elif tag_eff.startswith("PUT"):
+                            pos_dir = -1
                     qty_val = float(pos.get("qty", 0.0) or 0.0)
                     if cols[10].button(
                         "请求平仓",
-                        key=f"{key_prefix}_oms_manual_close_{sym}",
+                        key=f"{key_prefix}_oms_manual_close_{underlying}_{row_key_suffix}",
                         disabled=(not close_enabled) or pos_dir == 0 or qty_val <= 0,
                         type="primary" if close_enabled else "secondary",
                         use_container_width=True,
                     ):
                         ok, msg = submit_oms_manual_close(
-                            sym,
+                            underlying,
                             pos_dir,
                             qty_val,
                             ref_price=float(live_price or pos.get("last_opt_price", 0.0) or pos.get("cost", 0.0) or 0.01),
@@ -3443,10 +4057,11 @@ def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
                             tag=tag,
                         )
                         if ok:
-                            st.success(f"{close_msg_prefix} {sym} manual close request sent to OMS: {msg}")
+                            st.session_state["_dash_skip_next_auto_sleep"] = True
+                            st.success(f"{close_msg_prefix} {underlying} manual close request sent to OMS: {msg}")
                             st.rerun()
                         else:
-                            st.error(f"{close_msg_prefix} {sym} manual close request failed: {msg}")
+                            st.error(f"{close_msg_prefix} {underlying} manual close request failed: {msg}")
     else:
         st.info("No open positions for current mode/date.")
 
@@ -3459,10 +4074,19 @@ def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
     df_trade['paper_pnl'] = np.nan
     df_trade['paper_roi'] = np.nan
     for idx, row in df_trade.iterrows():
-        if row.get('action') == 'OPEN' and row.get('symbol') in open_positions:
+        if row.get('action') == 'OPEN':
             sym = row['symbol']
-            df_trade.at[idx, 'paper_pnl'] = open_positions[sym].get('paper_pnl', 0.0)
-            df_trade.at[idx, 'paper_roi'] = open_positions[sym].get('roi_pct', 0.0) / 100.0
+            pp = None
+            if sym in open_positions:
+                pp = open_positions[sym]
+            else:
+                for _pk, op in open_positions.items():
+                    if str(op.get("symbol") or "").strip().upper() == str(sym).strip().upper():
+                        pp = op
+                        break
+            if pp is not None:
+                df_trade.at[idx, 'paper_pnl'] = pp.get('paper_pnl', 0.0)
+                df_trade.at[idx, 'paper_roi'] = pp.get('roi_pct', 0.0) / 100.0
     display_cols = ['time', 'symbol', 'tag', 'action', 'qty', 'fill_spread_pct', 'fill_bid', 'fill_ask', 'fill_duration', 'fill_ratio', 'account_cash', 'price', 'paper_pnl', 'paper_roi', 'pnl', 'roi', 'stock_price', 'entry_stock', 'mode', 'alpha', 'reason']
     final_cols = [c for c in display_cols if c in df_trade.columns]
     st.dataframe(
@@ -3476,11 +4100,111 @@ def _render_trade_snapshot_tables(query_date, key_prefix="trade_snapshot"):
     )
 
 
+def _set_tab1_buy_feedback(ok: bool, symbol: str, tag: str, qty: int, msg: str):
+    st.session_state["tab1_buy_feedback"] = {
+        "ok": bool(ok),
+        "symbol": str(symbol or "").strip().upper(),
+        "tag": str(tag or ""),
+        "qty": int(qty or 0),
+        "msg": str(msg or ""),
+    }
+def _render_tab1_buy_feedback_banner():
+    fb = st.session_state.get("tab1_buy_feedback")
+    if not fb:
+        return
+    ny_ts = datetime.now(NY_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    with st.container(border=True):
+        if fb.get("ok"):
+            st.success(
+                f"买入请求已由 OMS 受理 · **{fb.get('symbol')}** `{fb.get('tag')}` × **{fb.get('qty')}** · {fb.get('msg')}"
+            )
+        else:
+            st.error(f"买入未完成 · **{fb.get('symbol')}** `{fb.get('tag')}` · {fb.get('msg')}")
+        st.caption(
+            f"提示时间 **美东 {ny_ts} ET**。请在 IBKR TWS / 网关核对挂单与成交。"
+        )
+        if st.button("清除此提示", key="tab1_buy_feedback_clear"):
+            st.session_state.pop("tab1_buy_feedback", None)
+            st.rerun()
+
+
+def _load_recent_oms_order_states(symbol: str = "", limit: int = 8) -> pd.DataFrame:
+    """Recent async OMS order outcomes for first-tab manual order visibility."""
+    sym = str(symbol or "").strip().upper()
+    try:
+        conn = psycopg2.connect(PG_DB_URL)
+        params = [OMS_STATE_NAMESPACE]
+        where = "namespace = %s"
+        if sym:
+            where += " AND symbol = %s"
+            params.append(sym)
+        params.append(int(limit))
+        df = pd.read_sql_query(
+            f"""
+            SELECT order_key, symbol, intent, status, is_terminal, updated_at, data
+            FROM oms_order_state
+            WHERE {where}
+            ORDER BY updated_at DESC
+            LIMIT %s
+            """,
+            conn,
+            params=tuple(params),
+        )
+        conn.close()
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+
+    rows = []
+    for item in df.to_dict("records"):
+        try:
+            data = json.loads(item.get("data") or "{}")
+        except Exception:
+            data = {}
+        updated_at = float(item.get("updated_at", 0.0) or 0.0)
+        try:
+            updated_ny = datetime.fromtimestamp(updated_at, NY_TZ).strftime("%H:%M:%S")
+        except Exception:
+            updated_ny = ""
+        rows.append({
+            "time_et": updated_ny,
+            "symbol": item.get("symbol", ""),
+            "intent": item.get("intent", ""),
+            "status": item.get("status", ""),
+            "filled": f"{int(data.get('filled_qty', 0) or 0)}/{int(data.get('target_qty', 0) or 0)}",
+            "remaining": int(data.get("remaining_qty", 0) or 0),
+            "limit": float(data.get("limit_price", 0.0) or 0.0),
+            "broker_status": data.get("broker_status", ""),
+            "broker_order_id": data.get("broker_order_id", ""),
+            "terminal": bool(item.get("is_terminal", False)),
+        })
+    return pd.DataFrame(rows)
+
+
+def _render_tab1_oms_order_status(symbol: str):
+    df = _load_recent_oms_order_states(symbol, limit=8)
+    if df.empty:
+        return
+    latest = df.iloc[0].to_dict()
+    latest_status = str(latest.get("status", "") or "").upper()
+    latest_filled = str(latest.get("filled", "0/0") or "0/0")
+    bad_status = latest_status in {"CANCELLED", "ERROR", "REJECTED", "INACTIVE", "API_CANCELLED"} and latest_filled.startswith("0/")
+    with st.expander("最近 OMS 订单状态", expanded=bad_status):
+        if bad_status:
+            st.error(
+                f"最近 {symbol} 订单终态为 {latest_status}，成交 {latest_filled}，"
+                f"broker_status={latest.get('broker_status') or 'N/A'}。"
+            )
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
 # --- Main: Tabs ---
-tab1, tab10, tab2, tab11, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab_sh, tab_gates = st.tabs([
-    "📈 Market Feed", 
-    "🏦 Positions",
-    "📜 History & Replay", 
+tab1, tab_oms_ledger, tab10, tab2, tab11, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab_sh, tab_gates = st.tabs([
+    "📈 Market Feed",
+    "📊 OMS 持仓 / 成交",
+    "🏦 IBKR Positions",
+    "📜 History & Replay",
     "Live Features",
     "🧠 Feature Heatmap", 
     "🏥 Model Health (IC)", 
@@ -3563,10 +4287,33 @@ with tab1:
         expected_modes=[RUN_MODE],
         return_meta=True,
     )
-    sym_pos = quick_positions.get(symbol, {}) if (is_live_chart_date and quick_meta.get("fresh")) else {}
+    sym_pos = (
+        lookup_oms_position_for_underlying(quick_positions, symbol)
+        if (is_live_chart_date and quick_meta.get("fresh"))
+        else {}
+    )
     quick_route_status = _build_quick_order_route_status(r)
     if is_live_chart_date:
         _render_quick_order_route_status(quick_route_status)
+        ae_now = fetch_strategy_auto_entry_enabled(r)
+        ae_cols = st.columns([1, 4])
+        with ae_cols[0]:
+            ae_chk = st.checkbox(
+                "允许策略自动开仓",
+                value=ae_now,
+                key="dash_strategy_auto_entry",
+                help="关闭后 OMS 不执行 ALPHA_FRAME 触发的策略建仓；K 线图 / 控制台手动开仓仍可用。写入 Redis meta:strategy_auto_entry。",
+            )
+        with ae_cols[1]:
+            st.caption(
+                f"手动模式={'否' if ae_chk else '是（仅手动下单）'} · "
+                f"config STRATEGY_AUTO_ENTRY_ENABLED={'开' if STRATEGY_AUTO_ENTRY_ENABLED else '关'} · "
+                "Redis 未写字段时以 config 为准"
+            )
+        if ae_chk != ae_now:
+            set_strategy_auto_entry_enabled(r, ae_chk)
+            st.success("已同步策略自动开仓开关至 Redis（OMS 即时读取）")
+            st.rerun()
     else:
         st.info("Historical chart mode: 下单控件禁用，不会提交 OMS 请求。")
     quick_msg_prefix = _quick_order_message_prefix(quick_route_status)
@@ -3579,6 +4326,7 @@ with tab1:
         }
         if is_live_chart_date else {}
     )
+    order_session_hint = fetch_order_session_hint_for_manual_buy(r) if is_live_chart_date else {}
 
     def _position_matches_tag(pos, tag):
         if not pos:
@@ -3590,6 +4338,15 @@ with tab1:
     if df_candle.empty:
         st.info(f"No minute stock bars found for {symbol} on {tab1_date}.")
     elif not use_plotly_fallback:
+        if is_live_chart_date and order_session_hint:
+            src = order_session_hint.get("session_source") or ""
+            src_zh = "Redis meta:global_gates" if src == "redis" else "本机美东时钟 + strategy_config"
+            st.caption(
+                f"策略时段（{src_zh}）· 美东 **{order_session_hint.get('now_ny', '--')} ET** · "
+                f"{order_session_hint.get('session_zh', '')} · {order_session_hint.get('schedule_line', '')}"
+            )
+            if order_session_hint.get("cb_note"):
+                st.caption(order_session_hint["cb_note"])
         init_leaders = None
         if is_live_chart_date and realtime_ws_ui:
             ld_long, ld_short, ld_stats = load_momentum_leaderboard(max_symbols=5)
@@ -3606,6 +4363,7 @@ with tab1:
             websocket_url=_kline_ws_url(symbol) if (is_live_chart_date and realtime_ws_ui) else "",
             initial_leaders=init_leaders,
             default_moneyness=TRADE_OPTION_MONEYNESS,
+            order_session=order_session_hint,
         )
         if isinstance(chart_event, dict) and chart_event.get("nonce"):
             action = str(chart_event.get("action", "") or "").lower()
@@ -3627,7 +4385,11 @@ with tab1:
                     tag = str(chart_event.get("tag", "") or "").upper()
                     side_label = "CALL" if str(tag).startswith("CALL") else "PUT"
                     quote = _get_bucket_quote_and_contract(event_symbol, tag) or quote_map.get(tag, {}) or {}
-                    event_pos = quick_positions.get(event_symbol, {}) if quick_meta.get("fresh") else {}
+                    event_pos = (
+                        lookup_oms_position_for_underlying(quick_positions, event_symbol)
+                        if quick_meta.get("fresh")
+                        else {}
+                    )
                     if action == "close":
                         pos_dir = int(
                             event_pos.get("position", 1 if str(tag).startswith("CALL") else -1)
@@ -3645,6 +4407,7 @@ with tab1:
                             tag=tag,
                         )
                         if ok:
+                            st.session_state["_dash_skip_next_auto_sleep"] = True
                             st.success(f"{quick_msg_prefix} {event_symbol} {side_label} close request sent: {msg}")
                             st.rerun()
                         else:
@@ -3660,6 +4423,7 @@ with tab1:
                             stock_price=tab1_latest_stock_price,
                             manual_exit_protect=manual_protect,
                         )
+                        _set_tab1_buy_feedback(ok, event_symbol, tag, event_qty, msg)
                         if ok:
                             st.success(f"{quick_msg_prefix} {msg}")
                             st.rerun()
@@ -3747,7 +4511,14 @@ with tab1:
                 )
                 if has_position:
                     st.button(f"{side_label} 已持仓", key=f"tab1_{tag}_held_{symbol}", disabled=True, use_container_width=True)
-                    if st.button(f"平仓 {side_label}", key=f"tab1_close_{tag}_{symbol}", type="primary", use_container_width=True):
+                    close_roi = 0.0
+                    try:
+                        _cost = float(sym_pos.get("cost", 0.0) or 0.0)
+                        _live = float(quote.get("mid", 0.0) or sym_pos.get("last_opt_price", 0.0) or _cost or 0.0)
+                        close_roi = ((_live / _cost) - 1) * 100 if _cost > 0 else 0.0
+                    except Exception:
+                        close_roi = 0.0
+                    if st.button(f"平仓 {side_label} {close_roi:+.1f}%", key=f"tab1_close_{tag}_{symbol}", type="primary", use_container_width=True):
                         pos_dir = int(sym_pos.get("position", 1 if str(tag).startswith("CALL") else -1) or (1 if str(tag).startswith("CALL") else -1))
                         qty_val = float(sym_pos.get("qty", 0.0) or 0.0)
                         ref_price = float(quote.get("mid", 0.0) or sym_pos.get("last_opt_price", 0.0) or sym_pos.get("cost", 0.0) or 0.01)
@@ -3761,6 +4532,7 @@ with tab1:
                             tag=tag,
                         )
                         if ok:
+                            st.session_state["_dash_skip_next_auto_sleep"] = True
                             st.success(f"{quick_msg_prefix} {symbol} {side_label} close request sent: {msg}")
                             st.rerun()
                         else:
@@ -3785,15 +4557,16 @@ with tab1:
                             stock_price=tab1_latest_stock_price,
                             manual_exit_protect=fallback_manual_protect,
                         )
+                        _set_tab1_buy_feedback(ok, symbol, tag, int(quick_qty), msg)
                         if ok:
                             st.success(f"{quick_msg_prefix} {msg}")
                             st.rerun()
                         else:
                             st.error(f"{quick_msg_prefix} {msg}")
 
-    st.divider()
-    st.subheader("Live Positions & Recent Trades")
-    _render_trade_snapshot_tables(tab1_date, key_prefix=f"tab1_{symbol}_{tab1_date}")
+    _render_tab1_buy_feedback_banner()
+    if is_live_chart_date:
+        _render_tab1_oms_order_status(symbol)
 
     st.divider()
     st.subheader("Option Chain Matrix")
@@ -3929,7 +4702,26 @@ with tab1:
     else:
         st.info(f"⏳ No option price history found for {symbol} on {tab1_date}.")
 
-# === [Tab 10] 🏦 Positions & Orders ===
+# === OMS 实时持仓 + 历史成交（独立 tab，与 Market Feed 上 WS K 线分区） ===
+with tab_oms_ledger:
+    st.header("📊 OMS 实时持仓与历史成交")
+    st.caption(
+        "合并 Redis `oms:live_positions`、`oms:broker_opt_legs` 与当日 trade log；"
+        "与「📈 Market Feed」分页展示，避免 K 线 WebSocket 与持仓表控件在同一竖屏交织。"
+    )
+    today_ny_ledger = datetime.now(NY_TZ).date()
+    oms_ledger_date = st.date_input(
+        "快照日期",
+        value=today_ny_ledger,
+        max_value=today_ny_ledger,
+        key="oms_ledger_trade_snap_date",
+    )
+    _render_trade_snapshot_tables(
+        oms_ledger_date,
+        key_prefix=f"oms_ledger_{oms_ledger_date}_{RUN_MODE}",
+    )
+
+# === [Tab 10] 🏦 IBKR Positions & Orders ===
 with tab10:
     st.header("🏦 Active Positions & IBKR Account")
     st.markdown("Retrieve live positions directly from IBKR Gateway and force close positions if needed.")
@@ -3962,6 +4754,7 @@ with tab10:
         return False, None, f"{last_err} (tried clientId={tried})"
 
     def fetch_ibkr_positions():
+        _ensure_asyncio_loop_for_ib_insync_import()
         import ib_insync
         ib = ib_insync.IB()
         try:
@@ -3986,6 +4779,7 @@ with tab10:
         批量平仓：单次连接、逐笔下单，返回每笔结果。
         position_rows: [{'Account','Contract','Symbol','Qty','_RawContract'}, ...]
         """
+        _ensure_asyncio_loop_for_ib_insync_import()
         import ib_insync
         ib = ib_insync.IB()
         results = []
@@ -4051,6 +4845,7 @@ with tab10:
         按 symbol + bucket tag（CALL_ATM / PUT_ATM）下手动单。
         合约来源：contract_locks；价格来源：当前快照 mid/bid/ask（仅用于展示与估算）。
         """
+        _ensure_asyncio_loop_for_ib_insync_import()
         import ib_insync
         qty = int(qty or 0)
         if qty <= 0:
@@ -4406,20 +5201,6 @@ with tab10:
                     use_container_width=True,
                     hide_index=True
                 )
-
-        st.subheader("Pending Orders")
-        df_pending = fetch_live_pending_orders()
-        if df_pending.empty:
-            st.info("No active OMS pending orders.")
-        else:
-            display_cols = [
-                "symbol", "intent", "side", "status",
-                "target_qty", "filled_qty", "remaining_qty",
-                "limit_price", "retry_count", "reserved_cash",
-                "slot_reserved", "broker_status", "updated_at_ny", "reason",
-            ]
-            exist_cols = [c for c in display_cols if c in df_pending.columns]
-            st.dataframe(df_pending[exist_cols], use_container_width=True, hide_index=True)
 
         st.subheader("Active Positions")
         if not portfolio:
@@ -4789,15 +5570,21 @@ with tab5:
                             return_meta=True,
                         )
                         if live_positions_meta.get("fresh"):
-                            stale_log_symbols = sorted(set(log_open_positions) - set(live_open_positions))
-                            broker_only_symbols = sorted(set(live_open_positions) - set(log_open_positions))
-                            for sym, pos in live_open_positions.items():
-                                log_pos = log_open_positions.get(sym, {})
+                            live_under = set()
+                            for pk, pos in live_open_positions.items():
+                                und = str(pos.get("symbol") or "").strip().upper()
+                                if not und:
+                                    pks = pk.decode("utf-8", errors="ignore") if isinstance(pk, (bytes, bytearray)) else str(pk)
+                                    und = pks.split("|", 1)[0].strip().upper()
+                                live_under.add(und)
+                                log_pos = log_open_positions.get(und, {})
                                 if not pos.get('tag') and log_pos.get('tag'):
                                     pos['tag'] = log_pos.get('tag', '')
                                 if pos.get('cost', 0.0) <= 0 and float(log_pos.get('cost', 0.0) or 0.0) > 0:
                                     pos['cost'] = float(log_pos.get('cost', 0.0) or 0.0)
-                            open_positions = live_open_positions
+                            stale_log_symbols = sorted(set(log_open_positions.keys()) - live_under)
+                            broker_only_symbols = sorted(live_under - set(log_open_positions.keys()))
+                            open_positions = finalize_realtime_positions_for_dashboard(live_open_positions, current_mode)
                             skipped_unconfirmed = int(live_positions_meta.get("skipped_unconfirmed", 0) or 0)
                             if stale_log_symbols or broker_only_symbols or skipped_unconfirmed:
                                 parts = []
@@ -4807,9 +5594,16 @@ with tab5:
                                     parts.append(f"adopted OMS live-only: {', '.join(broker_only_symbols[:6])}")
                                 if skipped_unconfirmed:
                                     parts.append(f"ignored unconfirmed pending: {skipped_unconfirmed}")
-                                st.caption("Current positions use `oms:live_positions` in realtime; " + " | ".join(parts))
+                                st.caption(
+                                    "Current positions use `oms:live_positions` + IBKR contract legs when present; "
+                                    + " | ".join(parts)
+                                )
                         else:
-                            st.caption("OMS live position projection is stale/unavailable; falling back to trade-log reconstruction.")
+                            open_positions = finalize_realtime_positions_for_dashboard(open_positions, current_mode)
+                            st.caption(
+                                "OMS live position projection is stale/unavailable; falling back to trade-log reconstruction "
+                                "and IBKR per-contract snapshot when present."
+                            )
 
                     # NOTE: Trade Log 上面那张 "Current Positions" + 平仓按钮已迁移到
                     # Intraday Performance（持仓表内嵌"请求平仓"列），此处不再重复渲染。
@@ -4972,12 +5766,12 @@ with tab5:
                         exist_cols = [c for c in timing_cols if c in open_df.columns]
                         st.dataframe(open_df[exist_cols], use_container_width=True)
 
-                # ✅ 3+4. Live Price 流式刷新卡片 (独立每 3s 自动更新，不需全页刷新)
-                @st.fragment(run_every=3)
+                # Live Price 卡片（嵌套函数保留备用；当前未 invoke，避免 fragment 内按钮与整页 rerun 不一致）
                 def _live_price_card(open_positions, closed_pnl, wins, losses):
                     from config import TAG_TO_INDEX
                     unrealized_pnl = 0.0
                     total_market_value = 0.0
+                    total_entry_deployed = 0.0
                     # [新增] 优先从数据库读取最新现金，无果则从流水尝试
                     latest_cash = fetch_latest_mock_cash()
                     paper_details = []
@@ -5074,7 +5868,8 @@ with tab5:
                             unrealized_pnl += paper_pnl_sym
                             market_value_sym = live_price * pos['qty'] * 100
                             total_market_value += market_value_sym
-                            
+                            total_entry_deployed += float(pos.get('cost', 0.0) or 0.0) * float(pos.get('qty', 0.0) or 0.0) * 100
+
                             roi_pct = ((live_price / pos['cost']) - 1) * 100 if pos['cost'] > 0 else 0
                             pos['paper_pnl'] = paper_pnl_sym
                             pos['roi_pct'] = roi_pct
@@ -5085,16 +5880,7 @@ with tab5:
                                 'Paper PnL ($)': round(paper_pnl_sym, 2), 'ROI (%)': round(roi_pct, 2)
                             })
 
-                    # 大屏指标
-                    st.write("##### 📈 Intraday Performance")
-                    c1, c2, c3, c4, c5, c6 = st.columns(6)
-                    c1.metric("Realized PnL (Closed)", f"${closed_pnl:.2f}")
-                    c2.metric("Unrealized PnL (Open)", f"${unrealized_pnl:.2f}")
-                    c3.metric("Total Market Value", f"${total_market_value:,.0f}")
-                    
-                    # 显示剩余现金
-                    # 实时/空跑模式下，OMS Redis 账本是唯一权威现金源；Trade Log 只做审计展示，
-                    # 不能作为实时现金兜底，否则旧回放/旧空跑日志会把 Remaining Cash 顶高。
+                    # 剩余现金：启用 Live Trading Cap 时为 cap − 开仓入场占用（cost×qty×100），不随市价波动。
                     live_cash, live_cash_source = fetch_live_oms_cash(
                         max_age_sec=120.0,
                         allow_stale=False,
@@ -5116,9 +5902,32 @@ with tab5:
                         latest_cash=latest_cash,
                         run_mode=RUN_MODE,
                     )
-                    c4.metric("Remaining Cash", f"${display_cash:,.2f}")
-                    c4.caption(f"source: {cash_source}")
-                    
+                    live_cap, live_cap_meta = get_runtime_live_trading_capital_limit(
+                        default_value=LIVE_TRADING_CAPITAL_LIMIT,
+                        r=r,
+                        return_meta=True,
+                    )
+                    live_cap = float(live_cap or 0.0)
+                    oms_display_cash_frag = float(display_cash or 0.0)
+                    if live_cap > 0.0:
+                        remaining_metric_frag = max(0.0, live_cap - total_entry_deployed)
+                        rem_caption_frag = (
+                            f"${live_cap:,.0f} cap − ${total_entry_deployed:,.0f} 开仓占用 "
+                            f"| OMS ledger ${oms_display_cash_frag:,.2f} ({cash_source})"
+                        )
+                    else:
+                        remaining_metric_frag = oms_display_cash_frag
+                        rem_caption_frag = f"source: {cash_source}"
+
+                    # 大屏指标
+                    st.write("##### 📈 Intraday Performance")
+                    c1, c2, c3, c4, c5, c6 = st.columns(6)
+                    c1.metric("Realized PnL (Closed)", f"${closed_pnl:.2f}")
+                    c2.metric("Unrealized PnL (Open)", f"${unrealized_pnl:.2f}")
+                    c3.metric("Total Market Value", f"${total_market_value:,.0f}")
+                    c4.metric("Remaining Cash", f"${remaining_metric_frag:,.2f}")
+                    c4.caption(rem_caption_frag)
+
                     win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
                     c5.metric("Win Rate", f"{win_rate:.1f}%", f"{wins}W / {losses}L")
                     c6.metric("Open Positions", f"{len(open_positions)} Symbols")
@@ -5129,12 +5938,6 @@ with tab5:
                         r=r,
                         return_meta=True,
                     )
-                    live_cap, live_cap_meta = get_runtime_live_trading_capital_limit(
-                        default_value=LIVE_TRADING_CAPITAL_LIMIT,
-                        r=r,
-                        return_meta=True,
-                    )
-                    live_cap = float(live_cap or 0.0)
                     broker_cols = st.columns(4)
                     broker_cols[0].metric(
                         "Broker Balance",
@@ -5181,6 +5984,8 @@ with tab5:
                                 st.caption(
                                     "右侧 `请求平仓` 按钮通过 OMS 复用执行引擎的 LMT 成交优先 + 重试 + MKT fallback 路径。"
                                 )
+                                if not intraday_close_enabled:
+                                    st.info("请先在上方的密码框中输入 **`CLOSE`**（全大写），「请求平仓」按钮才会启用。")
 
                             # 列宽对齐 Symbol / Tag / Qty / Cost / Live / MV / Paper PnL / ROI / Action
                             if show_close_button:
@@ -5226,11 +6031,21 @@ with tab5:
                                 )
                                 if show_close_button:
                                     pos = open_positions.get(sym, {}) or {}
+                                    tag_eff = str(row.get("Tag", "") or pos.get("tag", "") or "").strip().upper()
                                     pos_dir = int(pos.get("position", 0) or 0)
+                                    if pos_dir == 0:
+                                        pos_dir = (
+                                            1
+                                            if tag_eff.startswith("CALL")
+                                            else (-1 if tag_eff.startswith("PUT") else 0)
+                                        )
                                     qty_val = float(pos.get("qty", 0.0) or 0.0)
+                                    row_key_ix = str(pos.get("contract_con_id") or "").strip() or str(
+                                        abs(hash(str(pos.get("contract_id", "") or "")))
+                                    )
                                     if row_cols[8].button(
                                         "请求平仓",
-                                        key=f"intraday_oms_manual_close_{sym}",
+                                        key=f"intraday_oms_manual_close_{sym}_{row_key_ix}",
                                         disabled=(not intraday_close_enabled) or pos_dir == 0 or qty_val <= 0,
                                         type="primary" if intraday_close_enabled else "secondary",
                                         use_container_width=True,
@@ -5246,12 +6061,16 @@ with tab5:
                                             tag=str(row.get('Tag', '') or pos.get('tag', '') or ''),
                                         )
                                         if ok:
+                                            st.session_state["_dash_skip_next_auto_sleep"] = True
                                             st.success(f"{sym} manual close request sent to OMS: {msg}")
                                             st.rerun()
                                         else:
                                             st.error(f"{sym} manual close request failed: {msg}")
 
-                st.caption("实时持仓表和最近交易记录已移动到第一个 tab 的 K 线下方；Trade Log 保留执行质量和缺失交易分析。")
+                st.caption(
+                    "OMS 实时持仓与当日成交明细请在「📊 OMS 持仓 / 成交」tab 查看；"
+                    "本页 Trade Log 侧重执行质量与缺失信号分析。"
+                )
 
                 # ✅ [New] 渲染 "缺失交易" (有信号但没成交)
                 st.divider()
@@ -6186,6 +7005,7 @@ with tab_sh:
 #   meta:gate_trace:{sym}    - SE 每次 decide_entry/check_exit 后写的决策链 (节流)
 #   meta:gate_counter:{YYYYMMDD} - SE 拦截累计计数, 按 NY 日
 #   meta:strategy_config     - SE 启动广播的 strategy_config0 参数快照
+#   meta:strategy_auto_entry - Dashboard 写的策略自动开仓开关 (OMS 读 enabled)
 # ======================================================================
 with tab_gates:
     st.header("🧬 策略门禁 (V0) — 规则 & 实时命中状态")
@@ -6401,7 +7221,8 @@ with tab_gates:
             st.error(f"读 strategy_config 失败: {_e}")
 
 
-# 自动刷新逻辑
+# 自动刷新：平仓成功后下一轮跳过 sleep（避免与按钮同一节奏抢跑），仍 rerun 保持循环
 if auto_refresh:
-    time.sleep(1)
+    if not st.session_state.pop("_dash_skip_next_auto_sleep", False):
+        time.sleep(1)
     st.rerun()

@@ -83,7 +83,6 @@ from config import (
     COMMISSION_PER_CONTRACT,    # 期权手续费 ($/手)
     OMS_SIGNAL_DELAY_BARS,
     OMS_SIGNAL_DELAY_ACTIONS,
-    IS_BACKTEST,
     IS_SIMULATED,
     IS_REALTIME_DRY,
     OMS_GUARD_STALE_QUOTES,
@@ -95,6 +94,8 @@ from config import (
     OMS_STATE_NAMESPACE,
     LIVE_TRADING_CAPITAL_LIMIT,
     PURE_ALPHA_REPLAY,
+    OMS_ENTRY_MIN_BATCH_SYMBOLS,
+    STRATEGY_AUTO_ENTRY_ENABLED,
 )
 from runtime_trading_controls import get_runtime_live_trading_capital_limit
 
@@ -156,6 +157,17 @@ EXIT_ORDER_TYPE = 'LMT' if TRADING_ENABLED else 'MKT'
 #
 # 注意: 这个结构并不拥有策略 / 执行 / 撮合逻辑, 它只是一个有契约的 payload.
 #       真正的"分钟边界一次 + 60 秒循环"编排在 ExecutionEngineV8.execute_window 里.
+#
+# [Realtime / S4 Parity — 必读]
+#   回放: s4_run_historical_replay_s2_1s.py → exec_engine.execute_window → 每分钟首帧 ALPHA，
+#        随后 quotes_1s 每秒 ingest_execution_second_sync（内部调用 _oms_execution_quote_tick）。
+#   实盘双引擎: StrategyCore 仅在 orch_trade_signals 的 ALPHA_FRAME 上跑；每秒 tight-exit 必须依赖
+#        fused_market_stream → OMS._process_fused_market_for_execution → **同一** _oms_execution_quote_tick。
+#        若 fused 路径只做缓存不跑 tight-exit，则回测「秒级风控」与实盘脱节，回撤曲线不可比。
+#   SYNC / drain_trade_signal_queue: 共享内存回放走 ingest 尾部；Redis 实盘通常另由 SE xadd SYNC，
+#        与 fused 消息的消费顺序取决于 Redis，属于架构约束而非 tight-exit 公式差异。
+#   开仓批次门控：OMS_ENTRY_MIN_BATCH_SYMBOLS（默认 10），BACKTEST/S4 与 REALTIME 共用，禁止单标的帧放行。
+#   秒级 tight-exit：默认无开仓保护秒数；正股连续反向 tick（CALL 下跌 / PUT 上涨）满 N 秒可先于阶梯平仓。
 # ============================================================================
 @dataclass
 class ExecutionWindow:
@@ -271,6 +283,10 @@ class SymbolState:
         self.second_exit_streak_reason = ""
         self.second_exit_streak_count = 0
         self.second_exit_last_ts = 0.0
+        # 秒级「正股瞬时方向 vs 持仓」连续反向计数（与 second_exit_streak_* 独立）
+        self.dir_opp_prev_stock = 0.0
+        self.dir_opp_prev_ts = 0.0
+        self.dir_opp_streak = 0
 
         self.prev_macd_hist = 0.0
         
@@ -357,6 +373,9 @@ class SymbolState:
             'second_exit_streak_reason': self.second_exit_streak_reason,
             'second_exit_streak_count': int(self.second_exit_streak_count),
             'second_exit_last_ts': float(self.second_exit_last_ts),
+            'dir_opp_prev_stock': float(getattr(self, 'dir_opp_prev_stock', 0.0) or 0.0),
+            'dir_opp_prev_ts': float(getattr(self, 'dir_opp_prev_ts', 0.0) or 0.0),
+            'dir_opp_streak': int(getattr(self, 'dir_opp_streak', 0) or 0),
 
             # [新增] 历史数据 Buffer 持久化
             'prices': list(self.prices),
@@ -426,6 +445,9 @@ class SymbolState:
         self.second_exit_streak_reason = str(data.get('second_exit_streak_reason', '') or '')
         self.second_exit_streak_count = _coerce_int(data.get('second_exit_streak_count', 0))
         self.second_exit_last_ts = _coerce_float(data.get('second_exit_last_ts', 0.0))
+        self.dir_opp_prev_stock = _coerce_float(data.get('dir_opp_prev_stock', 0.0))
+        self.dir_opp_prev_ts = _coerce_float(data.get('dir_opp_prev_ts', 0.0))
+        self.dir_opp_streak = _coerce_int(data.get('dir_opp_streak', 0))
         
         # [新增] 恢复 Buffer
         if 'prices' in data: self.prices = deque(data['prices'], maxlen=self.prices.maxlen)
@@ -1149,15 +1171,59 @@ class ExecutionEngineV8:
         st.second_exit_last_ts = float(curr_ts or 0.0)
         return int(st.second_exit_streak_count) >= threshold
 
+    def _reset_dir_opp_track(self, st) -> None:
+        st.dir_opp_prev_stock = 0.0
+        st.dir_opp_prev_ts = 0.0
+        st.dir_opp_streak = 0
+
+    def _stock_dir_opposite_exit_trigger(self, st, side: int, curr_sp: float, curr_ts: float, thr_sec: int) -> bool:
+        """CALL: 正股相对上一秒下跌为反向；PUT: 正股上涨为反向。连续 thr_sec 次（约秒）触发。"""
+        thr_sec = max(1, int(thr_sec or 1))
+        min_rel = float(getattr(self.cfg, 'TIGHT_1S_DIR_OPP_MIN_REL_MOVE', 0.0) or 0.0)
+        prev_sp = float(getattr(st, 'dir_opp_prev_stock', 0.0) or 0.0)
+        prev_ts = float(getattr(st, 'dir_opp_prev_ts', 0.0) or 0.0)
+
+        if curr_sp <= 1e-9:
+            return False
+
+        if prev_ts <= 0.0 or prev_sp <= 1e-9:
+            st.dir_opp_prev_stock = float(curr_sp)
+            st.dir_opp_prev_ts = float(curr_ts)
+            st.dir_opp_streak = 0
+            return False
+
+        gap = abs(float(curr_ts) - prev_ts)
+        rel = (float(curr_sp) - prev_sp) / prev_sp if prev_sp > 1e-9 else 0.0
+        opposite = False
+        if side == 1:
+            opposite = rel < -min_rel if min_rel > 0.0 else rel < 0.0
+        elif side == -1:
+            opposite = rel > min_rel if min_rel > 0.0 else rel > 0.0
+
+        if gap > 2.5:
+            st.dir_opp_streak = 1 if opposite else 0
+        else:
+            if opposite:
+                st.dir_opp_streak = int(getattr(st, 'dir_opp_streak', 0) or 0) + 1
+            else:
+                st.dir_opp_streak = 0
+
+        st.dir_opp_prev_stock = float(curr_sp)
+        st.dir_opp_prev_ts = float(curr_ts)
+
+        return int(getattr(st, 'dir_opp_streak', 0) or 0) >= thr_sec
+
     def _build_second_dynamic_exit_signal(self, sym: str, st, quote: dict, curr_ts: float) -> Optional[Dict[str, Any]]:
         side = int(getattr(st, 'position', 0) or 0)
         if side == 0 or bool(getattr(st, 'is_pending', False)):
             self._reset_second_exit_streak(st)
+            self._reset_dir_opp_track(st)
             return None
 
         entry_p = float(getattr(st, 'entry_price', 0.0) or 0.0)
         if entry_p <= 0.01:
             self._reset_second_exit_streak(st)
+            self._reset_dir_opp_track(st)
             return None
 
         if side == 1:
@@ -1171,18 +1237,24 @@ class ExecutionEngineV8:
 
         if curr_p <= 0.01 or bid <= 0.01 or ask <= 0.01 or ask < bid:
             self._reset_second_exit_streak(st)
+            self._reset_dir_opp_track(st)
             return None
 
         spread_pct = (ask - bid) / max(curr_p, 0.01)
         max_exit_spread = float(getattr(self.cfg, 'MAX_SPREAD_PCT_EXIT', 0.20) or 0.20)
         if spread_pct > max_exit_spread:
             self._reset_second_exit_streak(st)
+            self._reset_dir_opp_track(st)
             return None
 
         roi = (curr_p - entry_p) / entry_p
         st.max_roi = max(float(getattr(st, 'max_roi', -1.0) or -1.0), roi)
         max_roi = float(getattr(st, 'max_roi', roi) or roi)
-        held_mins = self._calc_trading_minutes(float(getattr(st, 'entry_ts', 0.0) or 0.0), curr_ts)
+        entry_ts_f = float(getattr(st, 'entry_ts', 0.0) or 0.0)
+        held_sec = max(0.0, float(curr_ts) - entry_ts_f)
+        held_mins = held_sec / 60.0
+        protect_sec = float(getattr(self.cfg, 'TIGHT_1S_ENTRY_PROTECT_SECONDS', 0.0) or 0.0)
+        in_entry_protect = protect_sec > 0 and held_sec < protect_sec
 
         reason = ""
         # EOD still belongs to the fast path because stale holdings are worse
@@ -1196,12 +1268,17 @@ class ExecutionEngineV8:
         except Exception:
             reason = ""
 
-        if not reason and held_mins >= 1.0:
+        # 连续 N 秒正股瞬时变动方向与持仓相反 → 秒级平仓（优先于盈利阶梯 / FLASH）。
+        if not reason:
+            thr_d = int(getattr(self.cfg, 'TIGHT_1S_DIR_OPP_CONSEC_SECONDS', 5) or 5)
+            if thr_d > 0:
+                curr_sp = float(quote.get('stock_price', 0.0) or 0.0)
+                if self._stock_dir_opposite_exit_trigger(st, side, curr_sp, curr_ts, thr_d):
+                    reason = f"TIGHT_1S_DIR_OPP:{thr_d}s|stock={curr_sp:.4f}|held={held_mins:.1f}m"
+
+        # 建仓保护（TIGHT_1S_ENTRY_PROTECT_SECONDS>0）：仅抑制盈利侧阶梯 / FLASH；止损仍在下方评估。
+        if not reason and not in_entry_protect:
             ladder = list(getattr(self.cfg, 'LADDER_TIGHT', []) or [])
-            if held_mins < 3.0:
-                # During the opening minutes of a position, only protect
-                # meaningful profits; tiny early gains are too spread-sensitive.
-                ladder = [(trigger, floor) for trigger, floor in ladder if float(trigger) >= 0.08]
             for trigger, floor in sorted(ladder, reverse=True):
                 trigger = float(trigger)
                 floor = float(floor)
@@ -1213,15 +1290,15 @@ class ExecutionEngineV8:
                         )
                     break
 
-        if not reason and held_mins >= 3.0:
+        if not reason and not in_entry_protect:
             flash_trigger = float(getattr(self.cfg, 'FLASH_PROTECT_TRIGGER', 0.05) or 0.05)
             flash_exit = float(getattr(self.cfg, 'FLASH_PROTECT_EXIT', 0.02) or 0.02)
             if max_roi >= flash_trigger and roi <= flash_exit:
                 reason = f"TIGHT_1S_FLASH_PROT:{max_roi:.1%}->{roi:.1%}|held={held_mins:.1f}m"
 
-        if not reason and held_mins >= 3.0:
-            abs_stop = float(getattr(self.cfg, 'ABSOLUTE_STOP_LOSS', -0.15) or -0.15)
-            soft_stop = float(getattr(self.cfg, 'STOP_LOSS', -0.10) or -0.10)
+        abs_stop = float(getattr(self.cfg, 'ABSOLUTE_STOP_LOSS', -0.15) or -0.15)
+        soft_stop = float(getattr(self.cfg, 'STOP_LOSS', -0.10) or -0.10)
+        if not reason:
             if roi <= abs_stop:
                 candidate = f"TIGHT_1S_ABS_STOP:{roi:.1%}|held={held_mins:.1f}m"
                 if self._confirm_second_exit_streak(st, "TIGHT_1S_ABS_STOP", curr_ts, threshold=2):
@@ -1232,10 +1309,11 @@ class ExecutionEngineV8:
                     reason = candidate
             else:
                 self._reset_second_exit_streak(st)
-        elif reason:
-            self._reset_second_exit_streak(st)
-        else:
-            self._reset_second_exit_streak(st)
+
+        if reason:
+            rs = str(reason)
+            if rs.startswith(("TIGHT_1S_STEP_PROT", "TIGHT_1S_FLASH_PROT", "TIGHT_1S_EOD")):
+                self._reset_second_exit_streak(st)
 
         if not reason:
             return None
@@ -1254,6 +1332,7 @@ class ExecutionEngineV8:
                 'roi': roi,
                 'max_roi': max_roi,
                 'held_mins': held_mins,
+                'held_sec': held_sec,
                 'spread_pct': spread_pct,
                 'bid': bid,
                 'ask': ask,
@@ -1367,14 +1446,28 @@ class ExecutionEngineV8:
         sig['meta'] = meta
         payload['stock_price'] = float(quote.get('stock_price', payload.get('stock_price', 0.0)) or 0.0)
 
-    def _process_fused_market_for_execution(self, payload):
-        """Handle seconds-level fused data as execution market data only."""
+    async def _oms_execution_quote_tick(self, market_packet: dict) -> float:
+        """与 S4 ``ingest_execution_second_sync`` 前三步完全一致（回放 / 实盘共用）。
+
+        ``preprocess/backtest/second/s4_run_historical_replay_s2_1s.py`` 中每秒循环：
+        cache → MockIBKR 录制 → ``_evaluate_second_dynamic_exits``。
+        实盘 ``STREAM_FUSED_MARKET`` 必须走此函数，才能保证与回测同一套期权 tight-exit。
+        """
+        if not market_packet:
+            return 0.0
+        ts = float(market_packet.get('ts', 0.0) or 0.0)
+        self._cache_execution_market_packet(market_packet)
+        self._record_market_for_replay(market_packet)
+        if ts > 0:
+            await self._evaluate_second_dynamic_exits(ts)
+        return ts
+
+    async def _process_fused_market_for_execution(self, payload):
+        """Redis ``STREAM_FUSED_MARKET`` → 与回放每秒 ingest 对齐的执行报价 + tight-exit。"""
         market_packet = self._reconstruct_market_packet(payload)
         if not market_packet:
             return False
-        self._cache_execution_market_packet(market_packet)
-        if self.ibkr and hasattr(self.ibkr, 'record_market_data'):
-            self.ibkr.record_market_data(market_packet)
+        await self._oms_execution_quote_tick(market_packet)
         return True
 
     # ------------------------------------------------------------------
@@ -1437,16 +1530,14 @@ class ExecutionEngineV8:
         await self.drain_trade_signal_queue()
 
     async def ingest_execution_second_sync(self, market_packet: dict):
-        """单个 1s 行情包: 执行缓存 → 录制 → SYNC 屏障 → 再次排空队列。
+        """单个 1s 行情包: 执行缓存 → 录制 → tight-exit → SYNC → drain。
 
-        对应 S4 中每秒循环体的合体版; 不包含策略推理 (StrategyCore 仅在分钟帧运行)。
+        对应 ``s4_run_historical_replay_s2_1s.py`` 每分钟窗口内每秒循环；
+        tight-exit 本体在 ``_oms_execution_quote_tick``，与实盘 fused 路径共用。
         """
         if not market_packet:
             return
-        ts = float(market_packet.get('ts', 0.0) or 0.0)
-        self._cache_execution_market_packet(market_packet)
-        self._record_market_for_replay(market_packet)
-        await self._evaluate_second_dynamic_exits(ts)
+        ts = await self._oms_execution_quote_tick(market_packet)
         await self.process_trade_signal({'action': 'SYNC', 'ts': ts, 'payload': {}})
         await self.drain_trade_signal_queue()
 
@@ -2469,6 +2560,22 @@ class ExecutionEngineV8:
         )
         return retry_sig
 
+    def _strategy_auto_entry_allowed(self) -> bool:
+        """策略自动开仓：实盘可读 Redis meta:strategy_auto_entry；非 realtime 仅用 config。"""
+        try:
+            if getattr(self, "mode", "") != "realtime":
+                return bool(STRATEGY_AUTO_ENTRY_ENABLED)
+            raw = self.r.hget("meta:strategy_auto_entry", "enabled")
+            if raw is None:
+                return bool(STRATEGY_AUTO_ENTRY_ENABLED)
+            val = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            val = val.strip().lower()
+            if val in ("", "inherit", "default"):
+                return bool(STRATEGY_AUTO_ENTRY_ENABLED)
+            return val in ("1", "true", "yes", "on")
+        except Exception:
+            return bool(STRATEGY_AUTO_ENTRY_ENABLED)
+
     async def _process_alpha_frame(self, frame: dict):
         curr_ts = float(frame.get('ts', time.time()) or time.time())
         reject_before = dict(getattr(self, '_entry_reject_counts', {}) or {})
@@ -2551,6 +2658,9 @@ class ExecutionEngineV8:
                         exit_sig['ask_size'] = 999.0
                     logger.info(f"🎯 [OMS Strategy Exit] {sym} | {exit_sig.get('reason')}")
                     await self._submit_strategy_order('SELL', sym, exit_sig, ctx['price'], curr_ts, idx, frame_id=frame.get('frame_id'))
+                continue
+
+            if not self._strategy_auto_entry_allowed():
                 continue
 
             self._entry_attempt_count += 1
@@ -2687,7 +2797,7 @@ class ExecutionEngineV8:
                 ),
             })
 
-        min_symbols = 1 if (IS_BACKTEST or IS_SIMULATED) else 10
+        min_symbols = int(OMS_ENTRY_MIN_BATCH_SYMBOLS)
         diag_reason = ""
         diag_extra = {}
         if entry_candidates and len(items) < min_symbols:
@@ -2800,7 +2910,12 @@ class ExecutionEngineV8:
                 if raw_tag not in {'CALL_ATM', 'CALL_OTM', 'PUT_ATM', 'PUT_OTM'}:
                     raw_tag = 'CALL_ATM' if (pos == 1 or opt_type == 'call') else ('PUT_ATM' if (pos == -1 or opt_type == 'put') else '')
                 tag = raw_tag
-                active_states[sym] = json.dumps({
+                cid_raw = str(getattr(st, 'contract_id', '') or '').strip()
+                redis_field = sym
+                if cid_raw:
+                    safe_cid = cid_raw.replace('|', '/').replace('\n', '')[:160]
+                    redis_field = f"{sym}|{safe_cid}"
+                active_states[redis_field] = json.dumps({
                     'projection_only': True,
                     'pos': st.position,
                     'position': st.position,
@@ -2998,18 +3113,45 @@ class ExecutionEngineV8:
             return
             
         sym = payload.get('symbol')
+        if isinstance(sym, bytes):
+            sym = sym.decode("utf-8", errors="ignore")
+        sym = str(sym).strip().upper()
         if not sym:
             return
+        payload["symbol"] = sym
 
         sig = payload.get('sig')
         stock_price = payload.get('stock_price', 0.0)
 
         batch_idx = payload.get('batch_idx', -1)
 
-        if not sym or sym not in self.states: return
+        src_l = str(source or "").strip().lower()
+        # Dashboard 手工开平仓：标的可能不在 SE 启动时的 OMS universe 里，此前会静默丢弃（Redis 已入队 → 用户以为已提交）。
+        if sym not in self.states and src_l in ("dashboard_manual_open", "dashboard_manual_close"):
+            self.states[sym] = SymbolState(sym)
+            try:
+                sym_list = list(self.symbols) if self.symbols is not None else []
+                if sym not in sym_list:
+                    sym_list.append(sym)
+                self.symbols = sym_list
+            except Exception:
+                pass
+            logger.info(
+                "📌 [OMS] Lazy SymbolState for %s (source=%s) — manual order outside initial symbol universe.",
+                sym,
+                src_l,
+            )
+
+        if sym not in self.states:
+            logger.warning(
+                "🚫 [OMS] Ignored %s for %s: symbol not in OMS state map (no SymbolState).",
+                action,
+                sym,
+            )
+            return
         st = self.states[sym]
-        
-        logger.info(f"📥 [OMS] Received {action} signal for {sym}: {sig.get('reason', '')}")
+
+        logger.info(f"📥 [OMS] Received {action} signal for {sym}: {(sig or {}).get('reason', '')}")
         
         if action in ('BUY', 'SELL'):
             # 🚀 [核心修复: 全生命周期锁保护]
@@ -3081,6 +3223,24 @@ class ExecutionEngineV8:
         
         # 1. 确保消费组存在
         self._ensure_consumer_group()
+
+        # Dashboard 可写 meta:strategy_auto_entry；字段缺失时用 config 初始化，避免首次勾选无基准。
+        try:
+            if self.mode == 'realtime' and self.r.hget("meta:strategy_auto_entry", "enabled") is None:
+                self.r.hset(
+                    "meta:strategy_auto_entry",
+                    mapping={
+                        "enabled": "1" if STRATEGY_AUTO_ENTRY_ENABLED else "0",
+                        "updated_at": f"{time.time():.3f}",
+                    },
+                )
+                self.r.expire("meta:strategy_auto_entry", 7 * 24 * 3600)
+                logger.info(
+                    "🎚 [OMS-Init] meta:strategy_auto_entry seeded | STRATEGY_AUTO_ENTRY_ENABLED=%s",
+                    STRATEGY_AUTO_ENTRY_ENABLED,
+                )
+        except Exception as _sae_e:
+            logger.warning("⚠️ [OMS-Init] meta:strategy_auto_entry seed skipped: %s", _sae_e)
 
         # 1.1 [Startup Init] 双引擎 OMS 必须自行完成:
         #       (A) 连接 IBKR (REALTIME/REALTIME_DRY, 非 SIMULATED);
@@ -3280,7 +3440,7 @@ class ExecutionEngineV8:
                                     await self.process_trade_signal(payload)
                                     stats['signal'] += 1
                                 elif stream_str == STREAM_FUSED_MARKET:
-                                    self._process_fused_market_for_execution(payload)
+                                    await self._process_fused_market_for_execution(payload)
                                     stats['fused'] += 1
                             
                             try:

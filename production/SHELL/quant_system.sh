@@ -23,6 +23,8 @@ FILE_DB="data_persistence_service_v8_pg.py"
 FILE_IB="ibkr_connector_v8.py"
 FILE_ENG="feature_compute_service_v8.py"
 FILE_DASH="dashboard_monitor_ultimate.py"
+# K 线/动量实时推送（浏览器 WS → 默认 :8765）；与 Dashboard 分离进程
+FILE_DASH_WS="dashboard_ws_bridge.py"
 
 # 定义颜色
 GREEN='\033[0;32m'
@@ -34,17 +36,15 @@ NC='\033[0m' # No Color
 
 # ================= 工具函数 =================
 
-# 获取完整文件路径
+# 获取完整文件路径（脚本统一置于 baseline/ 下的一级目录，不使用 DAO、DB 等再嵌套子路径）
 get_script_path() {
     local name=$1
     if [ -f "$SCRIPT_DIR/$name" ]; then
         echo "$SCRIPT_DIR/$name"
     elif [ -f "$PROJECT_ROOT/$name" ]; then
         echo "$PROJECT_ROOT/$name"
-    elif [ -f "$PROJECT_ROOT/baseline/$name" ]; then  # [New] 支持 baseline 目录
+    elif [ -f "$PROJECT_ROOT/baseline/$name" ]; then
         echo "$PROJECT_ROOT/baseline/$name"
-    elif [ -f "$PROJECT_ROOT/DB/$name" ]; then        # [New] 支持 DB 目录
-        echo "$PROJECT_ROOT/DB/$name"
     else
         echo ""
     fi
@@ -85,6 +85,8 @@ start_task() {
     # 3. 启动命令区分 (Streamlit vs Python)
     if [[ "$alias" == "Dashboard" ]]; then
         nohup streamlit run "$full_script_path" --server.port 8501 > "$full_log_path" 2>&1 &
+    elif [[ "$alias" == "DashboardWSBridge" ]]; then
+        nohup python -u "$full_script_path" --host 0.0.0.0 --port 8765 > "$full_log_path" 2>&1 &
     else
         # -u: 禁用缓存，实时写日志
         if [ -n "$extra_env" ]; then
@@ -157,10 +159,12 @@ do_start() {
             sleep 1
             start_task "Engine"      "$FILE_ENG"
             sleep 1
+            # 先 SE（数据流）后 EE（OMS），与拆分 brain/se 语义一致
+            start_task "SignalEngine" "$FILE_SIGNAL" "SKIP_STARTUP_CLEANUP=1"
+            sleep 1
             start_task "ExecutionEngine" "$FILE_EXEC"
             sleep 1
-            # 协调启动时，SE 不应因 OMS 心跳短暂缺失触发激进启动清理
-            start_task "SignalEngine" "$FILE_SIGNAL" "SKIP_STARTUP_CLEANUP=1"
+            start_task "DashboardWSBridge" "$FILE_DASH_WS"
             sleep 1
             start_task "Dashboard"   "$FILE_DASH"
             ;;
@@ -172,16 +176,26 @@ do_start() {
             start_task "SignalEngine" "$FILE_SIGNAL"
             sleep 1
             start_task "ExecutionEngine" "$FILE_EXEC"
+            sleep 1
+            start_task "DashboardWSBridge" "$FILE_DASH_WS"
+            sleep 1
             start_task "Dashboard"   "$FILE_DASH"
             ;;
         db)    start_task "Persistence" "$FILE_DB" ;;
         ib)    start_task "Connector"   "$FILE_IB" ;;
         calc)  start_task "Engine"      "$FILE_ENG" ;;
-        brain) start_task "ExecutionEngine" "$FILE_EXEC"
+        brain|ee)
+            start_task "ExecutionEngine" "$FILE_EXEC"
+            ;;
+        se)
+            # SE 仅产出 fused/inference 等数据流；单独拉起时跳过激进启动清理，避免误伤同日状态
+            start_task "SignalEngine" "$FILE_SIGNAL" "SKIP_STARTUP_CLEANUP=1"
+            ;;
+        dash)
+            start_task "DashboardWSBridge" "$FILE_DASH_WS"
             sleep 1
-            # 协调重启 brain 时，SE 跳过启动清理，避免误删同日状态
-            start_task "SignalEngine" "$FILE_SIGNAL" "SKIP_STARTUP_CLEANUP=1" ;;
-        dash)  start_task "Dashboard"   "$FILE_DASH" ;;
+            start_task "Dashboard"   "$FILE_DASH"
+            ;;
         *)     echo -e "${RED}Unknown service: $target${NC}"; show_help ;;
     esac
 }
@@ -192,6 +206,7 @@ do_stop() {
     case "$target" in
         all)
             stop_task "Dashboard"    "$FILE_DASH"
+            stop_task "DashboardWSBridge" "$FILE_DASH_WS"
             stop_task "ExecutionEngine" "$FILE_EXEC"
             stop_task "SignalEngine" "$FILE_SIGNAL"
             stop_task "Engine"       "$FILE_ENG"
@@ -201,9 +216,16 @@ do_stop() {
         db)    stop_task "Persistence" "$FILE_DB" ;;
         ib)    stop_task "Connector"   "$FILE_IB" ;;
         calc)  stop_task "Engine"      "$FILE_ENG" ;;
-        brain) stop_task "ExecutionEngine" "$FILE_EXEC"
-            stop_task "SignalEngine" "$FILE_SIGNAL" ;;
-        dash)  stop_task "Dashboard"   "$FILE_DASH" ;;
+        brain|ee)
+            stop_task "ExecutionEngine" "$FILE_EXEC"
+            ;;
+        se)
+            stop_task "SignalEngine" "$FILE_SIGNAL"
+            ;;
+        dash)
+            stop_task "Dashboard"   "$FILE_DASH"
+            stop_task "DashboardWSBridge" "$FILE_DASH_WS"
+            ;;
         *)     echo -e "${RED}Unknown service: $target${NC}"; show_help ;;
     esac
 }
@@ -232,6 +254,7 @@ do_status() {
     check_one_status "Engine"      "$FILE_ENG"
     check_one_status "SignalEngine" "$FILE_SIGNAL"
     check_one_status "ExecutionEngine" "$FILE_EXEC"
+    check_one_status "DashboardWS" "$FILE_DASH_WS"
     check_one_status "Dashboard"   "$FILE_DASH"
     echo "=================================================="
 }
@@ -245,16 +268,19 @@ show_help() {
     echo "  status         : Show running PIDs"
     echo ""
     echo "Individual Services:"
-    echo "  db    : Persistence (SQLite)"
-    echo "  ib    : IBKR Connector"
-    echo "  calc  : Feature Engine"
-    echo "  brain : Signal Engine & Execution Engine"
-    echo "  dash  : Streamlit Dashboard"
-    echo "  replay: Start Backtest System (Persistence + Engine + Orch + Dash) in LIVEREPLAY mode"
+    echo "  db      : Persistence (SQLite)"
+    echo "  ib      : IBKR Connector"
+    echo "  calc    : Feature Engine"
+    echo "  se      : Signal Engine (run_live_signal → 行情/alpha 数据产出，不参与下单)"
+    echo "  brain | ee : Execution Engine / OMS (run_live_exec → 交易执行)"
+    echo "  dash    : Dashboard WS bridge (:8765) + Streamlit Dashboard (:8501)"
+    echo "  replay  : Backtest stack (Persistence + Engine + SE + EE + Dash) in LIVEREPLAY mode"
     echo ""
     echo "Example:"
-    echo "  $0 restart calc   (Restart only the feature engine)"
-    echo "  $0 stop dash      (Stop the dashboard)"
+    echo "  $0 restart calc       (Restart only the feature engine)"
+    echo "  $0 restart se         (Restart Signal Engine only)"
+    echo "  $0 restart brain      (Restart Execution Engine / OMS only)"
+    echo "  $0 stop dash          (Stop the dashboard)"
 }
 
 # ================= 主入口 =================

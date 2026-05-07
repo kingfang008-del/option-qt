@@ -74,6 +74,7 @@ class IBKRConnectorFinal:
         self.active_stocks = {}      # 原始 Symbol -> Stock Contract
         self.last_spot_prices = {}   # Symbol -> Price
         self.locked_contracts = {}   # Symbol -> {Tag: Option Contract}
+        self.position_hold_contracts = {}  # Symbol -> {conId(int): Option} 券商真实 OPT 持仓（与当日 lock 可能不一致）
         self.last_iv_cache = {}      # 缓存 IV
         self.rfr_cache = None        # [NEW] 动态利率缓存
         self.last_tick_time = {}     # [NEW] 记录最后一次收到行情的时间
@@ -314,6 +315,30 @@ class IBKRConnectorFinal:
         except Exception as e:
             logger.error(f"❌ Lock DB Init failed: {e}")
 
+    def _ensure_position_subscription_table(self):
+        """券商 OPT 持仓合约表：与 contract_locks 并行驱动 Connector 订阅。"""
+        try:
+            conn = self._get_pg_conn()
+            c = conn.cursor()
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS oms_position_subscription_contracts (
+                        con_id BIGINT PRIMARY KEY,
+                        underlying TEXT NOT NULL,
+                        expiry TEXT NOT NULL,
+                        strike DOUBLE PRECISION NOT NULL,
+                        p_right TEXT NOT NULL,
+                        multiplier TEXT,
+                        local_symbol TEXT,
+                        trading_class TEXT,
+                        position_qty DOUBLE PRECISION DEFAULT 0,
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    )"""
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"❌ Position subscription DB Init failed: {e}")
+
     def _save_locks(self):
         """[弃用] 批量保存已改用增量保存，保留空函数防报错"""
         pass
@@ -423,6 +448,71 @@ class IBKRConnectorFinal:
             logger.error(f"❌ Load locks db failed: {e}")
             return False
 
+    def _load_position_subscription_contracts(self):
+        """从 PG 加载券商 OPT 持仓合约（由 Reconciler 写入），订阅当日 lock 之外的实仓期权。"""
+        try:
+            today_obj = datetime.datetime.now(NY_TZ).date()
+            today_ymd = today_obj.strftime('%Y%m%d')
+            self._ensure_position_subscription_table()
+            conn = self._get_pg_conn()
+            c = conn.cursor()
+            c.execute(
+                """SELECT con_id, underlying, expiry, strike, p_right, multiplier,
+                          local_symbol, trading_class
+                   FROM oms_position_subscription_contracts"""
+            )
+            rows = c.fetchall()
+            conn.close()
+
+            loaded = {}
+            for r in rows:
+                con_id, sym, expiry, strike, right, multiplier, local_symbol, trading_class = r
+                if str(expiry) < today_ymd:
+                    continue
+                contract = Option(
+                    symbol=sym,
+                    lastTradeDateOrContractMonth=str(expiry),
+                    strike=float(strike),
+                    right=str(right or ""),
+                    exchange='SMART',
+                    currency='USD',
+                    multiplier=str(multiplier or "100"),
+                    localSymbol=local_symbol or "",
+                    tradingClass=trading_class or "",
+                )
+                contract.conId = int(con_id)
+                loaded.setdefault(sym, {})[int(con_id)] = contract
+
+            self.position_hold_contracts = loaded
+            n = sum(len(v) for v in loaded.values())
+            logger.info(f"📌 Loaded {n} OPT position-hold contracts from PG.")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Load position subscription contracts failed: {e}")
+            return False
+
+    async def _subscribe_position_hold_options(self, sym: str):
+        """对持仓表中该标的下的期权发起行情订阅（跳过已在 locked_contracts 中的 conId）。"""
+        cmap = self.position_hold_contracts.get(sym) or {}
+        if not cmap:
+            return
+        lock_ids = set()
+        for _tag, oc in (self.locked_contracts.get(sym) or {}).items():
+            try:
+                cid = int(getattr(oc, "conId", 0) or 0)
+                if cid > 0:
+                    lock_ids.add(cid)
+            except Exception:
+                pass
+        for cid, opt_c in cmap.items():
+            if cid in lock_ids:
+                continue
+            try:
+                await self.ib.qualifyContractsAsync(opt_c)
+                self.ib.reqMktData(opt_c, '100,101,106', False, False)
+            except Exception as e:
+                logger.warning(f"⚠️ Position-hold reqMktData failed {sym} conId={cid}: {e}")
+
      
 
     def _init_ib_connection(self):
@@ -475,7 +565,8 @@ class IBKRConnectorFinal:
         try:
             # 1. 加载持久化锁 (只需一次)
             self._load_locks()
-            
+            self._load_position_subscription_contracts()
+
             # 2. 并发启动每个 Symbol 的初始化 (各跑各的，互不等待)
             logger.info(f"🚀 Starting concurrent initialization for {len(symbols)} symbols...")
             tasks = [self._process_single_symbol(sym) for sym in symbols]
@@ -557,6 +648,8 @@ class IBKRConnectorFinal:
                                 # 持久化
                                 self._save_single_lock(original_key, tag, c)
                                 logger.info(f"   ➕ Subscribed & Saved: {c.localSymbol}")
+
+            await self._subscribe_position_hold_options(original_key)
 
         except Exception as e:
             logger.error(f"❌ Init failed for {sym}: {e}")
@@ -750,11 +843,15 @@ class IBKRConnectorFinal:
             # 否则下游 persistence service 在累加分钟级 VWAP (pv_sum) 时会发生指数级重复计算。
             bar_data['volume'] = 0.0
             
-            # 收集期权数据 (如果有锁定的话)
-            opt_buckets, opt_contracts = self._collect_option_buckets(sym)
-            if opt_buckets:
+            # 收集期权数据：当日 lock + 持仓表 extras
+            has_locks = bool(self.locked_contracts.get(sym))
+            opt_buckets, opt_contracts, extra_ob, extra_oc = self._collect_option_buckets(sym)
+            if has_locks or extra_ob:
                 payload['option_buckets'] = opt_buckets
                 payload['option_contracts'] = opt_contracts
+                if extra_ob:
+                    payload['option_extra_buckets'] = extra_ob
+                    payload['option_extra_contracts'] = extra_oc
                 
             batch_payloads.append(payload)
             
@@ -772,53 +869,101 @@ class IBKRConnectorFinal:
             )
 
     def _collect_option_buckets(self, sym):
-        """收集 6 个期权桶的实时快照 & 合约ID。
-        约定：IB 侧只推送价格/盘口，不推送 Greeks/IV；Greeks 统一由下游引擎按分钟计算。
+        """收集 6 个期权桶 + 持仓表中不在 lock 内的额外期权快照。
+        IB 侧只推送价格/盘口；Greeks/IV 由下游计算。
+        Returns:
+            (buckets_6, contracts_6, extra_bucket_rows, extra_contract_locals)
         """
         buckets_data = np.zeros((6, 12), dtype=float).tolist()
-        contracts_data = [""] * 6 
-        locks = self.locked_contracts.get(sym)
-        if not locks: return buckets_data, contracts_data
-            
-        for tag, contract in locks.items():
-            idx = TAG_TO_INDEX.get(tag)
-            if idx is None: continue
-            
+        contracts_data = [""] * 6
+
+        def _safe_float(val):
+            return float(val) if (val is not None and not np.isnan(val)) else 0.0
+
+        locks = self.locked_contracts.get(sym) or {}
+        if locks:
+            for tag, contract in locks.items():
+                idx = TAG_TO_INDEX.get(tag)
+                if idx is None:
+                    continue
+
+                t = self.ib.ticker(contract)
+                if not t:
+                    continue
+
+                last_p = _safe_float(t.last)
+                close_p = _safe_float(t.close)
+                bid_p = _safe_float(t.bid)
+                ask_p = _safe_float(t.ask)
+
+                if last_p > 0:
+                    price = last_p
+                elif close_p > 0:
+                    price = close_p
+                elif bid_p > 0 and ask_p > 0:
+                    price = (bid_p + ask_p) / 2.0
+                else:
+                    price = 0.0
+
+                iv, delta, gamma, vega, theta = 0.0, 0.0, 0.0, 0.0, 0.0
+
+                bid_size = _safe_float(t.bidSize)
+                ask_size = _safe_float(t.askSize)
+                vol = bid_size + ask_size
+
+                buckets_data[idx] = [
+                    price, delta, gamma, vega, theta, contract.strike, vol, iv,
+                    bid_p, ask_p, bid_size, ask_size,
+                ]
+                contracts_data[idx] = contract.localSymbol
+
+        lock_ids = set()
+        for _tag, oc in locks.items():
+            try:
+                cid = int(getattr(oc, "conId", 0) or 0)
+                if cid > 0:
+                    lock_ids.add(cid)
+            except Exception:
+                pass
+
+        extra_buckets = []
+        extra_contracts = []
+        for cid, contract in (self.position_hold_contracts.get(sym) or {}).items():
+            if cid in lock_ids:
+                continue
             t = self.ib.ticker(contract)
-            if not t: continue
-            
-            # =============================================================
-            # [🔥 防弹修复: 严格过滤 NaN，应对重启数据静默期]
-            # =============================================================
-            def _safe_float(val):
-                """安全转换，防止 nan 或 None 污染下游大脑"""
-                return float(val) if (val is not None and not np.isnan(val)) else 0.0
+            if not t:
+                continue
 
             last_p = _safe_float(t.last)
             close_p = _safe_float(t.close)
             bid_p = _safe_float(t.bid)
             ask_p = _safe_float(t.ask)
-            bid_size = _safe_float(t.bidSize) # [新增] 提取实盘 Bid 挂单量
-            ask_size = _safe_float(t.askSize) # [新增] 提取实盘 Ask 挂单量
 
-            if last_p > 0: price = last_p
-            elif close_p > 0: price = close_p
-            elif bid_p > 0 and ask_p > 0: price = (bid_p + ask_p) / 2.0
-            else: price = 0.0 # 保持 0.0，Orchestrator 识别到 0 会用 BSM 自动兜底！
-            
-            # Greeks/IV 在 IB 侧固定置零；统一由 realtime_feature_engine 在分钟级计算。
+            if last_p > 0:
+                price = last_p
+            elif close_p > 0:
+                price = close_p
+            elif bid_p > 0 and ask_p > 0:
+                price = (bid_p + ask_p) / 2.0
+            else:
+                price = 0.0
+
             iv, delta, gamma, vega, theta = 0.0, 0.0, 0.0, 0.0, 0.0
-
-            # 🚀 [核心对齐] 用盘口深度代替真实成交量 (与 step2_thetadata_sniper_v6 训练脚本一致)
             bid_size = _safe_float(t.bidSize)
             ask_size = _safe_float(t.askSize)
-            vol = bid_size + ask_size 
-            
-            # [🔥 修改] 将 Size 追加到列表末尾 (作为索引 10 和 11)
-            buckets_data[idx] = [price, delta, gamma, vega, theta, contract.strike, vol, iv, bid_p, ask_p, bid_size, ask_size]
-            contracts_data[idx] = contract.localSymbol 
+            vol = bid_size + ask_size
 
-        return buckets_data, contracts_data
+            extra_buckets.append([
+                price, delta, gamma, vega, theta, contract.strike, vol, iv,
+                bid_p, ask_p, bid_size, ask_size,
+            ])
+            extra_contracts.append(contract.localSymbol or "")
+
+        if not locks and not extra_buckets:
+            return buckets_data, contracts_data, [], []
+
+        return buckets_data, contracts_data, extra_buckets, extra_contracts
     
     async def _find_contracts(self, sym, spot):
         self.ib.reqMarketDataType(1) # Live Data
@@ -1160,6 +1305,13 @@ class IBKRConnectorFinal:
             # if changes_made:
             #     self._save_locks()
 
+            try:
+                self._load_position_subscription_contracts()
+                for sym in list(self.active_stocks.keys()):
+                    await self._subscribe_position_hold_options(sym)
+            except Exception as e:
+                logger.warning(f"⚠️ Refresh position_subscription contracts failed: {e}")
+
             # 4. [New] Heartbeat (主动心跳)
             try:
                 # 尝试发送请求以探测连接
@@ -1207,15 +1359,16 @@ class IBKRConnectorFinal:
                 except Exception as e:
                     pass
 
-            if self.locked_contracts:
+            snapshot_syms = set(self.locked_contracts.keys()) | set(self.position_hold_contracts.keys())
+            if snapshot_syms:
                 if time.time() - last_log > 60:
-                     logger.info(f"📡 Data Stream Loop ALIVE. Processing {len(self.locked_contracts)} symbols.")
+                     logger.info(f"📡 Data Stream Loop ALIVE. symbols(lock∪position)={len(snapshot_syms)}.")
                      last_log = time.time()
                      
                 pipe = self.redis.pipeline()
                 ts_now = datetime.datetime.now().timestamp()
                 has_data = False
-                for sym in self.locked_contracts:
+                for sym in snapshot_syms:
                     # =========================================================
                     # [核心强化 2B] 僵尸数据过滤防线 (Watchdog)
                     # =========================================================
@@ -1224,8 +1377,11 @@ class IBKRConnectorFinal:
                     if time.time() - last_alive > 15.0:
                         continue
 
-                    buckets, contracts = self._collect_option_buckets(sym)
+                    buckets, contracts, eb, ec = self._collect_option_buckets(sym)
                     msg = {'symbol': sym, 'buckets': buckets, 'contracts': contracts, 'ts': ts_now}
+                    if eb:
+                        msg['extra_buckets'] = eb
+                        msg['extra_contracts'] = ec
                     pipe.hset(HASH_KEY_SNAPSHOT, sym, ser.pack(msg))
                     has_data = True
                 if has_data: 

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -159,6 +159,12 @@ def fetch_live_oms_positions_map(
                 sym = raw_sym.decode("utf-8", errors="ignore") if isinstance(raw_sym, (bytes, bytearray)) else str(raw_sym)
                 if sym == "____SYSTEM_CASH____":
                     continue
+                field_key = sym
+                underlying_sym = (
+                    field_key.split("|", 1)[0].strip().upper()
+                    if "|" in field_key
+                    else field_key.strip().upper()
+                )
                 txt = raw_val.decode("utf-8", errors="ignore") if isinstance(raw_val, (bytes, bytearray)) else str(raw_val)
                 state = json.loads(txt)
                 pos = int(state.get("position", state.get("pos", 0)) or 0)
@@ -170,14 +176,23 @@ def fetch_live_oms_positions_map(
                 if not bool(state.get("open_fill_confirmed", False)):
                     continue
                 opt_type = str(state.get("opt_type", "") or "").strip().lower()
-                positions[sym] = {
+                cid_str = str(state.get("contract_id", "") or "").strip()
+                contract_con_id = 0
+                try:
+                    if cid_str.isdigit():
+                        contract_con_id = int(cid_str)
+                except Exception:
+                    contract_con_id = 0
+                positions[field_key] = {
+                    "symbol": underlying_sym,
                     "position": pos,
                     "qty": qty,
                     "cost": cost if math.isfinite(cost) and cost > 0 else 0.0,
                     "stock": stock if math.isfinite(stock) and stock > 0 else 0.0,
                     "tag": _valid_bucket_tag(state.get("tag", "")),
                     "opt_type": opt_type,
-                    "contract_id": str(state.get("contract_id", "") or ""),
+                    "contract_id": cid_str,
+                    "contract_con_id": contract_con_id,
                     "last_opt_price": float(state.get("last_opt_price", 0.0) or 0.0),
                     "entry_ts": float(state.get("entry_ts", 0.0) or 0.0),
                 }
@@ -191,7 +206,7 @@ def fetch_live_oms_positions_map(
 def _fetch_latest_option_snapshot(symbol: str):
     sym = str(symbol or "").strip().upper()
     if not sym:
-        return [], []
+        return [], [], [], []
     try:
         rds = _redis_client()
         if rds:
@@ -201,9 +216,16 @@ def _fetch_latest_option_snapshot(symbol: str):
                 if isinstance(snap, dict):
                     b = snap.get("buckets")
                     c = snap.get("contracts", [])
-                    return (b if isinstance(b, list) else []), (c if isinstance(c, list) else [])
+                    eb = snap.get("extra_buckets") or []
+                    ec = snap.get("extra_contracts") or []
+                    return (
+                        (b if isinstance(b, list) else []),
+                        (c if isinstance(c, list) else []),
+                        (eb if isinstance(eb, list) else []),
+                        (ec if isinstance(ec, list) else []),
+                    )
                 if isinstance(snap, list):
-                    return snap, []
+                    return snap, [], [], []
     except Exception:
         pass
 
@@ -221,19 +243,328 @@ def _fetch_latest_option_snapshot(symbol: str):
             if isinstance(snap, str):
                 snap = json.loads(snap)
             if isinstance(snap, dict):
-                return snap.get("buckets", []), snap.get("contracts", [])
+                eb = snap.get("extra_buckets") or snap.get("option_extra_buckets") or []
+                ec = snap.get("extra_contracts") or snap.get("option_extra_contracts") or []
+                return (
+                    snap.get("buckets", []),
+                    snap.get("contracts", []),
+                    eb if isinstance(eb, list) else [],
+                    ec if isinstance(ec, list) else [],
+                )
             if isinstance(snap, list):
-                return snap, []
+                return snap, [], [], []
     except Exception:
         pass
-    return [], []
+    return [], [], [], []
+
+
+def _clean_iv(raw) -> float | None:
+    """Bucket IV is decimal annualized vol (e.g. 0.35 ≈ 35%)."""
+    try:
+        v = float(raw or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v) or v <= 0.0:
+        return None
+    # Guard absurd values so UI stays sane if snapshot corrupt.
+    if v > 5.0:
+        return None
+    return v
+
+
+def parse_snapshot_buckets_cell(cell) -> list:
+    """Normalize Redis/PG buckets_json cell to list of bucket rows."""
+    if cell is None:
+        return []
+    if isinstance(cell, dict):
+        b = cell.get("buckets")
+        return b if isinstance(b, list) else []
+    if isinstance(cell, str):
+        try:
+            obj = json.loads(cell)
+        except Exception:
+            return []
+        if isinstance(obj, dict):
+            b = obj.get("buckets")
+            return b if isinstance(b, list) else []
+        if isinstance(obj, list):
+            return obj
+        return []
+    if isinstance(cell, list):
+        return cell
+    return []
+
+
+def ny_intraday_epoch_bounds() -> tuple[int, int]:
+    """NY 日历日的 [start_ts, end_ts) Unix 秒，与 market_bars_1m / option_snapshots_1m 对齐。"""
+    today = datetime.now(NY_TZ).date()
+    start_dt = NY_TZ.localize(datetime.combine(today, dt_time(0, 0, 0)))
+    end_dt = start_dt + timedelta(days=1)
+    return int(start_dt.timestamp()), int(end_dt.timestamp())
+
+
+def atm_iv_legs_from_buckets(buckets) -> tuple[float | None, float | None]:
+    """ATM Call / Put 侧 IV（bucket 列 7），索引与 TAG_TO_INDEX 一致。"""
+    if not buckets or not isinstance(buckets, list):
+        return None, None
+    ic = TAG_TO_INDEX.get("CALL_ATM", -1)
+    ip = TAG_TO_INDEX.get("PUT_ATM", -1)
+    row_c = buckets[ic] if 0 <= ic < len(buckets) else None
+    row_p = buckets[ip] if 0 <= ip < len(buckets) else None
+    iv_c = None
+    iv_p = None
+    if isinstance(row_c, (list, tuple)) and len(row_c) > 7:
+        iv_c = _clean_iv(row_c[7])
+    if isinstance(row_p, (list, tuple)) and len(row_p) > 7:
+        iv_p = _clean_iv(row_p[7])
+    return iv_c, iv_p
+
+
+def atm_iv_mid_from_buckets(buckets) -> float | None:
+    """由快照 buckets 聚合 ATM IV（与 quotes._atm_iv.mid 一致）。"""
+    iv_c, iv_p = atm_iv_legs_from_buckets(buckets)
+    if iv_c is not None and iv_p is not None:
+        return (iv_c + iv_p) / 2.0
+    if iv_c is not None:
+        return iv_c
+    if iv_p is not None:
+        return iv_p
+    return None
+
+
+def _clean_gamma(raw) -> float | None:
+    """Bucket Gamma（列 2）；多头香草一般为非负，异常值丢弃。"""
+    try:
+        v = float(raw or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    if v < 0.0:
+        v = abs(v)
+    if v > 2.0:
+        return None
+    return v
+
+
+def atm_gamma_legs_from_buckets(buckets) -> tuple[float | None, float | None]:
+    """ATM Call / Put 侧 Gamma（列 2 = Gamma）。"""
+    if not buckets or not isinstance(buckets, list):
+        return None, None
+    ic = TAG_TO_INDEX.get("CALL_ATM", -1)
+    ip = TAG_TO_INDEX.get("PUT_ATM", -1)
+    row_c = buckets[ic] if 0 <= ic < len(buckets) else None
+    row_p = buckets[ip] if 0 <= ip < len(buckets) else None
+    g_c = _clean_gamma(row_c[2]) if isinstance(row_c, (list, tuple)) and len(row_c) > 2 else None
+    g_p = _clean_gamma(row_p[2]) if isinstance(row_p, (list, tuple)) and len(row_p) > 2 else None
+    return g_c, g_p
+
+
+def atm_gamma_mid_from_buckets(buckets) -> float | None:
+    """Call/Put ATM Gamma 平均；用于相邻分钟突变检测。"""
+    g_c, g_p = atm_gamma_legs_from_buckets(buckets)
+    if g_c is not None and g_p is not None:
+        return (g_c + g_p) / 2.0
+    if g_c is not None:
+        return g_c
+    if g_p is not None:
+        return g_p
+    return None
+
+
+def _minute_bar_open_close_map_conn(conn, symbol: str, start_ts: int, end_ts: int) -> dict[int, tuple[float, float]]:
+    """ts -> (open, close)；Gamma 突变点的 C/P 以当根阴阳线为主。"""
+    out: dict[int, tuple[float, float]] = {}
+    sym = str(symbol or "").strip().upper()
+    if not sym or conn is None:
+        return out
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT ts, open, close FROM market_bars_1m
+            WHERE symbol = %s AND ts >= %s AND ts < %s
+            ORDER BY ts ASC
+            """,
+            (sym, int(start_ts), int(end_ts)),
+        )
+        for ts, o, cl in c.fetchall():
+            out[int(ts)] = (float(o or 0.0), float(cl or 0.0))
+        c.close()
+    except Exception:
+        pass
+    return out
+
+
+def _bar_rows_sorted_index(bar_oc: dict[int, tuple[float, float]]) -> tuple[list[tuple[int, float, float]], dict[int, int]]:
+    """按时间排序的 (ts, open, close) 及 ts -> 下标。"""
+    rows = [(t, float(oc[0]), float(oc[1])) for t, oc in sorted(bar_oc.items(), key=lambda x: x[0])]
+    idx_map = {t: i for i, (t, _, _) in enumerate(rows)}
+    return rows, idx_map
+
+
+def _gamma_marker_trend_divergence_adjust(
+    txt: str,
+    col: str,
+    ts: int,
+    bar_oc: dict[int, tuple[float, float]],
+    bar_rows: list[tuple[int, float, float]],
+    ts_to_idx: dict[int, int],
+    lookback_bars: int = 4,
+) -> tuple[str, str]:
+    """
+    形态与更短区间净值不一致时的弱提示（非严谨假突破判定）：
+    - 当根为阴标 P，但当前价仍高于约 N 根前的开盘 → P?（常见为上涨中的回踩）
+    - 当根为阳标 C，但当前价仍低于窗口参考 → C?（下跌中的反抽）
+    """
+    _warn_color = "#f59e0b"
+    if not bar_rows or ts not in ts_to_idx or ts not in bar_oc:
+        return txt, col
+    o, cl = bar_oc[ts]
+    ix = ts_to_idx[ts]
+    j = max(0, ix - int(lookback_bars))
+    _, o_win, _ = bar_rows[j]
+    net_bull_window = cl > o_win
+    net_bear_window = cl < o_win
+    if txt == "P" and cl < o and net_bull_window:
+        return "P?", _warn_color
+    if txt == "C" and cl > o and net_bear_window:
+        return "C?", _warn_color
+    return txt, col
+
+
+def _cp_marker_gamma_direction(
+    ts: int,
+    call_g: float | None,
+    put_g: float | None,
+    prev_cg: float | None,
+    prev_pg: float | None,
+    bar_oc: dict[int, tuple[float, float]],
+) -> tuple[str, str]:
+    """
+    Gamma 突变分钟：优先用该分钟标的收盘 vs 开盘 定 C（阳）/ P（阴）；
+    无 K 线或十字时，用 Call/Put ATM Gamma 增量谁更大作次要提示。
+    """
+    _call_color = "#ef553b"
+    _put_color = "#00cc96"
+    _neutral_color = "#f59e0b"
+    oc = bar_oc.get(ts)
+    if oc:
+        o, cl = oc
+        if cl > o:
+            return "C", _call_color
+        if cl < o:
+            return "P", _put_color
+    dgc = (call_g - prev_cg) if (call_g is not None and prev_cg is not None) else None
+    dgp = (put_g - prev_pg) if (put_g is not None and prev_pg is not None) else None
+    if dgc is not None and dgp is not None:
+        if dgc > dgp:
+            return "C", _call_color
+        if dgp > dgc:
+            return "P", _put_color
+        return "Γ", _neutral_color
+    if dgc is not None and dgp is None:
+        return ("C", _call_color) if dgc >= 0 else ("P", _put_color)
+    if dgp is not None and dgc is None:
+        return ("P", _put_color) if dgp >= 0 else ("C", _call_color)
+    return "Γ", _neutral_color
+
+
+def build_iv_spike_markers_for_symbol(
+    symbol: str,
+    *,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    gamma_abs_thresh: float = 8e-5,
+    gamma_rel_thresh: float = 0.12,
+    max_rows: int = 4000,
+) -> list[dict]:
+    """
+    基于 option_snapshots_1m：检测 ATM Gamma（凸性）相对上一分钟的显著抬升/变化，
+    标出「premium 对标的价格更敏感」的时段。C/P：优先当根 1m 阴阳线，否则比较两侧 Gamma 增量；
+    P?/C?：当根方向与近若干根 1m 窗口净值不一致时的弱提示（不等同假突破定式）。
+    （函数名沿用 build_iv_spike_* 以免 WS/Streamlit 导入断裂。）
+    """
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return []
+    if start_ts is None or end_ts is None:
+        start_ts, end_ts = ny_intraday_epoch_bounds()
+    sql = """
+        SELECT ts, buckets_json FROM option_snapshots_1m
+        WHERE symbol = %s AND ts >= %s AND ts < %s
+        ORDER BY ts ASC
+        LIMIT %s
+    """
+    conn = None
+    bar_oc: dict[int, tuple[float, float]] = {}
+    df = pd.DataFrame()
+    try:
+        conn = psycopg2.connect(PG_DB_URL)
+        bar_oc = _minute_bar_open_close_map_conn(conn, sym, int(start_ts), int(end_ts))
+        df = pd.read_sql(sql, conn, params=(sym, int(start_ts), int(end_ts), int(max_rows)))
+    except Exception:
+        pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if df.empty:
+        return []
+    bar_rows, bar_ts_to_idx = _bar_rows_sorted_index(bar_oc)
+    markers: list[dict] = []
+    prev_mid_g: float | None = None
+    prev_call_g: float | None = None
+    prev_put_g: float | None = None
+    for _, row in df.iterrows():
+        try:
+            ts = int(row.get("ts") or 0)
+            if ts <= 0:
+                continue
+            buckets = parse_snapshot_buckets_cell(row.get("buckets_json"))
+            call_g, put_g = atm_gamma_legs_from_buckets(buckets)
+            mid_g = atm_gamma_mid_from_buckets(buckets)
+            if mid_g is None:
+                continue
+            if prev_mid_g is not None:
+                dg = mid_g - prev_mid_g
+                if dg <= 0:
+                    prev_mid_g = mid_g
+                    prev_call_g = call_g
+                    prev_put_g = put_g
+                    continue
+                rel_up = dg / prev_mid_g if prev_mid_g > 1e-10 else 0.0
+                if dg >= float(gamma_abs_thresh) or (
+                    prev_mid_g > 1e-10 and rel_up >= float(gamma_rel_thresh)
+                ):
+                    txt, col = _cp_marker_gamma_direction(
+                        ts, call_g, put_g, prev_call_g, prev_put_g, bar_oc,
+                    )
+                    txt, col = _gamma_marker_trend_divergence_adjust(
+                        txt, col, ts, bar_oc, bar_rows, bar_ts_to_idx,
+                    )
+                    markers.append({
+                        "time": ts,
+                        "position": "aboveBar",
+                        "color": col,
+                        "shape": "circle",
+                        "text": txt,
+                    })
+            prev_mid_g = mid_g
+            prev_call_g = call_g
+            prev_put_g = put_g
+        except Exception:
+            continue
+    return markers
 
 
 def get_bucket_quote(symbol: str, tag: str) -> dict | None:
     idx = TAG_TO_INDEX.get(tag, -1)
     if idx < 0:
         return None
-    buckets, contracts = _fetch_latest_option_snapshot(symbol)
+    buckets, contracts, _, _ = _fetch_latest_option_snapshot(symbol)
     if not buckets or len(buckets) <= idx:
         return None
     row = buckets[idx]
@@ -244,6 +575,7 @@ def get_bucket_quote(symbol: str, tag: str) -> dict | None:
     last = float(row[0] or 0.0)
     mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 and ask >= bid else (last if last > 0 else 0.0)
     strike = float(row[5] or 0.0) if len(row) > 5 else 0.0
+    iv = _clean_iv(row[7]) if len(row) > 7 else None
     contract_txt = contracts[idx] if contracts and len(contracts) > idx else ""
     return {
         "bucket_idx": idx,
@@ -252,6 +584,7 @@ def get_bucket_quote(symbol: str, tag: str) -> dict | None:
         "last": last,
         "mid": mid,
         "strike": strike,
+        "iv": iv,
         "contract_text": contract_txt,
     }
 
@@ -264,6 +597,25 @@ def fetch_underlying_option_quotes(symbol: str) -> dict:
             out[tag] = q
         else:
             out[tag] = {}
+    ca = out.get("CALL_ATM") or {}
+    pa = out.get("PUT_ATM") or {}
+    c_iv = ca.get("iv")
+    p_iv = pa.get("iv")
+    c_iv = float(c_iv) if isinstance(c_iv, (int, float)) and math.isfinite(float(c_iv)) and float(c_iv) > 0 else None
+    p_iv = float(p_iv) if isinstance(p_iv, (int, float)) and math.isfinite(float(p_iv)) and float(p_iv) > 0 else None
+    mid_iv = None
+    if c_iv is not None and p_iv is not None:
+        mid_iv = (c_iv + p_iv) / 2.0
+    elif c_iv is not None:
+        mid_iv = c_iv
+    elif p_iv is not None:
+        mid_iv = p_iv
+    # Underscore prefix: not a bucket tag; consumed by futu_kline for ATM IV HUD / spike dot.
+    out["_atm_iv"] = {
+        "mid": mid_iv,
+        "call_iv": c_iv,
+        "put_iv": p_iv,
+    }
     return out
 
 

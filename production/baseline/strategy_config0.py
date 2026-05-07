@@ -11,8 +11,8 @@ class StrategyConfig:
     # ================= 1. Capital Management =================
     # 默认沿用基准配置，V0 核心主要专注信号逻辑
     INITIAL_ACCOUNT: float = 50000.0
-    MAX_POSITIONS: int = 2
-    POSITION_RATIO: float = 0.5
+    MAX_POSITIONS: int = 4
+    POSITION_RATIO: float = 0.25
     MAX_TRADE_CAP: float = 150000.0
     GLOBAL_EXPOSURE_LIMIT: float = 0.90
     COMMISSION_PER_CONTRACT: float = 0.65
@@ -61,9 +61,10 @@ class StrategyConfig:
     ENTRY_RANK_MACD_MAX_BONUS: float = 0.30
     # 趋势质量只做温和降权/小幅加分: alpha 仍是主轴，避免高 alpha 但正股路径来回织布的候选排太前。
     ENTRY_RANK_TREND_QUALITY_ENABLED: bool = True
-    ENTRY_RANK_TREND_WINDOW_MINS: int = 30
-    ENTRY_RANK_TREND_MIN_OBS: int = 16
-    ENTRY_RANK_TREND_NET_TARGET: float = 0.012
+    # 与 TREND_CORE_WINDOW_MINS 对齐：过长窗口会把 net 憋成大波段后才放行，高 beta 标的体感「确诊太晚」
+    ENTRY_RANK_TREND_WINDOW_MINS: int = 12
+    ENTRY_RANK_TREND_MIN_OBS: int = 8
+    ENTRY_RANK_TREND_NET_TARGET: float = 0.009
     ENTRY_RANK_TREND_QUALITY_FLOOR: float = 0.25
     ENTRY_RANK_TREND_QUALITY_BOOST: float = 0.06
     ENTRY_RANK_TREND_QUALITY_PENALTY: float = 0.04
@@ -92,15 +93,19 @@ class StrategyConfig:
     TREND_CORE_MIN_ALPHA_ABS: float = 0.35
     TREND_CORE_ALPHA_ALIGN_MIN_ABS: float = 0.80
     TREND_CORE_MIN_INDEX_ROC: float = 0.00015
-    TREND_CORE_MIN_STOCK_ROC: float = 0.00045
-    TREND_CORE_MIN_SNAP_ROC: float = -0.00012
-    TREND_CORE_MIN_MACD_HIST: float = 0.010
-    TREND_CORE_WINDOW_MINS: int = 30
-    TREND_CORE_MIN_OBS: int = 16
-    TREND_CORE_MIN_NET: float = 0.0040
-    TREND_CORE_MIN_EFFICIENCY: float = 0.22
-    TREND_CORE_MIN_R2: float = 0.08
-    TREND_CORE_STRONG_NET: float = 0.010
+    # 5m ROC / snap：略放宽，避免仅靠更长单边才把 roc_5m 推过阈值
+    TREND_CORE_MIN_STOCK_ROC: float = 0.00028
+    TREND_CORE_MIN_SNAP_ROC: float = -0.00015
+    # MACD 柱默认 0.01 偏滞后，略降以便趋势早期对齐仍能下单
+    TREND_CORE_MIN_MACD_HIST: float = 0.007
+    # 窗口缩短：net = (窗口首尾价差)，30m 易等来「已经涨了一段」的形态；18m 更偏早期顺势
+    TREND_CORE_WINDOW_MINS: int = 12
+    TREND_CORE_MIN_OBS: int = 8
+    # 窗口内需累积的方向性净值（小数）；0.004≈0.4%，偏高 Beta 要等很久；略降提高先手、噪声亦略升
+    TREND_CORE_MIN_NET: float = 0.0022
+    TREND_CORE_MIN_EFFICIENCY: float = 0.18
+    TREND_CORE_MIN_R2: float = 0.06
+    TREND_CORE_STRONG_NET: float = 0.008
     TREND_CORE_SCORE_ALPHA_WEIGHT: float = 0.35
     TREND_CORE_SCORE_TREND_WEIGHT: float = 1.00
     TREND_CORE_SCORE_MOMENTUM_WEIGHT: float = 0.65
@@ -153,16 +158,16 @@ class StrategyConfig:
     MIN_OPTION_PRICE: float = 2.0
 
     # ================= 7. Liquidity =================
-    MAX_SPREAD_PCT_ENTRY: float = 0.10        # 兼容保留：未区分方向时的默认准入点差
-    MAX_SPREAD_PCT_ENTRY_CALL: float = 0.08   # V0 做多(CALL)开仓点差上限 8%
-    MAX_SPREAD_PCT_ENTRY_PUT: float = 0.10    # V0 做空(PUT)开仓点差上限 10%
+    MAX_SPREAD_PCT_ENTRY: float = 0.05        # 兼容保留：未区分方向时的默认准入点差
+    MAX_SPREAD_PCT_ENTRY_CALL: float = 0.05   # V0 做多(CALL)开仓点差上限 8%
+    MAX_SPREAD_PCT_ENTRY_PUT: float = 0.07    # V0 做空(PUT)开仓点差上限 10%
     MAX_SPREAD_PCT_EXIT: float = 0.2 
     MAX_SPREAD_DIVERGENCE: float = 0.02
     
     # ================= 8. Exit & Stop Loss =================
     # V0 止损较紧: -10% 常规，-15% 绝对
-    STOP_LOSS: float = -0.10         
-    ABSOLUTE_STOP_LOSS: float = -0.15
+    STOP_LOSS: float = -0.05
+    ABSOLUTE_STOP_LOSS: float = -0.07
     MID_TIME_STOP_MINS: int = 15      # 15 分钟未走强则提前离场
     MID_TIME_STOP_ROI: float = 0.05   # 15 分钟时当前收益若仍低于 5%，则离场
     TIME_STOP_MINS: int = 30          # V0 的长期时间止损窗口
@@ -262,6 +267,13 @@ class StrategyConfig:
     ])
     FLASH_PROTECT_TRIGGER: float = 0.05
     FLASH_PROTECT_EXIT: float = 0.02
+    # OMS 秒级 tight-exit：原为开仓后延迟盈利阶梯 / FLASH；默认 0 = 不再延迟。
+    # 亏损侧 ABSOLUTE_STOP_LOSS / STOP_LOSS 仍按秒级评估。
+    TIGHT_1S_ENTRY_PROTECT_SECONDS: float = 0.0
+    # 正股瞬时涨跌与持仓方向相反（CALL 遇正股下跌 tick、PUT 遇正股上涨 tick），连续 N 秒触发秒级平仓。
+    TIGHT_1S_DIR_OPP_CONSEC_SECONDS: int = 5
+    # >0 时仅当 |ΔS/S| 超过该阈值才算反向；0 = 任一反向 tick 计数。
+    TIGHT_1S_DIR_OPP_MIN_REL_MOVE: float = 0.0
     TRAILING_TRIGGER_ROI: float = 5.50
     TRAILING_KEEP_RATIO: float = 0.92
     COUNTER_TREND_PROTECT_TRIGGER: float = 0.25

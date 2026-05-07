@@ -135,7 +135,7 @@ class StrategyCoreTrend(StrategyCoreV0):
             return None
 
         tq = self._trend_quality(ctx, direction)
-        min_obs = int(getattr(self.cfg, "TREND_CORE_MIN_OBS", 16) or 16)
+        min_obs = int(getattr(self.cfg, "TREND_CORE_MIN_OBS", 8) or 8)
         min_net = float(getattr(self.cfg, "TREND_CORE_MIN_NET", 0.004) or 0.004)
         min_eff = float(getattr(self.cfg, "TREND_CORE_MIN_EFFICIENCY", 0.22) or 0.22)
         min_r2 = float(getattr(self.cfg, "TREND_CORE_MIN_R2", 0.08) or 0.08)

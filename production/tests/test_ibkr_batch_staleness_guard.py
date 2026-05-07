@@ -77,6 +77,8 @@ def test_ibkr_batch_staleness_guard() -> None:
 
     svc = type("S", (), {})()
     svc.active_stocks = {"NVDA": object(), "AAPL": object()}
+    svc.locked_contracts = {}
+    svc.position_hold_contracts = {}
     svc._last_bar_cache = {
         "NVDA": {"open": 1.0, "high": 1.2, "low": 0.9, "close": 1.1, "volume": 10.0, "ts": 100.0},
         "AAPL": {"open": 2.0, "high": 2.2, "low": 1.9, "close": 2.1, "volume": 20.0, "ts": 97.0},
@@ -84,7 +86,7 @@ def test_ibkr_batch_staleness_guard() -> None:
     svc._max_batch_staleness_sec = 1.5
     svc.redis = _RedisStub()
     svc._sanitize_publish_ts = lambda ts_val, source_tag="": float(ts_val)
-    svc._collect_option_buckets = lambda sym: ([], [])
+    svc._collect_option_buckets = lambda sym: ([], [], [], [])
 
     bound = fn.__get__(svc, svc.__class__)
     bound(100.0)

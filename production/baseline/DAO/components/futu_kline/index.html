@@ -276,10 +276,26 @@
     .call { background: rgba(239, 85, 59, 0.20); }
     .put { background: rgba(0, 204, 150, 0.18); }
     .held { background: rgba(132, 142, 158, 0.18); }
+    .trade-card-title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      width: 100%;
+      margin-bottom: 3px;
+      flex-wrap: nowrap;
+      min-height: 18px;
+    }
     #tradebar .title {
       font-size: 11px;
       font-weight: 700;
-      margin-bottom: 3px;
+      margin-bottom: 0;
+      flex-shrink: 0;
+    }
+    .trade-card-title-row .manual-protect-row {
+      margin: 0;
+      justify-content: flex-end;
+      flex-shrink: 0;
     }
     #tradebar .strike-txt {
       font-size: 10px;
@@ -299,7 +315,7 @@
       align-items: center;
       justify-content: center;
       gap: 4px;
-      margin: 0 0 5px 0;
+      margin: 0;
       font-size: 10px;
       font-weight: 800;
       color: inherit;
@@ -389,6 +405,137 @@
       z-index: 20;
       background: rgba(255,255,255,0.88);
     }
+
+    /* --- Buy confirmation modal (strict JSON-safe props from Streamlit) --- */
+    .buy-modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 200;
+      background: rgba(15, 20, 29, 0.52);
+      align-items: center;
+      justify-content: center;
+      padding: 12px;
+      box-sizing: border-box;
+    }
+    .buy-modal-overlay.buy-modal-open {
+      display: flex;
+    }
+    .buy-modal-panel {
+      width: 100%;
+      max-width: 392px;
+      border-radius: 12px;
+      padding: 16px 18px;
+      box-sizing: border-box;
+      border: 1px solid rgba(31, 41, 55, 0.14);
+      box-shadow: 0 12px 44px rgba(0, 0, 0, 0.38);
+    }
+    .buy-modal-title {
+      font-size: 15px;
+      font-weight: 800;
+      margin: 0 0 10px 0;
+      line-height: 1.35;
+    }
+    .buy-modal-session {
+      font-size: 13px;
+      font-weight: 700;
+      margin: 0 0 6px 0;
+      line-height: 1.4;
+    }
+    .buy-modal-session.buy-modal-okline {
+      border-left: 3px solid #10b981;
+      padding-left: 10px;
+    }
+    .buy-modal-session.buy-modal-warnline {
+      border-left: 3px solid #f59e0b;
+      padding-left: 10px;
+    }
+    .buy-modal-session.buy-modal-badline {
+      border-left: 3px solid #ef4444;
+      padding-left: 10px;
+    }
+    .buy-modal-schedule {
+      font-size: 11px;
+      opacity: 0.82;
+      line-height: 1.45;
+      margin: 0 0 8px 0;
+    }
+    .buy-modal-detail {
+      font-size: 12px;
+      line-height: 1.52;
+      margin: 0 0 8px 0;
+      opacity: 0.95;
+    }
+    .buy-modal-cb {
+      font-size: 12px;
+      font-weight: 700;
+      color: #dc2626;
+      margin: 0 0 8px 0;
+      display: none;
+    }
+    .buy-modal-order {
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: rgba(127, 127, 127, 0.12);
+      margin: 0 0 14px 0;
+      line-height: 1.45;
+    }
+    .buy-modal-order-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 6px;
+    }
+    .buy-modal-order-row:last-of-type {
+      margin-bottom: 8px;
+    }
+    .buy-modal-order-lab {
+      font-size: 12px;
+      font-weight: 700;
+      opacity: 0.85;
+      flex: 0 0 auto;
+    }
+    .buy-modal-order-val {
+      font-size: 15px;
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .buy-modal-order-meta {
+      font-size: 11px;
+      opacity: 0.82;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      line-height: 1.4;
+      padding-top: 4px;
+      border-top: 1px solid rgba(127, 127, 127, 0.2);
+    }
+    .buy-modal-actions {
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+    }
+    .buy-modal-btn {
+      min-width: 96px;
+      padding: 8px 14px;
+      border-radius: 8px;
+      border: 1px solid rgba(31, 41, 55, 0.22);
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .buy-modal-cancel {
+      background: rgba(127, 127, 127, 0.14);
+      color: inherit;
+    }
+    .buy-modal-ok {
+      background: #2563eb;
+      color: #fff;
+      border-color: transparent;
+    }
   </style>
 </head>
 <body>
@@ -399,7 +546,7 @@
         <div id="topbar">
           <div id="topbar-left">
             <div class="symbol" id="symbol">-</div>
-            <div class="trade-hint" id="trade-hint">右上侧 ATM/OTM 正上方单行：− 金额 +；买入入队 OMS（步长 ±1000 存在 session）。十字光标可查其它分钟 OHLC（ET）。</div>
+            <div class="trade-hint" id="trade-hint">ATM/OTM 切换与 − / + 名义金额（session 记忆）；买入 Call/Put 会先弹出确认框并展示策略时段（meta:global_gates）。平仓仍为单击生效。十字光标：其它分钟 OHLC（ET）。K 线标点：ATM Gamma 抬升；C/P 依当根 1m 阴阳线；P?/C? 表短期方向分歧（非投资建议）。</div>
           </div>
           <div class="ohlc" id="ohlc">Move crosshair over candles</div>
         </div>
@@ -429,6 +576,31 @@
     </div>
   </div>
 
+  <div id="buy-modal-overlay" class="buy-modal-overlay" aria-hidden="true">
+    <div class="buy-modal-panel" id="buy-modal-panel" role="dialog" aria-modal="true" aria-labelledby="buy-modal-title">
+      <div class="buy-modal-title" id="buy-modal-title">确认买入</div>
+      <div class="buy-modal-session buy-modal-warnline" id="buy-modal-session"></div>
+      <div class="buy-modal-schedule" id="buy-modal-schedule"></div>
+      <div class="buy-modal-detail" id="buy-modal-detail"></div>
+      <div class="buy-modal-cb" id="buy-modal-cb"></div>
+      <div class="buy-modal-order" id="buy-modal-order">
+        <div class="buy-modal-order-row">
+          <span class="buy-modal-order-lab">数量</span>
+          <span class="buy-modal-order-val" id="buy-modal-qty-val">—</span>
+        </div>
+        <div class="buy-modal-order-row">
+          <span class="buy-modal-order-lab">名义金额</span>
+          <span class="buy-modal-order-val" id="buy-modal-notional-val">—</span>
+        </div>
+        <div class="buy-modal-order-meta" id="buy-modal-order-meta"></div>
+      </div>
+      <div class="buy-modal-actions">
+        <button type="button" class="buy-modal-btn buy-modal-cancel" id="buy-modal-cancel">取消</button>
+        <button type="button" class="buy-modal-btn buy-modal-ok" id="buy-modal-ok">确认下单</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     function postStreamlitMessage(payload) {
       window.parent.postMessage({ isStreamlitMessage: true, ...payload }, "*");
@@ -447,6 +619,8 @@
     let bars = [];
     let ws = null;
     let wsUrl = "";
+    let chartPollTimer = null;
+    let chartPollKick = null;
     let leaderScoreCache = {};
     let lastStatText = {};
     /** DB / bars use Unix UTC seconds; axis & crosshair labels show US Eastern session clock. */
@@ -456,6 +630,8 @@
     let lastMnySymbol = "";
     let manualNotionalUsd = 5000;
     let manualNotionalStep = 1000;
+    /** 避免重复 setMarkers：与 PG option_snapshots_1m 对齐的 Gamma 抬升标点 */
+    let ivMarkersSignature = "";
 
     function notionalStorageKeyAmt() {
       const s = String(currentArgs.symbol || "").trim().toUpperCase();
@@ -521,8 +697,7 @@
       const d = Number(dirSign) >= 0 ? step : -step;
       manualNotionalUsd = Math.min(2_000_000, Math.max(100, Math.round(manualNotionalUsd + d)));
       persistNotional();
-      syncNotionalLabel();
-      lastTradebarContentKey = "";
+      refreshLatestTradebarInner();
     }
 
 
@@ -579,6 +754,31 @@
       return n > 0 ? n.toFixed(3) : "--";
     }
 
+    /** Bucket IV stored as decimal annualized vol (0.35 → 35%). */
+    function fmtIvDecimal(iv) {
+      const n = Number(iv);
+      if (!Number.isFinite(n) || n <= 0) return "--";
+      return `${(n * 100).toFixed(1)}%`;
+    }
+
+    function readAtmIvMeta(quotes) {
+      try {
+        const meta = (quotes || {})._atm_iv;
+        if (!meta || meta.mid == null) return null;
+        const mid = Number(meta.mid);
+        if (!Number.isFinite(mid) || mid <= 0) return null;
+        const call_iv = meta.call_iv != null ? Number(meta.call_iv) : null;
+        const put_iv = meta.put_iv != null ? Number(meta.put_iv) : null;
+        return {
+          mid,
+          call_iv: Number.isFinite(call_iv) && call_iv > 0 ? call_iv : null,
+          put_iv: Number.isFinite(put_iv) && put_iv > 0 ? put_iv : null,
+        };
+      } catch (_e) {
+        return null;
+      }
+    }
+
     function fmtStrike(quote) {
       if (!quote || quote.strike === undefined || quote.strike === null) return "--";
       const n = Number(quote.strike);
@@ -619,9 +819,24 @@
       return formatNyFromUtcSec(n, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
     }
 
+    /** Streamlit 通过 IP/域名访问时，Python 注入的 ws://localhost:8765 会指向浏览者本机；改为当前页面主机名。 */
+    function resolveDashboardWsUrl(raw) {
+      try {
+        const u = new URL(String(raw || "").trim(), window.location.href);
+        const h = (u.hostname || "").toLowerCase();
+        const pageHost = String(window.location.hostname || "").trim();
+        if (pageHost && (h === "localhost" || h === "127.0.0.1")) {
+          u.hostname = pageHost;
+        }
+        return u.toString();
+      } catch (_e) {
+        return String(raw || "").trim();
+      }
+    }
+
     function apiBaseFromWsUrl(url) {
       try {
-        const u = new URL(String(url || ""), window.location.href);
+        const u = new URL(resolveDashboardWsUrl(String(url || "").trim()), window.location.href);
         u.protocol = u.protocol === "wss:" ? "https:" : "http:";
         u.pathname = u.pathname.replace(/\/ws\/?$/, "");
         u.search = "";
@@ -636,7 +851,7 @@
       const s = String(sym || "").trim().toUpperCase();
       if (!s || !currentArgs.websocketUrl) return "";
       try {
-        const u = new URL(String(currentArgs.websocketUrl), window.location.href);
+        const u = new URL(resolveDashboardWsUrl(String(currentArgs.websocketUrl)), window.location.href);
         u.searchParams.set("symbol", s);
         return u.toString();
       } catch (_e) {
@@ -646,6 +861,34 @@
 
     function setChartSymbolLabel(sym) {
       document.getElementById("symbol").textContent = `${sym || ""} · 1m · ET`;
+    }
+
+    function normalizeIvMarkers(raw) {
+      if (!Array.isArray(raw)) return [];
+      return raw.map((m) => ({
+        time: Number(m.time),
+        position: m.position || "aboveBar",
+        color: m.color || "#fbbf24",
+        shape: m.shape || "circle",
+        text: m.text != null ? String(m.text) : "",
+      })).filter((m) => m.time && Number.isFinite(m.time));
+    }
+
+    /** PG option_snapshots_1m：ATM Gamma 抬升分钟标点（Lightweight Charts markers） */
+    function syncIvMarkersFromArgs(force) {
+      const mk = normalizeIvMarkers(currentArgs.ivMarkers);
+      let sig = "";
+      try {
+        sig = JSON.stringify(mk);
+      } catch (_e) {
+        sig = String(Math.random());
+      }
+      if (!force && sig === ivMarkersSignature) return;
+      ivMarkersSignature = sig;
+      if (!candleSeries || typeof candleSeries.setMarkers !== "function") return;
+      try {
+        candleSeries.setMarkers(mk);
+      } catch (_e) {}
     }
 
     function applyBars(nextBars) {
@@ -669,6 +912,7 @@
         chart.timeScale().fitContent();
         restoreOhlcLatestLine();
       }
+      syncIvMarkersFromArgs(false);
       updateLatestAnchors();
     }
 
@@ -677,9 +921,11 @@
       if (!s || s === String(currentArgs.symbol || "").trim().toUpperCase()) return;
       const base = apiBaseFromWsUrl(currentArgs.websocketUrl || "");
       if (!base) return;
+      ivMarkersSignature = "";
       currentArgs.symbol = s;
       currentArgs.quotes = {};
       currentArgs.position = null;
+      currentArgs.ivMarkers = [];
       lastMnySymbol = s;
       setChartSymbolLabel(s);
       applyBars([]);
@@ -693,6 +939,7 @@
         if (String(payload.symbol || "").toUpperCase() !== s) return;
         currentArgs.quotes = payload.quotes || {};
         currentArgs.position = payload.position || null;
+        currentArgs.ivMarkers = payload.ivMarkers || [];
         applyBars(payload.bars || []);
         lastTradebarContentKey = "";
         updateLatestAnchors();
@@ -764,6 +1011,16 @@
       return pt === String(bucketTag || "").trim().toUpperCase();
     }
 
+    function roiTextForPosition(position, quote) {
+      if (!position) return "";
+      const cost = Number(position.cost || position.entry_price || 0);
+      const live = Number((quote && quote.mid) || position.last_opt_price || cost || 0);
+      if (!Number.isFinite(cost) || !Number.isFinite(live) || cost <= 0 || live <= 0) return "";
+      const roi = ((live / cost) - 1) * 100;
+      if (!Number.isFinite(roi)) return "";
+      return ` ${roi >= 0 ? "+" : ""}${roi.toFixed(1)}%`;
+    }
+
     function mkCard(side, quote, position, bucketTag) {
       const sideUpper = side === "call" ? "CALL" : "PUT";
       const hasThis = positionMatchesBucket(position, bucketTag);
@@ -771,7 +1028,7 @@
       const kindCls = side === "call" ? "call" : "put";
       const cls = hasThis ? "held" : kindCls;
       const disabled = hasOther || (!quote || !(Number(quote.mid) > 0));
-      const buttonText = hasThis ? `平仓 ${sideUpper}` : (hasOther ? "已有另一侧持仓" : `买入 ${sideUpper}`);
+      const buttonText = hasThis ? `平仓 ${sideUpper}${roiTextForPosition(position, quote)}` : (hasOther ? "已有另一侧持仓" : `买入 ${sideUpper}`);
       const buttonClass = hasThis ? "close-btn" : `${side === "call" ? "call" : "put"}-btn`;
       const theme = chartTheme();
       const strikeColor = escapeHtml(theme.text || "#1f2937");
@@ -781,10 +1038,12 @@
         : "";
       return `
         <div class="trade-card ${cls}">
-          <div class="title">${sideUpper}</div>
+          <div class="trade-card-title-row">
+            <div class="title">${sideUpper}</div>
+            ${manualProtectHtml}
+          </div>
           <div class="strike-txt" style="color:${strikeColor};">行权 $${fmtStrike(quote)}</div>
-          <div class="quote">mid ${fmtPrice(quote && quote.mid)} · bid ${fmtPrice(quote && quote.bid)} · ask ${fmtPrice(quote && quote.ask)}</div>
-          ${manualProtectHtml}
+          <div class="quote">mid ${fmtPrice(quote && quote.mid)} · bid ${fmtPrice(quote && quote.bid)} · ask ${fmtPrice(quote && quote.ask)} · IV ${fmtIvDecimal(quote && quote.iv)}</div>
           <button type="button" class="${buttonClass}" data-action="${hasThis ? "close" : "buy"}" data-tag="${safeTag}" ${disabled ? "disabled" : ""}>${buttonText}</button>
         </div>
       `;
@@ -816,6 +1075,105 @@
         manualProtect: Boolean(manualProtect),
         notionalUsd: Math.round(manualNotionalUsd),
         nonce: Date.now(),
+      });
+    }
+
+    let pendingBuyConfirm = null;
+
+    function applyBuyModalTheme() {
+      const theme = chartTheme();
+      const panel = document.getElementById("buy-modal-panel");
+      if (!panel) return;
+      panel.style.background = theme.panel;
+      panel.style.color = theme.text;
+      panel.style.borderColor = theme.border;
+    }
+
+    function buyModalSessionClass(os) {
+      const w = os.within_entry_window;
+      const s = String(os.session || "");
+      if (w === true) return "buy-modal-session buy-modal-okline";
+      if (s === "close_forced") return "buy-modal-session buy-modal-badline";
+      return "buy-modal-session buy-modal-warnline";
+    }
+
+    function closeBuyConfirmModal() {
+      pendingBuyConfirm = null;
+      const overlay = document.getElementById("buy-modal-overlay");
+      if (overlay) {
+        overlay.classList.remove("buy-modal-open");
+        overlay.setAttribute("aria-hidden", "true");
+      }
+    }
+
+    function openBuyConfirmModal(tag, manualProtect) {
+      pendingBuyConfirm = {
+        tag: String(tag || "").trim().toUpperCase(),
+        manualProtect: !!manualProtect,
+      };
+      const os = currentArgs.orderSession || {};
+      const t = pendingBuyConfirm.tag;
+      const qs = currentArgs.quotes || {};
+      const q = qs[t] || {};
+      const mid = Number(q.mid);
+      const mult = 100;
+      let qty = 1;
+      if (Number.isFinite(mid) && mid > 0 && Number.isFinite(manualNotionalUsd) && manualNotionalUsd > 0)
+        qty = Math.max(1, Math.floor(manualNotionalUsd / (mid * mult)));
+
+      applyBuyModalTheme();
+      const titleEl = document.getElementById("buy-modal-title");
+      const sessEl = document.getElementById("buy-modal-session");
+      const schedEl = document.getElementById("buy-modal-schedule");
+      const detEl = document.getElementById("buy-modal-detail");
+      const cbEl = document.getElementById("buy-modal-cb");
+      const qtyValEl = document.getElementById("buy-modal-qty-val");
+      const notionalValEl = document.getElementById("buy-modal-notional-val");
+      const orderMetaEl = document.getElementById("buy-modal-order-meta");
+      const overlay = document.getElementById("buy-modal-overlay");
+      if (!titleEl || !sessEl || !schedEl || !detEl || !cbEl || !qtyValEl || !notionalValEl || !orderMetaEl || !overlay)
+        return;
+
+      titleEl.textContent = `确认买入 · ${String(currentArgs.symbol || "").toUpperCase()} · ${t}`;
+      sessEl.className = buyModalSessionClass(os);
+      sessEl.textContent = `${os.session_zh || "❓ 时段未知"} · 美东 ${os.now_ny || "--"} ET`;
+      schedEl.textContent = os.schedule_line || "";
+      detEl.textContent = os.detail_zh || "（无门禁详情）";
+      const cbNote = os.cb_note ? String(os.cb_note) : "";
+      cbEl.textContent = cbNote;
+      cbEl.style.display = cbNote ? "block" : "none";
+
+      const mp = pendingBuyConfirm.manualProtect ? "是" : "否";
+      const midTxt = Number.isFinite(mid) && mid > 0 ? mid.toFixed(3) : "--";
+      const nu = Math.round(Number(manualNotionalUsd) || 0);
+      qtyValEl.textContent = `${qty} 张`;
+      notionalValEl.textContent = `${nu.toLocaleString("zh-CN")} USD`;
+      const approxPrem = Number.isFinite(mid) && mid > 0 ? qty * mid * mult : null;
+      const premTxt =
+        approxPrem != null && Number.isFinite(approxPrem)
+          ? ` · 权利金名义约 ${approxPrem.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD`
+          : "";
+      orderMetaEl.textContent = `折算依据：mid ${midTxt} × 乘数 ${mult}${premTxt} · 「手动保护」${mp}`;
+
+      overlay.classList.add("buy-modal-open");
+      overlay.setAttribute("aria-hidden", "false");
+    }
+
+    function bindBuyConfirmModalOnce() {
+      if (window.__buyConfirmModalBound) return;
+      window.__buyConfirmModalBound = true;
+      const overlay = document.getElementById("buy-modal-overlay");
+      const cancelBtn = document.getElementById("buy-modal-cancel");
+      const okBtn = document.getElementById("buy-modal-ok");
+      if (!overlay || !cancelBtn || !okBtn) return;
+      cancelBtn.addEventListener("click", closeBuyConfirmModal);
+      overlay.addEventListener("click", (e) => {
+        if (e.target === overlay) closeBuyConfirmModal();
+      });
+      okBtn.addEventListener("click", () => {
+        if (!pendingBuyConfirm) return;
+        emitBuy(pendingBuyConfirm.tag, pendingBuyConfirm.manualProtect);
+        closeBuyConfirmModal();
       });
     }
 
@@ -865,10 +1223,13 @@
           cd: currentArgs.chartDate || "",
           dm: currentArgs.defaultMoneyness || "",
           mny: mnyMode,
+          nu: Math.round(manualNotionalUsd),
+          ns: Math.round(manualNotionalStep),
           CALL_ATM: q.CALL_ATM || {},
           CALL_OTM: q.CALL_OTM || {},
           PUT_ATM: q.PUT_ATM || {},
           PUT_OTM: q.PUT_OTM || {},
+          atmIv: q._atm_iv || {},
           pos: p,
         });
       } catch (_e) {
@@ -886,12 +1247,20 @@
       syncNotionalLabel();
     }
 
+    function atmIvOhlcSuffix() {
+      const ivMeta = readAtmIvMeta(currentArgs.quotes);
+      return ivMeta ? ` · ATM IV ${fmtIvDecimal(ivMeta.mid)}` : "";
+    }
+
     function restoreOhlcLatestLine() {
       if (!bars.length) return;
       const last = bars[bars.length - 1];
       const tl = formatNyFromUtcSec(last.time, { hour: "2-digit", minute: "2-digit", hour12: false });
-      document.getElementById("ohlc").textContent =
-        `${tl} ET · Latest O ${last.open.toFixed(2)} H ${last.high.toFixed(2)} L ${last.low.toFixed(2)} C ${last.close.toFixed(2)}`;
+      const ohlcEl = document.getElementById("ohlc");
+      if (ohlcEl) {
+        ohlcEl.textContent =
+          `${tl} ET · Latest O ${last.open.toFixed(2)} H ${last.high.toFixed(2)} L ${last.low.toFixed(2)} C ${last.close.toFixed(2)}${atmIvOhlcSuffix()}`;
+      }
     }
 
     /** 最新收盘价呼吸灯；CALL/PUT 固定在右侧 #tradebar-host，不叠在 K 线上 */
@@ -964,11 +1333,48 @@
       });
       const tl = formatNyFromUtcSec(bar.time, { hour: "2-digit", minute: "2-digit", hour12: false });
       document.getElementById("ohlc").textContent =
-        `${tl} ET · Latest O ${bar.open.toFixed(2)} H ${bar.high.toFixed(2)} L ${bar.low.toFixed(2)} C ${bar.close.toFixed(2)}`;
+        `${tl} ET · Latest O ${bar.open.toFixed(2)} H ${bar.high.toFixed(2)} L ${bar.low.toFixed(2)} C ${bar.close.toFixed(2)}${atmIvOhlcSuffix()}`;
       updateLatestAnchors();
       if (isNewCandle && chart) {
         try { chart.timeScale().scrollToRealTime(); } catch (_e) {}
       }
+    }
+
+    function stopChartPollFallback() {
+      if (chartPollTimer) {
+        clearInterval(chartPollTimer);
+        chartPollTimer = null;
+      }
+      if (chartPollKick) {
+        clearTimeout(chartPollKick);
+        chartPollKick = null;
+      }
+    }
+
+    /** WS 连不上或未运行时：轮询 bridge 的 REST，仍能刷新最后一根 1m K 线（需 bridge≥当前版本）。 */
+    function scheduleChartPollFallback() {
+      if (currentArgs.readOnly) return;
+      const rawWs = String(currentArgs.websocketUrl || "").trim();
+      if (!rawWs) return;
+      const base = apiBaseFromWsUrl(rawWs);
+      if (!base) return;
+      stopChartPollFallback();
+      chartPollKick = window.setTimeout(() => {
+        chartPollKick = null;
+        const sym = String(currentArgs.symbol || "").trim().toUpperCase();
+        if (!sym) return;
+        if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+        const tick = async () => {
+          try {
+            const resp = await fetch(`${base}/api/latest_bar?symbol=${encodeURIComponent(sym)}`, { cache: "no-store" });
+            if (!resp.ok) return;
+            const data = await resp.json();
+            if (data && data.bar) updateLatestBar(data.bar);
+          } catch (_e) {}
+        };
+        tick();
+        chartPollTimer = window.setInterval(tick, 2000);
+      }, 2800);
     }
 
     function leaderRowHtml(row, side, compatFloat) {
@@ -1087,16 +1493,32 @@
     }
 
     function connectWs(url) {
-      const nextUrl = String(url || "").trim();
-      if (nextUrl === wsUrl) return;
+      const trimmed = String(url || "").trim();
+      const nextUrl = trimmed ? resolveDashboardWsUrl(trimmed) : "";
+      if (!nextUrl) {
+        stopChartPollFallback();
+        wsUrl = "";
+        if (ws) {
+          try { ws.close(); } catch (_e) {}
+          ws = null;
+        }
+        return;
+      }
+      const sameTarget = nextUrl === wsUrl;
+      const alive = ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN);
+      if (sameTarget && alive) return;
+
       wsUrl = nextUrl;
+      stopChartPollFallback();
       if (ws) {
         try { ws.close(); } catch (_e) {}
         ws = null;
       }
-      if (!wsUrl) return;
       try {
-        ws = new WebSocket(wsUrl);
+        ws = new WebSocket(nextUrl);
+        ws.onopen = () => {
+          stopChartPollFallback();
+        };
         ws.onmessage = (event) => {
           try {
             const msg = JSON.parse(event.data);
@@ -1112,6 +1534,10 @@
             else if (msg.type === "bar" || msg.close !== undefined) updateLatestBar(msg);
             if (msg.quotes) currentArgs.quotes = msg.quotes;
             if (msg.position !== undefined) currentArgs.position = msg.position;
+            if (msg.ivMarkers) {
+              currentArgs.ivMarkers = msg.ivMarkers;
+              syncIvMarkersFromArgs(true);
+            }
             if (msg.quotes || msg.position !== undefined) {
               lastTradebarContentKey = "";
               updateLatestAnchors();
@@ -1121,6 +1547,7 @@
         ws.onclose = () => {
           const reconnectUrl = wsUrl;
           ws = null;
+          scheduleChartPollFallback();
           if (reconnectUrl) {
             window.setTimeout(() => {
               if (wsUrl === reconnectUrl && !ws) {
@@ -1135,6 +1562,7 @@
         };
       } catch (_e) {
         ws = null;
+        scheduleChartPollFallback();
       }
     }
 
@@ -1169,6 +1597,7 @@
                 if (tb) {
                   tb.innerHTML = buildLatestTradebarHtml();
                   syncNotionalLabel();
+                  lastTradebarContentKey = tradebarContentKey();
                 }
               }
               e.stopPropagation();
@@ -1182,7 +1611,7 @@
           if (act === "buy") {
             const card = btn.closest(".trade-card");
             const manualInput = card ? card.querySelector("input[data-manual-protect]") : null;
-            emitBuy(btn.dataset.tag, Boolean(manualInput && manualInput.checked));
+            openBuyConfirmModal(btn.dataset.tag, Boolean(manualInput && manualInput.checked));
           }
           else emitAction(act, btn.dataset.tag);
         });
@@ -1260,9 +1689,19 @@
       return true;
     }
 
+    let lastRenderedSymbol = "";
+
     function render(args) {
       currentArgs = args || {};
+      currentArgs.ivMarkers = Array.isArray(currentArgs.ivMarkers) ? currentArgs.ivMarkers : [];
+      currentArgs.orderSession =
+        currentArgs.orderSession && typeof currentArgs.orderSession === "object" ? currentArgs.orderSession : {};
+      bindBuyConfirmModalOnce();
       const ns = String(currentArgs.symbol || "").trim().toUpperCase();
+      if (ns !== lastRenderedSymbol) {
+        ivMarkersSignature = "";
+        lastRenderedSymbol = ns;
+      }
       if (ns && ns !== lastMnySymbol) {
         const defaultMny = String(currentArgs.defaultMoneyness || "ATM").trim().toLowerCase();
         mnyMode = defaultMny === "otm" ? "otm" : "atm";
