@@ -24,7 +24,8 @@ def get_target_symbols(db_path: str) -> set:
          
         cursor = conn.cursor()
         # 建议使用的 Top 50 训练白名单 (按流动性降序)
-        from config import TARGET_SYMBOLS
+        #from config import TARGET_SYMBOLS
+        TARGET_SYMBOLS = ['QQQ']
          # 动态生成占位符并执行查询
         placeholders = ','.join(['?'] * len(TARGET_SYMBOLS))
         query = f"SELECT  symbol  FROM stocks_us WHERE symbol IN ({placeholders})"

@@ -3,7 +3,8 @@
 第三代路径。与 `production/`(legacy 多标的截面)、`New_Pro/`(QQQ 0DTE 过渡版)完全隔离,
 不修改旧路径任何文件;复用旧代码中已验证正确的逻辑,重写有结构缺陷的部分。
 
-> **分阶段里程碑与 MAG7 模型集群设计** → [CLUSTER_ROADMAP.md](./CLUSTER_ROADMAP.md)
+> **分阶段里程碑与 MAG7 模型集群设计** → [CLUSTER_ROADMAP.md](./CLUSTER_ROADMAP.md)  
+> **G3 shadow 逐日核对** → [PARITY_CHECKLIST.md](./PARITY_CHECKLIST.md) · **端到端时序** → [§2.6](#26-端到端时序bar-close--fill)
 
 ## 1. 设计原则(来自架构审查的结论)
 
@@ -438,6 +439,190 @@ Signal 侧在 `absolute` 模式下不做 z-score;**production/baseline** 若 `OM
 
 `system_orchestrator_v8` / `run_live_orchestrator.py` 单进程合体,与双引擎 Redis 边界不一致;
 S4 / `verify_dual_engine` 以双引擎为准。**qqq_btc 不维护 Monolith**。
+
+### 2.6 端到端时序(bar close → fill)
+
+> **G3 shadow 逐日核对表** → [PARITY_CHECKLIST.md](./PARITY_CHECKLIST.md)
+
+#### 2.6.1 总览:三进程 + 三层决策
+
+```mermaid
+flowchart TB
+    subgraph L0["L0 数据"]
+        IBKR["IBKR tick/1m"]
+        FCS["FCS 进程<br/>feature_compute_service_v8"]
+    end
+
+    subgraph L1["L1 TFT 信号"]
+        SE["Signal 进程<br/>DualStreamAlphaNet"]
+    end
+
+    subgraph L2["L2 规则"]
+        ED["entry_decision.choose_entry"]
+        ER["exit_rails.check_exit / disaster_stop"]
+        FM["FillModel 0.775"]
+        RS["ReplaySession 状态机"]
+    end
+
+    subgraph L3["L3 执行"]
+        OMS["OMS 进程<br/>ExecutionEngineV8"]
+        OX["OrchestratorExecution → IBKR"]
+    end
+
+    IBKR --> FCS
+    FCS -->|"unified_inference_stream"| SE
+    SE -->|"orch_trade_signals<br/>ALPHA_FRAME"| OMS
+    IBKR -->|"fused_market_stream 1s"| OMS
+    SE --- L1
+    ED & ER & FM & RS --- L2
+    OMS --> OX --> IBKR
+```
+
+**契约**: 离线 replay 与 live 共用 `ReplaySession` + `entry_decision` + `exit_rails` + `FillModel`。
+G2 验 replay alpha; G3 验 live 与 replay 一致。组合权重/标的竞争不在此链,见 [CLUSTER_ROADMAP.md](./CLUSTER_ROADMAP.md) L3。
+
+#### 2.6.2 主路径:空仓 → 入场 → Fill
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant IBKR
+    participant FCS as FCS 进程
+    participant Redis as Redis Streams
+    participant SE as Signal 进程 (TFT)
+    participant RS as ReplaySession (规则)
+    participant OMS as OMS 进程
+    participant SC as StrategyCore (entry_bridge)
+    participant OX as OrchestratorExecution
+    participant FM as FillModel (0.775)
+
+    Note over IBKR,FM: 每分钟 bar close
+
+    IBKR->>FCS: 1min bar + tick 聚合
+    FCS->>FCS: 慢特征 + IV/greeks/bucket
+    FCS->>Redis: unified_inference_stream
+
+    Redis->>SE: process_batch(is_new_minute)
+    SE->>SE: fcs_adapter.enrich_fcs_bars (time/trend)
+    Note right of SE: G3 #1 feature parity > 0.95
+
+    SE->>SE: DualStreamAlphaNet → net_edge, q10, call/put
+    Note right of SE: G1 val IC>0, q10≈10%
+
+    SE->>RS: SessionSignal(edge, q10, call/put)
+    RS->>RS: choose_entry() 阈值/session/spread/q10
+    Note right of RS: G2 入场 bar/reason 与 replay 一致
+
+    alt edge ≥ threshold 且 spread 合格
+        RS->>RS: pending_entry_bar = bar + entry_delay
+        RS-->>SE: SIGNAL(leg, edge, pending_bar)
+    end
+
+    SE->>Redis: ALPHA_FRAME {items[], net_edge, opt_data}
+    SE->>Redis: SYNC(execute_window 屏障)
+
+    Redis->>OMS: _process_alpha_frame
+
+    alt 有 pending / edge 达标
+        OMS->>SC: decide_entry_via_replay (V0 E1–E6b + choose_entry)
+        SC-->>OMS: BUY candidate
+        OMS->>OX: submit BUY
+        OX->>FM: limit = bid + 0.775×spread
+        Note right of FM: G3 #2 fill median 0.75–0.80
+        OX->>IBKR: 限价单
+        IBKR-->>OX: fill callback
+        OX->>OMS: 更新持仓/cash + fill_audit.csv
+    end
+```
+
+#### 2.6.3 出场路径:分钟 rails + tick disaster
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant IBKR
+    participant Redis
+    participant OMS as OMS 进程
+    participant SC as StrategyCore (exit_bridge)
+    participant ER as exit_rails
+    participant OX as OrchestratorExecution
+
+    Note over IBKR,OX: 持仓中 · 分钟 bar close
+
+    Redis->>OMS: ALPHA_FRAME (每分钟)
+    OMS->>SC: check_exit_via_rails(ctx)
+    SC->>ER: check_exit(mid, max_roi, held_bars)
+    alt 触发退出
+        ER-->>SC: reason (hard_stop / ladder / ...)
+        SC-->>OMS: SELL
+        OMS->>OX: exit_limit = ask − 0.775×spread
+        OX->>IBKR: 限价卖单 → fill
+    end
+
+    Note over IBKR,OX: 持仓中 · 秒级 tick (并行)
+
+    IBKR->>Redis: fused_market_stream 1s
+    Redis->>OMS: _oms_execution_quote_tick
+    OMS->>ER: check_disaster_stop only (−25%, 3–5s 平滑)
+    Note right of ER: 禁止 legacy 秒级阶梯,否则 G3 失败
+    alt ROI ≤ disaster 阈值
+        OMS->>OX: fast_stop 紧急卖
+        OX->>IBKR: 市价/激进限价
+    end
+```
+
+#### 2.6.4 逐步对照(谁做什么 + 验什么)
+
+| 步骤 | 进程/模块 | 层 | 输入 → 输出 | 离线 replay 对应 | 验收门 |
+|------|-----------|-----|-------------|------------------|--------|
+| ① | FCS | 数据 | tick → 1m 特征 batch | 离线 parquet | **G0** |
+| ② | `fcs_adapter` | 数据 | + time/trend | 同函数 | **G3** feature |
+| ③ | `DualStreamAlphaNet` | TFT | tensor → net_edge/q10 | `run_inference.py` | **G1** |
+| ④ | `choose_entry` | 规则 | edge+spread → leg | 同函数 | **G2** |
+| ⑤ | `ReplaySession` | 规则 | SIGNAL → ENTER | `run_replay.py` | **G2** PnL |
+| ⑥ | SE → ALPHA_FRAME | SE | preds + opt_data | alpha parquet | G3 日志 |
+| ⑦ | `decide_entry_via_replay` | 规则+OMS | V0 + choose_entry | 同 L2 | G3 gate_trace |
+| ⑧ | `entry_limit_price_qqq_btc` | 规则+OMS | 0.775 限价 | FillModel.entry_fill | **G3** fill |
+| ⑨ | IBKR fill | OMS | 实际成交价 | replay 模拟 fill | fill_audit |
+| ⑩ | `check_exit_via_rails` | 规则+OMS | mid → exit reason | 同 check_exit | **G3** exit |
+| ⑪ | `check_disaster_stop` | 规则+OMS | tick → 兜底 | 同 on_tick | tick 不污染 max_roi |
+
+#### 2.6.5 G2 vs G3:同链不同环境
+
+```text
+                    ┌─────────────────────────────────────────┐
+                    │           common/ 共享层                 │
+                    │  FillModel · entry_decision · exit_rails │
+                    │           ReplaySession                  │
+                    └──────────────┬──────────────────────────┘
+                                   │
+              ┌────────────────────┴────────────────────┐
+              ▼                                         ▼
+    ┌──────────────────┐                    ┌──────────────────┐
+    │  G2 离线 strict   │                    │  G3 live shadow   │
+    │  run_replay.py    │                    │  REALTIME_DRY     │
+    │  历史 parquet     │                    │  FCS→SE→OMS 实盘栈 │
+    └──────────────────┘                    └──────────────────┘
+              │                                         │
+    fill PnL > 0                           feature parity > 0.95
+    去 best-2-day 仍为正                    fill median 0.75–0.80
+    exit reason 分布基准                    exit L1 vs G2 ≤ 0.35
+```
+
+#### 2.6.6 两个最易 G3 挂掉的点
+
+| 风险 | 表现 | 缓解 |
+|------|------|------|
+| **秒级 exit 口径漂移** | exit reason JS/L1 超标;实盘过早止盈 | `QQQ_BTC_LIVE=1`;勿设 `QQQ_BTC_TICK_EXITS=legacy`;tick 仅 disaster |
+| **entry_delay 不对齐** | live 当根成交,replay 延迟 1 bar | OMS 与 S4 `execute_window` 对齐;`ReplaySession.pending_entry_bar` |
+
+**记忆口诀**:
+
+```text
+FCS 造特征 → TFT 出 edge → 规则决定进不进/进哪条腿
+→ SE 发 ALPHA_FRAME → OMS 再跑一遍规则 + 0.775 限价 → IBKR fill
+→ 分钟 rails 出场,tick 仅 disaster 兜底
+```
 
 ## 3. 复用映射(旧代码 → 新路径)
 

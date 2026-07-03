@@ -19,16 +19,15 @@
   - 报告: `New_Pro/baseline_qqq/reports/aapl_2026-03-18_quote_rule_validation.json`
   - 限制: 当前没有正股价格, 只能验证期权 quote/结构/退出, 不能完整验证 V0 突破信号。
 
-- [ ] 批量接入多天 AAPL 9DTE quote 文件。
+- [x] 批量接入多天 AAPL 9DTE quote 文件。
   - 目的: 避免单日过拟合。
-  - 输入: 至少 20 个交易日, 优先覆盖开盘冲高回落、单边趋势、震荡、尾盘反转。
+  - 实现: `quote_rule_validation.py --raw-1s-dir /mnt/s990/data/raw_1s --symbol QQQ --bucket 2 --batch-days 60`
+  - 报告: `New_Pro/baseline_qqq/reports/qqq_bucket2_60d_raw1s_rule_validation.json` + `{stem}_days/`
   - 通过标准: 脚本可一次生成 per-day + aggregate 报告。
-  - 下一步动作: 给 `quote_rule_validation.py` 增加 `--glob` / `--batch-out`。
 
-- [ ] 补齐正股 1s/1m 数据对齐。
-  - 目的: 把 quote-only 动量替换/补充为正股突破、VWAP、OR、回撤等规则。
-  - 通过标准: 每个期权 timestamp 能 join 到同秒或前向填充的 AAPL stock quote/bar。
-  - 下一步动作: 明确服务器上 AAPL stock 秒级数据路径或从现有缓存补齐。
+- [x] 补齐正股 1s/1m 数据对齐（QQQ 路径）。
+  - 数据: `/mnt/s990/data/raw_1s/stocks/QQQ` 已存在；当前 batch 模式先验 CALL ATM bucket=2 期权 quote + qqq_btc rails。
+  - 待做: 秒级 join 正股 OR/VWAP 规则（V0 突破信号层）。
 
 ## 1. 开盘执行规则
 
@@ -163,7 +162,7 @@
 
 ## 当前最近下一步
 
-1. 给 `quote_rule_validation.py` 增加批量模式。
-2. 从服务器/本地挑选至少 20 天 AAPL 9DTE quote。
-3. 先跑四个 playbook 的独立结果, 不急着合并 router。
-4. 对亏损交易做失败归因, 再决定下一轮参数。
+1. 跑 QQQ 批量验证: `python New_Pro/baseline_qqq/tools/quote_rule_validation.py --raw-1s-dir /mnt/s990/data/raw_1s --symbol QQQ --bucket 2 --batch-days 60 --sensitivity`
+2. 根据 aggregate 报告收敛 `qqq_btc/qqq/config.py` 的 TIME_STOP / LADDER（优先 P0）
+3. 先跑四个 playbook 的独立结果（AAPL legacy 模式仍可用）, 不急着合并 router
+4. 对亏损交易做失败归因, 再决定下一轮参数

@@ -1,0 +1,272 @@
+{
+  "per_day": [
+    {
+      "date": "2026-03-02",
+      "dte": 10,
+      "spread_med": 0.0064,
+      "oracle_n": 6,
+      "oracle_hit": 0.667,
+      "oracle_roi": 0.2732,
+      "forced_n": 6,
+      "forced_hit": 1.0,
+      "forced_roi": 0.4497,
+      "time_stop_false_kill": 0.2121,
+      "top_exit": "EARLY_STOP"
+    },
+    {
+      "date": "2026-03-03",
+      "dte": 9,
+      "spread_med": 0.0082,
+      "oracle_n": 6,
+      "oracle_hit": 0.833,
+      "oracle_roi": 0.3722,
+      "forced_n": 6,
+      "forced_hit": 0.167,
+      "forced_roi": -0.1589,
+      "time_stop_false_kill": 0.198,
+      "top_exit": "TIME_STOP"
+    },
+    {
+      "date": "2026-03-04",
+      "dte": 11,
+      "spread_med": 0.005,
+      "oracle_n": 6,
+      "oracle_hit": 1.0,
+      "oracle_roi": 0.6954,
+      "forced_n": 3,
+      "forced_hit": 0.0,
+      "forced_roi": -0.2097,
+      "time_stop_false_kill": 0.0667,
+      "top_exit": "STEP_PROTECT"
+    },
+    {
+      "date": "2026-03-05",
+      "dte": 10,
+      "spread_med": 0.0087,
+      "oracle_n": 6,
+      "oracle_hit": 0.833,
+      "oracle_roi": 0.2138,
+      "forced_n": 6,
+      "forced_hit": 0.667,
+      "forced_roi": 0.0578,
+      "time_stop_false_kill": 0.1604,
+      "top_exit": "STEP_PROTECT"
+    },
+    {
+      "date": "2026-03-06",
+      "dte": 10,
+      "spread_med": 0.0073,
+      "oracle_n": 6,
+      "oracle_hit": 1.0,
+      "oracle_roi": 0.1985,
+      "forced_n": 6,
+      "forced_hit": 0.167,
+      "forced_roi": -0.1351,
+      "time_stop_false_kill": 0.241,
+      "top_exit": "TIME_STOP"
+    },
+    {
+      "date": "2026-03-09",
+      "dte": 10,
+      "spread_med": 0.0069,
+      "oracle_n": 6,
+      "oracle_hit": 0.667,
+      "oracle_roi": 0.1611,
+      "forced_n": 6,
+      "forced_hit": 0.333,
+      "forced_roi": 0.0931,
+      "time_stop_false_kill": 0.2771,
+      "top_exit": "TIME_STOP"
+    },
+    {
+      "date": "2026-03-10",
+      "dte": 10,
+      "spread_med": 0.0065,
+      "oracle_n": 6,
+      "oracle_hit": 0.667,
+      "oracle_roi": 0.1745,
+      "forced_n": 6,
+      "forced_hit": 0.5,
+      "forced_roi": 0.0978,
+      "time_stop_false_kill": 0.0811,
+      "top_exit": "TIME_STOP"
+    },
+    {
+      "date": "2026-03-11",
+      "dte": 9,
+      "spread_med": 0.006,
+      "oracle_n": 6,
+      "oracle_hit": 0.667,
+      "oracle_roi": 0.009,
+      "forced_n": 6,
+      "forced_hit": 0.167,
+      "forced_roi": -0.1749,
+      "time_stop_false_kill": 0.1212,
+      "top_exit": "TIME_STOP"
+    },
+    {
+      "date": "2026-03-12",
+      "dte": 11,
+      "spread_med": 0.0074,
+      "oracle_n": 6,
+      "oracle_hit": 0.833,
+      "oracle_roi": 0.1153,
+      "forced_n": 6,
+      "forced_hit": 0.333,
+      "forced_roi": -0.1,
+      "time_stop_false_kill": 0.0267,
+      "top_exit": "TIME_STOP"
+    },
+    {
+      "date": "2026-03-13",
+      "dte": 10,
+      "spread_med": 0.0089,
+      "oracle_n": 6,
+      "oracle_hit": 0.667,
+      "oracle_roi": 0.0845,
+      "forced_n": 6,
+      "forced_hit": 0.333,
+      "forced_roi": -0.1533,
+      "time_stop_false_kill": 0.0,
+      "top_exit": "TIME_STOP"
+    },
+    {
+      "date": "2026-03-16",
+      "dte": 10,
+      "spread_med": 0.0069,
+      "oracle_n": 6,
+      "oracle_hit": 0.667,
+      "oracle_roi": 0.1241,
+      "forced_n": 6,
+      "forced_hit": 0.5,
+      "forced_roi": -0.0508,
+      "time_stop_false_kill": 0.1111,
+      "top_exit": "TIME_STOP"
+    },
+    {
+      "date": "2026-03-17",
+      "dte": 10,
+      "spread_med": 0.0052,
+      "oracle_n": 6,
+      "oracle_hit": 0.833,
+      "oracle_roi": 0.2208,
+      "forced_n": 6,
+      "forced_hit": 0.333,
+      "forced_roi": -0.1012,
+      "time_stop_false_kill": 0.0,
+      "top_exit": "TIME_STOP"
+    },
+    {
+      "date": "2026-03-18",
+      "dte": 9,
+      "spread_med": 0.0067,
+      "oracle_n": 6,
+      "oracle_hit": 0.667,
+      "oracle_roi": 0.0684,
+      "forced_n": 6,
+      "forced_hit": 0.667,
+      "forced_roi": -0.0105,
+      "time_stop_false_kill": 0.125,
+      "top_exit": "TIME_STOP"
+    }
+  ],
+  "aggregate": {
+    "days": 13,
+    "days_with_ticks": 13,
+    "quote_stats": {
+      "spread_median_mean": 0.0069,
+      "spread_gt_6pct_frac_mean": 0.0124
+    },
+    "tick_rails_conflict_mean": {
+      "shadow_hard_but_close_ok_frac": 0.0,
+      "shadow_soft_but_close_ok_frac": 0.0002
+    },
+    "oracle_replay_l2_mean": {
+      "trades_total": 78,
+      "hit_rate_mean": 0.7692
+    },
+    "false_kill_mean": {
+      "time_stop_false_kill_frac": 0.1246,
+      "early_stop_false_kill_frac": 0.0
+    }
+  },
+  "sensitivity_fill_0775": {
+    "current": {
+      "trades": 78,
+      "total_net_return": 9.5132,
+      "avg_net_return": 0.0325,
+      "hit_rate": 0.7692,
+      "worst_trade": -0.0833,
+      "exit_reasons": {
+        "TIME_STOP": 50,
+        "STEP_PROTECT": 12,
+        "MAX_HOLD": 9,
+        "EARLY_STOP": 7
+      }
+    },
+    "no_early_stop": {
+      "trades": 78,
+      "total_net_return": 12.4574,
+      "avg_net_return": 0.0355,
+      "hit_rate": 0.8077,
+      "worst_trade": -0.0918,
+      "exit_reasons": {
+        "TIME_STOP": 57,
+        "STEP_PROTECT": 11,
+        "MAX_HOLD": 9,
+        "SOFT_STOP": 1
+      }
+    },
+    "time_stop_20min_3pct": {
+      "trades": 78,
+      "total_net_return": 4.4981,
+      "avg_net_return": 0.0244,
+      "hit_rate": 0.6282,
+      "worst_trade": -0.0833,
+      "exit_reasons": {
+        "TIME_STOP": 32,
+        "STEP_PROTECT": 20,
+        "EARLY_STOP": 13,
+        "MAX_HOLD": 13
+      }
+    },
+    "time_stop_off": {
+      "trades": 77,
+      "total_net_return": 2.9349,
+      "avg_net_return": 0.0203,
+      "hit_rate": 0.6364,
+      "worst_trade": -0.0833,
+      "exit_reasons": {
+        "MAX_HOLD": 34,
+        "STEP_PROTECT": 23,
+        "EARLY_STOP": 20
+      }
+    },
+    "ladder_v0_first_tier": {
+      "trades": 78,
+      "total_net_return": 6.8122,
+      "avg_net_return": 0.0281,
+      "hit_rate": 0.7564,
+      "worst_trade": -0.0624,
+      "exit_reasons": {
+        "TIME_STOP": 43,
+        "STEP_PROTECT": 22,
+        "MAX_HOLD": 7,
+        "EARLY_STOP": 6
+      }
+    },
+    "entry_threshold_0.020": {
+      "trades": 78,
+      "total_net_return": 9.0838,
+      "avg_net_return": 0.0318,
+      "hit_rate": 0.7436,
+      "worst_trade": -0.0833,
+      "exit_reasons": {
+        "TIME_STOP": 49,
+        "STEP_PROTECT": 12,
+        "MAX_HOLD": 10,
+        "EARLY_STOP": 7
+      }
+    }
+  }
+}

@@ -439,14 +439,7 @@ def summarize(trades: List[dict], account: float) -> dict:
     }
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Validate option rules on raw 1s quotes.")
-    parser.add_argument("--quotes", default="~/Downloads/AAPL_2026-03-18.parquet")
-    parser.add_argument("--expiry", default=None)
-    parser.add_argument("--account", type=float, default=50_000.0)
-    parser.add_argument("--out", default="New_Pro/baseline_qqq/reports/aapl_2026-03-18_quote_rule_validation.json")
-    args = parser.parse_args()
-
+def _run_aapl_legacy(args: argparse.Namespace) -> dict:
     quote_path = Path(args.quotes).expanduser()
     wide, mapping = load_quotes(quote_path, args.expiry)
     strategies = {
@@ -455,10 +448,15 @@ def main() -> int:
         "router_structured": _sig_router,
     }
     result = {
+        "mode": "aapl_legacy",
         "quote_path": str(quote_path),
         "rows": int(len(wide)),
         "contracts": mapping,
-        "fill_model": {"entry_frac": ENTRY_FRAC, "exit_frac": EXIT_FRAC, "commission_per_contract": COMMISSION_PER_CONTRACT},
+        "fill_model": {
+            "entry_frac": ENTRY_FRAC,
+            "exit_frac": EXIT_FRAC,
+            "commission_per_contract": COMMISSION_PER_CONTRACT,
+        },
         "strategies": {},
     }
     for name, fn in strategies.items():
@@ -467,7 +465,151 @@ def main() -> int:
             "summary": summarize(trades, args.account),
             "trades": trades,
         }
+    return result
 
+
+def _run_raw1s_batch(args: argparse.Namespace) -> dict:
+    import sys
+
+    tools_dir = Path(__file__).resolve().parent
+    if str(tools_dir) not in sys.path:
+        sys.path.insert(0, str(tools_dir))
+    from raw1s_rule_validation import (
+        QuoteGateConfig,
+        discover_raw1s_days,
+        validate_raw1s_batch,
+        write_batch_reports,
+    )
+
+    raw_dir = Path(args.raw_1s_dir).expanduser()
+    files = discover_raw1s_days(
+        raw_dir,
+        args.symbol,
+        glob_pattern=args.glob,
+        batch_days=args.batch_days,
+    )
+    if not files:
+        raise FileNotFoundError(
+            f"No parquet files for {args.symbol} under {raw_dir} "
+            f"(options/ | options_databento/ | {{symbol}}/)"
+        )
+
+    fill_fracs = tuple(float(x) for x in args.fill_sensitivity.split(","))
+    gate_grid = [
+        QuoteGateConfig(3, 0.06, 2, 0),
+        QuoteGateConfig(3, 0.04, 2, 0),
+        QuoteGateConfig(5, 0.06, 2, 0),
+        QuoteGateConfig(3, 0.06, 5, 0),
+        QuoteGateConfig(3, 0.06, 2, 3),
+        QuoteGateConfig(5, 0.06, 2, 3),
+    ]
+
+    import sys
+
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    from qqq_btc.common.fill_model import OptionSpreadFillModel
+    from qqq_btc.qqq import config as qcfg
+
+    fill_model = OptionSpreadFillModel(
+        entry_frac=args.entry_frac,
+        exit_frac=args.exit_frac,
+    )
+    result = validate_raw1s_batch(
+        raw_dir=raw_dir,
+        symbol=args.symbol,
+        bucket_id=args.bucket,
+        files=files,
+        fill_model=fill_model,
+        rails_cfg=qcfg.EXIT_RAILS,
+        replay_cfg=qcfg.REPLAY,
+        gate_grid=gate_grid,
+        run_sensitivity=args.sensitivity,
+        fill_sensitivity=fill_fracs,
+    )
+    out = Path(args.out)
+    write_batch_reports(result, out, write_per_day=not args.no_per_day)
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Validate option rules on raw 1s quotes (AAPL legacy or QQQ raw_1s batch)."
+    )
+    parser.add_argument(
+        "--raw-1s-dir",
+        default=None,
+        help="Server raw_1s root, e.g. /mnt/s990/data/raw_1s (enables QQQ bucket batch mode)",
+    )
+    parser.add_argument("--symbol", default="QQQ")
+    parser.add_argument(
+        "--bucket",
+        type=int,
+        default=2,
+        help="Option bucket_id (QQQ CALL ATM = 2)",
+    )
+    parser.add_argument(
+        "--glob",
+        default=None,
+        help="Filename glob under options/{symbol}/, e.g. QQQ_2026-*.parquet",
+    )
+    parser.add_argument(
+        "--batch-days",
+        type=int,
+        default=None,
+        help="Use last N trading-day parquet files",
+    )
+    parser.add_argument(
+        "--sensitivity",
+        action="store_true",
+        help="Run qqq_btc rails / fill sensitivity grid (slower)",
+    )
+    parser.add_argument(
+        "--fill-sensitivity",
+        default="0.775",
+        help="Comma-separated fill fracs when --sensitivity (e.g. 0.65,0.775,0.90)",
+    )
+    parser.add_argument("--entry-frac", type=float, default=ENTRY_FRAC)
+    parser.add_argument("--exit-frac", type=float, default=EXIT_FRAC)
+    parser.add_argument("--no-per-day", action="store_true", help="Skip per-day JSON subfolder")
+
+    parser.add_argument("--quotes", default="~/Downloads/AAPL_2026-03-18.parquet")
+    parser.add_argument("--expiry", default=None)
+    parser.add_argument("--account", type=float, default=50_000.0)
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Aggregate JSON path (default depends on mode)",
+    )
+    args = parser.parse_args()
+
+    if args.raw_1s_dir:
+        if args.out is None:
+            tag = f"{args.symbol.lower()}_bucket{args.bucket}"
+            if args.batch_days:
+                tag += f"_{args.batch_days}d"
+            args.out = f"New_Pro/baseline_qqq/reports/{tag}_raw1s_rule_validation.json"
+        result = _run_raw1s_batch(args)
+        print(
+            json.dumps(
+                {
+                    "aggregate": result.get("aggregate"),
+                    "sensitivity_keys": list(result.get("sensitivity", {}).keys()),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        print(f"Wrote {args.out}")
+        if not args.no_per_day:
+            print(f"Per-day reports: {Path(args.out).parent / (Path(args.out).stem + '_days')}")
+        return 0
+
+    if args.out is None:
+        args.out = "New_Pro/baseline_qqq/reports/aapl_2026-03-18_quote_rule_validation.json"
+    result = _run_aapl_legacy(args)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

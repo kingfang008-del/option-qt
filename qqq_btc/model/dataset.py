@@ -6,8 +6,9 @@ LMDB 数据集 —— 从原 UnifiedLMDBDataset 内化。
 设计修正:
   - 训练期依赖(lmdb/msgpack/zstandard)在类内部 import,
     模块 import 本身不拉重依赖、无日志文件副作用
-  - 标签严格读 qqq_btc 标签链的列名,缺 label_return_fwd_net 直接报错,
-    不再静默 fallback 到旧标签(原版 fallback 是 net 标签全 0 事故的温床)
+  - 标签严格读 process_labels_file / label_pipeline 列名,
+    缺必需列直接报错,不再静默 fallback(原版 fallback 是 net 全 0 / 方向恒盘整的温床)
+  - REQUIRED_LABELS 与 build_lmdb 对齐:回归三件套 + direction_net(方向 CE 权重最高)
   - sanity check 返回 dict 供训练脚本断言,而非只打日志
 """
 from __future__ import annotations
@@ -23,7 +24,13 @@ from .backbone import STATIC_FEATURE_NAMES
 
 logger = logging.getLogger("qqq_btc.dataset")
 
-REQUIRED_LABELS = ("label_return_fwd_net", "label_return_fwd_gross", "label_execution_cost")
+# 与 tools/build_lmdb.REQUIRED_LABELS 一致;NetEdgeLoss 方向头依赖 direction_net。
+REQUIRED_LABELS = (
+    "label_return_fwd_net",
+    "label_return_fwd_gross",
+    "label_execution_cost",
+    "label_direction_net",
+)
 
 
 class LMDBAlphaDataset(Dataset):
@@ -101,8 +108,8 @@ class LMDBAlphaDataset(Dataset):
         if self.strict_labels:
             if missing > 0:
                 raise ValueError(
-                    f"{self.db_path}: {missing}/{n} 条缺 net 标签。"
-                    "LMDB 必须由 qqq_btc 标签链生成,不做旧标签 fallback。"
+                    f"{self.db_path}: {missing}/{n} 条缺必需标签 {REQUIRED_LABELS}。"
+                    "LMDB 须由 process_labels_file(或 label_pipeline)生成,不做旧标签 fallback。"
                 )
             if report["net_std"] < 1e-9:
                 raise ValueError(f"{self.db_path}: net 标签方差为 0,检查标签管线。")
@@ -160,15 +167,18 @@ class LMDBAlphaDataset(Dataset):
         }
 
         lbl = data.get("labels", {})
-        net = lbl.get("label_return_fwd_net")
-        gross = lbl.get("label_return_fwd_gross")
-        cost = lbl.get("label_execution_cost")
-        if net is None or gross is None or cost is None:
+        if any(k not in lbl for k in REQUIRED_LABELS):
             if self.strict_labels:
-                return None  # 缺标签样本剔除,不 fallback
-            net = lbl.get("label_return_fwd", 0.0) or 0.0
-            gross, cost = net, 0.0
-        d_val = lbl.get("label_direction_net", lbl.get("label_direction", 1))
+                return None  # 缺标签样本剔除,不 fallback 到恒盘整/旧列
+            net = lbl.get("label_return_fwd_net", lbl.get("label_return_fwd", 0.0)) or 0.0
+            gross = lbl.get("label_return_fwd_gross", net) or 0.0
+            cost = lbl.get("label_execution_cost", 0.0) or 0.0
+            d_val = lbl.get("label_direction_net", lbl.get("label_direction", 1))
+        else:
+            net = lbl["label_return_fwd_net"]
+            gross = lbl["label_return_fwd_gross"]
+            cost = lbl["label_execution_cost"]
+            d_val = lbl["label_direction_net"]
 
         target = {
             "direction": int(d_val),

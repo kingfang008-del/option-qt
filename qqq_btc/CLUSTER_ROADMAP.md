@@ -328,5 +328,7 @@ qqq_btc/registry/symbols.yaml
 ## 13. 相关文档
 
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — 原则、双引擎拓扑、fill 单一真相源  
+- [ARCHITECTURE.md §2.6](./ARCHITECTURE.md#26-端到端时序bar-close--fill) — bar close → fill 端到端时序  
+- [PARITY_CHECKLIST.md](./PARITY_CHECKLIST.md) — G3 shadow 逐日/逐周核对表  
 - [EXECUTION_PLAN.md](./EXECUTION_PLAN.md) — Phase 0 命令与文件索引  
 - [New_Pro/baseline_qqq/docs/LAYOUT.md](../New_Pro/baseline_qqq/docs/LAYOUT.md) — 运行时目录分层  

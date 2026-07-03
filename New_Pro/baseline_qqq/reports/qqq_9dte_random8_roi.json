@@ -1,0 +1,138 @@
+{
+  "picked_days": [
+    "/mnt/s990/data/raw_1s/options/QQQ/QQQ_2022-04-20.parquet",
+    "/mnt/s990/data/raw_1s/options/QQQ/QQQ_2022-09-15.parquet",
+    "/mnt/s990/data/raw_1s/options/QQQ/QQQ_2023-06-22.parquet",
+    "/mnt/s990/data/raw_1s/options/QQQ/QQQ_2023-11-14.parquet",
+    "/mnt/s990/data/raw_1s/options/QQQ/QQQ_2024-06-07.parquet",
+    "/mnt/s990/data/raw_1s/options/QQQ/QQQ_2024-09-17.parquet",
+    "/mnt/s990/data/raw_1s/options/QQQ/QQQ_2025-01-06.parquet",
+    "/mnt/s990/data/raw_1s/options/QQQ/QQQ_2025-06-23.parquet"
+  ],
+  "rows": [
+    {
+      "date": "2022-04-20",
+      "dte": 9,
+      "oracle_trades": 6,
+      "oracle_hit_rate": 0.833,
+      "oracle_day_roi": 0.1785,
+      "oracle_avg_trade": 0.0283,
+      "forced_trades": 6,
+      "forced_day_roi": -0.1607,
+      "forced_hit_rate": 0.5,
+      "exit_reasons": {
+        "TIME_STOP": 4,
+        "MAX_HOLD": 1,
+        "STEP_PROTECT": 1
+      }
+    },
+    {
+      "date": "2022-09-15",
+      "dte": 11,
+      "oracle_trades": 6,
+      "oracle_hit_rate": 0.5,
+      "oracle_day_roi": 0.0085,
+      "oracle_avg_trade": 0.002,
+      "forced_trades": 6,
+      "forced_day_roi": -0.0143,
+      "forced_hit_rate": 0.333,
+      "exit_reasons": {
+        "TIME_STOP": 5,
+        "EARLY_STOP": 1
+      }
+    },
+    {
+      "date": "2023-06-22",
+      "dte": 11,
+      "oracle_trades": 6,
+      "oracle_hit_rate": 0.667,
+      "oracle_day_roi": 0.0647,
+      "oracle_avg_trade": 0.011,
+      "forced_trades": 6,
+      "forced_day_roi": 0.2442,
+      "forced_hit_rate": 0.833,
+      "exit_reasons": {
+        "TIME_STOP": 4,
+        "STEP_PROTECT": 2
+      }
+    },
+    {
+      "date": "2023-11-14",
+      "dte": 10,
+      "oracle_trades": 6,
+      "oracle_hit_rate": 0.667,
+      "oracle_day_roi": 0.4697,
+      "oracle_avg_trade": 0.0716,
+      "forced_trades": 6,
+      "forced_day_roi": 0.4503,
+      "forced_hit_rate": 0.833,
+      "exit_reasons": {
+        "TIME_STOP": 4,
+        "MAX_HOLD": 1,
+        "STEP_PROTECT": 1
+      }
+    },
+    {
+      "date": "2024-06-07",
+      "dte": 10,
+      "oracle_trades": 6,
+      "oracle_hit_rate": 1.0,
+      "oracle_day_roi": 0.3503,
+      "oracle_avg_trade": 0.0518,
+      "forced_trades": 6,
+      "forced_day_roi": -0.0474,
+      "forced_hit_rate": 0.333,
+      "exit_reasons": {
+        "STEP_PROTECT": 3,
+        "TIME_STOP": 3
+      }
+    },
+    {
+      "date": "2024-09-17",
+      "dte": 10,
+      "oracle_trades": 6,
+      "oracle_hit_rate": 0.833,
+      "oracle_day_roi": 0.095,
+      "oracle_avg_trade": 0.0165,
+      "forced_trades": 6,
+      "forced_day_roi": -0.1201,
+      "forced_hit_rate": 0.5,
+      "exit_reasons": {
+        "TIME_STOP": 4,
+        "SOFT_STOP": 1,
+        "STEP_PROTECT": 1
+      }
+    },
+    {
+      "date": "2025-01-06",
+      "dte": 10,
+      "oracle_trades": 6,
+      "oracle_hit_rate": 0.5,
+      "oracle_day_roi": 0.1781,
+      "oracle_avg_trade": 0.0291,
+      "forced_trades": 6,
+      "forced_day_roi": 0.02,
+      "forced_hit_rate": 0.5,
+      "exit_reasons": {
+        "TIME_STOP": 5,
+        "MAX_HOLD": 1
+      }
+    },
+    {
+      "date": "2025-06-23",
+      "dte": 10,
+      "oracle_trades": 6,
+      "oracle_hit_rate": 0.333,
+      "oracle_day_roi": 0.044,
+      "oracle_avg_trade": 0.0118,
+      "forced_trades": 6,
+      "forced_day_roi": 0.0422,
+      "forced_hit_rate": 0.5,
+      "exit_reasons": {
+        "TIME_STOP": 3,
+        "EARLY_STOP": 2,
+        "MAX_HOLD": 1
+      }
+    }
+  ]
+}

@@ -133,7 +133,99 @@ class FeatureEngineer:
         ]
         self.session_label_map = {"pre_market_0400_0700": 0, "pre_market_0700_0930": 1, "regular": 2, 
                                   "after_hours_1600_1800": 3, "after_hours_1800_2000": 4}
- 
+
+        # 0DTE 日内时间/趋势特征(与 qqq_btc.common.time_features / trend_features 对齐)
+        self._session_open_minute = 9 * 60 + 30   # 09:30
+        self._session_close_minute = 16 * 60      # 16:00
+        self._session_minutes = self._session_close_minute - self._session_open_minute  # 390
+
+    @staticmethod
+    def _rolling_linear_fit(y: np.ndarray, window: int) -> tuple:
+        """滚动 OLS:返回 (fit_ret, r2),与 qqq_btc.common.trend_features 一致。"""
+        n = len(y)
+        fit_ret = np.full(n, np.nan)
+        r2 = np.full(n, np.nan)
+        if n < window:
+            return fit_ret, r2
+
+        win = sliding_window_view(y, window_shape=window)
+        t = np.arange(window, dtype=np.float64)
+        t_mean = t.mean()
+        t_var = ((t - t_mean) ** 2).sum()
+
+        y_mean = win.mean(axis=1)
+        cov = ((win - y_mean[:, None]) * (t - t_mean)).sum(axis=1)
+        slope = cov / t_var
+
+        y_var = ((win - y_mean[:, None]) ** 2).sum(axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            r2_win = np.where(y_var > 1e-18, cov**2 / (t_var * y_var), 0.0)
+
+        fit_ret[window - 1:] = slope * (window - 1)
+        r2[window - 1:] = np.clip(r2_win, 0.0, 1.0)
+        return fit_ret, r2
+
+    def _add_time_features(self, df: pd.DataFrame, timestamps: pd.Series) -> None:
+        """
+        日内时间特征(calc=raw,rolling_norm 跳过):
+          time_session_sin / time_session_cos / time_session_progress / time_to_expiry_norm
+        """
+        t = pd.to_datetime(timestamps)
+        if t.dt.tz is None:
+            t = t.dt.tz_localize("America/New_York", ambiguous="infer")
+        else:
+            t = t.dt.tz_convert(self.ny_tz)
+        minute_of_day = t.dt.hour * 60 + t.dt.minute
+        sm = (minute_of_day - self._session_open_minute).clip(
+            lower=0, upper=self._session_minutes
+        ).astype(np.float64)
+        progress = sm / self._session_minutes
+        angle = 2.0 * np.pi * progress
+        df["time_session_sin"] = np.sin(angle)
+        df["time_session_cos"] = np.cos(angle)
+        df["time_session_progress"] = progress
+        df["time_to_expiry_norm"] = 1.0 - progress
+
+    def _add_trend_features(
+        self,
+        df: pd.DataFrame,
+        timestamps: pd.Series,
+        price_col: str = "close",
+        short_window: int = 30,
+        long_window: int = 120,
+    ) -> None:
+        """
+        日内趋势结构特征(calc=raw):
+          trend_fit_ret/r2_{30,120}m, day_range_pos, drawdown_from_day_high, drawup_from_day_low
+        窗口按 bar 计(1min 下即 30/120 分钟);因果安全(只用当前及之前 bar)。
+        """
+        px = pd.to_numeric(df[price_col], errors="coerce").astype(np.float64)
+        log_px = np.log(px.replace(0, np.nan))
+
+        fit_s, r2_s = self._rolling_linear_fit(log_px.to_numpy(), short_window)
+        fit_l, r2_l = self._rolling_linear_fit(log_px.to_numpy(), long_window)
+        df["trend_fit_ret_30m"] = np.nan_to_num(fit_s, nan=0.0)
+        df["trend_fit_r2_30m"] = np.nan_to_num(r2_s, nan=0.0)
+        df["trend_fit_ret_120m"] = np.nan_to_num(fit_l, nan=0.0)
+        df["trend_fit_r2_120m"] = np.nan_to_num(r2_l, nan=0.0)
+
+        t = pd.to_datetime(timestamps)
+        if t.dt.tz is None:
+            t = t.dt.tz_localize("America/New_York", ambiguous="infer")
+        else:
+            t = t.dt.tz_convert(self.ny_tz)
+        day_key = t.dt.date
+
+        high_col = "high" if "high" in df.columns else price_col
+        low_col = "low" if "low" in df.columns else price_col
+        day_high = pd.to_numeric(df[high_col], errors="coerce").groupby(day_key).cummax()
+        day_low = pd.to_numeric(df[low_col], errors="coerce").groupby(day_key).cummin()
+
+        rng = (day_high - day_low).replace(0, np.nan)
+        df["day_range_pos"] = ((px - day_low) / rng).clip(0.0, 1.0).fillna(0.5)
+        df["drawdown_from_day_high"] = (px / day_high.replace(0, np.nan) - 1.0).fillna(0.0)
+        df["drawup_from_day_low"] = (px / day_low.replace(0, np.nan) - 1.0).fillna(0.0)
+
     def _robust_scaler(self, series: pd.Series):
         # --- 加固点 ---
         if series.isnull().all():
@@ -633,6 +725,13 @@ class FeatureEngineer:
         df[cols_to_fill] = df[cols_to_fill].ffill().fillna(0.0)
         # --- 修正结束 ---
 
+        # 0DTE 时间/趋势特征(calc=raw,循环里会 skip;须在此写入才能进最终列选择)
+        # 与 qqq_btc.common.time_features / trend_features 数值口径一致
+        try:
+            self._add_time_features(df, timestamps)
+            self._add_trend_features(df, timestamps, price_col="close")
+        except Exception as e:
+            logging.warning(f"time/trend 特征计算失败: {e}")
 
         # 阶段3: 循环计算
         for feature in self.config['features']: 
@@ -2005,7 +2104,7 @@ def _estimate_round_trip_cost_series(df: pd.DataFrame, config: dict, valid_len: 
     """
     idx = df.index[:valid_len]
     floor = float(_labeling_param(config, "executable_cost_margin", 0.0025))
-    fill_frac = float(_labeling_param(config, "opt_fill_spread_frac", 0.75))
+    fill_frac = float(_labeling_param(config, "opt_fill_spread_frac", 0.775))
     fill_frac = min(1.0, max(0.5, fill_frac))
 
     bid_col = _first_existing_col(df, [
@@ -2074,16 +2173,21 @@ def _apply_executable_net_labels(
 def process_labels_file(file_path: Path, config: dict = None) -> dict:
     """
     [New Delta 架构 - 30min Horizon 适配版]
-    修改点:
-    1. k_slow: 5 -> 30 (30分钟预测)
-    2. vol_window: 60 -> 120 (更稳定的基准)
-    3. Multipliers: 根据 sqrt(T) 放大阈值，防止标签噪声化。
+
+    写入标签列(与 slow_feature_qqq_v2.json labels 对齐):
+      label_direction / label_event / label_volatility / label_return_fwd
+      label_return_fwd_gross / label_return_fwd_net / label_direction_net
+      label_execution_cost
+
+    超参优先读 config.parameters.labeling:
+      k_slow(默认30), vol_window(默认120), opt_fill_spread_frac(默认0.775)
     """
     try:
-        # 1. [I/O] 读取数据
         if not file_path.exists():
             return {'status': 'error', 'path': str(file_path), 'message': 'File not found'}
-            
+
+        cfg = config or {}
+        # 1. [I/O] 读取数据
         df = pd.read_parquet(file_path)
         if 'timestamp' in df.columns:
             df = df.sort_values('timestamp').reset_index(drop=True)
@@ -2095,13 +2199,10 @@ def process_labels_file(file_path: Path, config: dict = None) -> dict:
         # 2. [基础计算]
         df['log_ret'] = np.log(df[price_col] / df[price_col].shift(1).replace(0, np.nan)).fillna(0.0)
         
-        # [修改点 A] 波动率基准窗口放大
-        # 预测未来 30 分钟，建议参考过去 2 小时 (120 min) 的波动率环境
-        vol_window = 120 
+        # 波动率基准窗口 / 预测 horizon:与 slow_feature_qqq_v2.json labeling 对齐
+        vol_window = int(_labeling_param(cfg, "vol_window", 120))
         current_vol = df['log_ret'].rolling(window=vol_window).std()
-        
-        # [修改点 B] 核心预测窗口
-        k_slow = 30
+        k_slow = int(_labeling_param(cfg, "k_slow", 30))
         
         # 准备数据视图
         from numpy.lib.stride_tricks import sliding_window_view

@@ -172,6 +172,8 @@ python qqq_btc/tools/parity_audit.py exits \
 
 **验收门 G3**: feature pass_rate>0.95; fill median≈0.775; exit distribution L1≤0.35。
 
+> **逐日核对表** → [PARITY_CHECKLIST.md](./PARITY_CHECKLIST.md)(含每日/每周打勾项与挂掉排查)
+
 ---
 
 ## 文件索引(新增)

@@ -430,7 +430,8 @@ class OptionIVCalculator:
         # 从本地股票池获取我们需要的标的
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        from config import TARGET_SYMBOLS
+        #from config import TARGET_SYMBOLS
+        TARGET_SYMBOLS= ['QQQ']
          
         placeholders = ','.join(['?'] * len(TARGET_SYMBOLS))
         query = f"SELECT symbol FROM stocks_us WHERE symbol IN ({placeholders})"

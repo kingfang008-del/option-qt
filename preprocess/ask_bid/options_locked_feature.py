@@ -198,8 +198,8 @@ def main():
     OUTPUT_DIR = Path.home() / "train_data/quote_options_bucketed_v7/" 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    from config import TARGET_SYMBOLS
-
+    #from config import TARGET_SYMBOLS
+    TARGET_SYMBOLS = ['QQQ']
     tasks = []
     print("🚀 启动极速微观特征聚合管线...")
     for sym in tqdm(TARGET_SYMBOLS):
