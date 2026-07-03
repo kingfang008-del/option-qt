@@ -1,0 +1,5 @@
+{
+  "comment": "LMDB metadata stock_id/sector_id — 不依赖 Postgres。按实际 LMDB 映射填写。",
+  "QQQ": {"stock_id": 1, "sector_id": 1},
+  "SPY": {"stock_id": 2, "sector_id": 1}
+}

@@ -2457,6 +2457,7 @@ class ExecutionEngineV8:
             'curr_stock': price,
             'bid': ctx_bid,
             'ask': ctx_ask,
+            # 空仓 last_spread_pct==0 → 散度恒为 0；入场判定点差主要靠 bid/ask 与 MAX_SPREAD_*（与回放一致）。
             'spread_divergence': 0.0,
             'snap_roc': st.last_snap_roc,
             'global_regime_reversal_cnt': int(frame.get('global_regime_reversal_cnt', 0) or 0),

@@ -1,0 +1,495 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+文件名: config.py
+描述: V8 系统统一配置文件
+      所有模块共享的硬编码常量集中管理于此。
+      [V8.1 重构版] 采用系统级环境变量 RUN_MODE 作为单一事实来源，彻底解决多进程死锁问题。
+"""
+
+import os
+import pytz
+from pathlib import Path
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    return os.environ.get(name, "1" if default else "0").strip().lower() in {"1", "true", "yes", "on"}
+
+# ================= 时区 =================
+NY_TZ = pytz.timezone('America/New_York')
+
+# ================= 路径配置 =================
+PROJECT_ROOT = Path.home() / "quant_project" # V8 根目录
+DATA_DIR     = PROJECT_ROOT / "data"
+LOG_DIR      = PROJECT_ROOT / "logs"
+DB_DIR    = DATA_DIR / "history_sqlite_1m"
+DB_DIR_1S    = DATA_DIR / "history_sqlite_1s"
+CACHE_DIR    = DATA_DIR / "cache"
+
+# 自动创建目录
+for p in [DATA_DIR, LOG_DIR, DB_DIR, CACHE_DIR]:
+    p.mkdir(parents=True, exist_ok=True)
+
+FEATURE_SERVICE_STATE_FILE = CACHE_DIR / "feature_service_state.pkl"
+
+# ================= 系统运行模式 (单一事实来源) =================
+# 模式枚举:
+# - 'REALTIME'      : 实盘链路 + 可下单
+# - 'REALTIME_DRY'  : 实盘链路 + 禁止下单 (Dry Run)
+# - 'BACKTEST'      : 极速回测 (模拟)
+# 通过环境变量隔离，确保所有子进程对当前环境的认知绝对一致
+# 默认使用 REALTIME_DRY，防止未显式设置 RUN_MODE 时误入可成交路径。
+RUN_MODE = os.environ.get("RUN_MODE", "REALTIME_DRY").upper()
+_LEGACY_STREAM_REPLAY_MODE = "LIVE" + "REPLAY"
+if RUN_MODE == _LEGACY_STREAM_REPLAY_MODE:
+    RUN_MODE = "BACKTEST"
+if RUN_MODE not in {"REALTIME", "REALTIME_DRY", "BACKTEST"}:
+    raise ValueError(f"Unsupported RUN_MODE={RUN_MODE!r}; expected REALTIME, REALTIME_DRY, or BACKTEST")
+
+IS_BACKTEST   = (RUN_MODE == 'BACKTEST')
+IS_REALTIME_DRY = (RUN_MODE == 'REALTIME_DRY')
+IS_SIMULATED  = IS_BACKTEST
+
+# ================= Alpha Replay / 排序模式 =================
+# True:
+#   候选排序更偏纯 alpha，并放宽部分 IV 缺失保护，适合当前 TREND 实盘/回测保持一致。
+# False:
+#   排序会纳入 IV penalty，期权数据缺失时更保守。
+PURE_ALPHA_REPLAY = _env_flag("PURE_ALPHA_REPLAY", True)
+os.environ.setdefault("PURE_ALPHA_REPLAY", "1" if PURE_ALPHA_REPLAY else "0")
+
+# ================= Exec Profile (Path A / Path C) =================
+# scalp_0dte | swing_1dte | auto_hybrid
+# scalp_0dte | swing_1dte | auto_hybrid | multi_band (三档滚仓: BAND1/2/3)
+EXEC_PROFILE = os.environ.get("EXEC_PROFILE", "auto_hybrid").strip().lower()
+EXEC_PROFILE_SHADOW_COMPARE = _env_flag("EXEC_PROFILE_SHADOW_COMPARE", False)
+EXEC_PROFILE_SHADOW_OUTPUT = os.environ.get("EXEC_PROFILE_SHADOW_OUTPUT", "").strip()
+
+# 全局交易开关:
+# - 仿真模式 (BACKTEST): 强制 False
+# - 实盘 Dry 模式 (REALTIME_DRY): 强制 False
+# - REALTIME: 默认 True，可通过环境变量 TRADING_ENABLED 显式关闭
+TRADING_ENABLED = (
+    _env_flag("TRADING_ENABLED", True)
+    and not IS_SIMULATED
+    and not IS_REALTIME_DRY
+)
+
+# ================= REALTIME 上游诊断旁路 =================
+# 仅放宽 Alpha/FCS 上游门禁，帮助定位 “REALTIME 无 Alpha/无交易记录” 问题。
+# 不影响 OMS 的 stale quote / no option feed / alpha barrier 等真实下单保护。
+REALTIME_ALLOW_WARMUP_BYPASS = _env_flag(
+    "REALTIME_ALLOW_WARMUP_BYPASS",
+    RUN_MODE == "REALTIME",
+)
+REALTIME_ALLOW_IV_GATE_BYPASS = _env_flag(
+    "REALTIME_ALLOW_IV_GATE_BYPASS",
+    RUN_MODE == "REALTIME",
+)
+
+# ================= OMS 断流保护 (防自杀式平仓) =================
+# 当 IBKR/Gateway 断流或行情明显陈旧时, 阻止 OMS 用过期报价触发策略交易。
+# 典型场景: REALTIME_DRY 停掉 Gateway 后, 旧报价导致 ROI 失真并触发异常止损。
+OMS_GUARD_STALE_QUOTES = _env_flag("OMS_GUARD_STALE_QUOTES", True)
+# 以事件时间(curr_ts 与 quote.ts)衡量的新鲜度阈值(秒)
+OMS_MAX_QUOTE_STALE_SEC = float(os.environ.get("OMS_MAX_QUOTE_STALE_SEC", "75"))
+# 以系统墙钟(time.time 与 quote_wall_ts)衡量的新鲜度阈值(秒)
+OMS_MAX_QUOTE_WALL_STALE_SEC = float(os.environ.get("OMS_MAX_QUOTE_WALL_STALE_SEC", "20"))
+# 行情陈旧时是否仍允许开仓/平仓。默认全部禁止, 避免断流期间误触发。
+OMS_BLOCK_ENTRY_ON_STALE = _env_flag("OMS_BLOCK_ENTRY_ON_STALE", True)
+OMS_BLOCK_EXIT_ON_STALE = _env_flag("OMS_BLOCK_EXIT_ON_STALE", True)
+# 允许 EOD 类平仓在陈旧行情下放行(默认关闭, 更保守)。
+OMS_ALLOW_EOD_EXIT_ON_STALE = _env_flag("OMS_ALLOW_EOD_EXIT_ON_STALE", False)
+
+# OMS 开仓：QQQ-only 默认 1 个标的即可决策，不再依赖截面样本数。
+# 多标的 legacy 路径可在 import 前 export OMS_ENTRY_MIN_BATCH_SYMBOLS=10。
+_oms_min_syms_raw = os.environ.get("OMS_ENTRY_MIN_BATCH_SYMBOLS", "1").strip()
+try:
+    OMS_ENTRY_MIN_BATCH_SYMBOLS = max(1, int(_oms_min_syms_raw))
+except ValueError:
+    OMS_ENTRY_MIN_BATCH_SYMBOLS = 10
+
+def is_forced_deterministic(r=None) -> bool:
+    """
+    检查是否处于强制确定性模式 (用于 S4 对齐)
+    优先级: 环境变量 > Redis 标志位
+    """
+    # 1. 优先检查环境变量 (这是最强硬的开关)
+    if os.environ.get("SYNC_EXECUTION") == "1" or os.environ.get("RUN_MODE") == "BACKTEST":
+        return True
+        
+    # 2. 如果提供了 Redis 客户端，检查全局对齐总线
+    if r is not None:
+        try:
+            flag = r.get("sync:force_backtest_mode")
+            if flag and (flag.decode('utf-8') if isinstance(flag, bytes) else str(flag)) == "1":
+                return True
+        except:
+            pass
+            
+    return False
+
+# 0: 原始模式 (不干预) | 1: 严格过滤 (总深度>100) | 2: 基准对齐 (强制100)
+STRICT_LIQUIDITY_MODE = int(os.environ.get("STRICT_LIQUIDITY_MODE", "0"))
+ 
+# 动态获取 Redis DB
+def get_redis_db():
+    if os.environ.get('REDIS_DB'):
+        return int(os.environ.get('REDIS_DB'))
+    # 仿真模式使用 DB 1，实盘使用 DB 0
+    return 1 if IS_SIMULATED else 0
+
+def get_feature_service_state_file() -> Path:
+    """
+    为 FCS 状态文件生成环境隔离路径，避免实盘/回放互相覆盖。
+    优先级:
+    1. FCS_STATE_NAMESPACE 显式指定
+    2. RUN_MODE + realtime live/paper + redis db 自动生成
+    """
+    namespace = os.environ.get("FCS_STATE_NAMESPACE", "").strip()
+    if not namespace:
+        mode_label = RUN_MODE.lower()
+        if RUN_MODE.startswith("REALTIME"):
+            acct_label = "paper" if int(IBKR_PORT) == 4002 else "live"
+            namespace = f"{mode_label}_{acct_label}_db{get_redis_db()}"
+        else:
+            namespace = f"{mode_label}_db{get_redis_db()}"
+    return CACHE_DIR / f"feature_service_state_{namespace}.pkl"
+
+FCS_RECENT_STATE_MAX_HOURS = float(os.environ.get("FCS_RECENT_STATE_MAX_HOURS", "24"))
+
+# ================= IBKR 连接配置 =================
+IBKR_HOST       = '127.0.0.1'
+IBKR_PORT       = 4001          # 🚨 4002=Paper (模拟盘), 4001=Real (实盘)
+IBKR_CLIENT_ID  = 102
+IBKR_ACCOUNT_ID = "DUK363545"
+
+
+def get_oms_state_namespace() -> str:
+    """
+    为 OMS PostgreSQL 状态表生成隔离 namespace。
+
+    symbol_state 是账本/持仓恢复的权威快照，必须按运行模式、账号口径、Redis DB
+    隔离，避免 REALTIME_DRY / REALTIME / 回放之间互相污染。
+    """
+    namespace = os.environ.get("OMS_STATE_NAMESPACE", "").strip()
+    if namespace:
+        return namespace
+    mode_label = RUN_MODE.lower()
+    if RUN_MODE.startswith("REALTIME"):
+        acct_label = "paper" if int(IBKR_PORT) == 4002 else "live"
+        return f"oms_{mode_label}_{acct_label}_db{get_redis_db()}"
+    return f"oms_{mode_label}_db{get_redis_db()}"
+
+
+OMS_STATE_NAMESPACE = get_oms_state_namespace()
+
+# ================= Redis 配置 =================
+# 🚩 [核心流定义]
+STREAM_FUSED_MARKET  = 'fused_market_stream'       # IBKR Connector → Feature Service
+STREAM_INFERENCE     = 'unified_inference_stream'  # Feature Service → Orchestrator (SE)
+STREAM_ORCH_SIGNAL   = 'orch_trade_signals'        # Orchestrator (SE) → Execution Engine (OMS)
+STREAM_TRADE_LOG     = 'trade_log_stream'          # All Engines → Dashboard / Persistence
+
+# 👥 [核心消费组定义]
+GROUP_FEATURE        = 'feature_group'             # 特征计算组
+GROUP_ORCH           = 'v8_orch_group'             # 信号引擎 (SE) 组
+GROUP_OMS            = 'v8_oms_group'              # 执行引擎 (OMS) 组
+GROUP_PERSISTENCE    = 'persistence_group'         # 持久化存储组
+
+REDIS_CFG = {
+    'host': 'localhost',
+    'port': 6379,
+    'db': get_redis_db(),  # 动态路由 (Backtest=1, Realtime=0)
+    'group': GROUP_FEATURE,
+    'orch_group': GROUP_ORCH,
+    'oms_group': GROUP_OMS,
+    'pg_group': GROUP_PERSISTENCE,
+    'input_stream': STREAM_INFERENCE,
+    'raw_stream': STREAM_FUSED_MARKET,
+    'signal_stream': STREAM_ORCH_SIGNAL,
+    'trade_log_stream': STREAM_TRADE_LOG,
+    'option_stream': 'live_option_snapshot'
+}
+HASH_OPTION_SNAPSHOT = 'live_option_snapshot'      # IBKR Connector → Dashboard
+
+# ================= 数据库配置 (PostgreSQL) =================
+PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=localhost port=5432"
+
+# ================= 核心交易标的 =================
+# GS 先注释掉，生产的时候再恢复，因为秒级回测数据里没有 GS 的期权数据，可能会导致回测失败
+# TARGET_SYMBOLS =  [
+#     # --- Tier 1: 巨无霸 ---
+#     'NVDA', 'AAPL', 'META', 'PLTR', 'TSLA', 'UNH', 'AMZN', 'AMD', 'MSTR', 'QQQ',
+#     # --- Tier 2: 核心蓝筹 ---
+#     'NFLX', 'CRWV', 'AVGO', 'MSFT', 'HOOD', 'MU',  'GOOGL', 'WMT', 'COIN', 'SPY',
+#     # --- Tier 3: 高流动性 --- 
+#     'SMCI', 'ADBE', 'ORCL', 'NKE', 'XOM', 'INTC', 'DELL', 'IWM', 'GLD', 'VIXY'
+# ]
+
+TARGET_SYMBOLS = ['QQQ', 'VIXY']
+
+# ================= 交易与归一化白/黑名单 =================
+# VIXY 仅用于 regime，不参与 QQQ 期权交易
+NON_TRADABLE_SYMBOLS = ['VIXY']
+
+# absolute 模式：直接使用模型 net_edge，不做截面 z-score
+ALPHA_NORMALIZATION_EXCLUDE_SYMBOLS = ['VIXY']
+
+# Alpha 口径:
+#   absolute      = 直接使用 net_edge（QQQ baseline 默认）
+#   rolling       = per-symbol rolling zscore
+#   cross_section = legacy 全市场截面（baseline_qqq 不使用）
+ALPHA_ZSCORE_MODE = os.environ.get("ALPHA_ZSCORE_MODE", "absolute")
+USE_NET_EDGE_ALPHA = _env_flag("USE_NET_EDGE_ALPHA", True)
+NET_EDGE_CLIP = float(os.environ.get("NET_EDGE_CLIP", "0.25"))
+
+# ================= Bidirectional (Phase 2–4) =================
+BIDIRECTIONAL_ENABLED = _env_flag("BIDIRECTIONAL_ENABLED", True)
+# 极简栈默认关：定边用 sign(net_edge)；审计证明瓶颈后再开
+BIDIRECTIONAL_DUAL_EDGE_ENABLED = _env_flag("BIDIRECTIONAL_DUAL_EDGE_ENABLED", False)
+# 极简栈默认关：EXEC_PROFILE 由人/session 选定，不靠日型自动切
+REGIME_ROUTING_ENABLED = _env_flag("REGIME_ROUTING_ENABLED", False)
+# 极简双路径进场：错价腿 + 趋势腿（关则回退 Ch-A / Ch-B 全量门禁）
+V0_SIMPLE_ENTRY_ENABLED = _env_flag("V0_SIMPLE_ENTRY_ENABLED", True)
+os.environ.setdefault("V0_SIMPLE_ENTRY_ENABLED", "1" if V0_SIMPLE_ENTRY_ENABLED else "0")
+BIDIRECTIONAL_DAY_ROC_THRESHOLD = float(os.environ.get("BIDIRECTIONAL_DAY_ROC_THRESHOLD", "0.0035"))
+BIDIRECTIONAL_DUAL_EDGE_THRESHOLD = float(os.environ.get("BIDIRECTIONAL_DUAL_EDGE_THRESHOLD", "0.015"))
+VOL_Z_USE_PRICE_PROXY = _env_flag("VOL_Z_USE_PRICE_PROXY", False)
+os.environ.setdefault("VOL_Z_USE_PRICE_PROXY", "0" if not VOL_Z_USE_PRICE_PROXY else "1")
+FAST_GATE_SPREAD_MAX = float(os.environ.get("FAST_GATE_SPREAD_MAX", "0.12"))
+FAST_GATE_IV_MOMENTUM_ABS_MAX = float(os.environ.get("FAST_GATE_IV_MOMENTUM_ABS_MAX", "0.50"))
+ALPHA_ROLLING_WINDOW = int(os.environ.get("ALPHA_ROLLING_WINDOW", "120"))
+ALPHA_ROLLING_MIN_PERIODS = int(os.environ.get("ALPHA_ROLLING_MIN_PERIODS", "30"))
+ALPHA_BUCKET_MIN_SIZE = int(os.environ.get("ALPHA_BUCKET_MIN_SIZE", "3"))
+ALPHA_MIXED_SYMBOL_WEIGHT = float(os.environ.get("ALPHA_MIXED_SYMBOL_WEIGHT", "0.6"))
+ALPHA_MIXED_BUCKET_WEIGHT = float(os.environ.get("ALPHA_MIXED_BUCKET_WEIGHT", "0.4"))
+
+# 大科技持续拉升信号增益（默认关闭）
+MEGA_TECH_LIFT_GAIN_ENABLED = _env_flag("MEGA_TECH_LIFT_GAIN_ENABLED", False)
+MEGA_TECH_LIFT_SYMBOLS = os.environ.get(
+    "MEGA_TECH_LIFT_SYMBOLS",
+    "AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO",
+).split(",")
+MEGA_TECH_LIFT_TOP_N = int(os.environ.get("MEGA_TECH_LIFT_TOP_N", "5"))
+MEGA_TECH_LIFT_MIN_TOP_DURATION = int(os.environ.get("MEGA_TECH_LIFT_MIN_TOP_DURATION", "5"))
+MEGA_TECH_LIFT_MIN_VOL_DURATION = int(os.environ.get("MEGA_TECH_LIFT_MIN_VOL_DURATION", "3"))
+MEGA_TECH_LIFT_VOL_Z_THRESHOLD = float(os.environ.get("MEGA_TECH_LIFT_VOL_Z_THRESHOLD", "0.5"))
+MEGA_TECH_LIFT_VOL_IMPULSE_THRESHOLD = float(os.environ.get("MEGA_TECH_LIFT_VOL_IMPULSE_THRESHOLD", "0.5"))
+MEGA_TECH_LIFT_GAIN = float(os.environ.get("MEGA_TECH_LIFT_GAIN", "0.25"))
+MEGA_TECH_LIFT_MAX_GAIN = float(os.environ.get("MEGA_TECH_LIFT_MAX_GAIN", "0.4"))
+
+# 指数趋势计算参考符号
+INDEX_TREND_SYMBOLS = ['SPY', 'QQQ']
+
+# ================= 期权快照完整性门控（防发球机抖动） =================
+# 核心特征预热开关 (实盘建议开启，保证开盘即稳定；研究/重放模式建议根据需求关闭)
+ENABLE_DEEP_WARMUP = _env_flag("ENABLE_DEEP_WARMUP", True) 
+
+# 连续通过 N 个分钟边界才放行到模型输入（非阻塞）
+OPTION_GATE_MIN_CONSECUTIVE_PASS = 1
+# 放行后连续失败 M 个分钟边界才撤销放行（防抖）
+OPTION_GATE_MAX_CONSECUTIVE_FAIL = 2
+# 已放行后允许短抖的宽限期（分钟）
+OPTION_GATE_GRACE_MINUTES = 1
+# ATM IV 最低有效阈值
+OPTION_GATE_MIN_IV = 0.01
+# 是否启用 seq/frame_complete 强一致门控（无该字段时自动降级放行）
+OPTION_GATE_REQUIRE_FRAME_CONSISTENCY = True
+
+
+def get_option_gate_profile() -> dict:
+    """
+    返回统一的 Option Gate 配置剖面（可由环境变量覆盖）。
+    让 FCS 不感知具体市场细节，便于未来切换不同市场 profile。
+    """
+    require_frame_env = os.environ.get("OPTION_GATE_REQUIRE_FRAME_CONSISTENCY")
+    if require_frame_env is None:
+        require_frame = bool(OPTION_GATE_REQUIRE_FRAME_CONSISTENCY)
+    else:
+        require_frame = require_frame_env.strip().lower() not in {"0", "false", "no", "off"}
+
+    return {
+        "min_pass": max(1, int(os.environ.get("OPTION_GATE_MIN_PASS", OPTION_GATE_MIN_CONSECUTIVE_PASS))),
+        "max_fail": max(1, int(os.environ.get("OPTION_GATE_MAX_FAIL", OPTION_GATE_MAX_CONSECUTIVE_FAIL))),
+        "grace_minutes": max(0, int(os.environ.get("OPTION_GATE_GRACE_MINUTES", OPTION_GATE_GRACE_MINUTES))),
+        "min_iv": float(os.environ.get("OPTION_GATE_MIN_IV", OPTION_GATE_MIN_IV)),
+        "require_frame_consistency": bool(require_frame),
+    }
+
+# ================= 资金管理与风控 =================
+INITIAL_ACCOUNT         = 50000.0     # 初始资金 ($)
+MAX_POSITIONS           = 1           # QQQ-only：单标的
+POSITION_RATIO          = 1.0 / 3.0   # 单标的最大仓位比例
+MAX_TRADE_CAP           = 100000.0    # 单笔交易最大金额 ($)
+GLOBAL_EXPOSURE_LIMIT   = 0.90        # 全局风险敞口上限
+COMMISSION_PER_CONTRACT = 0.65        # 手续费 ($/手)
+
+# 自动/手动仓位池拆分:
+# - AUTO_TRADING_CAPITAL_RATIO: 自动策略可使用的总资金比例
+# - MANUAL_TRADING_CAPITAL_RATIO: 手动触发预留资金比例（自动计算为 1 - AUTO）
+# 默认 AUTO=1.0，保持历史行为不变；需要人工池时可设为例如 0.70。
+AUTO_TRADING_CAPITAL_RATIO = min(
+    1.0,
+    max(0.0, float(os.environ.get("AUTO_TRADING_CAPITAL_RATIO", "1.0")))
+)
+MANUAL_TRADING_CAPITAL_RATIO = max(0.0, 1.0 - AUTO_TRADING_CAPITAL_RATIO)
+
+# 实盘总资金上限（美元）：
+# - 仅在 RUN_MODE=REALTIME 时生效
+# - 0 表示关闭，沿用 OMS 当前账本/恢复资金
+# - 典型用法：实盘账户很大，但只想先拿 $5,000 做真实验证
+LIVE_TRADING_CAPITAL_LIMIT = max(
+    0.0,
+    float(os.environ.get("LIVE_TRADING_CAPITAL_LIMIT", "5000"))
+)
+
+# 手动触发单笔默认占用手动资金池比例（Dashboard 使用）
+MANUAL_ORDER_ALLOC_RATIO = min(
+    1.0,
+    max(0.01, float(os.environ.get("MANUAL_ORDER_ALLOC_RATIO", "0.25")))
+)
+
+# ================= BSM 定价参数 =================
+ONLY_LOG_ALPHA=False
+
+# ================= Alpha / 信号 =================
+ROLLING_WINDOW = 30               # Alpha 滚动窗口
+CORR_THRESHOLD = -0.1             # 反转相关性阈值
+
+# ================= 策略核心选择 =================
+# 只在这里/环境变量切换策略版本，避免修改 Signal/Execution 引擎代码。
+# 可选值:
+# - V0: strategy_core_v0.py + strategy_config0.py
+# - V1: strategy_core_v1.py + strategy_config.py
+# - TREND: strategy_core_trend.py + strategy_config0.py
+STRATEGY_CORE_VERSION = os.environ.get("STRATEGY_CORE_VERSION", "V0").strip().upper()
+
+# ================= V0/TREND 利润出场：阶梯 + 连续规则 =================
+# False（默认）：不跑 TRAILING_EPIC 连续层，与此前线上「以阶梯为主」口径一致。
+# True：启用 TRAILING_EPIC（需 TRAILING_TRIGGER_ROI 合理，见 strategy_config0）。
+# 硬止损等其它 exits 不受此开关影响。如需开启：export V0_PROFIT_HYBRID_CONTINUOUS_ENABLED=1
+V0_PROFIT_HYBRID_CONTINUOUS_ENABLED = _env_flag(
+    "V0_PROFIT_HYBRID_CONTINUOUS_ENABLED",
+    False,
+)
+os.environ.setdefault(
+    "V0_PROFIT_HYBRID_CONTINUOUS_ENABLED",
+    "1" if V0_PROFIT_HYBRID_CONTINUOUS_ENABLED else "0",
+)
+
+# ================= 订单执行 =================
+ORDER_TIMEOUT_SECONDS = 5          # 挂单超时
+ORDER_MAX_RETRIES     = 3          # 最大追单次数
+COOLDOWN_MINUTES      = 60         # 止损后的品种冷却时间 (分钟)
+LIMIT_BUFFER_ENTRY    = 1.03       # 买入限价缓冲 (Ask * 1.03)
+LIMIT_BUFFER_EXIT     = 0.97       # 卖出限价缓冲 (Bid * 0.97)
+ENTRY_MAX_REQUOTE_SLIPPAGE_PCT = float(os.environ.get("ENTRY_MAX_REQUOTE_SLIPPAGE_PCT", "0.02"))  # 建仓追价最大偏离(相对初始信号价)
+ENTRY_REQUOTE_STEP_CAP_PCT = float(os.environ.get("ENTRY_REQUOTE_STEP_CAP_PCT", "0.006"))  # 建仓单次重提最大涨幅(相对上一笔限价)
+EXIT_ORDER_TYPE       = 'MKT'      # 平仓订单类型 (MKT/LMT)
+DISABLE_ICEBERG       = _env_flag("DISABLE_ICEBERG", False)      # [新增] 是否禁用冰山拆单逻辑 (用于对比秒级与分钟级一致性)
+SYNC_EXECUTION        = _env_flag("SYNC_EXECUTION", False)       # [新增] 同步执行模式 (用于 bit-perfect 确定性回放验证)
+# 通用执行延迟: 作为 OMS 与 Mock IBKR 的统一来源。
+# 1min 级回测优先使用 bars，1s 级高仿真回测可使用 seconds。
+EXECUTION_DELAY_BARS = int(
+    os.environ.get("EXECUTION_DELAY_BARS", os.environ.get("OMS_SIGNAL_DELAY_BARS", "0"))
+)
+# Keep delay opt-in by default. A non-zero default (e.g. 1s) can amplify
+# 1s micro-structure noise and create unstable PnL jumps when gentle mode is off.
+EXECUTION_DELAY_SECONDS = int(os.environ.get("EXECUTION_DELAY_SECONDS", "0"))
+# 1s 回测温和执行模式：避免把秒级数据上的微结构噪声过度放大成收益折损。
+BACKTEST_1S_GENTLE_EXECUTION = _env_flag("BACKTEST_1S_GENTLE_EXECUTION", True)
+# 1s 严格执行模式：默认开启，更接近“仓位保守/不拆单”的可信口径。
+# 关闭方式：BACKTEST_1S_STRICT_EXECUTION=0
+BACKTEST_1S_STRICT_EXECUTION = _env_flag("BACKTEST_1S_STRICT_EXECUTION", True)
+BACKTEST_1S_DISABLE_DELAY = _env_flag("BACKTEST_1S_DISABLE_DELAY", BACKTEST_1S_GENTLE_EXECUTION)
+BACKTEST_1S_DISABLE_POSTHOC_REPRICE = _env_flag("BACKTEST_1S_DISABLE_POSTHOC_REPRICE", BACKTEST_1S_GENTLE_EXECUTION)
+BACKTEST_1S_DISABLE_ICEBERG = _env_flag(
+    "BACKTEST_1S_DISABLE_ICEBERG",
+    (BACKTEST_1S_GENTLE_EXECUTION or BACKTEST_1S_STRICT_EXECUTION),
+)
+# MockIBKR 1s / S4：期权“理论成交”在 bid–ask 之间的位置（与 Accounting `fill_spread_pct` 语义一致）。
+# BUY: 0=Bid, 0.5=Mid, 1.0=Ask；SELL（平多）: 0=Ask, 0.5=Mid, 1.0=Bid。
+# 例：试探更保守买方成交价 → BACKTEST_OPT_FILL_SPREAD_FRAC=0.75
+try:
+    _bf = float(os.environ.get("BACKTEST_OPT_FILL_SPREAD_FRAC", "0.5"))
+except (TypeError, ValueError):
+    _bf = 0.5
+BACKTEST_OPT_FILL_SPREAD_FRAC = min(1.0, max(0.0, _bf))
+# 温和模式下默认用后录订单价不重算；设为 1 则在 _match_trades 按当时盘口与 FRAC 重标进出价（便于做点差敏感度实验）。
+BACKTEST_OPT_SNAP_FILLS_TO_QUOTE = _env_flag("BACKTEST_OPT_SNAP_FILLS_TO_QUOTE", False)
+
+# OMS 延迟执行: 保持特征/标签时间不变，仅把真正下单延后 N 根 1min bar。
+# 默认只延迟 BUY，避免把风控平仓也一起拖后；如有需要可通过环境变量扩展到 SELL。
+OMS_SIGNAL_DELAY_BARS = EXECUTION_DELAY_BARS
+OMS_SIGNAL_DELAY_ACTIONS = tuple(
+    a.strip().upper()
+    for a in os.environ.get("OMS_SIGNAL_DELAY_ACTIONS", "BUY").split(",")
+    if a.strip()
+)
+
+# 策略自动开仓（ALPHA_FRAME → 策略 BUY）；关闭后仅保留 Dashboard 手动/K 线图开仓等路径。
+# 实盘可由 Dashboard 写入 Redis meta:strategy_auto_entry 覆盖（OMS 优先读 Redis）。
+STRATEGY_AUTO_ENTRY_ENABLED = _env_flag("STRATEGY_AUTO_ENTRY_ENABLED", True)
+
+# ================= Dashboard 配置 =================
+DASHBOARD_REFRESH_RATE = 1.0
+
+# ================= 期权锚点 (Legacy 6-bucket / QQQ 0DTE 4-bucket) =================
+_BUCKET_SPECS_ALL = {
+    'PUT_ATM':       {'delta': -0.50, 'bucket_idx': 0},
+    'PUT_OTM':       {'delta': -0.25, 'bucket_idx': 1},
+    'CALL_ATM':      {'delta':  0.50, 'bucket_idx': 2},
+    'CALL_OTM':      {'delta':  0.25, 'bucket_idx': 3},
+    'NEXT_PUT_ATM':  {'delta': -0.50, 'bucket_idx': 4},
+    'NEXT_CALL_ATM': {'delta':  0.50, 'bucket_idx': 5},
+}
+OPTION_ANCHOR_PROFILE = os.environ.get("OPTION_ANCHOR_PROFILE", "qqq_0dte").strip().lower()
+ANCHOR_CONFIG_PATH = os.environ.get(
+    "ANCHOR_CONFIG_PATH",
+    str(Path(__file__).resolve().parent.parent / "CONFIG" / "anchor_qqq_0dte.json"),
+)
+
+if OPTION_ANCHOR_PROFILE in {"qqq_0dte", "0dte", "1", "true", "yes", "on"}:
+    BUCKET_SPECS = {k: v for k, v in _BUCKET_SPECS_ALL.items() if "NEXT" not in k}
+else:
+    BUCKET_SPECS = dict(_BUCKET_SPECS_ALL)
+
+TAG_TO_INDEX = {k: v['bucket_idx'] for k, v in BUCKET_SPECS.items()}
+
+# 策略默认交易的期权档位。ATM 为当前生产默认；OTM 便于 S4 对照测试进攻性/成本差异。
+TRADE_OPTION_MONEYNESS = os.environ.get(
+    "TRADE_OPTION_MONEYNESS",
+    os.environ.get("OPTION_MONEYNESS", "ATM"),
+).strip().upper()
+if TRADE_OPTION_MONEYNESS not in {"ATM", "OTM"}:
+    raise ValueError("TRADE_OPTION_MONEYNESS must be ATM or OTM")
+
+_OPTION_LEGACY_TAG = {
+    "PUT_ATM": "opt_0",
+    "PUT_OTM": "opt_4",
+    "CALL_ATM": "opt_8",
+    "CALL_OTM": "opt_12",
+}
+
+def option_bucket_tag(direction: int, moneyness: str = None) -> str:
+    side = "CALL" if int(direction or 0) >= 0 else "PUT"
+    money = str(moneyness or TRADE_OPTION_MONEYNESS or "ATM").strip().upper()
+    if money not in {"ATM", "OTM"}:
+        money = "ATM"
+    return f"{side}_{money}"
+
+def option_legacy_tag(direction: int, moneyness: str = None) -> str:
+    return _OPTION_LEGACY_TAG.get(option_bucket_tag(direction, moneyness), "opt_8" if int(direction or 0) >= 0 else "opt_0")
+
+def get_synced_funds(real_balance: float = None) -> float:
+    """
+    统一的资金同步逻辑：
+    - 读取 TRADING_ENABLED 的状态
+    - 如果 TRADING_ENABLED == True 且能获取到有效的真实资金 (real_balance > 0)，则使用真实资金
+    - 否则 (只读模式或获取失败) 统一返回 INITIAL_ACCOUNT (模拟资金)
+    """
+    if TRADING_ENABLED and real_balance is not None and real_balance > 0:
+        return float(real_balance)
+    return float(INITIAL_ACCOUNT)

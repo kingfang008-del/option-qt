@@ -1,0 +1,93 @@
+{
+  "comment": "此配置文件专为【BTC 永续/期货 TFT 模型】设计，核心思想是从股票期权的 Greeks/结构特征切换到 BTC 的 Flow Greeks（OI / Funding / Liquidation / Basis / Volatility）。第一阶段默认基于 CoinAPI 可获得的 OHLCV + Funding + OI + Mark/Index/Basis 类数据。",
+  "comment_keys": "键名在所有部分(labels, loss_weights)中保持一致，并与H5数据集内部路径匹配。",
+  "parameters": {
+    "slow_channel": {
+      "window_duration_minutes": {
+        "regular": 60,
+        "pre_market": 60,
+        "after_hours": 60
+      },
+      "step_duration_minutes": {
+        "regular": 5,
+        "pre_market": 5,
+        "after_hours": 5
+      },
+      "label_horizon_k": 6
+    },
+    "labeling": {
+      "method": "multi_task",
+      "targets": [
+        "direction",
+        "volatility",
+        "event"
+      ],
+      "volatility_k": 6,
+      "event_k": 3,
+      "k_option": 6,
+      "resolutions": {
+        "1min": {
+          "horizon": 30,
+          "entry_threshold": 0.0015,
+          "upper_threshold": 0.0015,
+          "lower_threshold": -0.0015,
+          "vol_multiplier": 2.0
+        },
+        "5min": {
+          "horizon": 6,
+          "entry_threshold": 0.0035,
+          "upper_threshold": 0.0035,
+          "lower_threshold": -0.0035,
+          "vol_multiplier": 2.0
+        }
+      }
+    },
+    "pre_post_dropout_rate": 0.0,
+    "expert_dropout_rate": 0.20,
+    "backbone_dropout_rate": 0.25,
+    "1min": {
+      "sequence_length": 60,
+      "hidden_dim": 64,
+      "learning_rate": 0.0005,
+      "epochs": 40
+    },
+    "5min": {
+      "sequence_length": 24,
+      "hidden_dim": 96,
+      "learning_rate": 0.0002,
+      "epochs": 50
+    }
+  },
+  "labels": {
+    "direction": {
+      "type": "classification",
+      "output_dim": 3
+    },
+    "volatility": {
+      "type": "regression"
+    },
+    "event": {
+      "type": "classification",
+      "output_dim": 1
+    },
+    "return_fwd": {
+      "type": "regression"
+    }
+  },
+  "loss_weights": {
+    "direction": 4.0,
+    "return_fwd": 1.0,
+    "volatility": 0.3,
+    "event": 0.8
+  },
+  "resample_freq": {
+    "regular": {
+      "00:00-23:59": ["1min", "5min"]
+    }
+  },
+  "OHLV": ["open", "high", "low", "close", "volume"],
+  "features":[
+    {"name":"close_log_return","type":"real","calc":"custom","resolution":"1min"},    {"name":"return_5m","type":"real","calc":"custom","resolution":"5min"},  {"name":"volume_log","type":"real","calc":"custom","resolution":"1min"},  {"name":"volume_ratio","type":"real","calc":"volume_ratio","resolution":"1min"},  {"name":"trade_count_log","type":"real","calc":"custom","resolution":"1min"},  {"name":"realized_vol_5m","type":"real","calc":"rolling_volatility","resolution":"5min"},  {"name":"garman_klass_vol","type":"real","calc":"leading","resolution":"5min"},  {"name":"range_pct","type":"real","calc":"custom","resolution":"1min"},  {"name":"bb_width","type":"real","calc":"BollingerBands(close, window=20,   window_dev=2).bollinger_width()","resolution":"5min"},  {"name":"volatility_expansion","type":"real","calc":"zscore","resolution":"5min"},  {"name":"rsi","type":"real","calc":"RSIIndicator(close,   window=14).rsi()","alpha_sign":-1,"resolution":"5min"},  {"name":"adx_smooth_10","type":"real","calc":"adx_smooth_10","resolution":"5min"},  {"name":"price_slope_norm_by_atr","type":"real","calc":"atr_normalized","resolution":"5min"},
+
+{"name":"deriv_funding_rate","type":"real","calc":"funding","resolution":"5min"},{"name":"deriv_funding_change","type":"real","calc":"funding","resolution":"5min"},{"name":"deriv_funding_zscore","type":"real","calc":"zscore","resolution":"5min"},{"name":"deriv_open_interest","type":"real","calc":"oi","resolution":"5min"},{"name":"deriv_oi_change","type":"real","calc":"oi","resolution":"5min"},{"name":"deriv_oi_momentum","type":"real","calc":"oi","resolution":"5min"},{"name":"deriv_price_oi_divergence","type":"real","calc":"oi","resolution":"5min"},{"name":"deriv_mark_price_diff","type":"real","calc":"mark_price","resolution":"1min"},{"name":"deriv_index_price_diff","type":"real","calc":"index_price","resolution":"1min"},{"name":"deriv_basis_perp_vs_index","type":"real","calc":"basis","resolution":"5min"},{"name":"deriv_basis_momentum","type":"real","calc":"basis","resolution":"5min"},{"name":"deriv_current_future_basis","type":"real","calc":"futures_curve","resolution":"5min"},{"name":"deriv_next_future_basis","type":"real","calc":"futures_curve","resolution":"5min"},{"name":"deriv_basis_slope","type":"real","calc":"futures_curve","resolution":"5min"},{"name":"deriv_aggressive_buy_volume","type":"real","calc":"trade_flow","resolution":"1min"},{"name":"deriv_aggressive_sell_volume","type":"real","calc":"trade_flow","resolution":"1min"},{"name":"deriv_trade_imbalance","type":"real","calc":"trade_flow","resolution":"1min"},{"name":"deriv_liquidation_long","type":"real","calc":"liquidation","resolution":"5min"},{"name":"deriv_liquidation_short","type":"real","calc":"liquidation","resolution":"5min"},{"name":"deriv_liquidation_imbalance","type":"real","calc":"liquidation","resolution":"5min"},{"name":"hour","type":"categorical","calc":"time.hour","cardinality":24,"resolution":"5min"},  {"name":"day_of_week","type":"categorical","calc":"time.day_of_week","cardinality":7,"resolution":"5min"}]
+}

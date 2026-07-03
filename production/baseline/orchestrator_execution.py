@@ -48,6 +48,7 @@ class OrchestratorExecution:
         "STOP_LOSS",
         "STOCK_STOP",
         "COND_STOP",
+        "DIR_OPP",
         "EOD",
         "FORCE",
         "FLIP",
@@ -58,6 +59,15 @@ class OrchestratorExecution:
         "STOP_LOSS",
         "STOCK_STOP",
         "COND_STOP",
+        "DIR_OPP",
+    )
+    PROFIT_PROTECT_EXIT_REASON_TOKENS = (
+        "STEP_PROT",
+        "FLASH_PROT",
+        "TRAILING_EPIC",
+        "PROTECT_COUNTER",
+        "SMALL_GAIN",
+        "MACD_FADE",
     )
 
     def __init__(self, orchestrator):
@@ -390,6 +400,11 @@ class OrchestratorExecution:
     def _is_fast_stop_exit_reason(cls, reason: str) -> bool:
         reason_text = str(reason or "").upper()
         return any(token in reason_text for token in cls.FAST_STOP_EXIT_REASON_TOKENS)
+
+    @classmethod
+    def _is_profit_protect_exit_reason(cls, reason: str) -> bool:
+        reason_text = str(reason or "").upper()
+        return any(token in reason_text for token in cls.PROFIT_PROTECT_EXIT_REASON_TOKENS)
 
     @classmethod
     def _resolve_exit_order_type(cls, configured_order_type: str, reason: str, is_force: bool = False) -> str:
@@ -1461,8 +1476,13 @@ class OrchestratorExecution:
                 f"skip auto exit reason={sig.get('reason')}"
             )
             return
-        if not is_urgent and curr_ts - st.entry_ts < 60:
-            logger.warning(f"🛡️ [Ghost B] {sym} 处于平仓保护期 (已持仓 {curr_ts - st.entry_ts:.1f}s < 60s)，忽略该信号。")
+        is_profit_protect = self._is_profit_protect_exit_reason(sig.get('reason', ''))
+        protect_sec = max(0.0, float(self._cfg_value('NON_URGENT_EXIT_PROTECT_SECONDS', 60.0) or 0.0))
+        if not is_urgent and not is_profit_protect and curr_ts - st.entry_ts < protect_sec:
+            logger.warning(
+                f"🛡️ [Ghost B] {sym} 处于平仓保护期 "
+                f"(已持仓 {curr_ts - st.entry_ts:.1f}s < {protect_sec:.0f}s)，忽略该信号。"
+            )
             return
 
         logger.info(f"🚪 [Exit 准入] {sym} | 信号: {sig.get('reason')} | 持仓: {st.position} | 数量: {st.qty} | Pending: {st.is_pending}")

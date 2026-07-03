@@ -1,0 +1,474 @@
+{
+  "symbol": "AAPL",
+  "dates": [
+    "2026-06-26",
+    "2026-06-29",
+    "2026-07-01",
+    "2026-07-02"
+  ],
+  "summary": {
+    "baseline_single": {
+      "days": 4,
+      "trades": 11,
+      "pnl": -1351.5499999999995,
+      "roi": -0.02703099999999999,
+      "avg_day_roi": -0.006757749999999997,
+      "worst_day_roi": -0.071278,
+      "win_rate": 0.5454545454545454,
+      "profit_factor": 0.7226494564520349,
+      "by_structure": {
+        "LONG_CALL": 11
+      }
+    },
+    "routed": {
+      "days": 4,
+      "trades": 11,
+      "pnl": -367.12500000000074,
+      "roi": -0.007342500000000015,
+      "avg_day_roi": -0.0018356250000000037,
+      "worst_day_roi": -0.009167999999999999,
+      "win_rate": 0.2727272727272727,
+      "profit_factor": 0.747424364906004,
+      "by_structure": {
+        "CALL_DEBIT_SPREAD": 3,
+        "LONG_CALL": 6,
+        "STRADDLE": 2
+      }
+    }
+  },
+  "days": [
+    {
+      "date": "2026-06-26",
+      "rows": 297,
+      "baseline_single": {
+        "trades": [
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-06-26T10:03:00-04:00",
+            "exit": "2026-06-26T10:09:00-04:00",
+            "entry_debit": 2.8345,
+            "exit_value": 3.3977500000000003,
+            "contracts": 11,
+            "net": 0.19412594813900183,
+            "pnl": 605.2750000000008,
+            "exit_reason": "TRAILING",
+            "route_reason": "false_break_risk",
+            "call_score": 1.1766860934719572,
+            "put_score": -0.9766860934719572,
+            "stock_entry": 277.145
+          },
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-06-26T10:27:00-04:00",
+            "exit": "2026-06-26T11:11:00-04:00",
+            "entry_debit": 3.8875,
+            "exit_value": 4.78375,
+            "contracts": 8,
+            "net": 0.22720257234726687,
+            "pnl": 706.6,
+            "exit_reason": "TRAILING",
+            "route_reason": "false_break_risk",
+            "call_score": 0.8551151299153901,
+            "put_score": -0.65511512991539,
+            "stock_entry": 278.8561
+          },
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-06-26T12:41:00-04:00",
+            "exit": "2026-06-26T13:02:00-04:00",
+            "entry_debit": 3.119,
+            "exit_value": 3.7247500000000002,
+            "contracts": 10,
+            "net": 0.1900448861814683,
+            "pnl": 592.7499999999997,
+            "exit_reason": "TRAILING",
+            "route_reason": "clean_trend",
+            "call_score": 1.3419975092882974,
+            "put_score": -1.1419975092882975,
+            "stock_entry": 277.91
+          }
+        ],
+        "pnl": 1904.6250000000005,
+        "roi": 0.03809250000000001,
+        "blocks": {
+          "no_signal": 114,
+          "cooldown": 16,
+          "max_trades": 94
+        }
+      },
+      "routed": {
+        "trades": [
+          {
+            "structure": "CALL_DEBIT_SPREAD",
+            "entry": "2026-06-26T10:03:00-04:00",
+            "exit": "2026-06-26T10:22:00-04:00",
+            "entry_debit": 2.35525,
+            "exit_value": 2.3364999999999996,
+            "contracts": 4,
+            "net": -0.019000106145844457,
+            "pnl": -17.900000000000063,
+            "exit_reason": "STEP_PROTECT",
+            "route_reason": "false_break_risk",
+            "call_score": 1.1766860934719572,
+            "put_score": -0.9766860934719572,
+            "stock_entry": 277.145
+          },
+          {
+            "structure": "CALL_DEBIT_SPREAD",
+            "entry": "2026-06-26T10:48:00-04:00",
+            "exit": "2026-06-26T11:21:00-04:00",
+            "entry_debit": 3.2194999999999996,
+            "exit_value": 3.0977500000000004,
+            "contracts": 3,
+            "net": -0.04589221928870921,
+            "pnl": -44.32499999999978,
+            "exit_reason": "STEP_PROTECT",
+            "route_reason": "false_break_risk",
+            "call_score": 0.4460072051731118,
+            "put_score": -0.2460072051731118,
+            "stock_entry": 279.755
+          },
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-06-26T12:41:00-04:00",
+            "exit": "2026-06-26T13:02:00-04:00",
+            "entry_debit": 3.119,
+            "exit_value": 3.7247500000000002,
+            "contracts": 10,
+            "net": 0.1900448861814683,
+            "pnl": 592.7499999999997,
+            "exit_reason": "TRAILING",
+            "route_reason": "clean_trend",
+            "call_score": 1.3419975092882974,
+            "put_score": -1.1419975092882975,
+            "stock_entry": 277.91
+          }
+        ],
+        "pnl": 530.5249999999999,
+        "roi": 0.010610499999999997,
+        "blocks": {
+          "no_signal": 89,
+          "cooldown": 40,
+          "max_trades": 94
+        }
+      }
+    },
+    {
+      "date": "2026-06-29",
+      "rows": 143,
+      "baseline_single": {
+        "trades": [
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-06-29T11:18:00-04:00",
+            "exit": "2026-06-29T11:19:00-04:00",
+            "entry_debit": 0.2055,
+            "exit_value": 0.17125,
+            "contracts": 162,
+            "net": -0.22992700729926993,
+            "pnl": -765.4499999999995,
+            "exit_reason": "SOFT_STOP",
+            "route_reason": "ambiguous_high_range",
+            "call_score": 0.026597028707837922,
+            "put_score": 0.1734029712921621,
+            "stock_entry": 282.345
+          },
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-06-29T13:21:00-04:00",
+            "exit": "2026-06-29T14:40:00-04:00",
+            "entry_debit": 0.057749999999999996,
+            "exit_value": 0.02225,
+            "contracts": 577,
+            "net": -0.8398268398268399,
+            "pnl": -2798.4500000000003,
+            "exit_reason": "HARD_STOP",
+            "route_reason": "ambiguous_high_range",
+            "call_score": -0.00866484609417964,
+            "put_score": 0.20866484609417965,
+            "stock_entry": 281.15
+          }
+        ],
+        "pnl": -3563.8999999999996,
+        "roi": -0.071278,
+        "blocks": {
+          "no_signal": 110,
+          "cooldown": 20,
+          "halted": 7
+        }
+      },
+      "routed": {
+        "trades": [
+          {
+            "structure": "STRADDLE",
+            "entry": "2026-06-29T11:18:00-04:00",
+            "exit": "2026-06-29T11:49:00-04:00",
+            "entry_debit": 3.2855,
+            "exit_value": 2.807,
+            "contracts": 3,
+            "net": -0.15355349261908388,
+            "pnl": -151.35000000000002,
+            "exit_reason": "EARLY_STOP",
+            "route_reason": "ambiguous_high_range",
+            "call_score": 0.026597028707837922,
+            "put_score": 0.1734029712921621,
+            "stock_entry": 282.345
+          },
+          {
+            "structure": "STRADDLE",
+            "entry": "2026-06-29T13:21:00-04:00",
+            "exit": "2026-06-29T13:51:00-04:00",
+            "entry_debit": 3.90775,
+            "exit_value": 2.9102500000000004,
+            "contracts": 3,
+            "net": -0.2619154244770008,
+            "pnl": -307.04999999999995,
+            "exit_reason": "SOFT_STOP",
+            "route_reason": "ambiguous_high_range",
+            "call_score": -0.00866484609417964,
+            "put_score": 0.20866484609417965,
+            "stock_entry": 281.15
+          }
+        ],
+        "pnl": -458.4,
+        "roi": -0.009167999999999999,
+        "blocks": {
+          "no_signal": 102,
+          "cooldown": 28
+        }
+      }
+    },
+    {
+      "date": "2026-07-01",
+      "rows": 248,
+      "baseline_single": {
+        "trades": [
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-07-01T09:58:00-04:00",
+            "exit": "2026-07-01T10:01:00-04:00",
+            "entry_debit": 3.017,
+            "exit_value": 2.37575,
+            "contracts": 11,
+            "net": -0.21685449121644015,
+            "pnl": -719.675,
+            "exit_reason": "SOFT_STOP",
+            "route_reason": "false_break_risk",
+            "call_score": 1.1463486453076572,
+            "put_score": -0.9463486453076573,
+            "stock_entry": 292.5
+          },
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-07-01T10:27:00-04:00",
+            "exit": "2026-07-01T10:45:00-04:00",
+            "entry_debit": 3.25775,
+            "exit_value": 4.394,
+            "contracts": 10,
+            "net": 0.3447931854807766,
+            "pnl": 1123.25,
+            "exit_reason": "STEP_PROTECT",
+            "route_reason": "clean_trend",
+            "call_score": 0.39391922954944125,
+            "put_score": -0.1939192295494412,
+            "stock_entry": 292.98
+          },
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-07-01T11:17:00-04:00",
+            "exit": "2026-07-01T11:26:00-04:00",
+            "entry_debit": 5.48925,
+            "exit_value": 5.65125,
+            "contracts": 6,
+            "net": 0.027143963200801507,
+            "pnl": 89.3999999999998,
+            "exit_reason": "STEP_PROTECT",
+            "route_reason": "clean_trend",
+            "call_score": 0.9063177377733216,
+            "put_score": -0.7063177377733215,
+            "stock_entry": 295.561
+          }
+        ],
+        "pnl": 492.97499999999985,
+        "roi": 0.009859499999999997,
+        "blocks": {
+          "no_signal": 54,
+          "cooldown": 28,
+          "max_trades": 133
+        }
+      },
+      "routed": {
+        "trades": [
+          {
+            "structure": "CALL_DEBIT_SPREAD",
+            "entry": "2026-07-01T09:58:00-04:00",
+            "exit": "2026-07-01T10:23:00-04:00",
+            "entry_debit": 2.5789999999999997,
+            "exit_value": 2.4305,
+            "contracts": 4,
+            "net": -0.06766188445133764,
+            "pnl": -69.7999999999999,
+            "exit_reason": "TIME_STOP",
+            "route_reason": "false_break_risk",
+            "call_score": 1.1463486453076572,
+            "put_score": -0.9463486453076573,
+            "stock_entry": 292.5
+          },
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-07-01T10:44:00-04:00",
+            "exit": "2026-07-01T10:45:00-04:00",
+            "entry_debit": 4.837000000000001,
+            "exit_value": 4.394,
+            "contracts": 6,
+            "net": -0.09427330990283248,
+            "pnl": -273.6000000000004,
+            "exit_reason": "SOFT_STOP",
+            "route_reason": "clean_trend",
+            "call_score": 1.5808585880642807,
+            "put_score": -1.3808585880642807,
+            "stock_entry": 294.83
+          },
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-07-01T11:17:00-04:00",
+            "exit": "2026-07-01T11:26:00-04:00",
+            "entry_debit": 5.48925,
+            "exit_value": 5.65125,
+            "contracts": 6,
+            "net": 0.027143963200801507,
+            "pnl": 89.3999999999998,
+            "exit_reason": "STEP_PROTECT",
+            "route_reason": "clean_trend",
+            "call_score": 0.9063177377733216,
+            "put_score": -0.7063177377733215,
+            "stock_entry": 295.561
+          }
+        ],
+        "pnl": -254.0000000000005,
+        "roi": -0.00508000000000001,
+        "blocks": {
+          "no_signal": 37,
+          "cooldown": 40,
+          "max_trades": 133
+        }
+      }
+    },
+    {
+      "date": "2026-07-02",
+      "rows": 152,
+      "baseline_single": {
+        "trades": [
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-07-02T09:50:00-04:00",
+            "exit": "2026-07-02T09:51:00-04:00",
+            "entry_debit": 7.61225,
+            "exit_value": 6.811,
+            "contracts": 4,
+            "net": -0.10696574600151078,
+            "pnl": -325.70000000000016,
+            "exit_reason": "SOFT_STOP",
+            "route_reason": "clean_trend",
+            "call_score": 1.3385881860037556,
+            "put_score": -1.1385881860037557,
+            "stock_entry": 302.34
+          },
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-07-02T10:12:00-04:00",
+            "exit": "2026-07-02T10:36:00-04:00",
+            "entry_debit": 8.9395,
+            "exit_value": 10.3,
+            "contracts": 3,
+            "net": 0.15073549974830802,
+            "pnl": 404.24999999999994,
+            "exit_reason": "TRAILING",
+            "route_reason": "clean_trend",
+            "call_score": 1.285747158516226,
+            "put_score": -1.085747158516226,
+            "stock_entry": 304.035
+          },
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-07-02T11:00:00-04:00",
+            "exit": "2026-07-02T11:05:00-04:00",
+            "entry_debit": 12.79525,
+            "exit_value": 11.48925,
+            "contracts": 2,
+            "net": -0.10308512924718154,
+            "pnl": -263.7999999999999,
+            "exit_reason": "EARLY_STOP",
+            "route_reason": "clean_trend",
+            "call_score": 0.7620660227510392,
+            "put_score": -0.5620660227510391,
+            "stock_entry": 307.475
+          }
+        ],
+        "pnl": -185.2500000000001,
+        "roi": -0.003705000000000002,
+        "blocks": {
+          "no_signal": 33,
+          "cooldown": 28,
+          "max_trades": 58
+        }
+      },
+      "routed": {
+        "trades": [
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-07-02T09:50:00-04:00",
+            "exit": "2026-07-02T09:51:00-04:00",
+            "entry_debit": 7.61225,
+            "exit_value": 6.811,
+            "contracts": 4,
+            "net": -0.10696574600151078,
+            "pnl": -325.70000000000016,
+            "exit_reason": "SOFT_STOP",
+            "route_reason": "clean_trend",
+            "call_score": 1.3385881860037556,
+            "put_score": -1.1385881860037557,
+            "stock_entry": 302.34
+          },
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-07-02T10:12:00-04:00",
+            "exit": "2026-07-02T10:36:00-04:00",
+            "entry_debit": 8.9395,
+            "exit_value": 10.3,
+            "contracts": 3,
+            "net": 0.15073549974830802,
+            "pnl": 404.24999999999994,
+            "exit_reason": "TRAILING",
+            "route_reason": "clean_trend",
+            "call_score": 1.285747158516226,
+            "put_score": -1.085747158516226,
+            "stock_entry": 304.035
+          },
+          {
+            "structure": "LONG_CALL",
+            "entry": "2026-07-02T11:00:00-04:00",
+            "exit": "2026-07-02T11:05:00-04:00",
+            "entry_debit": 12.79525,
+            "exit_value": 11.48925,
+            "contracts": 2,
+            "net": -0.10308512924718154,
+            "pnl": -263.7999999999999,
+            "exit_reason": "EARLY_STOP",
+            "route_reason": "clean_trend",
+            "call_score": 0.7620660227510392,
+            "put_score": -0.5620660227510391,
+            "stock_entry": 307.475
+          }
+        ],
+        "pnl": -185.2500000000001,
+        "roi": -0.003705000000000002,
+        "blocks": {
+          "no_signal": 33,
+          "cooldown": 28,
+          "max_trades": 58
+        }
+      }
+    }
+  ]
+}

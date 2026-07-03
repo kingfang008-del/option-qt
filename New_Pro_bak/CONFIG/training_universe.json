@@ -1,0 +1,66 @@
+{
+  "comment": "Training universes for regime-specific net-edge models. Do not mix these groups blindly.",
+  "production_priority": [
+    "index_etf_options",
+    "qqq_only",
+    "spy_only",
+    "single_stock_options",
+    "btc_perpetual"
+  ],
+  "universes": {
+    "index_etf_options": {
+      "description": "Low-IV, tight-spread index ETF options. Primary shared model for SPY/QQQ.",
+      "symbols": ["SPY", "QQQ"],
+      "model_family": "tft_index_etf_net_edge",
+      "checkpoint_dir": "checkpoints_index_etf_net_edge",
+      "allow_cross_sectional_rank": false,
+      "primary_metric": "per_symbol_top_quantile_net_return"
+    },
+    "qqq_only": {
+      "description": "QQQ-only calibration and strict replay validation.",
+      "symbols": ["QQQ"],
+      "base_model": "checkpoints_index_etf_net_edge/advanced_alpha_best.pth",
+      "checkpoint_dir": "checkpoints_qqq_net_edge",
+      "fine_tune_layers": [
+        "symbol_calibrator",
+        "head_net_edge",
+        "head_execution_cost",
+        "head_gross_return",
+        "fusion"
+      ],
+      "allow_cross_sectional_rank": false,
+      "primary_metric": "qqq_strict_replay_net_pnl"
+    },
+    "spy_only": {
+      "description": "SPY-only calibration and strict replay validation.",
+      "symbols": ["SPY"],
+      "base_model": "checkpoints_index_etf_net_edge/advanced_alpha_best.pth",
+      "checkpoint_dir": "checkpoints_spy_net_edge",
+      "fine_tune_layers": [
+        "symbol_calibrator",
+        "head_net_edge",
+        "head_execution_cost",
+        "head_gross_return",
+        "fusion"
+      ],
+      "allow_cross_sectional_rank": false,
+      "primary_metric": "spy_strict_replay_net_pnl"
+    },
+    "single_stock_options": {
+      "description": "High-liquidity single-stock options. Separate model because IV/spread/event structure differs from SPY/QQQ.",
+      "symbols": ["AAPL", "MSFT", "NVDA", "AMD", "TSLA", "META", "AMZN"],
+      "model_family": "tft_single_stock_net_edge",
+      "checkpoint_dir": "checkpoints_single_stock_net_edge",
+      "allow_cross_sectional_rank": false,
+      "primary_metric": "per_symbol_top_quantile_net_return"
+    },
+    "btc_perpetual": {
+      "description": "BTC perpetual futures. Separate non-option regime.",
+      "symbols": ["BTC"],
+      "model_family": "tft_btc_perp_net_edge",
+      "checkpoint_dir": "checkpoints_btc_perp_net_edge",
+      "allow_cross_sectional_rank": false,
+      "primary_metric": "strict_replay_net_pnl"
+    }
+  }
+}

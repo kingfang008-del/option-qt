@@ -1,0 +1,41 @@
+{
+  "dates": [
+    "synthetic"
+  ],
+  "mode": "synthetic",
+  "n_minutes": 390,
+  "tradable_ratio": 1.0,
+  "oracle_call_share": 0.5128205128205128,
+  "oracle_put_share": 0.4794871794871795,
+  "model_call_share": 0.2794871794871795,
+  "model_put_share": 0.27692307692307694,
+  "side_agreement": 0.5564102564102564,
+  "missed_put_edge_mean": 0.01544702904266602,
+  "missed_call_edge_mean": 0.013888972400710334,
+  "by_day_type": {
+    "chop": {
+      "n": 159,
+      "oracle_put_share": 0.44654088050314467,
+      "model_put_share": 0.025157232704402517,
+      "side_agreement": 0.05660377358490566
+    },
+    "dislocation": {
+      "n": 3,
+      "oracle_put_share": 0.6666666666666666,
+      "model_put_share": 0.0,
+      "side_agreement": 0.0
+    },
+    "trend_down": {
+      "n": 114,
+      "oracle_put_share": 1.0,
+      "model_put_share": 0.9122807017543859,
+      "side_agreement": 0.9122807017543859
+    },
+    "trend_up": {
+      "n": 114,
+      "oracle_put_share": 0.0,
+      "model_put_share": 0.0,
+      "side_agreement": 0.9122807017543859
+    }
+  }
+}

@@ -1,6 +1,12 @@
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
+try:
+    from config import V0_PROFIT_HYBRID_CONTINUOUS_ENABLED as _CFG_V0_PROFIT_HYBRID_CONTINUOUS
+except Exception:  # pragma: no cover
+    _CFG_V0_PROFIT_HYBRID_CONTINUOUS = False
+
+
 @dataclass
 class StrategyConfig:
     """
@@ -159,8 +165,8 @@ class StrategyConfig:
 
     # ================= 7. Liquidity =================
     MAX_SPREAD_PCT_ENTRY: float = 0.05        # 兼容保留：未区分方向时的默认准入点差
-    MAX_SPREAD_PCT_ENTRY_CALL: float = 0.05   # V0 做多(CALL)开仓点差上限 8%
-    MAX_SPREAD_PCT_ENTRY_PUT: float = 0.07    # V0 做空(PUT)开仓点差上限 10%
+    MAX_SPREAD_PCT_ENTRY_CALL: float = 0.05   # V0 做多(CALL)开仓点差上限
+    MAX_SPREAD_PCT_ENTRY_PUT: float = 0.07    # V0 做空(PUT)开仓点差上限
     MAX_SPREAD_PCT_EXIT: float = 0.2 
     MAX_SPREAD_DIVERGENCE: float = 0.02
     
@@ -270,12 +276,18 @@ class StrategyConfig:
     # OMS 秒级 tight-exit：原为开仓后延迟盈利阶梯 / FLASH；默认 0 = 不再延迟。
     # 亏损侧 ABSOLUTE_STOP_LOSS / STOP_LOSS 仍按秒级评估。
     TIGHT_1S_ENTRY_PROTECT_SECONDS: float = 0.0
+    # OMS 平仓保护期：只挡 TIME/SPREAD/ZOMBIE 等非风险、非利润保护退出；
+    # STEP/FLASH/TRAILING 等利润保护不再等待 60s。
+    NON_URGENT_EXIT_PROTECT_SECONDS: float = 60.0
     # 正股瞬时涨跌与持仓方向相反（CALL 遇正股下跌 tick、PUT 遇正股上涨 tick），连续 N 秒触发秒级平仓。
     TIGHT_1S_DIR_OPP_CONSEC_SECONDS: int = 5
     # >0 时仅当 |ΔS/S| 超过该阈值才算反向；0 = 任一反向 tick 计数。
     TIGHT_1S_DIR_OPP_MIN_REL_MOVE: float = 0.0
-    TRAILING_TRIGGER_ROI: float = 5.50
+    # 峰值 ROI≥该值后启用 TRAILING_EPIC（与 LADDER 同口径：0.05=5%）。原 5.50 易被当成 550%，几乎永不触发。
+    TRAILING_TRIGGER_ROI: float = 0.22
     TRAILING_KEEP_RATIO: float = 0.92
+    # 与 config.V0_PROFIT_HYBRID_CONTINUOUS_ENABLED 同步；False 时跳过 TRAILING_EPIC（仅阶梯等离散档 + 其它 exit）
+    V0_PROFIT_HYBRID_CONTINUOUS_ENABLED: bool = _CFG_V0_PROFIT_HYBRID_CONTINUOUS
     COUNTER_TREND_PROTECT_TRIGGER: float = 0.25
     COUNTER_TREND_PROTECT_EXIT: float = 0.10
     MACD_FADE_MIN_ROI: float = 0.03            # V0 动能衰减门槛极低 (3%)

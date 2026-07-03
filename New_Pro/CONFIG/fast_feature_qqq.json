@@ -1,0 +1,48 @@
+{
+  "comment": "QQQ 快通道 Regime Gate：不训练 WaveTCN，仅提供波动率/IV/Spread 门控特征。",
+  "parameters": {
+    "fast_channel": {
+      "window_duration_minutes": {
+        "regular": 10,
+        "pre_market": 10,
+        "after_hours": 5
+      },
+      "step_duration_minutes": {
+        "regular": 1,
+        "pre_market": 1,
+        "after_hours": 1
+      },
+      "label_horizon_k": 5
+    },
+    "labeling": {
+      "method": "multi_task",
+      "targets": ["direction", "volatility", "event"],
+      "volatility_k": 10,
+      "event_k": 10,
+      "k_option": 10
+    }
+  },
+  "labels": {
+    "direction": { "type": "classification", "output_dim": 3 },
+    "volatility": { "type": "regression" },
+    "event": { "type": "classification", "output_dim": 1 }
+  },
+  "loss_weights": {
+    "direction": 0.0,
+    "volatility": 1.0,
+    "event": 0.0
+  },
+  "resample_freq": {
+    "regular": {
+      "09:30-16:00": ["1min"]
+    }
+  },
+  "OHLV": ["open", "high", "low", "close", "volume"],
+  "features": [
+    { "name": "fast_vol", "type": "real", "calc": "fast_vol", "use_for_anomaly": false },
+    { "name": "qqq_roc_5min", "type": "real", "calc": "qqq_roc_5min", "use_for_anomaly": false },
+    { "name": "options_vw_spread", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_iv_momentum", "type": "real", "calc": "options", "use_for_anomaly": false },
+    { "name": "options_vw_iv", "type": "real", "calc": "options", "use_for_anomaly": false }
+  ]
+}

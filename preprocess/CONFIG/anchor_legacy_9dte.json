@@ -1,0 +1,21 @@
+{
+  "profile": "legacy_9dte",
+  "description": "Legacy front ~9DTE + next ~37DTE，6-bucket",
+
+  "front_allowed_dte": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+  "front_prefer_dte": 9,
+  "front_min_dte": 5,
+  "front_max_dte": 16,
+  "use_next_buckets": true,
+
+  "delta_tolerance": 0.15,
+  "atm_center": 0.50,
+  "otm_center": 0.25,
+
+  "symbols": [],
+
+  "paths": {
+    "raw_iv_dir": "~/train_data/nq_options_day_iv",
+    "locked_targets_output": "~/train_data/locked_targets_map.parquet"
+  }
+}

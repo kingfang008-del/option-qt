@@ -7,6 +7,7 @@ import logging
 import math
 import sys
 import types
+from collections import deque
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
@@ -37,7 +38,8 @@ def _load_execution_engine_module():
     sys.modules["ibkr_connector_v8"] = ibkr_stub
     with patch.object(logging, "FileHandler", lambda *_args, **_kwargs: logging.NullHandler()):
         import execution_engine_v8 as ee  # noqa: E402
-    return ee
+        import strategy_ctx_contract as scc  # noqa: E402
+    return ee, scc
 
 
 def _state(**overrides):
@@ -56,6 +58,10 @@ def _state(**overrides):
         last_alpha_z=0.0,
         warmup_complete=False,
         correction_mode="NORMAL",
+        prices=deque(maxlen=60),
+        alpha_history=deque(maxlen=120),
+        pct_history=deque(maxlen=120),
+        last_min_ts=0,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -77,7 +83,7 @@ def _build_engine(ee, state, *, mode="realtime", latest_quote=None):
 
 def test_v0_ctx_for_flat_position_uses_alpha_direction_and_feed_mid() -> None:
     _bootstrap_imports()
-    ee = _load_execution_engine_module()
+    ee, scc = _load_execution_engine_module()
     st = _state(position=0, last_valid_iv=0.20)
     engine = _build_engine(ee, st, mode="realtime")
 
@@ -135,11 +141,12 @@ def test_v0_ctx_for_flat_position_uses_alpha_direction_and_feed_mid() -> None:
     assert ctx["spread_divergence"] == 0.0, "空仓路径当前不会计算 spread_divergence"
     assert st.warmup_complete is True
     assert math.isclose(st.last_alpha_z, 1.20, rel_tol=0, abs_tol=1e-9)
+    scc.validate_strategy_ctx_for_v0(ctx)
 
 
 def test_v0_ctx_for_open_position_prefers_fresh_execution_quote_and_updates_roi() -> None:
     _bootstrap_imports()
-    ee = _load_execution_engine_module()
+    ee, scc = _load_execution_engine_module()
     st = _state(
         position=1,
         last_valid_iv=0.35,
@@ -215,6 +222,7 @@ def test_v0_ctx_for_open_position_prefers_fresh_execution_quote_and_updates_roi(
     assert math.isclose(st.max_roi, 0.25, rel_tol=0, abs_tol=1e-9)
     assert math.isclose(st.last_spread_pct, 0.04, rel_tol=0, abs_tol=1e-9)
     assert math.isclose(st.last_opt_price, 2.50, rel_tol=0, abs_tol=1e-9)
+    scc.validate_strategy_ctx_for_v0(ctx)
 
 
 def main() -> None:

@@ -209,7 +209,7 @@ REDIS_CFG = {
 HASH_OPTION_SNAPSHOT = 'live_option_snapshot'      # IBKR Connector → Dashboard
 
 # ================= 数据库配置 (PostgreSQL) =================
-PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=192.168.50.229 port=5432"
+PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=localhost port=5432"
 
 # ================= 核心交易标的 =================
 # GS 先注释掉，生产的时候再恢复，因为秒级回测数据里没有 GS 的期权数据，可能会导致回测失败
@@ -228,7 +228,7 @@ TARGET_SYMBOLS =  [
     # --- Tier 2: 核心蓝筹 ---
     'NFLX',   'AVGO', 'MSFT', 'HOOD', 'MU',  'GOOGL',  'COIN', 'SPY',
     # --- Tier 3: 高流动性 --- 
-    'SMCI', 'ADBE', 'ORCL',   'INTC',   'VIXY'
+    'ADBE', 'ORCL',   'INTC',   'VIXY'
 ]
 
 # ================= 交易与归一化白/黑名单 =================
@@ -349,6 +349,19 @@ CORR_THRESHOLD = -0.1             # 反转相关性阈值
 # - V1: strategy_core_v1.py + strategy_config.py
 # - TREND: strategy_core_trend.py + strategy_config0.py
 STRATEGY_CORE_VERSION = os.environ.get("STRATEGY_CORE_VERSION", "V0").strip().upper()
+
+# ================= V0/TREND 利润出场：阶梯 + 连续规则 =================
+# False（默认）：不跑 TRAILING_EPIC 连续层，与此前线上「以阶梯为主」口径一致。
+# True：启用 TRAILING_EPIC（需 TRAILING_TRIGGER_ROI 合理，见 strategy_config0）。
+# 硬止损等其它 exits 不受此开关影响。如需开启：export V0_PROFIT_HYBRID_CONTINUOUS_ENABLED=1
+V0_PROFIT_HYBRID_CONTINUOUS_ENABLED = _env_flag(
+    "V0_PROFIT_HYBRID_CONTINUOUS_ENABLED",
+    False,
+)
+os.environ.setdefault(
+    "V0_PROFIT_HYBRID_CONTINUOUS_ENABLED",
+    "1" if V0_PROFIT_HYBRID_CONTINUOUS_ENABLED else "0",
+)
 
 # ================= 订单执行 =================
 ORDER_TIMEOUT_SECONDS = 5          # 挂单超时

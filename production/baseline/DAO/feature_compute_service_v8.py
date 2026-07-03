@@ -28,7 +28,7 @@ import torch
 import time
 import copy
 import psycopg2
-from config import PG_DB_URL
+# from config import PG_DB_URL
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -48,6 +48,7 @@ from fcs_parity_snapshot_utils import (
     save_feature_parity_snapshot,
     should_capture_feature_parity,
 )
+PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=localhost port=5432"
 
 from config import (
     REDIS_CFG as _REDIS_BASE, NY_TZ,
@@ -339,6 +340,8 @@ class FeatureComputeService:
         # [Performance] Persistent PG Connection
         from config import PG_DB_URL
         try:
+            PG_DB_URL = "dbname=quant_trade user=postgres password=postgres host=localhost port=5432"
+
             self.pg_conn = psycopg2.connect(PG_DB_URL)
             self.pg_conn.autocommit = True
             logger.info("🐘 Persistent PostgreSQL connection established.")
@@ -558,6 +561,10 @@ class FeatureComputeService:
         self.feature_parity_ts = int(_safe_float_env("FCS_FEATURE_PARITY_TS", 1767366000.0))
         parity_out_default = f"{self.feature_parity_symbol.lower()}_fcs_parity_{self.feature_parity_ts}.npz"
         self.feature_parity_output = os.environ.get("FCS_FEATURE_PARITY_OUTPUT", parity_out_default).strip() or parity_out_default
+        # 与 S4 一致：SPY/QQQ 1s 收盘环形缓冲，用于 spy/qqq_roc_5min 特征异常时回算（见 replay_live_parity_utils）
+        self._index_1s_close_ring: Dict[str, deque] = {k: deque(maxlen=400) for k in ("SPY", "QQQ")}
+        self._index_1s_close_last_wall: Dict[str, Optional[float]] = {k: None for k in ("SPY", "QQQ")}
+        self._index_roc_repair_last_log = 0.0
         if self.runtime_payload_audit_enabled:
             logger.info(
                 f"🧪 Runtime payload audit enabled | symbol={self.runtime_payload_audit_symbol} "
@@ -583,6 +590,78 @@ class FeatureComputeService:
             return self.pg_conn
         except:
             return psycopg2.connect(PG_DB_URL)
+
+    def record_index_1s_close_for_parity(self, sym: str, price: float, ts: float) -> None:
+        """融合行情每条 tick 更新 SPY/QQQ 收盘价；同物理秒内多次更新只刷新末点（对齐 1s bar close）。"""
+        ring = getattr(self, "_index_1s_close_ring", None)
+        if ring is None or sym not in ring:
+            return
+        try:
+            p = float(price)
+            t = float(ts)
+        except (TypeError, ValueError):
+            return
+        if p <= 0.0 or not np.isfinite(p):
+            return
+        dq = ring[sym]
+        last_wall = self._index_1s_close_last_wall.get(sym)
+        same_second = last_wall is not None and abs(t - last_wall) < 0.5
+        if same_second and len(dq) > 0:
+            dq[-1] = p
+        else:
+            dq.append(p)
+            self._index_1s_close_last_wall[sym] = t
+
+    def _index_roc_from_s4_buffer(self, sym: str) -> Optional[float]:
+        from replay_live_parity_utils import index_roc_5min_from_series
+
+        ring = getattr(self, "_index_1s_close_ring", None)
+        if ring is None:
+            return None
+        dq = ring.get(sym)
+        if not dq or len(dq) < 301:
+            return None
+        arr = np.asarray(dq, dtype=np.float64)
+        return float(index_roc_5min_from_series(arr, periods=300))
+
+    def _merge_tensor_and_s4_index_roc(
+        self,
+        index_sym: str,
+        raw_from_tensor: float,
+        idx_feat: Optional[int],
+        *,
+        alpha_label_ts: float,
+    ) -> float:
+        """张量槽位与 1s 缓冲 S4 定义 ROC 二选一；不一致或无效时用缓冲并节流打日志。"""
+        fb = self._index_roc_from_s4_buffer(index_sym)
+        t_ok = idx_feat is not None and np.isfinite(raw_from_tensor)
+        t_raw = float(raw_from_tensor) if t_ok else float("nan")
+
+        use_fb = False
+        reason = ""
+        if fb is None:
+            return float(t_raw) if t_ok else 0.0
+        if idx_feat is None:
+            use_fb, reason = True, "no_feat_idx"
+        elif not t_ok:
+            use_fb, reason = True, "non_finite_tensor"
+        else:
+            delta = abs(t_raw - fb)
+            tol = max(5e-4, 0.2 * max(abs(t_raw), abs(fb), 1e-9))
+            if delta > tol:
+                use_fb, reason = True, f"mismatch_d={delta:.5g}_tol={tol:.5g}_tensor={t_raw:.6g}_buf={fb:.6g}"
+
+        if use_fb:
+            now = time.time()
+            if now - float(getattr(self, "_index_roc_repair_last_log", 0.0)) >= 30.0:
+                buf_len = len(self._index_1s_close_ring.get(index_sym, ()))
+                logger.info(
+                    f"📐 [FCS-IndexROC-S4] {index_sym} → buffer ROC={fb:.6f} (override tensor) "
+                    f"| reason={reason} | label_ts={int(alpha_label_ts)} | buf_len={buf_len}"
+                )
+                self._index_roc_repair_last_log = now
+            return float(fb)
+        return float(t_raw)
 
     def _to_audit_matrix(self, snap):
         return self.support_handler.to_audit_matrix(snap)
@@ -1417,6 +1496,8 @@ class FeatureComputeService:
 
         run_mode = _runtime_mode()
         dry_mode = (run_mode == "REALTIME_DRY")
+        spy_merged_roc = None
+        qqq_merged_roc = None
         for b_idx, sym in enumerate(self.symbols):
             if sym not in ready_symbols or sym not in results_map:
                 continue
@@ -1452,9 +1533,20 @@ class FeatureComputeService:
             batch_stock_ids.append(int(self.stock_id_map.get(sym, b_idx)))
             
             idx_spy = self.feat_name_to_idx.get('spy_roc_5min')
-            batch_spy_rocs.append(raw_mat[b_idx, idx_spy] if idx_spy is not None else 0.0)
+            # spy_roc_5min / qqq_roc_5min：张量应与 S4（300×1s pct_change）一致；偏小时用 1s 缓冲回算
+            raw_spy = float(raw_mat[b_idx, idx_spy]) if idx_spy is not None else float("nan")
+            if spy_merged_roc is None:
+                spy_merged_roc = self._merge_tensor_and_s4_index_roc(
+                    "SPY", raw_spy, idx_spy, alpha_label_ts=alpha_label_ts
+                )
+            batch_spy_rocs.append(spy_merged_roc)
             idx_qqq = self.feat_name_to_idx.get('qqq_roc_5min')
-            batch_qqq_rocs.append(raw_mat[b_idx, idx_qqq] if idx_qqq is not None else 0.0)
+            raw_qqq = float(raw_mat[b_idx, idx_qqq]) if idx_qqq is not None else float("nan")
+            if qqq_merged_roc is None:
+                qqq_merged_roc = self._merge_tensor_and_s4_index_roc(
+                    "QQQ", raw_qqq, idx_qqq, alpha_label_ts=alpha_label_ts
+                )
+            batch_qqq_rocs.append(qqq_merged_roc)
             idx_vol = self.feat_name_to_idx.get('fast_vol')
             batch_fast_vols.append(raw_mat[b_idx, idx_vol] if idx_vol is not None else 0.0)
             

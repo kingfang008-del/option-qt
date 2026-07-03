@@ -1,0 +1,33 @@
+{
+  "profile": "qqq_hybrid",
+  "description": "QQQ 混合执行：默认 1DTE swing + 高确信 0DTE scalp（Phase 1 共用 front bucket，双 DTE 锁在 Phase 2）",
+
+  "front_allowed_dte": [0, 1, 2],
+  "front_prefer_dte": 1,
+  "front_min_dte": 0,
+  "front_max_dte": 2,
+  "use_next_buckets": false,
+
+  "min_volume": 0,
+  "atm_center": 0.50,
+  "otm_center": 0.25,
+  "delta_tolerance": 0.15,
+
+  "label_trade_bucket_id": 2,
+  "label_dte_min": 0,
+  "label_dte_max": 2,
+
+  "exec_lanes": {
+    "scalp": { "prefer_dte": 0, "hold_profile": "scalp_v1" },
+    "swing": { "prefer_dte": 1, "hold_profile": "swing_v1" }
+  },
+
+  "symbols": ["QQQ"],
+
+  "paths": {
+    "raw_iv_dir": "~/train_data/nq_options_day_iv",
+    "sniper_option_dir": "~/train_data/option_quote_sniper",
+    "day_iv_dir": "~/train_data/quote_options_day_iv",
+    "locked_targets_output": "~/train_data/locked_targets_map_hybrid.parquet"
+  }
+}

@@ -56,13 +56,21 @@
   },
   "labels": {
     "direction": { "type": "classification", "output_dim": 3 },
+    "direction_net": { "type": "classification", "output_dim": 3 },
     "volatility": { "type": "regression" },
     "event": { "type": "classification", "output_dim": 1 },
-    "return_fwd": { "type": "regression" }
+    "return_fwd": { "type": "regression" },
+    "return_fwd_gross": { "type": "regression" },
+    "return_fwd_net": { "type": "regression" },
+    "execution_cost": { "type": "regression" }
   },
   "loss_weights": {
     "direction": 4.0,
+    "direction_net": 4.0,
     "return_fwd": 1.0,
+    "return_fwd_net": 1.0,
+    "return_fwd_gross": 0.0,
+    "execution_cost": 0.0,
     "volatility": 0.1,
     "event": 0.5
   },

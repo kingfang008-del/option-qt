@@ -540,18 +540,21 @@ class StrategyCoreV0:
 
         # 2. 顺势单：动态防线判定
         
-        # Level Epic: 暴利追踪 (史诗级别)
-        if max_roi >= self.cfg.TRAILING_TRIGGER_ROI:
-            trailing_exit = max_roi * self.cfg.TRAILING_KEEP_RATIO
-            if current_roi < trailing_exit:
-                self._trace("X10.trailing_epic", "block",
-                            f"max={max_roi:.1%} cur={current_roi:.1%} < trail={trailing_exit:.1%}")
-                return {'action': 'SELL', 'reason': f"TRAILING_EPIC({max_roi:.1%}->{current_roi:.1%})"}
-            self._trace("X10.trailing_epic", "pass",
-                        f"Epic 就位 max={max_roi:.1%} cur={current_roi:.1%} 高于 trail={trailing_exit:.1%}")
+        # Level Epic: 暴利追踪（连续回撤带）；关闭开关后与旧「纯阶梯」口径对比
+        if getattr(self.cfg, "V0_PROFIT_HYBRID_CONTINUOUS_ENABLED", True):
+            if max_roi >= self.cfg.TRAILING_TRIGGER_ROI:
+                trailing_exit = max_roi * self.cfg.TRAILING_KEEP_RATIO
+                if current_roi < trailing_exit:
+                    self._trace("X10.trailing_epic", "block",
+                                f"max={max_roi:.1%} cur={current_roi:.1%} < trail={trailing_exit:.1%}")
+                    return {'action': 'SELL', 'reason': f"TRAILING_EPIC({max_roi:.1%}->{current_roi:.1%})"}
+                self._trace("X10.trailing_epic", "pass",
+                            f"Epic 就位 max={max_roi:.1%} cur={current_roi:.1%} 高于 trail={trailing_exit:.1%}")
+            else:
+                self._trace("X10.trailing_epic", "skip",
+                            f"max_roi={max_roi:.1%} < trigger={self.cfg.TRAILING_TRIGGER_ROI:.0%}")
         else:
-            self._trace("X10.trailing_epic", "skip",
-                        f"max_roi={max_roi:.1%} < trigger={self.cfg.TRAILING_TRIGGER_ROI:.0%}")
+            self._trace("X10.trailing_epic", "skip", "V0_PROFIT_HYBRID_CONTINUOUS_ENABLED=False")
 
         # Step Ladder: 阶梯防线 (按 LADDER 配置循环评估)
         ladder = self._get_dynamic_ladder(pos)

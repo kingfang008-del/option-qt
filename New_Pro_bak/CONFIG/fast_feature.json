@@ -1,0 +1,132 @@
+{
+  "comment": "此配置文件专为【快通道】(WaveTCN, 10分钟窗口)设计，包含股票+期权的联合特征和联合标签。",
+  "comment_keys": "键名(如 'direction', 'delta_iv') 在所有部分(labels, loss_weights)中保持一致，并与H5数据集内部路径匹配。",
+
+  "parameters": {
+    
+    "fast_channel": {
+      "window_duration_minutes": {
+        "regular": 10,
+        "pre_market": 10,
+        "after_hours": 5
+      },
+      "step_duration_minutes": {
+        "regular": 1,
+        "pre_market": 1,
+        "after_hours": 1
+      },
+      "label_horizon_k": 5
+    },
+    "labeling": {
+      
+      "method": "multi_task",
+      "targets": ["direction", "volatility", "event"],
+      "volatility_k": 10,
+      "event_k": 10,
+      "k_option": 10
+    }
+  },
+
+  "labels": {
+     
+    "direction": { "type": "classification", "output_dim": 3 },
+    "volatility": { "type": "regression" },
+    "event": { "type": "classification", "output_dim": 1 },
+    "return_fwd": { "type": "regression" },
+    
+    
+    "delta_iv": { "type": "regression" },
+    "gamma_pnl_std": { "type": "regression" },
+    "vol_direction": { "type": "classification" }
+  },
+
+  "loss_weights": {
+    
+    "direction": 1.0,
+    "volatility": 0.5,
+    "event": 0.2,
+
+    "delta_iv": 1.0,
+    "option_return": 0.5,
+    "iv_rv_spread": 1.5,
+    "gamma_pnl_std": 1.0,
+    "vol_direction": 0.8
+  },
+
+  "resample_freq": {
+     
+    "pre_market": {
+      "04:00-07:00": ["10s", "1min"],
+      "07:00-09:30": ["1min", "5min"]
+    },
+    "regular": {
+      "09:30-16:00": ["1min", "5min"]
+    },
+    "after_hours": {
+      "16:00-18:00": ["5s", "30s"],
+      "18:00-20:00": ["15s", "1min"]
+    }
+  },
+  "OHLV": ["open", "high", "low", "close", "volume"],
+    "features": [
+      { "name": "fast_vol", "type": "real", "calc": "fast_vol" },
+      
+      { "name": "vwap_diff", "type": "real", "calc": "vwap_diff" },
+      { "name": "volume_ratio", "type": "real", "calc": "volume_ratio" },
+      { "name": "price_slope_norm_by_atr", "type": "real", "calc": "atr_normalized" },
+
+      
+      { "name": "macd_ratio", "type": "real", "calc": "ta.macd() / close" },
+      { "name": "macd_diff_ratio", "type": "real", "calc": "ta.macd_diff() / close" },
+      { "name": "rsi", "type": "real", "calc": "RSIIndicator(close, window=14).rsi()" },
+      { "name": "sma_ratio_30", "type": "real", "calc": "sma_ratio_30" },
+      {"name": "day_of_week", "type": "categorical", "calc": "time.day_of_week", "cardinality": 7},
+      {"name": "hour", "type": "categorical", "calc": "time.hour", "cardinality": 24}, 
+       {"name": "garman_klass_vol", "type": "real", "calc": "leading", "use_for_anomaly": false},
+      {"name": "vix_level", "type": "real", "calc": "vix_gate"},
+      
+      { "name": "vol_roc", "type": "real", "calc": "vol_roc" },
+      { "name": "vol_contraction_ratio", "type": "real", "calc": "leading", "use_for_anomaly": false},
+       {"name": "garch_vol", "type": "real", "calc": "garch_vol", "use_for_anomaly": false},
+
+      
+      { "name": "vixy_detrended_level", "type": "real", "calc": "vix_gate" },
+      {"name": "chaikin_vol", "type": "real", "calc": "leading", "use_for_anomaly": false},
+
+
+
+      {"name": "spy_roc_5min", "type": "real", "calc": "spy_roc_5min", "use_for_anomaly": false},
+
+      {"name": "qqq_roc_5min", "type": "real", "calc": "qqq_roc_5min", "use_for_anomaly": false},
+
+      {"name": "fast_vol", "type": "real", "calc": "fast_vol", "use_for_anomaly": false},
+      
+      
+       
+      
+    
+     {"name": "options_vw_iv", "type": "real", "calc": "options", "use_for_anomaly": false},
+    {"name": "options_vw_delta", "type": "real", "calc": "options", "use_for_anomaly": false}, 
+    {"name": "options_vw_gamma", "type": "real", "calc": "options", "use_for_anomaly": false},
+    {"name": "options_vw_vega", "type": "real", "calc": "options", "use_for_anomaly": false},
+    {"name": "options_vw_theta", "type": "real", "calc": "options", "use_for_anomaly": false},
+
+    
+
+    {"name": "options_pcr_volume", "type": "real", "calc": "options", "use_for_anomaly": false},
+    {"name": "options_flow_skew", "type": "real", "calc": "options", "use_for_anomaly": false}, 
+    {"name": "options_iv_momentum", "type": "real", "calc": "options", "use_for_anomaly": false},
+    {"name": "options_gamma_accel", "type": "real", "calc": "options", "use_for_anomaly": false},
+    {"name": "options_iv_divergence", "type": "real", "calc": "options", "use_for_anomaly": false},
+    
+
+    {"name": "options_struc_atm_iv", "type": "real", "calc": "options", "use_for_anomaly": false},
+    {"name": "options_struc_skew", "type": "real", "calc": "options", "use_for_anomaly": false}, 
+    {"name": "options_struc_term", "type": "real", "calc": "options", "use_for_anomaly": false}
+
+    
+
+
+      
+    ]
+}
