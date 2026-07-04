@@ -556,7 +556,13 @@ def validate_raw1s_batch(
                 "early_stop_roi": rails_cfg.early_stop_roi,
                 "time_stop_bars": rails_cfg.time_stop_bars,
                 "time_stop_min_roi": rails_cfg.time_stop_min_roi,
+                "tick_fast_hard_roi": rails_cfg.tick_fast_hard_roi,
+                "tick_fast_hard_smooth_n": rails_cfg.tick_fast_hard_smooth_n,
                 "disaster_stop_roi": rails_cfg.disaster_stop_roi,
+                "disaster_smooth_n": rails_cfg.disaster_smooth_n,
+                "tick_profit_trigger_roi": rails_cfg.tick_profit_trigger_roi,
+                "tick_profit_keep_ratio": rails_cfg.tick_profit_keep_ratio,
+                "tick_profit_ladder": list(rails_cfg.tick_profit_ladder),
             },
             "replay": {
                 "entry_threshold": replay_cfg.entry_threshold,

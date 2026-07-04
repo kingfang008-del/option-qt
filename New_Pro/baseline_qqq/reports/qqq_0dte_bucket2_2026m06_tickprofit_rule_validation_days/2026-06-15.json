@@ -1,0 +1,129 @@
+{
+  "date": "2026-06-15",
+  "source": "/mnt/s990/data/raw_1s/options_databento/QQQ/QQQ_2026-06-15.parquet",
+  "bucket_id": 2,
+  "quote_stats": {
+    "ticks": 1593,
+    "minutes": 356,
+    "spread_median": 0.0095,
+    "spread_p90": 0.015,
+    "spread_p99": 0.0231,
+    "spread_gt_6pct_frac": 0.0028,
+    "first_spread_ok_second_after_open": 9
+  },
+  "intra_minute": {
+    "range": {
+      "median": 0.0298,
+      "p90": 0.0753,
+      "p99": 0.1503
+    },
+    "max_dn": {
+      "median": -0.0113,
+      "p90": 0.0,
+      "p99": 0.0
+    },
+    "close_vs_open": {
+      "median": 0.0,
+      "p90": 0.0547,
+      "p99": 0.145
+    }
+  },
+  "tick_rails_conflict": {
+    "minutes": 137,
+    "shadow_hard_but_close_ok_frac": 0.0,
+    "shadow_soft_but_close_ok_frac": 0.0146,
+    "shadow_disaster_frac": 0.0,
+    "peak_ge_8pct_close_lt_5pct_frac": 0.0
+  },
+  "false_kill": {
+    "entry_points": 128,
+    "early_stop_false_kill_frac": 0.0625,
+    "early_stop_correct_kill_frac": 0.1719,
+    "time_stop_false_kill_frac": 0.0781,
+    "time_stop_correct_kill_frac": 0.3594
+  },
+  "quote_gate": [
+    {
+      "gate": {
+        "min_seconds_after_open": 3,
+        "max_spread_pct": 0.06,
+        "min_bid_ask_size": 2,
+        "stable_quote_seconds": 0
+      },
+      "ticks_passed": 1526,
+      "ticks_passed_frac": 0.9579
+    },
+    {
+      "gate": {
+        "min_seconds_after_open": 3,
+        "max_spread_pct": 0.04,
+        "min_bid_ask_size": 2,
+        "stable_quote_seconds": 0
+      },
+      "ticks_passed": 1523,
+      "ticks_passed_frac": 0.9561
+    },
+    {
+      "gate": {
+        "min_seconds_after_open": 5,
+        "max_spread_pct": 0.06,
+        "min_bid_ask_size": 2,
+        "stable_quote_seconds": 0
+      },
+      "ticks_passed": 1526,
+      "ticks_passed_frac": 0.9579
+    },
+    {
+      "gate": {
+        "min_seconds_after_open": 3,
+        "max_spread_pct": 0.06,
+        "min_bid_ask_size": 5,
+        "stable_quote_seconds": 0
+      },
+      "ticks_passed": 1322,
+      "ticks_passed_frac": 0.8299
+    },
+    {
+      "gate": {
+        "min_seconds_after_open": 3,
+        "max_spread_pct": 0.06,
+        "min_bid_ask_size": 2,
+        "stable_quote_seconds": 3
+      },
+      "ticks_passed": 22,
+      "ticks_passed_frac": 0.0138
+    },
+    {
+      "gate": {
+        "min_seconds_after_open": 5,
+        "max_spread_pct": 0.06,
+        "min_bid_ask_size": 2,
+        "stable_quote_seconds": 3
+      },
+      "ticks_passed": 22,
+      "ticks_passed_frac": 0.0138
+    }
+  ],
+  "rails_replay": {
+    "l1_minute": {
+      "trades": 2,
+      "total_net_return": -0.2984,
+      "avg_net_return": -0.1621,
+      "hit_rate": 0.0,
+      "worst_trade": -0.1826,
+      "exit_reasons": {
+        "HARD_STOP": 2
+      }
+    },
+    "l2_1s_disaster": {
+      "trades": 2,
+      "total_net_return": -0.2984,
+      "avg_net_return": -0.1621,
+      "hit_rate": 0.0,
+      "worst_trade": -0.1826,
+      "exit_reasons": {
+        "HARD_STOP": 2
+      }
+    }
+  }
+}

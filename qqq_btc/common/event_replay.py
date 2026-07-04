@@ -10,7 +10,7 @@
      - signal_at=minute_open: 分钟首 tick 发信号(S4 ExecutionWindow 首包)
      - signal_at=minute_close: 分钟末发信号(L1 infer parquet 默认)
      - rails 退出:始终在分钟末 mid(CLOSE 相位)
-     - 持仓期:秒级 tick 仅灾难止损
+     - 持仓期:秒级 tick 仅风险轨(tick_fast_hard + disaster),不跑完整 check_exit
 
 当前 run_event_replay 若只喂 infer parquet + 独立 tick 文件、未走 build_s4_bundle,
 则**决策状态机自洽**,但**不具备 S4 的数据融合与 alpha 延迟语义** —— 需显式选 --from-s4-sqlite
@@ -126,16 +126,58 @@ def _run_disaster_ticks(
     *,
     n_smooth: int,
 ) -> bool:
-    """秒内灾难止损;返回 True 若已平仓。"""
-    buf: List[float] = []
+    """
+    秒内风险止损;返回 True 若已平仓。
+
+    disaster 用较短平滑(更快反应闪崩);
+    tick_fast_hard 用较长平滑(降影线误杀)。
+    """
+    rails = session.rails_cfg
+    n_disaster = int(getattr(rails, "disaster_smooth_n", None) or n_smooth or 3)
+    n_fast = int(getattr(rails, "tick_fast_hard_smooth_n", None) or 5)
+    n_profit = int(getattr(rails, "tick_profit_smooth_n", None) or 3)
+    # fast_hard / 浮盈共用较长平滑窗(取 max),避免两套缓冲不一致
+    n_risk_profit = max(n_fast, n_profit)
+    buf_d: List[float] = []
+    buf_rp: List[float] = []
+    use_risk_profit = (
+        rails.tick_fast_hard_roi is not None
+        or rails.tick_profit_trigger_roi is not None
+        or bool(rails.tick_profit_ladder)
+    )
+
     for _, tick_row in ticks.iterrows():
         tq = SessionQuotes.from_row(tick_row)
         if session.position is None:
             return False
-        smooth = _tick_mtm_smooth(buf, tq.mid(session.position.leg), n_smooth)
-        evs = session.on_tick(bar_index, tick_row["timestamp"], tq, smoothed_mtm=smooth)
+        mid = tq.mid(session.position.leg)
+        if not (np.isfinite(mid) and mid > 0):
+            continue
+
+        # 1) 短平滑 → 仅 disaster
+        smooth_d = _tick_mtm_smooth(buf_d, float(mid), n_disaster)
+        evs = session.on_tick(
+            bar_index,
+            tick_row["timestamp"],
+            tq,
+            smoothed_mtm=smooth_d,
+            disaster_only=True,
+        )
         if evs and evs[0].kind == "DISASTER_EXIT":
             return True
+
+        # 2) 风险+浮盈平滑 → fast_hard / tick_peak 回撤 / tick 阶梯
+        if use_risk_profit and session.position is not None:
+            smooth_rp = _tick_mtm_smooth(buf_rp, float(mid), n_risk_profit)
+            evs = session.on_tick(
+                bar_index,
+                tick_row["timestamp"],
+                tq,
+                smoothed_mtm=smooth_rp,
+                disaster_only=False,
+            )
+            if evs and evs[0].kind == "DISASTER_EXIT":
+                return True
     return False
 
 

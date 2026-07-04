@@ -819,7 +819,7 @@ def test_loss_call_put_term():
 # ---------------------------------------------------------------------------
 
 def test_disaster_stop_tick_level():
-    from qqq_btc.common.exit_rails import check_disaster_stop
+    from qqq_btc.common.exit_rails import check_disaster_stop, check_tick_stops
 
     cfg = ExitRailsConfig(hard_stop_roi=-0.12, disaster_stop_roi=-0.25)
     pos = PositionState(entry_price=2.0, entry_bar=0)
@@ -831,6 +831,56 @@ def test_disaster_stop_tick_level():
     # 未启用时永远 None
     cfg_off = ExitRailsConfig(disaster_stop_roi=None)
     assert check_disaster_stop(cfg_off, pos, 2.0 * 0.50) is None
+
+
+def test_tick_fast_hard_between_hard_and_disaster():
+    from qqq_btc.common.exit_rails import check_tick_stops
+
+    cfg = ExitRailsConfig(
+        hard_stop_roi=-0.12,
+        tick_fast_hard_roi=-0.15,
+        disaster_stop_roi=-0.25,
+    )
+    pos = PositionState(entry_price=2.0, entry_bar=0)
+    # -13%: 深于分钟 hard 水位,但未到 fast_hard
+    assert check_tick_stops(cfg, pos, 2.0 * 0.87) is None
+    # -16%: tick_fast_hard
+    assert check_tick_stops(cfg, pos, 2.0 * 0.84) == "TICK_FAST_HARD"
+    # -30%: disaster 优先于 fast_hard
+    assert check_tick_stops(cfg, pos, 2.0 * 0.70) == "DISASTER_STOP"
+    assert pos.max_roi == 0.0  # 不污染分钟棘轮
+
+
+def test_tick_profit_trail_independent_of_minute_max_roi():
+    """冲高回落:tick_peak 独立,不写入 max_roi。"""
+    from qqq_btc.common.exit_rails import check_tick_stops
+
+    cfg = ExitRailsConfig(
+        tick_profit_trigger_roi=0.20,
+        tick_profit_keep_ratio=0.50,
+        disaster_stop_roi=-0.25,
+    )
+    pos = PositionState(entry_price=2.0, entry_bar=0)
+    # 冲到 +100%
+    assert check_tick_stops(cfg, pos, 2.0 * 2.0) is None
+    assert pos.tick_peak_roi == 1.0
+    assert pos.max_roi == 0.0
+    # 回落到 +40%(< peak*0.5=50%) → 锁利
+    assert check_tick_stops(cfg, pos, 2.0 * 1.40) == "TICK_PROFIT_TRAIL"
+    assert pos.max_roi == 0.0
+
+
+def test_tick_profit_step_ladder():
+    from qqq_btc.common.exit_rails import check_tick_stops
+
+    cfg = ExitRailsConfig(
+        tick_profit_ladder=((0.30, 0.18), (0.50, 0.30)),
+        disaster_stop_roi=None,
+    )
+    pos = PositionState(entry_price=2.0, entry_bar=0)
+    assert check_tick_stops(cfg, pos, 2.0 * 1.40) is None  # peak 40%, floor 18%
+    assert check_tick_stops(cfg, pos, 2.0 * 1.20) is None  # 20% > 18%
+    assert check_tick_stops(cfg, pos, 2.0 * 1.10) == "TICK_PROFIT_STEP"  # 10% < 18%
 
 
 def test_disaster_stop_stateless_no_max_roi_pollution():

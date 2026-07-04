@@ -111,9 +111,23 @@ EXIT_RAILS = ExitRailsConfig(
     flash_trigger_roi=0.08,
     flash_exit_roi=0.03,
     eod_close_bar_index=380,   # 09:30 起第 380 分钟 = 15:50 强平
-    # tick 级只挂灾难止损(check_disaster_stop):0DTE ATM 分钟内振幅常见 15%+,
-    # 其余 rails 一律按分钟收盘 mid 评估(与标签/回放同口径),否则影线震仓
+    # tick 级风险/浮盈轨(check_tick_stops):不污染分钟 max_roi。
+    # fast_hard:略深于分钟 hard(-12%);disaster 只兜闪崩。
+    # tick_profit:独立 tick_peak,peak≥20% 后回落到 peak*50% 平仓
+    # (吃「一分钟内翻倍再吐光」;比分钟 trailing 触发更早、锁利更紧)。
+    tick_fast_hard_roi=-0.15,
+    tick_fast_hard_smooth_n=3,
     disaster_stop_roi=-0.25,
+    disaster_smooth_n=3,
+    tick_profit_trigger_roi=0.20,
+    tick_profit_keep_ratio=0.50,
+    tick_profit_smooth_n=3,
+    tick_profit_ladder=(
+        (0.15, 0.08),
+        (0.30, 0.18),
+        (0.50, 0.30),
+        (0.80, 0.50),
+    ),
 )
 
 # 交易时段(分钟序号,自 09:30 开盘起算) —— 与 REPLAY.session_entry_* 同步

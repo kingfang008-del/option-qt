@@ -1,0 +1,7 @@
+{
+  "date": "2026-06-30",
+  "source": "/mnt/s990/data/raw_1s/options_databento/QQQ/QQQ_2026-06-30.parquet",
+  "bucket_id": 2,
+  "skipped": true,
+  "reason": "no_bucket_ticks"
+}

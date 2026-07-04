@@ -21,9 +21,12 @@ replay_harness 与实盘策略层共用本模块,保证回放退出分布 = 实�
     b) pos.update() 会把 max_roi 棘轮到影线高点,
        导致 trailing/阶梯/flash 全部相对影线提前引爆。
   两者都会使实盘退出分布系统性偏离回放,回放验收随之失效。
-  tick 级监控只允许调用 `check_disaster_stop`:宽幅灾难止损(如 -25%),
-  无状态、不更新 max_roi,只为跳空/闪崩兜底,正常波动永远不应触发。
-  建议实盘 tick MTM 先做 3-5s 中价平滑再喂灾难止损,避免单笔异常报价触发。
+  tick 级监控只允许调用 `check_tick_stops`(不更新分钟 max_roi):
+    - disaster_stop:跳空/闪崩兜底
+    - tick_fast_hard:分钟内快速亏损
+    - tick_profit_*:独立 tick_peak 浮盈保护(冲高回落),与分钟棘轮解耦
+  禁止在 tick 上调用完整 check_exit(会把影线写入 max_roi)。
+  建议实盘 tick MTM 先做中价平滑再喂,避免单笔异常报价触发。
 """
 from __future__ import annotations
 
@@ -55,10 +58,20 @@ class ExitRailsConfig:
     flash_trigger_roi: float = 0.08       # 低于首档 ladder,避免与 8% 档重复抢 exit
     flash_exit_roi: float = 0.03
     eod_close_bar_index: Optional[int] = None  # 会话内强平 bar 序号(None=不启用)
-    # tick 级灾难止损(check_disaster_stop 专用,None=不启用)。
-    # 必须显著深于 hard_stop:hard_stop 由分钟收盘价触发,
-    # 灾难止损只为分钟内跳空/闪崩兜底,正常影线不应碰到。
+    # tick 级止损(check_tick_stops 专用,None=不启用)。不污染分钟 max_roi。
+    # tick_fast_hard:介于分钟 hard 与 disaster 之间,吃掉「分钟内已亏透、收盘才看见」。
+    # disaster:必须显著深于 fast_hard,只为跳空/闪崩兜底。
+    tick_fast_hard_roi: Optional[float] = None
+    tick_fast_hard_smooth_n: int = 5
     disaster_stop_roi: Optional[float] = None
+    disaster_smooth_n: int = 3
+    # tick 浮盈保护:独立 tick_peak(与分钟 max_roi 解耦)。
+    # peak 达 trigger 后,回落到 peak*keep 以下则平仓 —— 吃「一分钟内翻倍再吐光」。
+    tick_profit_trigger_roi: Optional[float] = None
+    tick_profit_keep_ratio: float = 0.50
+    tick_profit_smooth_n: int = 3
+    # 可选:按 tick_peak 的阶梯 floor(与分钟 ladder 同语义,但只读 tick_peak)
+    tick_profit_ladder: Tuple[Tuple[float, float], ...] = ()
 
 
 @dataclass
@@ -66,12 +79,25 @@ class PositionState:
     entry_price: float
     entry_bar: int
     max_roi: float = 0.0
+    # 仅 check_tick_stops 更新;分钟 check_exit 绝不读写
+    tick_peak_roi: float = 0.0
 
     def update(self, current_price: float) -> float:
         roi = current_price / self.entry_price - 1.0
         if roi > self.max_roi:
             self.max_roi = roi
         return roi
+
+
+def ladder_floor_from(
+    ladder: Tuple[Tuple[float, float], ...], max_roi: float
+) -> float:
+    """累积 ratchet 阶梯底价:所有 max_roi 已触发的档位取 floor 最大值。"""
+    floor = float("-inf")
+    for trigger, f in sorted(ladder, key=lambda x: x[0]):
+        if max_roi >= trigger:
+            floor = max(floor, f)
+    return floor
 
 
 def ladder_floor(cfg: ExitRailsConfig, max_roi: float) -> float:
@@ -81,11 +107,7 @@ def ladder_floor(cfg: ExitRailsConfig, max_roi: float) -> float:
     旧实现只取「最高一档」且 floor 偏低(9DTE 手拍),0DTE 下 peak 12% 却允许
     回吐到 3%。正确语义:peak 12% 时应锁 8%(若存在 (0.12,0.08) 档)。
     """
-    floor = float("-inf")
-    for trigger, f in sorted(cfg.ladder, key=lambda x: x[0]):
-        if max_roi >= trigger:
-            floor = max(floor, f)
-    return floor
+    return ladder_floor_from(cfg.ladder, max_roi)
 
 
 def check_exit(
@@ -142,15 +164,53 @@ def check_disaster_stop(
     pos: PositionState,
     tick_price: float,
 ) -> Optional[str]:
-    """
-    tick 级灾难止损 —— 实盘高频监控循环里唯一允许调用的 rails 入口。
+    """兼容旧调用:仅灾难档。新代码请用 check_tick_stops。"""
+    return check_tick_stops(cfg, pos, tick_price, disaster_only=True)
 
-    刻意无状态:不调用 pos.update(),分钟内影线不污染 max_roi,
-    trailing/阶梯/flash 的语义仍严格以分钟收盘为准(与回放一致)。
+
+def check_tick_stops(
+    cfg: ExitRailsConfig,
+    pos: PositionState,
+    tick_price: float,
+    *,
+    disaster_only: bool = False,
+) -> Optional[str]:
     """
-    if cfg.disaster_stop_roi is None:
-        return None
+    tick 级风险/浮盈轨 —— 实盘高频监控循环里唯一允许调用的 rails 入口。
+
+    不调用 pos.update():分钟 max_roi / trailing / 阶梯仍严格以分钟收盘为准。
+    浮盈侧只维护 pos.tick_peak_roi,与分钟棘轮解耦。
+
+    判定顺序:disaster → tick_fast_hard → tick 浮盈(trail / step)。
+    """
     roi = tick_price / pos.entry_price - 1.0
-    if roi <= cfg.disaster_stop_roi:
+
+    if cfg.disaster_stop_roi is not None and roi <= cfg.disaster_stop_roi:
         return "DISASTER_STOP"
+    if (
+        not disaster_only
+        and cfg.tick_fast_hard_roi is not None
+        and roi <= cfg.tick_fast_hard_roi
+    ):
+        return "TICK_FAST_HARD"
+
+    if disaster_only:
+        return None
+
+    # 浮盈保护:先更新独立 peak,再判回撤/阶梯
+    if roi > pos.tick_peak_roi:
+        pos.tick_peak_roi = roi
+
+    if (
+        cfg.tick_profit_trigger_roi is not None
+        and pos.tick_peak_roi >= cfg.tick_profit_trigger_roi
+        and roi < pos.tick_peak_roi * cfg.tick_profit_keep_ratio
+    ):
+        return "TICK_PROFIT_TRAIL"
+
+    if cfg.tick_profit_ladder:
+        lf = ladder_floor_from(cfg.tick_profit_ladder, pos.tick_peak_roi)
+        if lf > float("-inf") and roi < lf:
+            return "TICK_PROFIT_STEP"
+
     return None

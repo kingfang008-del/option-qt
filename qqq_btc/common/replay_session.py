@@ -5,7 +5,7 @@ Replay 状态机 —— strict replay / event replay / live 共用同一决策�
 
 设计约束:
   - 单 bar 调用 `on_minute_bar`,禁止向量化批量决策
-  - tick 级只允许 `on_tick` → check_disaster_stop(MTM 契约)
+  - tick 级只允许 `on_tick` → check_tick_stops(MTM 契约: fast_hard + disaster)
   - 成交/佣金口径统一走 FillModel
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 
 from .entry_decision import EntryDecision, choose_entry
-from .exit_rails import ExitRailsConfig, PositionState, check_disaster_stop, check_exit
+from .exit_rails import ExitRailsConfig, PositionState, check_exit, check_tick_stops
 from .fill_model import OptionSpreadFillModel, PerpFillModel
 from .replay_types import ReplayConfig, ReplayResult, Trade
 
@@ -301,14 +301,20 @@ class ReplaySession:
         quotes: SessionQuotes,
         *,
         smoothed_mtm: Optional[float] = None,
+        disaster_only: bool = False,
     ) -> List[ReplayEvent]:
-        """秒级 tick:仅灾难止损。"""
+        """秒级 tick:disaster + 可选 tick_fast_hard(均无状态,不污染 max_roi)。"""
         if self.position is None:
             return []
         mtm = smoothed_mtm if smoothed_mtm is not None else quotes.mid(self.position.leg)
         if not (np.isfinite(mtm) and mtm > 0):
             return []
-        reason = check_disaster_stop(self.rails_cfg, self.position.state, float(mtm))
+        reason = check_tick_stops(
+            self.rails_cfg,
+            self.position.state,
+            float(mtm),
+            disaster_only=disaster_only,
+        )
         if reason is None:
             return []
         return [self._close_position(bar_index, ts, quotes, reason, disaster=True)]

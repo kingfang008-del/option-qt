@@ -17,7 +17,7 @@ import logging
 import math
 from typing import Any, List, Dict, Optional
 
-from qqq_btc.common.exit_rails import ExitRailsConfig, PositionState, check_disaster_stop
+from qqq_btc.common.exit_rails import ExitRailsConfig, PositionState, check_tick_stops
 from qqq_btc.live.oms_adapter import limit_price_from_quote
 from qqq_btc.qqq import config as qcfg
 
@@ -136,12 +136,21 @@ def _quote_option_mid(quote: dict) -> Optional[float]:
 
 
 async def evaluate_disaster_tick_exits(engine, curr_ts: float, rails: ExitRailsConfig | None = None) -> None:
-    """disaster_only: 秒级仅 check_disaster_stop,不跑 legacy 阶梯/FLASH。"""
+    """秒级风险/浮盈轨:check_tick_stops,不跑 legacy 阶梯/FLASH。"""
     rails = rails or qcfg.EXIT_RAILS
-    if rails.disaster_stop_roi is None:
+    tick_on = (
+        rails.disaster_stop_roi is not None
+        or rails.tick_fast_hard_roi is not None
+        or rails.tick_profit_trigger_roi is not None
+        or bool(rails.tick_profit_ladder)
+    )
+    if not tick_on:
         return
     for sym, st in engine.states.items():
         if int(getattr(st, "position", 0) or 0) == 0:
+            # 平仓后清掉独立 tick_peak,避免下一笔继承
+            if hasattr(st, "qqq_btc_tick_peak_roi"):
+                st.qqq_btc_tick_peak_roi = 0.0
             continue
         quote = engine._second_quote_for_symbol(sym)
         if not quote:
@@ -150,10 +159,13 @@ async def evaluate_disaster_tick_exits(engine, curr_ts: float, rails: ExitRailsC
         mid = _quote_option_mid(quote)
         if entry_px is None or mid is None:
             continue
-        pos = PositionState(entry_price=entry_px, entry_bar=0)
-        reason = check_disaster_stop(rails, pos, mid)
+        peak = float(getattr(st, "qqq_btc_tick_peak_roi", 0.0) or 0.0)
+        pos = PositionState(entry_price=entry_px, entry_bar=0, tick_peak_roi=peak)
+        reason = check_tick_stops(rails, pos, mid)
+        st.qqq_btc_tick_peak_roi = pos.tick_peak_roi
         if not reason:
             continue
+        st.qqq_btc_tick_peak_roi = 0.0
         side = int(getattr(st, "position", 1) or 1)
         bid = float(quote.get("opt_bid", quote.get("bid", 0.0)) or 0.0)
         ask = float(quote.get("opt_ask", quote.get("ask", 0.0)) or 0.0)
@@ -166,11 +178,12 @@ async def evaluate_disaster_tick_exits(engine, curr_ts: float, rails: ExitRailsC
             "market_price": mid,
             "bid": bid,
             "ask": ask,
-            "meta": {"source": "qqq_btc_disaster_stop", "roi": mid / entry_px - 1.0},
+            "meta": {"source": "qqq_btc_tick_stop", "roi": mid / entry_px - 1.0},
         }
         logger.warning(
-            "⚡ [qqq_btc disaster_stop] %s | roi=%.1f%%",
+            "⚡ [qqq_btc tick_stop] %s | %s | roi=%.1f%%",
             sym,
+            reason,
             (mid / entry_px - 1.0) * 100.0,
         )
         await engine._submit_strategy_order(
