@@ -238,14 +238,25 @@ def _build_base_quote_df(
     df["occ_symbol"] = df["symbol"].map(databento_symbol_to_occ)
     df["ticker"] = df["occ_symbol"].str.replace("O:", "", regex=False)
     df["underlying"] = symbol
-    df["bucket_id"] = df["occ_symbol"].map(
-        lambda x: occ_to_meta.get(x, {}).get("bucket_id", -1)
-    )
-    df["tag"] = df["occ_symbol"].map(
-        lambda x: occ_to_meta.get(x, {}).get("tag", "")
-    )
     df["strike"] = df["occ_symbol"].map(parse_strike_from_occ)
-    return df
+
+    # 同一合约可能被锁给多个 bucket(如现货大幅跳空日 ATM CALL 与 OTM CALL
+    # 重合)。旧实现 occ→单bucket 字典会丢整个 bucket 的数据(历史上 30 天
+    # bucket2/3 或 0/1 碰撞,导致被覆盖 bucket 当日 0 分钟覆盖)。
+    # 修复:按 (occ, bucket) 展开,一份报价复制到它所属的每个 bucket。
+    parts = []
+    for occ, metas in occ_to_meta.items():
+        sub = df[df["occ_symbol"] == occ]
+        if sub.empty:
+            continue
+        for meta in metas:
+            part = sub.copy()
+            part["bucket_id"] = int(meta["bucket_id"])
+            part["tag"] = meta.get("tag", "")
+            parts.append(part)
+    if not parts:
+        return pd.DataFrame()
+    return pd.concat(parts, ignore_index=True)
 
 
 def _resample_to_1s(
@@ -279,7 +290,7 @@ def _resample_to_1s(
             )
             if c in df.columns
         ]
-        for _, sub in df.groupby("occ_symbol", sort=False):
+        for _, sub in df.groupby(["occ_symbol", "bucket_id"], sort=False):
             sub = sub.sort_values("timestamp").drop_duplicates(
                 subset=["timestamp"], keep="last"
             )
@@ -297,8 +308,9 @@ def _resample_to_1s(
         df = pd.concat(parts, ignore_index=True)
     else:
         df["ts_1s"] = df["timestamp"].dt.floor("1s")
+        # bucket_id 参与去重:碰撞合约的多 bucket 复制行不能互相吞掉
         df = df.sort_values("timestamp").drop_duplicates(
-            subset=["occ_symbol", "ts_1s"], keep="last"
+            subset=["occ_symbol", "bucket_id", "ts_1s"], keep="last"
         )
         df["timestamp"] = df["ts_1s"]
         df = df.drop(columns=["ts_1s"])
@@ -388,13 +400,15 @@ def process_single_day(args: tuple) -> str:
         return f"⏩ {symbol} {date_str} exists"
 
     occ_symbols = [normalize_occ_symbol(x) for x in group_df["contract_symbol"]]
-    occ_to_meta = {
-        occ: {
-            "bucket_id": int(row["bucket_id"]),
-            "tag": row.get("tag", "") if isinstance(row.get("tag", ""), str) else "",
-        }
-        for occ, (_, row) in zip(occ_symbols, group_df.iterrows())
-    }
+    # occ → 多个 bucket 元信息(合约碰撞时保留全部归属,下载后复制行)
+    occ_to_meta: dict[str, list[dict]] = {}
+    for occ, (_, row) in zip(occ_symbols, group_df.iterrows()):
+        occ_to_meta.setdefault(occ, []).append(
+            {
+                "bucket_id": int(row["bucket_id"]),
+                "tag": row.get("tag", "") if isinstance(row.get("tag", ""), str) else "",
+            }
+        )
 
     try:
         db_symbols = [occ_to_databento_symbol(x) for x in occ_symbols]

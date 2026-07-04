@@ -9,38 +9,42 @@
 
 ## 阶段 0:训练数据准备(P0,本机 + 数据盘)
 
-> 目标:产出带 qqq_btc 双腿标签的 LMDB,通过 strict 质量验收。
+> 目标:产出带主标签(及可选双腿标签)的 LMDB,通过 strict 质量验收。
+>
+> **完整命令、顺序与排错见 [DATA_PIPELINE.md](./DATA_PIPELINE.md)**（以该文档为准）。
 
 | # | 步骤 | 命令/工具 | 状态 |
 |---|---|---|---|
-| 0.1 | 选约锁定 | `step1_build_target_map_0dte.py` + `qqq/anchor.py` | ✅ |
-| 0.2 | 报价下载 | `step2_polygon_sniper_v7.py`(map=0dte) | ⏳ 你准备数据 |
-| 0.3 | 特征 merge | New_Pro 管线 ③④⑤ | ⏳ |
-| 0.4 | **标签管线** | `python qqq_btc/tools/label_pipeline.py --input ... --output ...` | ✅ |
-| 0.5 | rolling_norm | 复用 `apply_rolling_norm`(time/trend 为 raw,自动跳过) | ⏳ |
-| 0.6 | **LMDB 建库** | `python qqq_btc/tools/build_lmdb.py --feature-root ... --output ...` | ✅ |
-| 0.7 | 数据集验收 | `LMDBAlphaDataset.sanity_check()` | ✅ |
+| 0.1 | 选约锁定 | `step1_build_target_map.py` (qqq_0dte) | ✅ |
+| 0.2 | 报价下载 | `step2_databento_second_sniper_v1.py` → `step3_databento_aggregate_1s_to_1m.py` | ✅ |
+| 0.3 | IV / 特征 merge | `option_cac_day_vectorized_day` → `feature_merge_option_raw` | ✅ |
+| 0.4 | **主标签** | `write_main_labels.py` / `process_labels_file`（必需） | ✅ |
+| 0.4b | 双腿标签 | `label_pipeline.py`（可选） | 可选 |
+| 0.5 | **先** split | `split_raw_features.py` → train/val/test | ✅ |
+| 0.6 | **再** rolling_norm | `FEATURE_CONFIG=.../slow_feature_qqq_v2.json` + `apply_rolling_norm_standalone.py` | ✅ |
+| 0.7 | **LMDB** | `build_lmdb.py`（勿用旧 `s0_create_slow_channel_lmdb_alpha.py`） | ✅ |
+| 0.8 | 数据集验收 | `LMDBAlphaDataset.sanity_check()` | ✅ |
 
 ```bash
-# 0.4 标签(rolling_norm 之前)
-python qqq_btc/tools/label_pipeline.py \
-  --input ~/train_data/quote_features_merged/QQQ/regular/2022-03-01_2025-06-30/1min \
-  --output ~/train_data/quote_features_qqq_v2/QQQ/regular/2022-03-01_2025-06-30/1min \
-  --symbol QQQ \
-  --report ~/train_data/label_report.json
+# 主标签 → 切分 → 归一化 → LMDB（顺序不可调换 split/norm）
+python qqq_btc/tools/write_main_labels.py \
+  --feature-roots ~/train_data/quote_features_raw \
+  --config qqq_btc/CONFIG/slow_feature_qqq_v2.json
 
-# 0.5 rolling_norm (现有脚本,输入输出路径按你的 norm 流程)
+python preprocess/ask_bid/split_raw_features.py
 
-# 0.6 LMDB
+export FEATURE_CONFIG="/home/kingfang007/文档/GitHub/option-qt/qqq_btc/CONFIG/slow_feature_qqq_v2.json"
+python preprocess/ask_bid/apply_rolling_norm_standalone.py
+
 python qqq_btc/tools/build_lmdb.py \
-  --feature-root ~/train_data/quote_features_qqq_v2_norm \
+  --feature-root ~/train_data/quote_features_train \
   --config qqq_btc/CONFIG/slow_feature_qqq_v2.json \
   --symbol-map qqq_btc/CONFIG/symbol_map.json \
   --output ~/train_data/lmdb/train_qqq.lmdb \
   --symbols QQQ
 ```
 
-**验收门 G0**: `label_report.json` net_std>0; train/val **按日切分**; sanity_check strict 通过。
+**验收门 G0**: 主标签列齐全且 net_std>0; train/val/test 按月切分; sanity_check strict 通过。
 
 ---
 

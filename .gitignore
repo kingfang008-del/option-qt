@@ -169,3 +169,23 @@ production/preprocess/backtest/tools/archive.zip
 # macOS Finder metadata (ignore in every directory)
 .DS_Store
 **/.DS_Store
+
+# --- qqq_btc / baseline 本地训练与验证产物（大文件，不入库） ---
+checkpoints_*/
+*.pth
+*.pt
+*.ckpt
+
+# baseline 规则/TFT 验证报告（JSON/CSV + 日明细子目录）
+New_Pro/baseline_qqq/reports/
+New_Pro/baseline_qqq/reports/**/
+
+# walk-forward / eval 若输出到仓库内的工作目录
+qqq_wf_*/
+**/walk_forward_report.json
+**/walk_forward_trades.parquet
+
+# LMDB 建库输出（若在仓库内生成）
+*.lmdb/
+*.lmdb-data
+*.lmdb-lock

@@ -42,7 +42,7 @@ OUTPUT_FEATURES_DIR = Path.home() / "train_data/quote_features_raw"
 VIX_BASE_DIR = STOCK_RESAMPLED_DIR / "VIXY/regular/09:30-16:00"
 VIX_PATH_TEMPLATE = str(VIX_BASE_DIR / "{res}" / "{year_month}.parquet")
 # 配置文件路径
-CONFIG_FILE =  Path.home() /"notebook/train/feature_all.json"  
+CONFIG_FILE = "/home/kingfang007/文档/GitHub/option-qt/qqq_btc/CONFIG/slow_feature_qqq_v2.json"  
  
  
  
@@ -977,10 +977,15 @@ class FeatureEngineer:
         
         # --- 4. 最终列选择 ---
         final_feature_cols = [f['name'] for f in self.config['features']]
+        # OHLC 不进模型 features 列表，但标签(process_labels_file)依赖，始终落盘
+        ohlc_keep = [
+            c for c in ("open", "high", "low", "close", "volume", "vwap")
+            if c in df.columns and c not in final_feature_cols
+        ]
         
         # 2. 从 df 中只选择实际存在的列，避免因计算失败而报错
-        existing_cols = [col for col in final_feature_cols  if col in df.columns]
-        final_df = df[existing_cols]
+        existing_cols = [col for col in final_feature_cols if col in df.columns]
+        final_df = df[existing_cols + ohlc_keep]
         
         # 3. 将之前保存的 timestamp 作为第一列加回来
         final_df.insert(0, 'timestamp', timestamps)
@@ -1115,7 +1120,10 @@ nfp_release_dates = pd.to_datetime([
     "2024-01-05", "2024-02-02", "2024-03-08", "2024-04-05", "2024-05-03", "2024-06-07", 
     "2024-07-05", "2024-08-02", "2024-09-06", "2024-10-04", "2024-11-01", "2024-12-06",
     "2025-01-03", "2025-02-07", "2025-03-07", "2025-04-04", "2025-05-02", "2025-06-06",
-    "2025-07-03", "2025-08-01", "2025-09-05", "2025-10-03", "2025-11-07", "2025-12-05"
+    "2025-07-03", "2025-08-01", "2025-09-05", "2025-10-03", "2025-11-07", "2025-12-05",
+    # 2026 (BLS Employment Situation 官方日程;2/11 为周三,政府停摆修订所致)
+    "2026-01-09", "2026-02-11", "2026-03-06", "2026-04-03", "2026-05-08", "2026-06-05",
+    "2026-07-02", "2026-08-07", "2026-09-04", "2026-10-02", "2026-11-06", "2026-12-04"
 ]).tz_localize('America/New_York')
 
 # CPI (通胀) 发布日期列表 (通常在月中)
@@ -1130,7 +1138,10 @@ cpi_release_dates = pd.to_datetime([
     "2024-01-11", "2024-02-13", "2024-03-12", "2024-04-10", "2024-05-15", "2024-06-12", 
     "2024-07-11", "2024-08-14", "2024-09-11", "2024-10-10", "2024-11-13", "2024-12-11",
      "2025-01-14", "2025-02-13", "2025-03-13", "2025-04-10", "2025-05-13", "2025-06-11",
-    "2025-07-11", "2025-08-13", "2025-09-11", "2025-10-10", "2025-11-13", "2025-12-11"
+    "2025-07-11", "2025-08-13", "2025-09-11", "2025-10-10", "2025-11-13", "2025-12-11",
+    # 2026 (BLS CPI 官方日程)
+    "2026-01-13", "2026-02-13", "2026-03-11", "2026-04-10", "2026-05-12", "2026-06-10",
+    "2026-07-14", "2026-08-12", "2026-09-11", "2026-10-14", "2026-11-10", "2026-12-10"
 ]).tz_localize('America/New_York')
 
 fomc_dates_naive = [
@@ -1143,7 +1154,9 @@ fomc_dates_naive = [
     # --- 2024年 ---
     "2024-01-31", "2024-03-20", "2024-05-01", "2024-06-12", "2024-07-31", "2024-09-18", "2024-11-07", "2024-12-18",
     # --- 2025年 ---
-    "2025-01-29", "2025-03-19", "2025-04-30", "2025-06-11", "2025-07-30", "2025-09-17", "2025-11-05", "2025-12-17"
+    "2025-01-29", "2025-03-19", "2025-04-30", "2025-06-11", "2025-07-30", "2025-09-17", "2025-11-05", "2025-12-17",
+    # --- 2026年 (决议日=会议第二天;Fed 官方日程) ---
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17", "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09"
 ]
 
 
@@ -1159,7 +1172,11 @@ ppi_release_dates = pd.to_datetime([
     "2024-01-12", "2024-02-16", "2024-03-14", "2024-04-11", "2024-05-14", "2024-06-13",
     "2024-07-12", "2024-08-15", "2024-09-13", "2024-10-15", "2024-11-14", "2024-12-13",
     "2025-01-15", "2025-02-14", "2025-03-14", "2025-04-15", "2025-05-14", "2025-06-13",
-    "2025-07-15", "2025-08-14", "2025-09-12", "2025-10-15", "2025-11-14", "2025-12-12"
+    "2025-07-15", "2025-08-14", "2025-09-12", "2025-10-15", "2025-11-14", "2025-12-12",
+    # 2026 (BLS PPI 官方日程;1月因补发有两次)
+    "2026-01-14", "2026-01-30", "2026-02-27", "2026-03-18", "2026-04-14", "2026-05-13",
+    "2026-06-11", "2026-07-15", "2026-08-13", "2026-09-10", "2026-10-15", "2026-11-13",
+    "2026-12-15"
 ]).tz_localize('America/New_York')
 
 # --- 【核心修正】: 为FOMC日期列表本地化纽约时区 ---
@@ -2170,6 +2187,65 @@ def _apply_executable_net_labels(
     return net_consol_ratio, avg_cost
 
 
+def _inject_ohlc_from_stock(df: pd.DataFrame, feature_file_path: Path) -> pd.DataFrame:
+    """
+    slow_feature_qqq_v2 等配置不落盘 OHLC 时，从 spnq_train_resampled 回补。
+    路径约定: .../{symbol}/{session}/{time_range}/{res}/{YYYY-MM}.parquet
+    """
+    need = [c for c in ("open", "high", "low", "close") if c not in df.columns]
+    if not need:
+        return df
+
+    parts = feature_file_path.parts
+    try:
+        # .../SYMBOL/session/time_range/res/YYYY-MM.parquet
+        res = parts[-2]
+        time_range = parts[-3]
+        session = parts[-4]
+        symbol = parts[-5]
+        year_month = feature_file_path.stem
+    except Exception:
+        return df
+
+    stock_path = STOCK_RESAMPLED_DIR / symbol / session / time_range / res / f"{year_month}.parquet"
+    if not stock_path.exists():
+        logging.warning("OHLC 回补失败，正股文件不存在: %s", stock_path)
+        return df
+
+    stk = pd.read_parquet(stock_path)
+    if "timestamp" not in stk.columns or "close" not in stk.columns:
+        return df
+
+    stk = stk.copy()
+    stk["timestamp"] = pd.to_datetime(stk["timestamp"])
+    ohlc_cols = [c for c in ("open", "high", "low", "close", "volume", "vwap") if c in stk.columns]
+    stk = stk[["timestamp"] + ohlc_cols].sort_values("timestamp").drop_duplicates(
+        subset=["timestamp"], keep="last"
+    )
+
+    out = df.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"])
+    # 对齐时区，避免 merge_asof 因 tz-naive/aware 失败
+    if out["timestamp"].dt.tz is None and stk["timestamp"].dt.tz is not None:
+        out["timestamp"] = out["timestamp"].dt.tz_localize(stk["timestamp"].dt.tz)
+    elif out["timestamp"].dt.tz is not None and stk["timestamp"].dt.tz is None:
+        stk["timestamp"] = stk["timestamp"].dt.tz_localize(out["timestamp"].dt.tz)
+    elif (
+        out["timestamp"].dt.tz is not None
+        and stk["timestamp"].dt.tz is not None
+        and str(out["timestamp"].dt.tz) != str(stk["timestamp"].dt.tz)
+    ):
+        stk["timestamp"] = stk["timestamp"].dt.tz_convert(out["timestamp"].dt.tz)
+
+    out = pd.merge_asof(
+        out.sort_values("timestamp"),
+        stk,
+        on="timestamp",
+        direction="backward",
+    )
+    return out
+
+
 def process_labels_file(file_path: Path, config: dict = None) -> dict:
     """
     [New Delta 架构 - 30min Horizon 适配版]
@@ -2191,10 +2267,17 @@ def process_labels_file(file_path: Path, config: dict = None) -> dict:
         df = pd.read_parquet(file_path)
         if 'timestamp' in df.columns:
             df = df.sort_values('timestamp').reset_index(drop=True)
+
+        # v2 配置 features 不含 OHLC 时，从正股 1min 回补
+        df = _inject_ohlc_from_stock(df, Path(file_path))
         
         price_col = 'close' if 'close' in df.columns else 'price'
         if price_col not in df.columns:
-             return {'status': 'skipped', 'path': str(file_path), 'message': 'No price column'}
+             return {
+                 'status': 'skipped',
+                 'path': str(file_path),
+                 'message': 'No price column (feature file and stock OHLC inject both failed)',
+             }
 
         # 2. [基础计算]
         df['log_ret'] = np.log(df[price_col] / df[price_col].shift(1).replace(0, np.nan)).fillna(0.0)
@@ -3401,7 +3484,8 @@ def main():
     db_path = "/home/kingfang007/notebook/stocks.db"
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor() #level IN ('sp500', 'nq100', 'spnq', 'nq')
-    from config import TARGET_SYMBOLS
+    #from config import TARGET_SYMBOLS
+    TARGET_SYMBOLS = ['QQQ']
          # 动态生成占位符并执行查询
     placeholders = ','.join(['?'] * len(TARGET_SYMBOLS))
     query = f"SELECT  distinct  symbol  FROM stocks_us WHERE symbol IN ({placeholders})"
@@ -3410,7 +3494,7 @@ def main():
     symbols = [row[0] for row in cursor.fetchall()]
     conn.close()
     
-    date_range = pd.date_range(start="2022-03-01", end="2026-03-17", freq='MS')
+    date_range = pd.date_range(start="2023-04-01", end="2026-06-30", freq='MS')
     tasks = [(symbol, date.strftime('%Y-%m')) for symbol in symbols for date in date_range]
     
     # --- 2. 【新增】启动前诊断检查 ---
@@ -3503,7 +3587,8 @@ def add_option_labels_data():
         # *** 在这里修改你的 SQL 查询来选择特定的股票 ***
         # 示例: 选择所有在 'nq100' 或 'sp500' 列表中的股票
         cursor = conn.cursor() #level IN ('sp500', 'nq100', 'spnq', 'nq')
-        from config import TARGET_SYMBOLS
+        #from config import TARGET_SYMBOLS
+        TARGET_SYMBOLS = ['QQQ']
              # 动态生成占位符并执行查询
         placeholders = ','.join(['?'] * len(TARGET_SYMBOLS))
         query = f"SELECT distinct symbol  FROM stocks_us WHERE symbol IN ({placeholders})"

@@ -30,8 +30,12 @@ from .fill_model import OptionSpreadFillModel, PerpFillModel
 class LabelHorizon:
     """入场延迟 + 持有时间(与 New_Pro option_exec_label 语义一致)。"""
     entry_delay_bars: int = 1   # 60s @ 1min bar
-    hold_bars: int = 5          # 300s @ 1min bar
-    flat_margin: float = 0.0005  # |net| 低于此视为盘整(direction=1)
+    hold_bars: int = 30         # 30min 持有,与 trend_fit_30m / seq_len 对齐
+    flat_margin: float = 0.01   # |net| 低于此视为盘整(direction=1)
+    # 权利金过低时 ROI 爆炸(如 $0.01→$3),标为无效,避免训练被尾盘垃圾报价主导
+    min_entry_premium: float = 0.05
+    # 训练稳定:单腿净收益截断到 [-100%, +2000%]
+    net_clip: tuple = (-1.0, 20.0)
 
     @property
     def total_bars(self) -> int:
@@ -81,7 +85,7 @@ def _leg_net_arrays(
         exit_mid = mid[x_idx]
 
         ok = (
-            np.isfinite(entry_px) & (entry_px > 0)
+            np.isfinite(entry_px) & (entry_px >= float(horizon.min_entry_premium))
             & np.isfinite(exit_px) & (exit_px > 0)
             & np.isfinite(entry_mid) & (entry_mid > 0)
             & np.isfinite(exit_mid) & (exit_mid > 0)
@@ -94,8 +98,11 @@ def _leg_net_arrays(
             exit_px / np.where(entry_px > 0, entry_px, np.nan) - 1.0 - commission_drag,
             0.0,
         )
-        gross[idx] = np.nan_to_num(g, nan=0.0)
-        net[idx] = np.nan_to_num(v, nan=0.0)
+        lo, hi = horizon.net_clip
+        g = np.clip(np.nan_to_num(g, nan=0.0), lo, hi)
+        v = np.clip(np.nan_to_num(v, nan=0.0), lo, hi)
+        gross[idx] = g
+        net[idx] = v
         valid[idx] = ok
         entry_premium[idx] = np.where(ok, np.nan_to_num(entry_px, nan=0.0), 0.0)
 

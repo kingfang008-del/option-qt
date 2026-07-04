@@ -52,7 +52,12 @@ class NetEdgeLoss(nn.Module):
         w = torch.abs(net_r) * 12.0 + executable_edge * 8.0 + 1.0
         l_dir = (ce * torch.clamp(w, max=20.0)).mean()
 
-        l_net = F.smooth_l1_loss(out["net_edge"].squeeze(-1), net_r, beta=self.beta)
+        # 可交易量级(|net|>=1.5%)样本加权,避免被大量近零 theta 损耗主导
+        trade_w = 1.0 + 3.0 * (torch.abs(net_r) >= 0.015).float()
+        l_net = (
+            F.smooth_l1_loss(out["net_edge"].squeeze(-1), net_r, beta=self.beta, reduction="none")
+            * trade_w
+        ).mean()
         l_gross = F.smooth_l1_loss(out["gross_return"].squeeze(-1), gross_r, beta=self.beta)
         l_cost = F.smooth_l1_loss(out["execution_cost"].squeeze(-1), exec_cost, beta=self.beta)
         l_raw = F.smooth_l1_loss(
@@ -60,10 +65,16 @@ class NetEdgeLoss(nn.Module):
             torch.sign(gross_r) * executable_edge,
             beta=self.beta,
         )
+        # 分位损失同样加重可交易样本,改善 q10 校准
+        def _w_pinball(pred, target, q):
+            err = target - pred
+            pb = torch.maximum(q * err, (q - 1.0) * err)
+            return (pb * trade_w).mean()
+
         l_q = (
-            pinball_loss(out["net_edge_q10"].squeeze(-1), net_r, 0.1)
-            + pinball_loss(out["net_edge_q50"].squeeze(-1), net_r, 0.5)
-            + pinball_loss(out["net_edge_q90"].squeeze(-1), net_r, 0.9)
+            _w_pinball(out["net_edge_q10"].squeeze(-1), net_r, 0.1)
+            + _w_pinball(out["net_edge_q50"].squeeze(-1), net_r, 0.5)
+            + _w_pinball(out["net_edge_q90"].squeeze(-1), net_r, 0.9)
         )
 
         loss = (

@@ -19,9 +19,9 @@ VAL_DIR = Path.home() / "train_data/quote_features_val"
 TEST_DIR = Path.home() / "train_data/quote_features_test"
 
 # 定义训练集、验证集和测试集的时间范围 (左闭右闭)
-TRAIN_DATE_RANGE = ("2022-03-01", "2025-06-30") 
-VAL_DATE_RANGE = ("2025-07-01", "2026-02-28")
-TEST_DATE_RANGE = ("2026-03-01", "2026-03-18")
+TRAIN_DATE_RANGE = ("2023-03-01", "2025-12-31") 
+VAL_DATE_RANGE = ("2026-01-01", "2026-03-31")
+TEST_DATE_RANGE = ("2026-04-01", "2026-06-30")
 
 # 使用的CPU核心数
 MAX_WORKERS = 32
@@ -93,7 +93,8 @@ def get_valid_symbols() -> set:
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor() #level IN ('sp500', 'nq100', 'spnq', 'nq')
-        from config import TARGET_SYMBOLS
+        #from config import TARGET_SYMBOLS
+        TARGET_SYMBOLS = ['QQQ']
              # 动态生成占位符并执行查询
         placeholders = ','.join(['?'] * len(TARGET_SYMBOLS))
         query = f"SELECT distinct symbol  FROM stocks_us WHERE symbol IN ({placeholders})"

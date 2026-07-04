@@ -43,6 +43,7 @@ def run_strict_replay(
     call_edge_col: Optional[str] = None,
     put_edge_col: Optional[str] = None,
     straddle_edge_col: Optional[str] = None,
+    put_gate_col: Optional[str] = None,
 ) -> ReplayResult:
     """L1 分钟 strict replay —— 委托 event_replay(无 tick 流)。"""
     work = df.copy()
@@ -76,4 +77,5 @@ def run_strict_replay(
         call_edge_col=call_edge_col,
         put_edge_col=put_edge_col,
         straddle_edge_col=straddle_edge_col,
+        put_gate_col=put_gate_col,
     )

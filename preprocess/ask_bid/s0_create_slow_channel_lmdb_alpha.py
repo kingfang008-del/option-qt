@@ -33,7 +33,7 @@ import random
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 msgpack_numpy.patch() 
 
-CONFIG_PATH = Path.home() / 'notebook/train/slow_feature.json'
+CONFIG_PATH =  "/home/kingfang007/文档/GitHub/option-qt/qqq_btc/CONFIG/slow_feature_qqq_v2.json"
 PARQUET_ROOT = Path(Path.home() / 'train_data/quote_features_val').parent
 OUTPUT_DIR = Path('/mnt/s990/data/h5_unified_overlap_id')
 from config import PG_DB_URL

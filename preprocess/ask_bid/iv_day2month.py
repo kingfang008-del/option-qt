@@ -21,7 +21,8 @@ def get_target_symbols(db_path: str) -> set:
     try:
         conn = sqlite3.connect(expanded_db_path)
         cursor = conn.cursor()
-        from config import TARGET_SYMBOLS
+        #from config import TARGET_SYMBOLS
+        TARGET_SYMBOLS = ['QQQ']
         placeholders = ','.join(['?'] * len(TARGET_SYMBOLS))
         query = f"SELECT symbol FROM stocks_us WHERE symbol IN ({placeholders})"
         cursor.execute(query, TARGET_SYMBOLS)

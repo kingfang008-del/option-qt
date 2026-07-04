@@ -61,6 +61,8 @@ def entry_bar_mask(
     max_spread_pct: float = 0.06,
     edge_q10_col: Optional[str] = "net_edge_q10",
     require_q10_positive: bool = False,
+    edge_q10_floor: Optional[float] = -0.20,
+    session_entry_end_bar: Optional[int] = 330,
     bid_col: str = "exec_call_bid",
     ask_col: str = "exec_call_ask",
 ) -> np.ndarray:
@@ -74,9 +76,16 @@ def entry_bar_mask(
     else:
         mask &= False
 
-    if require_q10_positive and edge_q10_col and edge_q10_col in df.columns:
+    if edge_q10_col and edge_q10_col in df.columns:
         q10 = pd.to_numeric(df[edge_q10_col], errors="coerce").to_numpy(dtype=np.float64)
-        mask &= np.isfinite(q10) & (q10 > 0)
+        if require_q10_positive:
+            mask &= np.isfinite(q10) & (q10 > 0)
+        elif edge_q10_floor is not None:
+            mask &= np.isfinite(q10) & (q10 > float(edge_q10_floor))
+
+    if "timestamp" in df.columns and session_entry_end_bar is not None:
+        sbar = session_minute(df["timestamp"]).to_numpy()
+        mask &= sbar <= int(session_entry_end_bar)
 
     if bid_col in df.columns and ask_col in df.columns:
         bid = pd.to_numeric(df[bid_col], errors="coerce").to_numpy(dtype=np.float64)
@@ -283,9 +292,11 @@ def merge_bucket_suggestions(report: dict) -> dict:
     if not buckets:
         return {}
 
-    soft = max(v["suggested_soft_stop_roi"] for v in buckets)
-    hard = max(v["suggested_hard_stop_roi"] for v in buckets)
-    hard = min(hard, soft - 0.01)  # hard 必须深于 soft
+    # 30min 持有:取各时段中位宽度(过紧会把噪声当止损;过宽用 tick disaster 兜底)
+    soft = float(np.median([v["suggested_soft_stop_roi"] for v in buckets]))
+    hard = float(np.median([v["suggested_hard_stop_roi"] for v in buckets]))
+    soft = max(min(soft, -0.10), -0.35)
+    hard = max(min(hard, soft - 0.03), -0.45)
 
     ladders = [v["suggested_ladder_ratchet"] for v in buckets if v.get("suggested_ladder_ratchet")]
     merged_ladder: list = []
@@ -342,9 +353,12 @@ def main() -> None:
     parser.add_argument("--max-spread-pct", type=float, default=0.06)
     parser.add_argument("--require-q10", action="store_true", help="要求 net_edge_q10 > 0")
     parser.add_argument("--edge-q10-col", default="net_edge_q10")
+    parser.add_argument("--edge-q10-floor", type=float, default=-0.20,
+                        help="q10 下限门控(与 ReplayConfig.edge_q10_floor 一致)")
+    parser.add_argument("--session-entry-end-bar", type=int, default=330)
     parser.add_argument("--no-entry-filter", action="store_true", help="不过滤,用全 bar(不推荐)")
-    parser.add_argument("--early-stop-horizon", type=int, default=5, help="与标签 hold_bars 对齐")
-    parser.add_argument("--time-stop-horizon", type=int, default=15)
+    parser.add_argument("--early-stop-horizon", type=int, default=15, help="孵化期/early_stop bar")
+    parser.add_argument("--time-stop-horizon", type=int, default=30)
     parser.add_argument("--out", default=None, help="JSON 输出路径(默认 stdout)")
     args = parser.parse_args()
 
@@ -360,6 +374,8 @@ def main() -> None:
             max_spread_pct=args.max_spread_pct,
             edge_q10_col=args.edge_q10_col,
             require_q10_positive=args.require_q10,
+            edge_q10_floor=None if args.require_q10 else args.edge_q10_floor,
+            session_entry_end_bar=args.session_entry_end_bar,
         )
         n_entry = int(entry_mask.sum())
         if n_entry == 0:

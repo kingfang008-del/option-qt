@@ -57,11 +57,38 @@ def process_dataframe(df: pd.DataFrame, symbol: str, anchor_cfg: dict) -> pd.Dat
     if "timestamp" not in df.columns:
         raise ValueError("输入缺少 timestamp 列")
     df = df.sort_values("timestamp").reset_index(drop=True)
+    # 允许原地重跑:先清掉旧 exec_* / 旧标签列
+    drop_cols = [
+        c for c in df.columns
+        if c.startswith("exec_") or c.startswith("label_")
+    ]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
     df = anchor.merge_dual_leg_exec_quotes(df, symbol, anchor_cfg)
-    missing = [c for c in ("exec_call_bid", "exec_call_ask", "exec_put_bid", "exec_put_ask") if c not in df.columns]
-    if missing:
-        raise ValueError(f"双腿报价 merge 失败,缺列: {missing}. 检查 sniper/day_iv 与 locked map。")
-    df = add_time_features(df)
+    # 缺腿时补 NaN 列,由 label_net_valid 标记无效行(不整文件失败)
+    for leg in ("call", "put"):
+        for side in ("bid", "ask", "mid"):
+            col = f"exec_{leg}_{side}"
+            if col not in df.columns:
+                df[col] = float("nan")
+        mid_col = f"exec_{leg}_mid"
+        bid_col, ask_col = f"exec_{leg}_bid", f"exec_{leg}_ask"
+        need_mid = df[mid_col].isna() | (df[mid_col] <= 0)
+        if need_mid.any():
+            mid = (pd.to_numeric(df[bid_col], errors="coerce") + pd.to_numeric(df[ask_col], errors="coerce")) / 2.0
+            df.loc[need_mid, mid_col] = mid[need_mid]
+
+    n_call = int((pd.to_numeric(df["exec_call_bid"], errors="coerce") > 0).sum())
+    n_put = int((pd.to_numeric(df["exec_put_bid"], errors="coerce") > 0).sum())
+    if n_call == 0 and n_put == 0:
+        raise ValueError(
+            "双腿报价均为空。检查 quote_options_day_iv / locked map 与 anchor paths。"
+        )
+    logger.info("exec quotes: call_rows=%d put_rows=%d / %d", n_call, n_put, len(df))
+
+    # time/trend 已在 feature_merge 写入时可跳过重算;缺列时补算
+    if "time_session_sin" not in df.columns:
+        df = add_time_features(df)
     price_col = "close" if "close" in df.columns else None
     if price_col is None:
         for c in ("price", "vwap"):
@@ -70,7 +97,8 @@ def process_dataframe(df: pd.DataFrame, symbol: str, anchor_cfg: dict) -> pd.Dat
                 break
     if price_col is None:
         raise ValueError("缺 close/price 列,无法计算 trend 特征")
-    df = add_trend_features(df, price_col=price_col)
+    if "trend_fit_ret_30m" not in df.columns:
+        df = add_trend_features(df, price_col=price_col)
     df = build_dual_leg_net_labels(df, qcfg.FILL_MODEL, qcfg.LABEL_HORIZON)
     return df
 

@@ -27,6 +27,28 @@ class ReplayConfig:
     # 会话内 bar 序号(09:30=0)允许新开仓区间;None=不限制
     session_entry_start_bar: Optional[int] = 0
     session_entry_end_bar: Optional[int] = 360
+    # 0DTE 权利金 ROI 的经验 p10 约 -10%;高 edge bar 的预测 q10 中位约 -15%。
+    # 默认 floor=-0.20:过滤极端悲观分位,但不要求 q10>0。None=不检查 q10。
+    edge_q10_floor: Optional[float] = -0.20
+    # 账户仓位比例:权益复利用 (1 + f * option_roi)。
+    # 0DTE 单笔 ROI 波动大,f=1 远超 Kelly、波动拖累会把正期望复利打成大亏。
+    # 默认 1.0 保持旧口径;QQQ 路径用 ~0.25(半 Kelly)。
+    position_frac: float = 1.0
+    # --- 滚动分位阈值(None=关闭) ---
+    # 入场阈值 = max(静态调度阈值, 近 window 根入场窗 bar 的 edge 分位数)。
+    # 动机:模型打分分布随月份漂移(2026-04→06 过阈 bar 607→2113 而均值
+    # +0.15→+0.04),固定绝对阈值的选择性失控;分位数把"只做头部 x% 机会"
+    # 钉住。取 max = 只收紧不放松,绝对阈值仍然是覆盖成本的地板。
+    entry_quantile: Optional[float] = None
+    entry_quantile_window: int = 1500   # ~5 个交易日的入场窗 bar
+    entry_quantile_min_obs: int = 300   # 观测不足时退回静态阈值
+    # --- PUT 腿行情开关(None=不门控) ---
+    # PUT 只在恐慌/高波动 regime 有正期望:三时期审计显示 vix_level(归一化)
+    # 最高四分位贡献了 PUT 几乎全部利润,低 VIX 时 PUT 持续放血且挤占 CALL
+    # 额度(2026Q1: 门槛 0.25 把 PUT 腿从 -31% 变 +99%)。
+    # 语义:入场 bar 的 put_gate 信号值 >= put_gate_min 才允许开 PUT。
+    # 信号值缺失(NaN)时视为不通过——宁可错过,不可误开。
+    put_gate_min: Optional[float] = None
 
     def threshold_at(self, session_bar: Optional[int]) -> float:
         if self.entry_threshold_schedule is None or session_bar is None:
@@ -67,12 +89,18 @@ class Trade:
 class ReplayResult:
     trades: List[Trade] = field(default_factory=list)
     equity_curve: List[float] = field(default_factory=list)
+    position_frac: float = 1.0
 
-    def summary(self) -> dict:
+    def summary(self, position_frac: Optional[float] = None) -> dict:
+        f = float(self.position_frac if position_frac is None else position_frac)
         if not self.trades:
-            return {"trades": 0, "total_net_return": 0.0}
+            return {"trades": 0, "total_net_return": 0.0, "position_frac": f}
         rets = np.array([t.net_return for t in self.trades])
-        eq = np.array(self.equity_curve) if self.equity_curve else np.cumprod(1 + rets)
+        # equity_curve 已按 f 复利;无曲线时回退到 f * ROI
+        if self.equity_curve:
+            eq = np.array(self.equity_curve, dtype=float)
+        else:
+            eq = np.cumprod(1.0 + f * rets)
         peak = np.maximum.accumulate(eq)
         mdd = float(((eq - peak) / peak).min()) if len(eq) else 0.0
         wins = rets[rets > 0]
@@ -82,8 +110,13 @@ class ReplayResult:
         legs = pd.Series([t.leg for t in self.trades]).value_counts().to_dict()
         return {
             "trades": int(len(rets)),
-            "total_net_return": float(np.prod(1 + rets) - 1),
+            "position_frac": f,
+            # 账户复利(含仓位比例)
+            "total_net_return": float(eq[-1] - 1.0) if len(eq) else 0.0,
+            # 权利金 ROI 口径(信号质量,不受 f 影响)
             "avg_net_return": float(rets.mean()),
+            "sum_net_return": float(rets.sum()),
+            "full_size_compound": float(np.prod(1.0 + rets) - 1.0),
             "hit_rate": float((rets > 0).mean()),
             "profit_factor": profit_factor,
             "max_drawdown_mtm": mdd,

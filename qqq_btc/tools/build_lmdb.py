@@ -43,6 +43,9 @@ logger = logging.getLogger("qqq_btc.build_lmdb")
 WINDOW_1M = 30
 WINDOW_5M = 6
 WINDOW_STEP = 5
+# 与 ReplayConfig.session_entry_* 对齐:只写入可新开仓时段样本
+SESSION_ENTRY_START_BAR = 30  # 10:00;跳过开盘半小时
+SESSION_ENTRY_END_BAR = 330  # 15:00;hold=30min 时保证持有窗可走完
 
 REQUIRED_LABELS = [
     "label_return_fwd_net",
@@ -122,7 +125,10 @@ def build_samples_for_pair(
     df_5m = pd.read_parquet(f_5m)
     for col in REQUIRED_LABELS:
         if col not in df_1m.columns:
-            raise ValueError(f"{f_1m}: 缺必需标签 {col},请先跑 label_pipeline.py")
+            raise ValueError(
+                f"{f_1m}: 缺必需标签 {col}。"
+                "请先跑 qqq_btc/tools/label_pipeline.py(期权 fill 价标签)。"
+            )
 
     df_1m = align_timestamp_ny(df_1m, shift_minutes=1)
     df_5m = align_timestamp_ny(df_5m, shift_minutes=5)
@@ -144,6 +150,9 @@ def build_samples_for_pair(
     else:
         return out
 
+    # label_net_valid 列索引(若存在)
+    valid_j = active_labels.index("label_net_valid") if "label_net_valid" in active_labels else None
+
     for i in range(start_idx, len(df_1m), WINDOW_STEP):
         t = int(ts_1m[i])
         if t not in ts_5m_map:
@@ -156,6 +165,14 @@ def build_samples_for_pair(
         if idx_start_1m < 0:
             continue
 
+        # 只保留可交易时段(与 live/replay session_entry_end_bar 一致)
+        ts_ny = pd.Timestamp(t, unit="ns", tz="UTC").tz_convert("America/New_York")
+        session_bar = int(ts_ny.hour * 60 + ts_ny.minute - (9 * 60 + 30))
+        if session_bar < SESSION_ENTRY_START_BAR or session_bar > SESSION_ENTRY_END_BAR:
+            continue
+        if valid_j is not None and float(arr_lbl[i, valid_j]) < 0.5:
+            continue
+
         sample = {
             "1min": {n: arr_1m[idx_start_1m : i + 1, j].copy() for j, n in enumerate(feats_1m)},
             "5min": {n: arr_5m[idx_start_5m : idx_5 + 1, j].copy() for j, n in enumerate(feats_5m)},
@@ -165,6 +182,7 @@ def build_samples_for_pair(
                 "timestamp": t,
                 "stock_id": int(stock_id),
                 "sector_id": int(sector_id),
+                "session_bar": session_bar,
             },
         }
         key = f"{symbol}_{t}".encode("ascii")

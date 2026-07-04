@@ -96,6 +96,7 @@ def _signal_from_row(
     call_edge_col: Optional[str],
     put_edge_col: Optional[str],
     straddle_edge_col: Optional[str],
+    put_gate_col: Optional[str] = None,
 ) -> SessionSignal:
     def _f(col: Optional[str]) -> Optional[float]:
         if col is None or col not in row.index:
@@ -109,6 +110,7 @@ def _signal_from_row(
         put_edge=_f(put_edge_col),
         straddle_edge=_f(straddle_edge_col),
         edge_q10=_f(edge_q10_col),
+        put_gate=_f(put_gate_col),
     )
 
 
@@ -194,6 +196,7 @@ def run_event_replay(
     call_edge_col: Optional[str] = None,
     put_edge_col: Optional[str] = None,
     straddle_edge_col: Optional[str] = None,
+    put_gate_col: Optional[str] = None,
 ) -> ReplayResult:
     from .exit_rails import ExitRailsConfig
 
@@ -241,6 +244,7 @@ def run_event_replay(
             call_edge_col=call_edge_col,
             put_edge_col=put_edge_col,
             straddle_edge_col=straddle_edge_col,
+            put_gate_col=put_gate_col,
         )
         minute_quotes = SessionQuotes.from_row(row)
         ticks = ticks_by_minute.get(minute_key)

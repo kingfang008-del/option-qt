@@ -30,7 +30,7 @@ replay_harness 与实盘策略层共用本模块,保证回放退出分布 = 实�
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional, Tuple
 
 
@@ -38,6 +38,8 @@ from typing import List, Optional, Tuple
 class ExitRailsConfig:
     hard_stop_roi: float = -0.12          # 期权权利金 ROI 硬止损
     soft_stop_roi: float = -0.08          # 软止损
+    # 孵化期:持有未满 N bar 时只跑 hard_stop(不做 soft/利润保护),给 thesis 时间
+    profit_protect_min_bars: Optional[int] = None
     # 早期止损:持有 early_stop_bars 后 ROI 仍 <= early_stop_roi 则离场(None=关闭)
     early_stop_bars: Optional[int] = None
     early_stop_roi: float = -0.05
@@ -72,6 +74,81 @@ class ExitRailsConfig:
     tick_profit_smooth_n: int = 3
     # 可选:按 tick_peak 的阶梯 floor(与分钟 ladder 同语义,但只读 tick_peak)
     tick_profit_ladder: Tuple[Tuple[float, float], ...] = ()
+    # --- 波动自适应缩放(vol_scale_ref=None 关闭) ---
+    # 动机:阈值是按常态波动校准的静态数;高波动月(2026-06 尾部 p99 从 2 拉到 10)
+    # 会"涨一点就 STEP_PROTECT 出场、跌一段就 HARD_STOP",把右尾剪掉、左尾留下。
+    # 做法:入场时用当日过去 vol_scale_window 根 bar 的权利金分钟收益 std,
+    # 除以历史参考 vol_scale_ref 得 scale(截断到 [min,max]),
+    # 所有 ROI 阈值乘 scale 后对该仓位生效(持仓期不变,比例参数不动)。
+    vol_scale_ref: Optional[float] = None
+    vol_scale_window: int = 60
+    vol_scale_min_obs: int = 20
+    vol_scale_min: float = 0.75
+    vol_scale_max: float = 2.5
+    # True = 只缩放利润保护侧(ladder/trailing/flash/time_stop_min/tick_profit),
+    # 止损(hard/soft/early/tick_fast/disaster)保持校准值。
+    # 依据:2026-06 复盘,亏损主因是 STEP_PROTECT 剪掉右尾(-1.60),
+    # 而放深止损只会加大左尾(全量缩放最差单笔 -0.40 vs -0.36)。
+    vol_scale_profit_only: bool = False
+
+
+def scale_rails(cfg: ExitRailsConfig, scale: float) -> ExitRailsConfig:
+    """
+    按波动缩放全部 ROI 阈值,返回新配置(bar 数与 keep_ratio 等比例参数不动)。
+
+    scale=1 返回原配置。scale>1 = 高波动日:止损更深、利润档位更高,
+    使"阈值 / 当日噪声尺度"保持与校准期一致。
+    """
+    if not (scale > 0) or scale == 1.0:
+        return cfg
+    s = float(scale)
+
+    def _opt(v: Optional[float]) -> Optional[float]:
+        return None if v is None else v * s
+
+    def _ladder(lad: Tuple[Tuple[float, float], ...]) -> Tuple[Tuple[float, float], ...]:
+        return tuple((trig * s, fl * s) for trig, fl in lad)
+
+    profit_fields = dict(
+        time_stop_min_roi=cfg.time_stop_min_roi * s,
+        trailing_trigger_roi=cfg.trailing_trigger_roi * s,
+        ladder=_ladder(cfg.ladder),
+        flash_trigger_roi=cfg.flash_trigger_roi * s,
+        flash_exit_roi=cfg.flash_exit_roi * s,
+        tick_profit_trigger_roi=_opt(cfg.tick_profit_trigger_roi),
+        tick_profit_ladder=_ladder(cfg.tick_profit_ladder),
+    )
+    if cfg.vol_scale_profit_only:
+        return replace(cfg, **profit_fields)
+    return replace(
+        cfg,
+        hard_stop_roi=cfg.hard_stop_roi * s,
+        soft_stop_roi=cfg.soft_stop_roi * s,
+        early_stop_roi=cfg.early_stop_roi * s,
+        tick_fast_hard_roi=_opt(cfg.tick_fast_hard_roi),
+        disaster_stop_roi=_opt(cfg.disaster_stop_roi),
+        **profit_fields,
+    )
+
+
+def vol_scale_from_returns(cfg: ExitRailsConfig, minute_returns: List[float]) -> float:
+    """
+    入场时的波动缩放因子:当日近端权利金分钟收益 std / 历史参考,截断到配置区间。
+
+    观测不足(开盘初段)返回 1.0 —— 用校准期默认阈值,不猜。
+    """
+    if cfg.vol_scale_ref is None or cfg.vol_scale_ref <= 0:
+        return 1.0
+    import numpy as np
+
+    arr = np.asarray(minute_returns, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < int(cfg.vol_scale_min_obs):
+        return 1.0
+    sd = float(arr[-int(cfg.vol_scale_window):].std())
+    if not (sd > 0):
+        return 1.0
+    return float(min(max(sd / cfg.vol_scale_ref, cfg.vol_scale_min), cfg.vol_scale_max))
 
 
 @dataclass
@@ -120,6 +197,10 @@ def check_exit(
     """返回退出原因字符串;None 表示继续持有。current_price 为 MTM 估值价。"""
     roi = pos.update(current_price)
     held = current_bar - pos.entry_bar
+    incubating = (
+        cfg.profit_protect_min_bars is not None
+        and held < int(cfg.profit_protect_min_bars)
+    )
 
     if (
         cfg.eod_close_bar_index is not None
@@ -128,10 +209,14 @@ def check_exit(
     ):
         return "EOD_CLOSE"
 
+    # 硬止损始终生效;孵化期内不做 soft / 利润保护(tick disaster 另轨)
     if roi <= cfg.hard_stop_roi:
         return "HARD_STOP"
-    if roi <= cfg.soft_stop_roi:
+    if not incubating and roi <= cfg.soft_stop_roi:
         return "SOFT_STOP"
+
+    if incubating:
+        return None
 
     if (
         cfg.early_stop_bars is not None

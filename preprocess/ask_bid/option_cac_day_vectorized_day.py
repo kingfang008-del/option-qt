@@ -314,87 +314,160 @@ class OptionIVCalculator:
         self.risk_free_cache_file = '/home/kingfang007/risk_free_rates.parquet'
         os.makedirs(os.path.dirname(self.risk_free_cache_file), exist_ok=True)
 
-    def _load_risk_free_rates(self):
-        """仅负责从原始文件或网络读取基础数据，不再进行静默填充"""
+    @staticmethod
+    def _normalize_rfr_df(df: pd.DataFrame) -> pd.DataFrame:
+        """统一为 tz-naive 日频 index + 小数利率 (0.04 = 4%)。"""
+        out = df.copy()
+        if not isinstance(out.index, pd.DatetimeIndex):
+            out.index = pd.to_datetime(out.index)
+        out.index = out.index.normalize().tz_localize(None)
+
+        if "DGS3MO" not in out.columns:
+            out = out.rename(columns={out.columns[0]: "DGS3MO"})
+
+        # FRED 原始单位是百分数 (3.65)；缓存若误存百分数则自动换算
+        s = pd.to_numeric(out["DGS3MO"], errors="coerce")
+        if s.dropna().median() > 1.0:
+            logger.warning(
+                "RFR 缓存疑似百分数 (median=%.4f)，自动 /100 转为小数利率",
+                float(s.dropna().median()),
+            )
+            s = s / 100.0
+        out["DGS3MO"] = s
+        out = out[~out.index.duplicated(keep="last")].sort_index()
+        return out
+
+    def _load_risk_free_rates(self, required_dates: pd.DatetimeIndex):
+        """按期权日期范围加载/刷新 FRED DGS3MO，保证覆盖 required_dates。"""
+        req_min = pd.Timestamp(required_dates.min()).normalize()
+        req_max = pd.Timestamp(required_dates.max()).normalize()
+        fetch_start = (req_min - pd.Timedelta(days=14)).date()
+        fetch_end = (req_max + pd.Timedelta(days=14)).date()
+        fetch_end = max(fetch_end, datetime.date.today())
+
+        rfr_df = pd.DataFrame()
         if os.path.exists(self.risk_free_cache_file):
             try:
-                df_cache = pd.read_parquet(self.risk_free_cache_file)
-                df_cache.index = pd.to_datetime(df_cache.index).normalize()
-                if not df_cache.empty:
-                    self.risk_free_cache = df_cache
-                    return self.risk_free_cache
+                rfr_df = self._normalize_rfr_df(pd.read_parquet(self.risk_free_cache_file))
+                logger.info(
+                    "Loaded RFR cache: %s ~ %s (%d rows)",
+                    rfr_df.index.min().date(),
+                    rfr_df.index.max().date(),
+                    len(rfr_df),
+                )
             except Exception as e:
-                logger.warning(f"Read RFR cache failed: {e}")
+                logger.warning("Read RFR cache failed: %s", e)
+                rfr_df = pd.DataFrame()
 
-        # 如果缓存不存在或读取失败，尝试下载
-        try:
-            logger.info("Attempting to download latest RFR from FRED...")
-            # 默认获取过去几年的数据
-            start = datetime.date(2020, 1, 1)
-            end = datetime.date.today()
-            df_new = web.DataReader('DGS3MO', 'fred', start, end)
-            df_new.index = pd.to_datetime(df_new.index).normalize()
-            df_new = df_new / 100.0
-            
-            self.risk_free_cache = df_new
-            df_new.to_parquet(self.risk_free_cache_file)
-            return self.risk_free_cache
-        except Exception as e:
-            logger.error(f"❌ Critical: Failed to download RFR: {e}")
-            if self.risk_free_cache is None:
-                raise RuntimeError("RFR data is completely missing and download failed.")
-        
+        need_fetch = (
+            rfr_df.empty
+            or rfr_df.index.min() > req_min
+            or rfr_df.index.max() < req_max
+        )
+        if need_fetch:
+            try:
+                logger.info(
+                    "Downloading RFR from FRED DGS3MO: %s ~ %s ...",
+                    fetch_start,
+                    fetch_end,
+                )
+                new_data = web.DataReader("DGS3MO", "fred", fetch_start, fetch_end)
+                new_data = self._normalize_rfr_df(new_data)
+                if rfr_df.empty:
+                    rfr_df = new_data
+                else:
+                    rfr_df = new_data.combine_first(rfr_df)
+                    rfr_df = self._normalize_rfr_df(rfr_df)
+                # FRED 仅交易日有值：日频 ffill 填周末/假日，属正常利率惯例
+                rfr_df = rfr_df.resample("D").ffill()
+                rfr_df.to_parquet(self.risk_free_cache_file)
+                logger.info(
+                    "RFR cache updated: %s ~ %s (%d rows)",
+                    rfr_df.index.min().date(),
+                    rfr_df.index.max().date(),
+                    len(rfr_df),
+                )
+            except Exception as e:
+                logger.error("Failed to download RFR: %s", e)
+                if rfr_df.empty:
+                    raise RuntimeError(
+                        "RFR data is completely missing and download failed."
+                    ) from e
+
+        # 缓存已覆盖时也统一成日频，避免周末/假日 exact-match 失败
+        if not isinstance(rfr_df.index, pd.DatetimeIndex) or rfr_df.index.freq is None:
+            rfr_df = rfr_df.resample("D").ffill()
+
+        self.risk_free_cache = rfr_df
         return self.risk_free_cache
 
-    def _audit_and_prepare_rfr(self, required_dates: pd.DatetimeIndex, max_consecutive_missing=3):
-        """🕵️ RFR 质量审计核心逻辑"""
+    def _audit_and_prepare_rfr(
+        self, required_dates: pd.DatetimeIndex, max_consecutive_missing=3
+    ):
+        """对齐期权交易日并审计 RFR；仅允许短缺口 ffill。"""
         if self.risk_free_cache is None or self.risk_free_cache.empty:
             raise RuntimeError("RFR cache is empty cannot audit.")
 
-        # 1. 对齐所需日期
-        # 确保 required_dates 是 DatetimeIndex
-        rfr_audit = self.risk_free_cache.reindex(required_dates)
-        missing_mask = rfr_audit['DGS3MO'].isnull()
-        missing_count = missing_mask.sum()
-        
-        if missing_count == 0:
-            logger.info(f"✅ RFR 数据完整性校验通过 (共 {len(required_dates)} 天)")
-            return rfr_audit['DGS3MO']
+        req = pd.DatetimeIndex(pd.to_datetime(required_dates)).normalize().tz_localize(None)
+        rfr = self.risk_free_cache["DGS3MO"].copy()
+        rfr.index = pd.DatetimeIndex(rfr.index).normalize().tz_localize(None)
 
-        # 2. 检测连续缺失长度
+        # 先在完整日频序列上 ffill，再取期权交易日（周末/假日不算系统性缺失）
+        full_idx = pd.date_range(req.min() - pd.Timedelta(days=7), req.max(), freq="D")
+        rfr_daily = rfr.reindex(full_idx).ffill()
+
+        rfr_audit = rfr_daily.reindex(req)
+        missing_mask = rfr_audit.isnull()
+        missing_count = int(missing_mask.sum())
+
+        if missing_count == 0:
+            logger.info("✅ RFR 数据完整性校验通过 (共 %d 天)", len(req))
+            logger.info(
+                "   RFR range: %.4f ~ %.4f (median=%.4f)",
+                float(rfr_audit.min()),
+                float(rfr_audit.max()),
+                float(rfr_audit.median()),
+            )
+            return rfr_audit
+
         is_missing = missing_mask.astype(int)
         groups = (is_missing != is_missing.shift()).cumsum()
-        consecutive_missing_lengths = is_missing.groupby(groups).sum()
-        max_lens = consecutive_missing_lengths.max()
+        max_lens = int(is_missing.groupby(groups).sum().max())
+        missing_dates = req[missing_mask]
 
-        # 打印审计报告
-        missing_dates = required_dates[missing_mask]
         logger.info("=" * 50)
-        logger.info(f"📊 RFR 数据健康报告:")
-        logger.info(f"   - 所需总天数: {len(required_dates)}")
-        logger.info(f"   - 缺失天数:   {missing_count}")
-        logger.info(f"   - 最大连续缺失: {max_lens} 天")
+        logger.info("📊 RFR 数据健康报告:")
+        logger.info("   - 所需总天数: %d", len(req))
+        logger.info("   - 缺失天数:   %d", missing_count)
+        logger.info("   - 最大连续缺失: %d 天", max_lens)
         logger.info("=" * 50)
 
         if max_lens > max_consecutive_missing:
-            logger.error(f"❌ 审计发现系统性数据缺失！连续 {max_lens} 天无利率数据 (上限 {max_consecutive_missing} 天)。")
-            logger.error(f"   缺失起始日期示例: {missing_dates[:5].tolist()}")
-            raise RuntimeError(f"RFR systematic gap detected ({max_lens} days). Aborting to prevent IV parity drift.")
+            logger.error(
+                "❌ 审计发现系统性数据缺失！连续 %d 天无利率数据 (上限 %d 天)。",
+                max_lens,
+                max_consecutive_missing,
+            )
+            logger.error("   缺失起始日期示例: %s", missing_dates[:5].tolist())
+            raise RuntimeError(
+                f"RFR systematic gap detected ({max_lens} days). "
+                "Aborting to prevent IV parity drift."
+            )
 
-        # 3. 执行容错修复 (Forward Fill)
-        logger.warning(f"⚠️ 检测到偶尔的数据缺口 ({missing_count} 天)，正在执行前向填充 (ffill)...")
-        rfr_fixed = rfr_audit['DGS3MO'].ffill()
-        
-        # 如果第一天就没数据，bfill 一次防止开头 NaN
+        logger.warning(
+            "⚠️ 检测到偶尔的数据缺口 (%d 天)，正在执行前向填充 (ffill)...",
+            missing_count,
+        )
+        rfr_fixed = rfr_audit.ffill()
         if rfr_fixed.isnull().any():
-             rfr_fixed = rfr_fixed.bfill()
-             
+            rfr_fixed = rfr_fixed.bfill()
         return rfr_fixed
 
     def get_target_symbols(self) -> list[str]:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        from config import TARGET_SYMBOLS
+        #from config import TARGET_SYMBOLS
+        TARGET_SYMBOLS = ['QQQ']
          
         placeholders = ','.join(['?'] * len(TARGET_SYMBOLS))
         query = f"SELECT symbol FROM stocks_us WHERE symbol IN ({placeholders})"
@@ -491,8 +564,8 @@ class OptionIVCalculator:
 
         sorted_dates = pd.to_datetime(sorted(list(all_required_dates))).normalize()
 
-        # 🚀 [Step 2] 加载并审计 RFR
-        self._load_risk_free_rates()
+        # 🚀 [Step 2] 加载并审计 RFR（按期权日期范围刷新 FRED 覆盖）
+        self._load_risk_free_rates(sorted_dates)
         r_series = self._audit_and_prepare_rfr(sorted_dates)
 
         logger.info(f"Starting ProcessPool with {max_concurrent_stocks} workers for {len(symbols)} symbols...")
@@ -520,7 +593,7 @@ if __name__ == "__main__":
 
     calculator = OptionIVCalculator(
         db_path="/home/kingfang007/notebook/stocks.db",
-        option_root="/mnt/s990/data/massive_options_1m_formatted", # 指向新下载的高精度文件
+        option_root="/mnt/s990/data/raw_1m/options_databento/", # 指向新下载的高精度文件
         data_root="/home/kingfang007/train_data/spnq_train_resampled",
         iv_option_root="/home/kingfang007/train_data/quote_options_day_iv" 
     )

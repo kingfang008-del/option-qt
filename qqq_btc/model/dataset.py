@@ -175,6 +175,9 @@ class LMDBAlphaDataset(Dataset):
             cost = lbl.get("label_execution_cost", 0.0) or 0.0
             d_val = lbl.get("label_direction_net", lbl.get("label_direction", 1))
         else:
+            # fill 标签无效行(无盘口/权利金过低)不进训练
+            if self.strict_labels and "label_net_valid" in lbl and not bool(lbl["label_net_valid"]):
+                return None
             net = lbl["label_return_fwd_net"]
             gross = lbl["label_return_fwd_gross"]
             cost = lbl["label_execution_cost"]

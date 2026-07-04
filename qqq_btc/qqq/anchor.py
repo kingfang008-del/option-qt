@@ -115,8 +115,18 @@ def get_daily_locked_contracts(df: pd.DataFrame, cfg: dict) -> Optional[pd.DataF
     locked_map = []
     targets = bucket_targets(cfg)
     delta_tol = float(cfg.get("delta_tolerance", 0.15))
+    # 锁约只允许用开盘窗口快照:与实盘一致(09:30 锁定后不换),且杜绝
+    # "用盘中晚些时候的 delta 选开盘合约"的前视。旧实现用全天快照,
+    # 2026 年日内波幅变大后锁出的"ATM"距开盘价中位偏离 0.85%+(2025H2
+    # 约 0.25%),深 ITM/OTM 合约报价稀疏,是 bucket 覆盖率劣化的主因。
+    lock_minutes = int(cfg.get("lock_window_minutes", 10))
 
     for date_val, daily_group in candidates.groupby("date_str"):
+        day_start = daily_group["timestamp"].min()
+        open_cut = day_start + pd.Timedelta(minutes=lock_minutes)
+        open_group = daily_group[daily_group["timestamp"] <= open_cut]
+        if not open_group.empty:
+            daily_group = open_group
         available_dtes = daily_group["dte"].unique()
         selected_front_dte = select_front_dte(available_dtes, cfg)
         if selected_front_dte is None:
@@ -297,7 +307,15 @@ def _normalize_ny_timestamp(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def merge_exec_bucket_quotes(df: pd.DataFrame, symbol: str, anchor_cfg: dict) -> pd.DataFrame:
+# 报价回看容差:断档超过该时长的分钟置 NaN(标签侧 label_*_valid 置无效,
+# 回放侧该腿不开仓)。2026 年 bucket0 覆盖劣化,无容差会拿几十分钟前的
+# 陈旧价成交,伪造 PUT 腿收益。
+QUOTE_ASOF_TOLERANCE = "5min"
+
+
+def merge_exec_bucket_quotes(
+    df: pd.DataFrame, symbol: str, anchor_cfg: dict, tolerance: Optional[str] = QUOTE_ASOF_TOLERANCE
+) -> pd.DataFrame:
     """将锁定 bucket 的分钟报价 merge_asof 进特征表。"""
     bucket_id = int(anchor_cfg.get("label_trade_bucket_id", 2))
     quotes = load_bucket_minute_quotes(symbol, df["timestamp"], bucket_id, anchor_cfg)
@@ -306,7 +324,13 @@ def merge_exec_bucket_quotes(df: pd.DataFrame, symbol: str, anchor_cfg: dict) ->
 
     merged = _normalize_ny_timestamp(df).sort_values("timestamp")
     quotes = quotes.sort_values("timestamp")
-    merged = pd.merge_asof(merged, quotes, on="timestamp", direction="backward")
+    merged = pd.merge_asof(
+        merged,
+        quotes,
+        on="timestamp",
+        direction="backward",
+        tolerance=pd.Timedelta(tolerance) if tolerance else None,
+    )
     return merged
 
 
@@ -314,7 +338,9 @@ def merge_exec_bucket_quotes(df: pd.DataFrame, symbol: str, anchor_cfg: dict) ->
 DUAL_LEG_BUCKETS: Dict[str, int] = {"exec_call": 2, "exec_put": 0}
 
 
-def merge_dual_leg_exec_quotes(df: pd.DataFrame, symbol: str, anchor_cfg: dict) -> pd.DataFrame:
+def merge_dual_leg_exec_quotes(
+    df: pd.DataFrame, symbol: str, anchor_cfg: dict, tolerance: Optional[str] = QUOTE_ASOF_TOLERANCE
+) -> pd.DataFrame:
     """
     同时 merge CALL ATM(exec_call_*)与 PUT ATM(exec_put_*)两条腿的分钟报价。
     双向策略的标签构建与回放都需要两条腿各自的 bid/ask —— 买 PUT 不是
@@ -322,6 +348,7 @@ def merge_dual_leg_exec_quotes(df: pd.DataFrame, symbol: str, anchor_cfg: dict) 
     """
     legs = anchor_cfg.get("dual_leg_buckets") or DUAL_LEG_BUCKETS
     merged = _normalize_ny_timestamp(df).sort_values("timestamp")
+    tol = pd.Timedelta(tolerance) if tolerance else None
     for prefix, bucket_id in legs.items():
         quotes = load_bucket_minute_quotes(
             symbol, merged["timestamp"], int(bucket_id), anchor_cfg, prefix=prefix
@@ -329,6 +356,10 @@ def merge_dual_leg_exec_quotes(df: pd.DataFrame, symbol: str, anchor_cfg: dict) 
         if quotes.empty:
             continue
         merged = pd.merge_asof(
-            merged, quotes.sort_values("timestamp"), on="timestamp", direction="backward"
+            merged,
+            quotes.sort_values("timestamp"),
+            on="timestamp",
+            direction="backward",
+            tolerance=tol,
         )
     return merged
