@@ -202,6 +202,7 @@ class ReplaySession:
         dual_mode: bool = False,
         default_leg: str = "CALL",
         is_option: bool = True,
+        signal_only: bool = False,
     ):
         self.replay_cfg = replay_cfg
         self.rails_cfg = rails_cfg
@@ -209,6 +210,7 @@ class ReplaySession:
         self.dual_mode = dual_mode
         self.default_leg = default_leg
         self.is_option = is_option
+        self.signal_only = signal_only
 
         self.result = ReplayResult(
             position_frac=float(getattr(replay_cfg, "position_frac", 1.0) or 1.0)
@@ -420,6 +422,17 @@ class ReplaySession:
         sp = quotes.spread_pct(decision.leg)
         if not (np.isfinite(sp) and sp <= self.replay_cfg.max_spread_pct):
             return []
+        if self.signal_only:
+            ev = ReplayEvent(
+                kind="SIGNAL",
+                ts=ts,
+                bar_index=bar_index,
+                leg=decision.leg,
+                edge=decision.edge,
+                extra={"threshold": decision.threshold, "signal_only": True},
+            )
+            self.events.append(ev)
+            return [ev]
         delay = int(self.replay_cfg.entry_delay_bars or 0)
         if bool(getattr(self.replay_cfg, "immediate_entry", False)):
             self.pending_edge = decision.edge

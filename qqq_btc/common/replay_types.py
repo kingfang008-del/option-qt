@@ -3,8 +3,8 @@
 """Replay 共享类型 —— 避免 replay_harness / replay_session / event_replay 循环依赖。"""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import dataclass, field, replace
+from typing import Any, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -141,6 +141,7 @@ class ReplayResult:
     trades: List[Trade] = field(default_factory=list)
     equity_curve: List[float] = field(default_factory=list)
     position_frac: float = 1.0
+    events: List[Any] = field(default_factory=list)
 
     def summary(self, position_frac: Optional[float] = None) -> dict:
         f = float(self.position_frac if position_frac is None else position_frac)

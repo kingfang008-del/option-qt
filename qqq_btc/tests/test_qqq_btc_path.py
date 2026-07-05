@@ -2068,6 +2068,31 @@ def test_live_session_governor_vol_scaled_rails():
     assert rails1.hard_stop_roi == base.hard_stop_roi  # profit_only
 
 
+def test_signal_decision_replay_vs_live_match():
+    from qqq_btc.common.signal_collect import collect_decision_signals, diff_signal_frames
+    from qqq_btc.common.replay_harness import run_strict_replay
+    from qqq_btc.qqq import config as qcfg
+
+    fm = qcfg.FILL_MODEL
+    df = _make_option_df(n=120, drift=0.02)
+    df["net_edge"] = 0.05
+    df["call_net_edge"] = 0.05
+    df["put_net_edge"] = 0.02
+    df["net_edge_q10"] = 0.01
+    df["vix_level"] = 0.3
+
+    day = str(pd.Timestamp(df.iloc[60]["timestamp"]).date())
+    r = collect_decision_signals(df.iloc[:80], warmup_through_day=day, target_day=day, replay_cfg=qcfg.REPLAY)
+    l = collect_decision_signals(df.iloc[:80], warmup_through_day=day, target_day=day, replay_cfg=qcfg.LIVE_REPLAY)
+    d = diff_signal_frames(r, l, time_tolerance_bars=0)
+    assert d["summary"]["n_matched"] == d["summary"]["n_replay"]
+    assert d["summary"]["n_matched"] == d["summary"]["n_live"]
+
+    # event replay 仍返回 events
+    result = run_strict_replay(df.iloc[:80], fm, qcfg.REPLAY, qcfg.EXIT_RAILS)
+    assert isinstance(result.events, list)
+
+
 def test_bootstrap_gate_convergence_env():
     import os
     os.environ["QQQ_BTC_LIVE"] = "1"

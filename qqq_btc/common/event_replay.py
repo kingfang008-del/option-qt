@@ -215,6 +215,7 @@ def run_event_replay(
     put_edge_col: Optional[str] = None,
     straddle_edge_col: Optional[str] = None,
     put_gate_col: Optional[str] = None,
+    signal_only: bool = False,
 ) -> ReplayResult:
     from .exit_rails import ExitRailsConfig
 
@@ -238,6 +239,7 @@ def run_event_replay(
         dual_mode=dual_mode,
         default_leg=default_leg,
         is_option=is_option,
+        signal_only=signal_only,
     )
 
     ticks_by_minute: dict = {}
@@ -347,7 +349,9 @@ def run_event_replay(
             allow_entry=(event_cfg.fill_timing == FillTiming.MINUTE_CLOSE),
         )
 
-    return session.result
+    result = session.result
+    result.events = list(session.events)
+    return result
 
 
 def compare_minute_vs_event(
