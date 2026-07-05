@@ -53,6 +53,8 @@ def bootstrap_qqq_btc_live(*, patch_oms: bool = True) -> bool:
         os.environ["SLOW_FEATURE_CONFIG"] = str(v2_cfg)
     os.environ.setdefault("ALPHA_ZSCORE_MODE", "absolute")
     os.environ.setdefault("USE_NET_EDGE_ALPHA", "1")
+    os.environ.setdefault("BIDIRECTIONAL_ENABLED", "1")
+    os.environ.setdefault("BIDIRECTIONAL_DUAL_EDGE_ENABLED", "1")
     # bar 收盘后立即下单:禁止 OMS 延迟队列与 Mock 回放延迟 bar
     os.environ.setdefault("EXECUTION_DELAY_BARS", "0")
     os.environ.setdefault("OMS_SIGNAL_DELAY_BARS", "0")

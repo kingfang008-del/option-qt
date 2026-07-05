@@ -40,6 +40,9 @@ def check_exit_via_rails(
         return None
 
     rails = rails or qcfg.EXIT_RAILS
+    if pos.get("qqq_btc_exit_rails") is not None:
+        rails = pos["qqq_btc_exit_rails"]
+
     entry_price = float(pos.get("entry_price", 0.0) or 0.0)
     curr_price = float(ctx.get("curr_price", 0.0) or 0.0)
     if entry_price <= 0 or curr_price <= 0:

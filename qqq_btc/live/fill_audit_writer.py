@@ -137,6 +137,21 @@ def apply_fill_audit_patch() -> None:
         _orig_open(self, sym, st, filled_qty, fill_price, stock_price, entry_ts, sig, *args, **kwargs)
         if filled_qty <= 0:
             return
+        try:
+            import pandas as pd
+            from pytz import timezone as tz
+
+            from qqq_btc.common.time_features import session_minute
+            from qqq_btc.live.session_governor import get_session_governor
+
+            ny = tz("America/New_York")
+            ts = pd.Series([pd.Timestamp.fromtimestamp(float(entry_ts), tz=ny)])
+            st.qqq_btc_entry_bar = int(session_minute(ts).iloc[0])
+            rails, vol_scale = get_session_governor().scaled_exit_rails(sym)
+            st.qqq_btc_exit_rails = rails
+            st.qqq_btc_vol_scale = float(vol_scale)
+        except Exception as e:
+            logger.warning("qqq_btc entry rails scale skipped: %s", e)
         meta = dict(sig.get("meta", {}) or {})
         execution_meta = kwargs.get("execution_meta") or {}
         if isinstance(execution_meta, dict):
@@ -158,6 +173,8 @@ def apply_fill_audit_patch() -> None:
         self, sym, st, filled_qty, fill_price, stock_price, curr_ts, reason, duration, ratio,
         original_position=None, execution_meta=None,
     ):
+        entry_px = float(getattr(st, "entry_price", 0.0) or 0.0)
+        pos_dir = int(original_position if original_position is not None else getattr(st, "position", 0) or 0)
         _orig_exit(
             self, sym, st, filled_qty, fill_price, stock_price, curr_ts, reason, duration, ratio,
             original_position=original_position, execution_meta=execution_meta,
@@ -178,6 +195,23 @@ def apply_fill_audit_patch() -> None:
             exit_reason=str(reason or ""),
             mode=str(getattr(self.orch, "mode", "") or ""),
         )
+        try:
+            from qqq_btc.live.session_governor import get_session_governor, net_return_from_prices
+
+            comm = 0.0
+            try:
+                comm = float(qcfg.FILL_MODEL.commission_return_drag(entry_px))
+            except Exception:
+                pass
+            nr = net_return_from_prices(entry_px, float(fill_price), commission_drag=comm)
+            leg = "PUT" if pos_dir < 0 else "CALL"
+            streak_until = get_session_governor().record_trade_close(
+                sym, net_ret=nr, curr_ts=float(curr_ts), leg=leg,
+            )
+            if streak_until > 0 and hasattr(st, "cooldown_until"):
+                st.cooldown_until = max(float(getattr(st, "cooldown_until", 0.0) or 0.0), streak_until)
+        except Exception as e:
+            logger.warning("session_governor trade_close skipped: %s", e)
 
     oac.OrchestratorAccounting._process_open_accounting = _wrapped_open
     oac.OrchestratorAccounting._process_exit_accounting = _wrapped_exit

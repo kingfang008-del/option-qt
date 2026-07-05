@@ -15,6 +15,7 @@ import pandas as pd
 
 from qqq_btc.common.entry_decision import choose_entry
 from qqq_btc.common.time_features import session_minute
+from qqq_btc.live.session_governor import get_session_governor
 from qqq_btc.qqq import config as qcfg
 
 
@@ -76,9 +77,40 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
 
     replay_cfg = qcfg.REPLAY
     session_bar = _session_bar_from_ctx(ctx)
+    sym = str(ctx.get("symbol", "QQQ") or "QQQ")
+    curr_ts = float(ctx.get("curr_ts", 0.0) or 0.0)
     edge = float(ctx.get("net_edge_raw", ctx.get("alpha_z", 0.0)) or 0.0)
+    call_edge = float(ctx.get("call_edge", edge) or edge)
+    put_edge = float(ctx.get("put_edge", 0.0) or 0.0)
     spread_pct = _spread_pct_from_ctx(ctx)
     edge_q10 = _edge_q10_from_ctx(ctx)
+
+    dual_mode = not bool(replay_cfg.long_only)
+    has_put = dual_mode
+
+    spot_day_ret = _f_ctx(ctx, "spot_day_ret")
+    if spot_day_ret is None:
+        spot_day_ret = _f_ctx(ctx, "qqq_day_roc")
+    spot_ret_5bar = _f_ctx(ctx, "spot_ret_5bar")
+    if spot_ret_5bar is None:
+        spot_ret_5bar = _f_ctx(ctx, "stock_roc")
+    trend_ret_30m = _f_ctx(ctx, "trend_fit_ret_30m")
+    trend_r2_30m = _f_ctx(ctx, "trend_fit_r2_30m")
+    vix_rev = _f_ctx(ctx, "vix_reversal_count_30m")
+    spot_range_30m = _f_ctx(ctx, "spot_range_30m")
+
+    gov = get_session_governor(replay_cfg)
+    if curr_ts > 0:
+        gov.maybe_reset_day(sym, curr_ts)
+    blocked, block_reason = gov.blocked_for_entry(
+        sym,
+        curr_ts=curr_ts if curr_ts > 0 else 0.0,
+        cooldown_until=float(ctx.get("cooldown_until", 0.0) or 0.0),
+    )
+    if blocked:
+        self._trace("E9.qqq_btc_governor", "block", block_reason)
+        self._last_reject_reason = block_reason
+        return None
 
     if not replay_cfg.session_allows_entry(session_bar):
         self._trace(
@@ -90,37 +122,61 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         return None
     self._trace("E9.qqq_btc_session", "pass", f"session_bar={session_bar}")
 
+    gov.record_edges(
+        sym,
+        session_bar=session_bar,
+        call_edge=call_edge,
+        put_edge=put_edge,
+        dual_mode=dual_mode,
+        trend_r2_30m=trend_r2_30m,
+        spot_day_ret=spot_day_ret,
+        vix_reversal_count_30m=vix_rev,
+        spot_range_30m=spot_range_30m,
+        trend_ret_30m=trend_ret_30m,
+    )
+    dyn_th, put_dyn_th = gov.dynamic_thresholds(sym)
+    straddles_today = gov.straddles_today_for(sym)
+
     decision = choose_entry(
         replay_cfg,
         session_bar=session_bar,
         edge=edge,
-        call_edge=float(ctx.get("call_edge", edge) or edge),
-        put_edge=float(ctx.get("put_edge", 0.0) or 0.0),
+        call_edge=call_edge,
+        put_edge=put_edge,
         edge_q10=edge_q10,
         spread_pct=spread_pct,
-        dual_mode=False,
-        has_put=False,
+        dual_mode=dual_mode,
+        has_put=has_put,
+        straddle_enabled=dual_mode,
+        straddles_today=straddles_today,
         default_leg="CALL",
+        dynamic_threshold=dyn_th,
+        put_dynamic_threshold=put_dyn_th,
         put_gate=_f_ctx(ctx, "vix_level"),
         open30_max_ret=_f_ctx(ctx, "open30_max_ret"),
         open30_peak_dd=_f_ctx(ctx, "open30_peak_dd"),
-        spot_ret_5bar=_f_ctx(ctx, "spot_ret_5bar"),
-        trend_ret_30m=_f_ctx(ctx, "trend_fit_ret_30m"),
-        trend_r2_30m=_f_ctx(ctx, "trend_fit_r2_30m"),
-        vix_reversal_count_30m=_f_ctx(ctx, "vix_reversal_count_30m"),
-        spot_day_ret=_f_ctx(ctx, "spot_day_ret"),
-        spot_range_30m=_f_ctx(ctx, "spot_range_30m"),
+        spot_ret_5bar=spot_ret_5bar,
+        trend_ret_30m=trend_ret_30m,
+        trend_r2_30m=trend_r2_30m,
+        vix_reversal_count_30m=vix_rev,
+        spot_day_ret=spot_day_ret,
+        spot_range_30m=spot_range_30m,
     )
 
     if decision is None:
         th = replay_cfg.threshold_at(session_bar)
+        dyn_note = ""
+        if dyn_th is not None:
+            dyn_note = f", dyn={dyn_th:.4f}"
+        if put_dyn_th is not None:
+            dyn_note += f", put_dyn={put_dyn_th:.4f}"
         q10_note = ""
         if edge_q10 is not None and edge > 0:
             q10_note = f", q10={edge_q10:.4f}"
         self._trace(
             "E9.qqq_btc_entry",
             "block",
-            f"edge={edge:.4f} th={th:.4f} spread={spread_pct:.4f}{q10_note}",
+            f"edge={edge:.4f} th={th:.4f}{dyn_note} spread={spread_pct:.4f}{q10_note}",
         )
         self._last_reject_reason = "qqq_btc_entry"
         return None

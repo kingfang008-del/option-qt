@@ -1824,13 +1824,14 @@ def test_minimal_stack_session_config():
 
     env_path = Path(__file__).resolve().parents[2] / "New_Pro" / "baseline_qqq" / "config" / "minimal_stack.env"
     text = env_path.read_text(encoding="utf-8")
-    assert "BIDIRECTIONAL_ENABLED=0" in text
+    assert "BIDIRECTIONAL_ENABLED=1" in text
+    assert "BIDIRECTIONAL_DUAL_EDGE_ENABLED=1" in text
     assert "BIDIRECTIONAL_DISLOCATION_ENTRY_ENABLED=0" in text
-    assert "START_MINUTE=30" in text
+    assert "START_MINUTE=45" in text
     assert "FAST_GATE_ENABLED=0" in text
     assert "COOLDOWN_MINUTES=5" in text
 
-    os.environ["START_MINUTE"] = "30"
+    os.environ["START_MINUTE"] = "45"
     os.environ["BIDIRECTIONAL_DISLOCATION_ENTRY_ENABLED"] = "0"
     # re-import would be heavy; spot-check config module if on path
     baseline = Path(__file__).resolve().parents[2] / "New_Pro" / "baseline_qqq"
@@ -1841,14 +1842,236 @@ def test_minimal_stack_session_config():
     import config as np_config
 
     importlib.reload(np_config)
-    assert np_config.START_MINUTE == 30
+    assert np_config.START_MINUTE == 45
     assert np_config.BIDIRECTIONAL_DISLOCATION_ENTRY_ENABLED is False
+
+
+def test_regime_ctx_extract_and_merge():
+    import numpy as np
+    from qqq_btc.live.regime_ctx import extract_regime_ctx, merge_regime_into_ctx
+    from qqq_btc.live.se_feature_bridge import _SymbolBarHistory
+
+    hist = _SymbolBarHistory()
+    base_ts = 1_700_000_000.0
+    for i, px in enumerate(np.linspace(400, 402, 40)):
+        hist.append(base_ts + i * 60, float(px))
+
+    batch = {
+        "features_dict": {
+            "vix_level": np.full((1, 30), 0.35, dtype=np.float32),
+        }
+    }
+    out = extract_regime_ctx(batch, ["QQQ"], history_store={"QQQ": hist})
+    assert "QQQ" in out
+    assert out["QQQ"].get("spot_day_ret") is not None
+    assert abs(out["QQQ"].get("vix_level", 0) - 0.35) < 1e-5
+
+    ctx = {"symbol": "QQQ"}
+    item = {"spot_day_ret": 0.01, "trend_fit_r2_30m": 0.2, "vix_reversal_count_30m": 3.0}
+    merge_regime_into_ctx(ctx, item)
+    assert ctx["spot_day_ret"] == 0.01
+    assert ctx["trend_fit_r2_30m"] == 0.2
+    assert ctx["vix_reversal_count_30m"] == 3.0
+
+
+def test_strategy_entry_bridge_put_dual(monkeypatch):
+    import sys
+    from datetime import datetime
+    from pathlib import Path
+
+    from pytz import timezone
+
+    baseline = Path(__file__).resolve().parents[2] / "New_Pro" / "baseline_qqq"
+    if str(baseline) not in sys.path:
+        sys.path.insert(0, str(baseline))
+    import baseline_paths  # noqa: E402,F401
+
+    from strategy.core_v0 import StrategyCoreV0
+    from strategy.config0 import StrategyConfig
+    from qqq_btc.live.strategy_entry_bridge import apply_strategy_entry_patch
+
+    apply_strategy_entry_patch(StrategyCoreV0)
+    core = StrategyCoreV0(StrategyConfig())
+
+    ny = timezone("America/New_York")
+    base_ctx = {
+        "is_ready": True,
+        "is_banned": False,
+        "position": 0,
+        "cooldown_until": 0.0,
+        "curr_ts": 1_700_000_000.0,
+        "time": datetime(2026, 6, 2, 10, 0, tzinfo=ny),
+        "net_edge_raw": 0.01,
+        "call_edge": 0.01,
+        "put_edge": 0.04,
+        "alpha_z": 0.01,
+        "vol_z": 0.5,
+        "bid": 1.98,
+        "ask": 2.02,
+        "curr_price": 2.0,
+        "options_vw_spread": 0.02,
+        "options_iv_momentum": 0.0,
+        "symbol": "QQQ",
+        "spy_roc": 0.001,
+        "qqq_roc": 0.001,
+        "spread_divergence": 0.0,
+        "vix_level": 0.30,
+    }
+
+    sig = core.decide_entry(dict(base_ctx))
+    assert sig is not None
+    assert sig["dir"] == -1
+    assert "PUT" in sig.get("reason", "")
+
+
+def test_entry_quantile_threshold():
+    from collections import deque
+
+    from qqq_btc.common.entry_quantile import quantile_threshold
+    from qqq_btc.common.replay_types import ReplayConfig
+
+    cfg = ReplayConfig(entry_quantile=0.80, entry_quantile_min_obs=3)
+    buf = deque([0.01, 0.02, 0.03, 0.04, 0.05])
+    th = quantile_threshold(buf, cfg)
+    assert th is not None
+    assert th >= 0.04
+    assert quantile_threshold(deque([0.01, 0.02]), cfg) is None
+
+
+def test_live_session_governor_frequency():
+    from qqq_btc.common.replay_types import ReplayConfig
+    from qqq_btc.live.session_governor import LiveSessionGovernor
+
+    cfg = ReplayConfig(
+        max_trades_per_day=2,
+        daily_loss_stop=-0.10,
+        loss_streak_n=2,
+        loss_streak_cooldown_bars=60,
+        entry_quantile=None,
+    )
+    gov = LiveSessionGovernor(cfg)
+    ts = 1_700_000_000.0
+    blocked, reason = gov.blocked_for_entry("QQQ", curr_ts=ts)
+    assert not blocked
+
+    gov.record_trade_close("QQQ", net_ret=-0.05, curr_ts=ts, leg="CALL")
+    gov.record_trade_close("QQQ", net_ret=-0.06, curr_ts=ts + 60, leg="CALL")
+    blocked, reason = gov.blocked_for_entry("QQQ", curr_ts=ts + 120)
+    assert blocked
+    assert reason in ("daily_loss_stop", "loss_streak_cooldown")
+    assert gov._state("QQQ").day_halted
+
+    gov2 = LiveSessionGovernor(ReplayConfig(max_trades_per_day=1, entry_quantile=None))
+    gov2.record_trade_close("QQQ", net_ret=0.01, curr_ts=ts, leg="CALL")
+    blocked, reason = gov2.blocked_for_entry("QQQ", curr_ts=ts + 60)
+    assert blocked and reason == "max_trades_per_day"
+
+
+def test_live_entry_quantile_raises_threshold():
+    import sys
+    from datetime import datetime
+    from pathlib import Path
+
+    from pytz import timezone
+
+    from qqq_btc.common.replay_types import ReplayConfig
+    from qqq_btc.live.session_governor import get_session_governor, _GOVERNORS
+
+    _GOVERNORS.clear()
+    cfg = ReplayConfig(
+        long_only=False,
+        entry_quantile=0.80,
+        entry_quantile_window=100,
+        entry_quantile_min_obs=5,
+        entry_threshold_schedule=((0, 0.03),),
+        put_gate_min=None,
+        call_trend_r2_min=None,
+        regime_vix_reversal_max=None,
+    )
+
+    baseline = Path(__file__).resolve().parents[2] / "New_Pro" / "baseline_qqq"
+    if str(baseline) not in sys.path:
+        sys.path.insert(0, str(baseline))
+    import baseline_paths  # noqa: E402,F401
+
+    from strategy.core_v0 import StrategyCoreV0
+    from strategy.config0 import StrategyConfig
+    from qqq_btc.live.strategy_entry_bridge import apply_strategy_entry_patch
+    import qqq_btc.qqq.config as qcfg
+
+    monkeypatch_cfg = cfg
+    old_replay = qcfg.REPLAY
+    qcfg.REPLAY = monkeypatch_cfg
+    try:
+        apply_strategy_entry_patch(StrategyCoreV0)
+        core = StrategyCoreV0(StrategyConfig())
+        ny = timezone("America/New_York")
+        base = {
+            "is_ready": True,
+            "is_banned": False,
+            "position": 0,
+            "cooldown_until": 0.0,
+            "curr_ts": 1_700_000_000.0,
+            "time": datetime(2026, 6, 2, 10, 30, tzinfo=ny),
+            "net_edge_raw": 0.035,
+            "call_edge": 0.035,
+            "put_edge": 0.01,
+            "alpha_z": 0.035,
+            "vol_z": 0.5,
+            "bid": 1.98,
+            "ask": 2.02,
+            "curr_price": 2.0,
+            "options_vw_spread": 0.02,
+            "options_iv_momentum": 0.0,
+            "symbol": "QQQ",
+            "spy_roc": 0.001,
+            "qqq_roc": 0.001,
+            "spread_divergence": 0.0,
+        }
+        gov = get_session_governor(monkeypatch_cfg)
+        for _ in range(6):
+            gov.record_edges("QQQ", session_bar=60, call_edge=0.05, put_edge=0.01, dual_mode=True)
+        assert gov.dynamic_thresholds("QQQ")[0] is not None
+
+        assert core.decide_entry(dict(base)) is None
+        base["call_edge"] = 0.06
+        base["net_edge_raw"] = 0.06
+        sig = core.decide_entry(dict(base))
+        assert sig is not None
+    finally:
+        qcfg.REPLAY = old_replay
+        _GOVERNORS.clear()
+
+
+def test_live_session_governor_vol_scaled_rails():
+    import numpy as np
+
+    from qqq_btc.common.replay_types import ReplayConfig
+    from qqq_btc.live.session_governor import LiveSessionGovernor
+    from qqq_btc.qqq import config as qcfg
+
+    gov = LiveSessionGovernor(ReplayConfig(entry_quantile=None))
+    ts = 1_700_000_000.0
+    base = qcfg.EXIT_RAILS
+    rails0, s0 = gov.scaled_exit_rails("QQQ", base)
+    assert s0 == 1.0
+    assert rails0.ladder == base.ladder
+
+    # 高波动 minute returns → scale > 1(vol_scale_min=1.0 下只有 std/ref>1 才放大)
+    px = 2.0
+    for i in range(40):
+        px *= 1.10 if i % 2 == 0 else 0.90
+        gov.record_minute_mid("QQQ", float(px), ts + i * 60)
+    rails1, s1 = gov.scaled_exit_rails("QQQ", base)
+    assert s1 > 1.0
+    assert rails1.ladder[0][0] > base.ladder[0][0]
+    assert rails1.hard_stop_roi == base.hard_stop_roi  # profit_only
 
 
 def test_bootstrap_gate_convergence_env():
     import os
     os.environ["QQQ_BTC_LIVE"] = "1"
-    for k in ("FAST_GATE_ENABLED", "COOLDOWN_MINUTES"):
+    for k in ("FAST_GATE_ENABLED", "COOLDOWN_MINUTES", "BIDIRECTIONAL_ENABLED", "BIDIRECTIONAL_DUAL_EDGE_ENABLED"):
         os.environ.pop(k, None)
     from qqq_btc.live.bootstrap import bootstrap_qqq_btc_live
 
@@ -1857,6 +2080,8 @@ def test_bootstrap_gate_convergence_env():
     assert os.environ.get("COOLDOWN_MINUTES") == "5"
     assert os.environ.get("EXECUTION_DELAY_BARS") == "0"
     assert os.environ.get("OMS_SIGNAL_DELAY_BARS") == "0"
+    assert os.environ.get("BIDIRECTIONAL_ENABLED") == "1"
+    assert os.environ.get("BIDIRECTIONAL_DUAL_EDGE_ENABLED") == "1"
     os.environ.pop("QQQ_BTC_LIVE", None)
 
 

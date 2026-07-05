@@ -161,6 +161,7 @@ async def evaluate_disaster_tick_exits(engine, curr_ts: float, rails: ExitRailsC
             continue
         peak = float(getattr(st, "qqq_btc_tick_peak_roi", 0.0) or 0.0)
         pos = PositionState(entry_price=entry_px, entry_bar=0, tick_peak_roi=peak)
+        rails = getattr(st, "qqq_btc_exit_rails", None) or rails
         reason = check_tick_stops(rails, pos, mid)
         st.qqq_btc_tick_peak_roi = pos.tick_peak_roi
         if not reason:
@@ -290,6 +291,35 @@ def apply_oms_patches(*, tick_exits_mode: str = "disaster_only") -> None:
         logger.info("patched StrategyCore.decide_entry → choose_entry")
     except ImportError as e:
         logger.warning("StrategyCore entry_bridge patch skipped: %s", e)
+
+    try:
+        import execution_engine_v8 as eex
+        from qqq_btc.live.regime_ctx import merge_regime_into_ctx
+
+        _orig_build_ctx = eex.ExecutionEngineV8._build_strategy_ctx
+
+        def _patched_build_ctx(self, item, opt_data, frame, ny_now, curr_ts, spy_roc, qqq_roc):
+            result = _orig_build_ctx(self, item, opt_data, frame, ny_now, curr_ts, spy_roc, qqq_roc)
+            ctx, market_opt_price, ctx_curr_price, ctx_bid, ctx_ask = result
+            merge_regime_into_ctx(ctx, item)
+            sym = str(item.get("symbol", "") or "")
+            if sym and ctx_curr_price > 0.01:
+                from qqq_btc.live.session_governor import get_session_governor
+
+                get_session_governor().record_minute_mid(sym, float(ctx_curr_price), float(curr_ts))
+            holding = ctx.get("holding")
+            st = self.states.get(sym) if sym else None
+            if holding and st is not None and int(getattr(st, "position", 0) or 0) != 0:
+                if getattr(st, "qqq_btc_exit_rails", None) is not None:
+                    holding["qqq_btc_exit_rails"] = st.qqq_btc_exit_rails
+                if getattr(st, "qqq_btc_entry_bar", None) is not None:
+                    holding["entry_bar"] = int(st.qqq_btc_entry_bar)
+            return ctx, market_opt_price, ctx_curr_price, ctx_bid, ctx_ask
+
+        eex.ExecutionEngineV8._build_strategy_ctx = _patched_build_ctx
+        logger.info("patched ExecutionEngineV8._build_strategy_ctx → regime ctx merge")
+    except Exception as e:
+        logger.warning("regime ctx patch skipped: %s", e)
 
     try:
         from qqq_btc.live.fill_audit_writer import apply_fill_audit_patch

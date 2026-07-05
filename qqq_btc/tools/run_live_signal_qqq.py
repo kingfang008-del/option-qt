@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-qqq_btc Signal 启动入口 —— legacy SignalEngineV8 外壳 + qqq_btc v2 checkpoint。
+qqq_btc Signal 启动入口 —— legacy SignalEngineV8 外壳 + qqq_btc v4 checkpoint。
 
     cd New_Pro/baseline_qqq
     QQQ_BTC_LIVE=1 python ../../qqq_btc/tools/run_live_signal_qqq.py \\
-      --checkpoint ~/quant_project/checkpoints_qqq_net_edge_v2/best.pth
+      --checkpoint ../../checkpoints_qqq_v4/best.pth
 
 仍走 Redis unified_inference_stream → ALPHA_FRAME → OMS;
 仅替换 slow_model 与 net_edge 口径,保留 FCS batch 消费与 SYNC 屏障。
@@ -57,9 +57,11 @@ logger = logging.getLogger("LiveRunnerSignalQqqBtc")
 def _default_paths():
     home = Path.home()
     repo_cfg = _REPO / "qqq_btc" / "CONFIG"
-    ckpt = home / "quant_project/checkpoints_qqq_net_edge_v2/best.pth"
+    ckpt = _REPO / "checkpoints_qqq_v4" / "best.pth"
     if not ckpt.exists():
-        ckpt = home / "quant_project/checkpoints_qqq_net_edge/advanced_alpha_best.pth"
+        ckpt = home / "quant_project/checkpoints_qqq_v4/best.pth"
+    if not ckpt.exists():
+        ckpt = home / "quant_project/checkpoints_qqq_net_edge_v2/best.pth"
     v2_slow = repo_cfg / "slow_feature_qqq_v2.json"
     slow_cfg = str(v2_slow) if v2_slow.exists() else str(_REPO / "New_Pro" / "CONFIG" / "slow_feature.json")
     return {
@@ -81,7 +83,7 @@ async def main() -> None:
     checkpoint = args.checkpoint or default_ckpt
 
     print("\n" + "=" * 60)
-    print("🚀 qqq_btc Signal Engine (SignalEngineV8 shell + v2 model)")
+    print("🚀 qqq_btc Signal Engine (SignalEngineV8 shell + v4 model)")
     print("=" * 60 + "\n")
     logger.info("RUN_MODE=%s | checkpoint=%s", RUN_MODE, checkpoint)
 
