@@ -155,25 +155,32 @@ def collect_live_sim_signals(
 
 def load_dry_run_signals(path: str | pd.PathLike) -> pd.DataFrame:
     """
-    读取 dry-run 导出的信号 CSV。
-    期望列: ts 或 timestamp, leg, 可选 session_bar / call_edge / put_edge / edge。
+    读取 dry-run OMS 信号 audit CSV(signal_audit_writer 或兼容格式)。
+    期望列: ts/timestamp, leg; PASS/ENTER 行用于对拍。
     """
     raw = pd.read_csv(path)
+    if "decision" in raw.columns:
+        raw = raw[raw["decision"].astype(str).str.upper() == "PASS"].copy()
+    elif "kind" in raw.columns:
+        raw = raw[raw["kind"].astype(str).str.upper().isin(("ENTER", "SIGNAL"))].copy()
+
+    ts_col = "timestamp" if "timestamp" in raw.columns else ("ts" if "ts" in raw.columns else None)
+    if ts_col is None or raw.empty:
+        if ts_col is None:
+            raise ValueError("dry-run CSV 需含 ts 或 timestamp 列")
+        return pd.DataFrame(
+            columns=["ts", "leg", "edge", "session_bar", "threshold", "source", "kind", "date"]
+        )
+
     out = pd.DataFrame()
-    ts_col = "ts" if "ts" in raw.columns else ("timestamp" if "timestamp" in raw.columns else None)
-    if ts_col is None:
-        raise ValueError("dry-run CSV 需含 ts 或 timestamp 列")
     out["ts"] = pd.to_datetime(raw[ts_col], utc=True, errors="coerce")
     out["leg"] = raw["leg"].astype(str) if "leg" in raw.columns else ""
-    out["edge"] = pd.to_numeric(
-        raw.get("edge", raw.get("net_edge_raw", raw.get("call_edge", 0.0))),
-        errors="coerce",
-    )
+    out["edge"] = pd.to_numeric(raw.get("edge", raw.get("net_edge_raw", 0.0)), errors="coerce")
     out["session_bar"] = pd.to_numeric(raw["session_bar"], errors="coerce") if "session_bar" in raw.columns else np.nan
+    out["threshold"] = pd.to_numeric(raw.get("threshold", np.nan), errors="coerce")
     out["source"] = "dry_run"
     out["kind"] = raw.get("kind", "ENTER")
     out["date"] = out["ts"].dt.tz_convert("America/New_York").dt.date.astype(str)
-    out["threshold"] = pd.to_numeric(raw.get("threshold", np.nan), errors="coerce")
     return out.dropna(subset=["ts"]).reset_index(drop=True)
 
 

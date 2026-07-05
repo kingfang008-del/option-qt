@@ -48,6 +48,11 @@ def _default_parquet() -> Path | None:
     return None
 
 
+def _default_dry_run_signals(date: str) -> Path | None:
+    p = Path.home() / "quant_project" / "shadow" / f"signals_{date}.csv"
+    return p if p.exists() else None
+
+
 def run_day_diff(
     *,
     parquet: Path,
@@ -88,17 +93,8 @@ def run_day_diff(
         "decision_replay_vs_live": diff_decision,
     }
 
-    if dry_run_signals is not None and dry_run_signals.exists():
-        dry_sig = load_dry_run_signals(dry_run_signals)
-        dry_day = dry_sig[dry_sig["date"] == str(pd.Timestamp(date).date())].copy()
-        dry_day["ts"] = dry_day["ts"].astype(str)
-        report["dry_run_signals"] = dry_day.to_dict("records")
-        report["replay_vs_dry_run"] = diff_signal_frames(
-            replay_sig, dry_day, time_tolerance_bars=tolerance_bars
-        )
-        report["live_sim_vs_dry_run"] = diff_signal_frames(
-            live_sig, dry_day, time_tolerance_bars=0
-        )
+    if dry_run_signals is None:
+        dry_run_signals = _default_dry_run_signals(date)
 
     s = diff_sim["summary"]
     ds = diff_decision["summary"]
@@ -116,6 +112,29 @@ def run_day_diff(
         f"  match rate replay: {s.get('match_rate_replay', 0):.1%}",
         f"  match rate live:   {s.get('match_rate_live', 0):.1%}",
     ]
+
+    if dry_run_signals is not None and dry_run_signals.exists():
+        dry_sig = load_dry_run_signals(dry_run_signals)
+        dry_day = dry_sig[dry_sig["date"] == str(pd.Timestamp(date).date())].copy()
+        dry_day["ts"] = dry_day["ts"].astype(str)
+        report["dry_run_signals"] = dry_day.to_dict("records")
+        report["dry_run_path"] = str(dry_run_signals)
+        report["replay_vs_dry_run"] = diff_signal_frames(
+            decision_replay, dry_day, time_tolerance_bars=0
+        )
+        report["live_sim_vs_dry_run"] = diff_signal_frames(
+            live_sig, dry_day, time_tolerance_bars=0
+        )
+        dr = report["replay_vs_dry_run"]["summary"]
+        lines.extend(
+            [
+                "",
+                f"[Dry-run OMS audit vs replay decision] path={dry_run_signals}",
+                f"  dry_run PASS: {dr.get('n_live', 0)}  matched: {dr.get('n_matched', 0)}",
+                f"  match rate: {dr.get('match_rate_replay', 0):.1%}",
+            ]
+        )
+
     if diff_sim["replay_only"]:
         lines.append(f"\nreplay-only ({len(diff_sim['replay_only'])}):")
         for row in diff_sim["replay_only"][:10]:

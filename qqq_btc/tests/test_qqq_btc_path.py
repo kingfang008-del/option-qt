@@ -2068,6 +2068,49 @@ def test_live_session_governor_vol_scaled_rails():
     assert rails1.hard_stop_roi == base.hard_stop_roi  # profit_only
 
 
+def test_signal_audit_writer(tmp_path, monkeypatch):
+    import os
+    from datetime import datetime
+
+    from pytz import timezone
+
+    monkeypatch.setenv("QQQ_BTC_LIVE", "1")
+    monkeypatch.setenv("QQQ_BTC_SIGNAL_AUDIT_DIR", str(tmp_path))
+
+    from qqq_btc.common.entry_decision import EntryDecision
+    from qqq_btc.common.signal_collect import load_dry_run_signals
+    from qqq_btc.live.signal_audit_writer import record_entry_signal_audit
+
+    ny = timezone("America/New_York")
+    ts = datetime(2026, 6, 2, 10, 30, tzinfo=ny).timestamp()
+    ctx = {
+        "symbol": "QQQ",
+        "curr_ts": ts,
+        "call_edge": 0.04,
+        "put_edge": 0.01,
+        "net_edge_raw": 0.04,
+        "net_edge_q10": 0.005,
+        "bid": 1.98,
+        "ask": 2.02,
+        "curr_price": 2.0,
+    }
+    row = record_entry_signal_audit(
+        ctx=ctx,
+        decision=EntryDecision(leg="CALL", edge=0.04, threshold=0.03),
+        session_bar=60,
+    )
+    assert row is not None
+    assert row["decision"] == "PASS"
+
+    path = tmp_path / "signals_2026-06-02.csv"
+    assert path.exists()
+    loaded = load_dry_run_signals(path)
+    assert len(loaded) == 1
+    assert loaded.iloc[0]["leg"] == "CALL"
+
+    os.environ.pop("QQQ_BTC_LIVE", None)
+
+
 def test_signal_decision_replay_vs_live_match():
     from qqq_btc.common.signal_collect import collect_decision_signals, diff_signal_frames
     from qqq_btc.common.replay_harness import run_strict_replay

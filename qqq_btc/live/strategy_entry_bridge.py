@@ -16,6 +16,7 @@ import pandas as pd
 from qqq_btc.common.entry_decision import choose_entry
 from qqq_btc.common.time_features import session_minute
 from qqq_btc.live.session_governor import get_session_governor
+from qqq_btc.live.signal_audit_writer import record_entry_signal_audit
 from qqq_btc.qqq import config as qcfg
 
 
@@ -110,6 +111,12 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
     if blocked:
         self._trace("E9.qqq_btc_governor", "block", block_reason)
         self._last_reject_reason = block_reason
+        record_entry_signal_audit(
+            ctx=ctx,
+            block_reason=block_reason,
+            session_bar=session_bar,
+            mode=getattr(self, "mode", ""),
+        )
         return None
 
     if not replay_cfg.session_allows_entry(session_bar):
@@ -119,6 +126,12 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
             f"session_bar={session_bar} outside [{replay_cfg.session_entry_start_bar},{replay_cfg.session_entry_end_bar}]",
         )
         self._last_reject_reason = "session_window"
+        record_entry_signal_audit(
+            ctx=ctx,
+            block_reason="session_window",
+            session_bar=session_bar,
+            mode=getattr(self, "mode", ""),
+        )
         return None
     self._trace("E9.qqq_btc_session", "pass", f"session_bar={session_bar}")
 
@@ -179,6 +192,14 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
             f"edge={edge:.4f} th={th:.4f}{dyn_note} spread={spread_pct:.4f}{q10_note}",
         )
         self._last_reject_reason = "qqq_btc_entry"
+        record_entry_signal_audit(
+            ctx=ctx,
+            block_reason="qqq_btc_entry",
+            session_bar=session_bar,
+            dyn_threshold=dyn_th,
+            put_dyn_threshold=put_dyn_th,
+            mode=getattr(self, "mode", ""),
+        )
         return None
 
     self._trace(
@@ -209,7 +230,24 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
             spread_threshold_override=replay_cfg.max_spread_pct,
         ):
             self._last_reject_reason = "liquidity_guard"
+            record_entry_signal_audit(
+                ctx=ctx,
+                decision=decision,
+                block_reason="liquidity_guard",
+                session_bar=session_bar,
+                dyn_threshold=dyn_th,
+                put_dyn_threshold=put_dyn_th,
+                mode=getattr(self, "mode", ""),
+            )
             return None
+    record_entry_signal_audit(
+        ctx=ctx,
+        decision=decision,
+        session_bar=session_bar,
+        dyn_threshold=dyn_th,
+        put_dyn_threshold=put_dyn_th,
+        mode=getattr(self, "mode", ""),
+    )
     return sig
 
 
