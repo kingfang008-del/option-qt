@@ -11,7 +11,8 @@ from __future__ import annotations
 import pandas as pd
 
 from qqq_btc.common.time_features import add_time_features
-from qqq_btc.common.trend_features import add_trend_features
+from qqq_btc.common.regime_features import add_vix_regime_features
+from qqq_btc.common.trend_features import add_trend_features, add_open30_features, add_spot_day_ret
 
 
 def enrich_fcs_bars(df: pd.DataFrame, price_col: str = "close") -> pd.DataFrame:
@@ -27,6 +28,9 @@ def enrich_fcs_bars(df: pd.DataFrame, price_col: str = "close") -> pd.DataFrame:
                 break
     if price_col in out.columns:
         out = add_trend_features(out, price_col=price_col)
+        out = add_open30_features(out, price_col=price_col)
+    out = add_vix_regime_features(out)
+    out = add_spot_day_ret(out, price_col=price_col if price_col in out.columns else "close")
     return out
 
 

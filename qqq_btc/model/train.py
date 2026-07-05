@@ -154,12 +154,39 @@ def run(args) -> None:
     if args.mode == "finetune":
         if not args.init_checkpoint:
             raise ValueError("--mode finetune 需要 --init-checkpoint(共训权重)。")
-        load_pretrain_checkpoint(model, args.init_checkpoint, device=str(device))
+        skipped = load_pretrain_checkpoint(model, args.init_checkpoint, device=str(device))
+        if skipped:
+            logger.info("checkpoint 形状跳过 %d 层(例: %s)", len(skipped), skipped[:3])
         trainable, total = freeze_for_finetune(model)
+        if skipped and any(k.startswith("tft_stock") for k in skipped):
+            # v4→v5: chop 只进 stock 塔;fusion/双腿头/calibrator 沿用 v4,避免 finetune 冲垮腿头
+            _v5_keep_frozen = (
+                "tft_option",
+                "fusion",
+                "head_call_net_edge",
+                "head_put_net_edge",
+                "head_straddle_net_edge",
+                "symbol_calibrator",
+                "head_dir",
+                "head_gross_return",
+                "head_execution_cost",
+            )
+            for name, p in model.named_parameters():
+                if name.startswith("tft_stock") or name.startswith("head_net_edge"):
+                    p.requires_grad = True
+                elif name.startswith(_v5_keep_frozen):
+                    p.requires_grad = False
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in model.parameters())
+            logger.info(
+                "v4→v5 迁移: 仅训 tft_stock + head_net_edge* (保留 fusion/双腿头/calibrator)"
+            )
         logger.info("Finetune 冻结: trainable %s / total %s (%.1f%%)",
                     f"{trainable:,}", f"{total:,}", trainable / total * 100)
     elif args.init_checkpoint:
-        load_pretrain_checkpoint(model, args.init_checkpoint, device=str(device))
+        skipped = load_pretrain_checkpoint(model, args.init_checkpoint, device=str(device))
+        if skipped:
+            logger.info("checkpoint 形状跳过 %d 层(例: %s)", len(skipped), skipped[:3])
 
     params = [p for p in model.parameters() if p.requires_grad]
     optim = AdamW(params, lr=args.lr, weight_decay=1e-3)

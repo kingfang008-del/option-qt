@@ -92,6 +92,12 @@ def _align_ts(left: pd.Series, right: pd.Series) -> tuple[pd.Series, pd.Series]:
     return l, r
 
 
+def drop_embedded_exec_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """去掉特征/label_pipeline 内嵌的 exec_* 列,避免回放用陈旧盘口。"""
+    drop = [c for c in df.columns if c.startswith("exec_")]
+    return df.drop(columns=drop) if drop else df
+
+
 def attach_exec_quotes(
     df: pd.DataFrame,
     option_root: Path,
@@ -242,32 +248,15 @@ def main() -> None:
             device=device,
             use_carryover=True,
         )
-        # label_pipeline 已写入 exec_*;仅缺列时从 1m 期权回补
-        need_exec = not {"exec_call_bid", "exec_call_ask"}.issubset(pred.columns)
-        if need_exec:
-            pred = attach_exec_quotes(
-                pred,
-                Path(args.option_1m_root),
-                args.symbol,
-                call_bucket=qcfg.TRADE_BUCKET_ID,
-                put_bucket=0,
-            )
-        else:
-            # 清理历史错误后缀列
-            for leg in ("call", "put"):
-                for side in ("bid", "ask"):
-                    base = f"exec_{leg}_{side}"
-                    for suf in ("_x", "_y"):
-                        alt = base + suf
-                        if alt in pred.columns and base not in pred.columns:
-                            pred[base] = pred[alt]
-                    if base in pred.columns and f"exec_{leg}_mid" not in pred.columns:
-                        pass
-            if "exec_call_mid" not in pred.columns and "exec_call_bid" in pred.columns:
-                pred["exec_call_mid"] = (
-                    pd.to_numeric(pred["exec_call_bid"], errors="coerce")
-                    + pd.to_numeric(pred["exec_call_ask"], errors="coerce")
-                ) / 2.0
+        # 回放成交一律从 databento 1m 重新 attach(5min 容差),不用特征内嵌 exec_*
+        pred = drop_embedded_exec_columns(pred)
+        pred = attach_exec_quotes(
+            pred,
+            Path(args.option_1m_root),
+            args.symbol,
+            call_bucket=qcfg.TRADE_BUCKET_ID,
+            put_bucket=0,
+        )
         all_parts.append(pred)
 
     full = pd.concat(all_parts, ignore_index=True).sort_values("timestamp").reset_index(drop=True)

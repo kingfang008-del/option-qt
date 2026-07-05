@@ -49,6 +49,57 @@ class ReplayConfig:
     # 语义:入场 bar 的 put_gate 信号值 >= put_gate_min 才允许开 PUT。
     # 信号值缺失(NaN)时视为不通过——宁可错过,不可误开。
     put_gate_min: Optional[float] = None
+    # --- 早盘冲高回落 PUT 门控(与 put_gate OR 关系) ---
+    # open30_max_ret >= morning_fade_min_ret 且 open30_peak_dd <= morning_fade_max_peak_dd
+    # 时允许 PUT(典型倒 V)。仅在 session_bar <= morning_fade_session_end_bar 生效。
+    morning_fade_min_ret: Optional[float] = None
+    morning_fade_max_peak_dd: Optional[float] = None
+    morning_fade_session_end_bar: Optional[int] = None
+    # --- 急速下跌防护:近 N 分钟现货跌幅过深时禁止新开 CALL ---
+    rapid_drop_ret: Optional[float] = None
+    rapid_drop_bars: int = 5
+    block_call_on_rapid_drop: bool = True
+    # 实盘 immediate_entry:信号当根 bar 收盘即成交(不等 pending 下一 bar)
+    immediate_entry: bool = False
+    # --- PUT 趋势对齐门控(None=关闭) ---
+    # 入场 bar 的 30min 拟合趋势收益 > put_trend_max_ret 时禁止新开 PUT。
+    # 双时期审计(2026Q2 / 2025H2):趋势向上时买 PUT 系统性亏损
+    # (Q2 逆势 PUT 合计 -0.18 vs 顺势 +2.54;H2 逆势单笔均值仅为顺势 1/3)。
+    # 趋势值缺失(NaN)时不拦截——该门控是减法保护,数据缺失不应误杀顺势单。
+    put_trend_max_ret: Optional[float] = None
+    # --- CALL 震荡过滤(None=关闭) ---
+    # 入场 bar 的 trend_fit_r2_30m < call_trend_r2_min 时禁止新开 CALL。
+    # 6 月审计:低 r2 = 无方向震荡,CALL 头 IC 转负;门控后 Q2 6.94→5.98x /
+    # 6 月 1.64→1.95x,连亏 5→3 天。r2 缺失时不拦截。
+    call_trend_r2_min: Optional[float] = None
+    # --- VIX 洗盘弃权(V0 REGIME_REVERSAL_THRESHOLD 对齐) ---
+    # vix_proxy_close 30min 内方向反转次数 > 此值时禁止一切新开仓。
+    # 6/10–11 审计:拦 2/4 连亏笔且 6 月账户 +44.6%→+60.9%;计数缺失时不拦截。
+    regime_vix_reversal_max: Optional[int] = None
+    regime_vix_reversal_window: int = 30
+    regime_vix_reversal_pct: float = 0.0015
+    # --- PUT 尾盘禁开(None=关闭) ---
+    # session_bar > put_late_session_bar 时禁止新开 PUT。6 月规则扫描:拦 3/16 亏单、
+    # 1/28 赢单,6 月 +9.5% / Q2 +43%。
+    put_late_session_bar: Optional[int] = None
+    # --- CALL 追涨洗盘禁开(None=关闭) ---
+    # spot_day_ret > call_chase_spot_day_ret_min 且 vix_rev >= call_chase_vix_rev_min
+    # 时禁止新开 CALL。6/11 型亏损:日涨+高洗盘仍追 CALL → EARLY_STOP。
+    call_chase_vix_rev_min: Optional[int] = None
+    call_chase_spot_day_ret_min: float = 0.0
+    # --- CALL 局部波动尖刺禁开(None=关闭) ---
+    # spot_range_30m >= call_spike_range30_min 时禁 CALL。6/15:低波日局部尖刺 2.77% → EARLY_STOP。
+    call_spike_range30_min: Optional[float] = None
+    # --- PUT 日涨禁开(None=关闭) ---
+    # spot_day_ret > put_spot_day_ret_min 时禁 PUT。6/29:尾盘现货日涨 1.27% 仍开 PUT → EARLY_STOP。
+    put_spot_day_ret_min: Optional[float] = None
+    # --- CALL 早盘追涨时点门控(6/11 型,None=关闭) ---
+    # spot_day_ret > call_timing_spot_min 且 session_bar < call_timing_max_bar
+    # 且 vix_rev >= call_timing_vix_min 时禁 CALL。6/11:日涨+洗盘+sb=42/160
+    # 而 Oracle 最优 sb=227–230;因果门控拦截早盘追 CALL。
+    call_timing_spot_min: Optional[float] = None
+    call_timing_max_bar: Optional[int] = None
+    call_timing_vix_min: Optional[int] = None
 
     def threshold_at(self, session_bar: Optional[int]) -> float:
         if self.entry_threshold_schedule is None or session_bar is None:

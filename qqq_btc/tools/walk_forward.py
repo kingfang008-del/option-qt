@@ -3,6 +3,11 @@
 """
 双周滚动 walk-forward:切数据 → 建 LMDB → 重训 → 交易窗推理+回放 → 汇总。
 
+v5 默认:
+  - slow_feature_qqq_v2.json(rank_net=0.5, chop 特征)
+  - finetune 模式(v4→v5 迁移时仅训 stock 塔+主头,保留双腿头/calibrator)
+  - warm-start 默认 checkpoints_qqq_v4/best.pth;折间续训上一折 ckpt
+
 动机:0DTE 信号月内衰减明显(六月实验:训练到 2025-12 的模型 -27%,
 训练到 2026-04 的模型 -3%,且月初强月末弱)。每个交易窗都用离它最近的
 数据重训,是把这个衰减压到最小的机制化方案。
@@ -153,6 +158,7 @@ def infer_trade_window(
     from qqq_btc.tools.eval_test_set import (
         _feat_names_by_res,
         attach_exec_quotes,
+        drop_embedded_exec_columns,
         merge_1m_5m,
     )
     from qqq_btc.tools.run_inference import load_model, run_inference_df
@@ -181,11 +187,12 @@ def infer_trade_window(
             device=dev,
             use_carryover=True,
         )
-        if not {"exec_call_bid", "exec_call_ask"}.issubset(pred.columns):
-            pred = attach_exec_quotes(
-                pred, option_1m_root, "QQQ",
-                call_bucket=qcfg.TRADE_BUCKET_ID, put_bucket=0,
-            )
+        # 回放成交一律从 databento 1m 重新 attach;特征内嵌 exec_* 可能是旧锁约/无容差
+        pred = drop_embedded_exec_columns(pred)
+        pred = attach_exec_quotes(
+            pred, option_1m_root, "QQQ",
+            call_bucket=qcfg.TRADE_BUCKET_ID, put_bucket=0,
+        )
         parts.append(pred)
     out = pd.concat(parts, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
     ts = pd.to_datetime(out["timestamp"])
@@ -229,16 +236,18 @@ def main() -> None:
         "~/train_data/quote_features_val,~/train_data/quote_features_test",
         help="逗号分隔;已带标签+归一化的月度特征根目录",
     )
-    parser.add_argument("--workdir", default="/tmp/qqq_wf_biweekly")
+    parser.add_argument("--workdir", default="/tmp/qqq_wf_v5_biweekly")
     parser.add_argument("--config", default="qqq_btc/CONFIG/slow_feature_qqq_v2.json")
     parser.add_argument("--symbol-map", default="qqq_btc/CONFIG/symbol_map.json")
     parser.add_argument("--option-1m-root", default="/mnt/s990/data/raw_1m/options_databento")
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--train-mode", choices=["pretrain", "finetune"], default="finetune",
+                        help="v5 默认 finetune:冻结双塔,只训 fusion+heads")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--keep-fold-data", action="store_true", help="保留每折切片数据")
     parser.add_argument(
-        "--init-checkpoint", default=None,
-        help="第一折的 warm-start 权重;后续折自动接上一折 best.pth",
+        "--init-checkpoint", default="checkpoints_qqq_v4/best.pth",
+        help="首折 warm-start 权重;默认 checkpoints_qqq_v4/best.pth,折间自动续训",
     )
     parser.add_argument(
         "--cold-start", action="store_true",
@@ -271,9 +280,12 @@ def main() -> None:
 
     all_trades: list[pd.DataFrame] = []
     fold_reports: list[dict] = []
-    prev_ckpt: Path | None = (
-        Path(args.init_checkpoint).expanduser() if args.init_checkpoint else None
-    )
+    prev_ckpt: Path | None = None
+    init_ckpt = Path(args.init_checkpoint).expanduser() if args.init_checkpoint else None
+    if init_ckpt is not None and init_ckpt.exists():
+        prev_ckpt = init_ckpt
+    elif init_ckpt is not None:
+        logger.warning("init-checkpoint 不存在,首折从零训练: %s", init_ckpt)
 
     for fold in folds:
         fold_dir = workdir / fold.name
@@ -313,15 +325,23 @@ def main() -> None:
                 )
             train_cmd = [
                 PYTHON, "-m", "qqq_btc.model.train",
-                "--mode", "pretrain",
+                "--mode", args.train_mode,
                 "--config", str(config_path),
                 "--data-root", str(fold_dir),
                 "--train-lmdb", "train.lmdb",
                 "--val-lmdbs", "val.lmdb",
                 "--checkpoint-dir", str(fold_dir / "ckpt"),
                 "--epochs", str(args.epochs),
+                "--device", args.device,
             ]
-            if not args.cold_start and prev_ckpt is not None and prev_ckpt.exists():
+            if args.train_mode == "finetune":
+                if not args.cold_start and prev_ckpt is not None and prev_ckpt.exists():
+                    train_cmd += ["--init-checkpoint", str(prev_ckpt)]
+                elif not args.cold_start:
+                    raise SystemExit(
+                        f"{fold.name}: finetune 需要 --init-checkpoint 或上一折 ckpt"
+                    )
+            elif not args.cold_start and prev_ckpt is not None and prev_ckpt.exists():
                 train_cmd += ["--init-checkpoint", str(prev_ckpt)]
             run_cmd(train_cmd, log_path)
 
@@ -371,6 +391,8 @@ def main() -> None:
     )
     overall = summarize_trades(combined, qcfg.REPLAY.position_frac)
     report = {
+        "model_version": "v5",
+        "train_mode": args.train_mode,
         "step_days": args.step_days,
         "val_days": args.val_days,
         "position_frac": qcfg.REPLAY.position_frac,

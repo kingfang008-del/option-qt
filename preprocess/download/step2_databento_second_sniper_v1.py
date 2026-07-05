@@ -357,8 +357,10 @@ def fetch_day_quotes(
     date_str: str,
     schema: str,
 ) -> pd.DataFrame:
-    start = f"{date_str}T09:30-04:00"
-    end = f"{date_str}T16:00-04:00"
+    # 用纽约时区计算真实 UTC 偏移:冬令时是 -05:00,硬编码 -04:00 会把
+    # 下载窗错位成 08:30~15:00 NY,尾盘一小时(15:00-16:00)整段缺失。
+    start = pd.Timestamp(f"{date_str} 09:30", tz=EASTERN).isoformat()
+    end = pd.Timestamp(f"{date_str} 16:00", tz=EASTERN).isoformat()
 
     last_err: Optional[Exception] = None
     for attempt in range(1, MAX_RETRIES + 1):

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-v2 损失 —— 从原 StrategicAlphaLoss 内化,结构性移除 rank 项,pinball 一等公民。
+v2 损失 —— 从原 StrategicAlphaLoss 内化,pinball 一等公民。
 
 组成:
   l_dir   方向 CE,按 |net| 与可执行 edge 加权(高价值样本权重大)
@@ -9,8 +9,9 @@ v2 损失 —— 从原 StrategicAlphaLoss 内化,结构性移除 rank 项,pinba
   l_gross / l_cost   毛收益与执行成本回归(辅助头)
   l_raw   net_edge_raw 与 sign(gross)*max(|gross|-cost,0) 的一致性
   l_q     q10/q50/q90 pinball 分位损失
-  l_cp    call/put 双腿头(softplus 非负)对 clamp(各腿净收益, min=0) 的回归;
-          仅当 batch 提供 call_return_fwd/put_return_fwd(双腿标签管线)时生效
+  l_rank  net_edge 成对排序损失(提升 bar 级区分度)
+  l_cp    call/put 双腿头对有符号净收益的回归 + 各腿 rank 损失;
+          不再 clamp(label, min=0) —— 负收益必须压低预测分
   l_strad 跨式头(有符号)对 label_straddle 的回归;负值区(theta 燃烧日)
           不截断 —— "今天不值得买波动"本身是要学的信号
 """
@@ -26,21 +27,44 @@ def pinball_loss(pred: torch.Tensor, target: torch.Tensor, quantile: float) -> t
     return torch.maximum(quantile * err, (quantile - 1.0) * err).mean()
 
 
+def pairwise_rank_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    temperature: float,
+    min_delta: float,
+) -> torch.Tensor:
+    """成对排序:label 更高者预测也应更高(随机配对,|diff|>min_delta 才计损失)。"""
+    if pred.numel() <= 1:
+        return pred.new_zeros(())
+    idx = torch.randperm(pred.numel(), device=pred.device)
+    diff = target - target[idx]
+    mask = torch.abs(diff) > min_delta
+    if not mask.any():
+        return pred.new_zeros(())
+    sign = torch.sign(diff[mask])
+    pred_diff = pred[mask] - pred[idx][mask]
+    weight = torch.clamp(torch.abs(diff[mask]) / min_delta, max=10.0)
+    return (F.softplus(-sign * pred_diff / temperature) * weight).mean()
+
+
 class NetEdgeLoss(nn.Module):
     def __init__(self, config=None):
         super().__init__()
         self.ce = nn.CrossEntropyLoss(reduction="none")
         lw = (config or {}).get("loss_weights", {})
+        train_cfg = (config or {}).get("parameters", {}).get("training", {})
         self.w_dir = float(lw.get("direction_net", lw.get("direction", 4.0)))
         self.w_net = float(lw.get("return_fwd_net", 3.0))
         self.w_gross = float(lw.get("return_fwd_gross", 0.5))
         self.w_cost = float(lw.get("execution_cost", 0.5))
         self.w_quantile = float(lw.get("net_edge_quantile", 1.0))
+        self.w_rank = float(lw.get("rank_net", 0.0))
         self.w_call_put = float(lw.get("call_put_edge", 0.0))
         self.w_straddle = float(lw.get("straddle_edge", 0.0))
-        self.beta = float(
-            (config or {}).get("parameters", {}).get("training", {}).get("return_huber_beta", 0.001)
-        )
+        self.beta = float(train_cfg.get("return_huber_beta", 0.001))
+        self.rank_temp = float(train_cfg.get("rank_temperature", 0.002))
+        self.rank_min_delta = float(train_cfg.get("rank_min_delta", 0.0002))
 
     def forward(self, out, target):
         net_r = torch.nan_to_num(target["return_fwd"], nan=0.0)
@@ -54,8 +78,9 @@ class NetEdgeLoss(nn.Module):
 
         # 可交易量级(|net|>=1.5%)样本加权,避免被大量近零 theta 损耗主导
         trade_w = 1.0 + 3.0 * (torch.abs(net_r) >= 0.015).float()
+        net_pred = out["net_edge"].squeeze(-1)
         l_net = (
-            F.smooth_l1_loss(out["net_edge"].squeeze(-1), net_r, beta=self.beta, reduction="none")
+            F.smooth_l1_loss(net_pred, net_r, beta=self.beta, reduction="none")
             * trade_w
         ).mean()
         l_gross = F.smooth_l1_loss(out["gross_return"].squeeze(-1), gross_r, beta=self.beta)
@@ -77,6 +102,12 @@ class NetEdgeLoss(nn.Module):
             + _w_pinball(out["net_edge_q90"].squeeze(-1), net_r, 0.9)
         )
 
+        l_rank = net_pred.new_zeros(())
+        if self.w_rank > 0:
+            l_rank = pairwise_rank_loss(
+                net_pred, net_r, temperature=self.rank_temp, min_delta=self.rank_min_delta
+            )
+
         loss = (
             self.w_dir * l_dir
             + self.w_net * l_net
@@ -84,14 +115,17 @@ class NetEdgeLoss(nn.Module):
             + self.w_cost * l_cost
             + 0.5 * l_raw
             + self.w_quantile * l_q
+            + self.w_rank * l_rank
         )
 
         if self.w_call_put > 0 and "call_return_fwd" in target and "put_return_fwd" in target:
             call_r = torch.clamp(torch.nan_to_num(target["call_return_fwd"], nan=0.0), min=0.0)
             put_r = torch.clamp(torch.nan_to_num(target["put_return_fwd"], nan=0.0), min=0.0)
+            call_pred = out["call_net_edge"].squeeze(-1)
+            put_pred = out["put_net_edge"].squeeze(-1)
             l_cp = (
-                F.smooth_l1_loss(out["call_net_edge"].squeeze(-1), call_r, beta=self.beta)
-                + F.smooth_l1_loss(out["put_net_edge"].squeeze(-1), put_r, beta=self.beta)
+                F.smooth_l1_loss(call_pred, call_r, beta=self.beta)
+                + F.smooth_l1_loss(put_pred, put_r, beta=self.beta)
             )
             loss = loss + self.w_call_put * l_cp
 

@@ -53,6 +53,9 @@ def bootstrap_qqq_btc_live(*, patch_oms: bool = True) -> bool:
         os.environ["SLOW_FEATURE_CONFIG"] = str(v2_cfg)
     os.environ.setdefault("ALPHA_ZSCORE_MODE", "absolute")
     os.environ.setdefault("USE_NET_EDGE_ALPHA", "1")
+    # bar 收盘后立即下单:禁止 OMS 延迟队列与 Mock 回放延迟 bar
+    os.environ.setdefault("EXECUTION_DELAY_BARS", "0")
+    os.environ.setdefault("OMS_SIGNAL_DELAY_BARS", "0")
     # 门控收敛: spread/q10/阈值由 choose_entry 负责;FAST_GATE 与 replay 6% 重复
     os.environ.setdefault("FAST_GATE_ENABLED", "0")
     # 冷却与 replay cooldown_bars=5 对齐(分钟 bar)
@@ -63,7 +66,7 @@ def bootstrap_qqq_btc_live(*, patch_oms: bool = True) -> bool:
 
         apply_oms_patches(tick_exits_mode=tick_exits_mode())
     logger.info(
-        "qqq_btc live bootstrap OK | tick_exits=%s | fill=0.775",
+        "qqq_btc live bootstrap OK | tick_exits=%s | fill=0.775 | immediate_entry=1",
         tick_exits_mode(),
     )
     return True

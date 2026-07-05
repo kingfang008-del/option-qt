@@ -267,8 +267,10 @@ class DualStreamAlphaNet(nn.Module):
     输出:logits_dir / gross_return / execution_cost / net_edge(_raw)
          / net_edge_q10/q50/q90 / call_net_edge / put_net_edge / straddle_net_edge。
 
-    straddle_net_edge 为有符号输出(不过 softplus):跨式大多数交易日净收益为负
-    (双份 theta),负值区分度("-2% 还是 -30%")本身就是信息,不能截断。
+    call_net_edge / put_net_edge 经 softplus 保证非负;训练用有符号标签 + 负样本压零,
+    不再 clamp(label,min=0)。rank 损失提升 bar 级排序。
+    straddle_net_edge 为有符号输出:跨式大多数交易日净收益为负(双份 theta),
+    负值区分度("-2% 还是 -30%")本身就是信息,不能截断。
     """
 
     def __init__(self, config, caps=None, hidden_dim=64, dropout=0.3):
@@ -389,10 +391,19 @@ def freeze_for_finetune(model: DualStreamAlphaNet) -> tuple[int, int]:
     return trainable, total
 
 
-def load_pretrain_checkpoint(model: DualStreamAlphaNet, ckpt_path: str, device: str = "cpu") -> None:
+def load_pretrain_checkpoint(
+    model: DualStreamAlphaNet,
+    ckpt_path: str,
+    device: str = "cpu",
+    *,
+    allow_shape_mismatch: bool = True,
+) -> list[str]:
     """
     加载共训/旧版 checkpoint:旧 head_rank 权重丢弃,
-    新 quantile 头保持随机初始化,其余必须完整匹配。
+    新 quantile 头保持随机初始化,其余尽量完整匹配。
+    allow_shape_mismatch=True 时跳过形状不兼容的层(如新增 chop 特征导致
+    stock 塔输入维度变化),用于 v4→v5 迁移。
+    返回被跳过的 key 列表。
     """
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
     for key in ("model_state_dict", "state_dict"):
@@ -400,10 +411,23 @@ def load_pretrain_checkpoint(model: DualStreamAlphaNet, ckpt_path: str, device: 
             state = state[key]
             break
     state = {k: v for k, v in state.items() if not k.startswith("head_rank")}
+    model_state = model.state_dict()
+    skipped_shape: list[str] = []
+    if allow_shape_mismatch:
+        filtered = {}
+        for k, v in state.items():
+            if k not in model_state:
+                continue
+            if tuple(model_state[k].shape) != tuple(v.shape):
+                skipped_shape.append(k)
+                continue
+            filtered[k] = v
+        state = filtered
     missing, unexpected = model.load_state_dict(state, strict=False)
     _new_heads = ("head_net_edge_quantile", "head_straddle_net_edge")
     keep_missing = [m for m in missing if not m.startswith(_new_heads)]
-    if keep_missing:
+    if keep_missing and not allow_shape_mismatch:
         raise RuntimeError(f"checkpoint 缺少非预期权重: {keep_missing[:8]}")
-    if unexpected:
+    if unexpected and not allow_shape_mismatch:
         raise RuntimeError(f"checkpoint 含未知权重: {unexpected[:8]}")
+    return skipped_shape

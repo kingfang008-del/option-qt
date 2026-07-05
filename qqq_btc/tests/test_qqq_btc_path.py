@@ -337,18 +337,18 @@ def test_replay_afternoon_threshold_blocks_weak_edge():
 
 
 def test_replay_q10_gate():
-    """q10 <= 0 时即使均值 edge 过阈值也不入场。"""
+    """q10 低于 edge_q10_floor(-0.20)时即使均值 edge 过阈值也不入场;轻度为负放行。"""
     fm = OptionSpreadFillModel()
     df = _make_option_df(n=40, drift=0.02)
     df["net_edge"] = 0.0
     df.loc[0, "net_edge"] = 0.05
-    df["net_edge_q10"] = -0.01
+    df["net_edge_q10"] = -0.25
     result = run_strict_replay(
         df, fm, ReplayConfig(), ExitRailsConfig(), edge_q10_col="net_edge_q10"
     )
     assert len(result.trades) == 0
 
-    df["net_edge_q10"] = 0.005
+    df["net_edge_q10"] = -0.01
     result2 = run_strict_replay(
         df, fm, ReplayConfig(), ExitRailsConfig(), edge_q10_col="net_edge_q10"
     )
@@ -442,7 +442,7 @@ def test_feature_config_v2_generated():
     names = {f["name"] for f in cfg["features"]}
     for feat in ("time_session_sin", "time_session_cos", "time_session_progress", "time_to_expiry_norm"):
         assert feat in names
-    assert cfg["loss_weights"]["rank_net"] == 0.0
+    assert cfg["loss_weights"]["rank_net"] == 1.0
     assert cfg["loss_weights"]["net_edge_quantile"] == 1.0
     assert cfg["parameters"]["qqq_btc_v2"]["fill_model"]["entry_frac"] == 0.775
 
@@ -577,17 +577,52 @@ def test_trend_features_choppy_low_r2():
     assert (df["trend_fit_r2_30m"].iloc[50:] < 0.05).all()
 
 
+def test_open30_features_inverted_v_snapshot():
+    """开盘冲高后回落:bar29 快照应体现倒 V(open30_reversal>0, peak_dd<0)。"""
+    from qqq_btc.common.trend_features import add_open30_features
+
+    n = 390
+    ts = pd.date_range("2026-06-10 09:30", periods=n, freq="1min", tz="America/New_York")
+    px = np.full(n, 500.0)
+    px[:15] = np.linspace(500.0, 504.0, 15)   # 前 15min 拉升
+    px[15:30] = np.linspace(504.0, 501.0, 15)  # 后 15min 回落
+    px[30:] = 501.0
+    df = add_open30_features(pd.DataFrame({"timestamp": ts, "close": px}))
+    snap = df.iloc[29]
+    assert snap["open30_max_ret"] > 0.005
+    assert snap["open30_peak_dd"] < -0.003
+    assert snap["open30_reversal"] > 0.003
+    # 10:00 后冻结
+    assert np.isclose(df.iloc[100]["open30_max_ret"], snap["open30_max_ret"])
+    assert np.isclose(df.iloc[100]["open30_reversal"], snap["open30_reversal"])
+
+
+def test_open30_features_non_contiguous_index():
+    """concat 后非连续 index 也应正确写入。"""
+    from qqq_btc.common.trend_features import add_open30_features
+
+    ts = pd.date_range("2026-06-10 09:30", periods=60, freq="1min", tz="America/New_York")
+    df = pd.DataFrame({"timestamp": ts, "close": np.linspace(500, 502, 60)})
+    df.index = list(range(10, 40)) + list(range(100, 130))
+    out = add_open30_features(df.copy())
+    assert out.loc[39, "open30_max_ret"] > 0
+    assert out.loc[129, "open30_max_ret"] == out.loc[39, "open30_max_ret"]
+
+
 def test_feature_config_v2_contains_trend_features():
     import json
 
     with open(_REPO_ROOT / "qqq_btc" / "CONFIG" / "slow_feature_qqq_v2.json") as f:
         cfg = json.load(f)
     names = {f["name"] for f in cfg["features"]}
-    from qqq_btc.common.trend_features import TREND_FEATURE_NAMES
+    from qqq_btc.common.trend_features import TREND_FEATURE_NAMES, OPEN30_FEATURE_NAMES
 
     for feat in TREND_FEATURE_NAMES:
         assert feat in names
+    for feat in OPEN30_FEATURE_NAMES:
+        assert feat in names
     assert set(cfg["parameters"]["qqq_btc_v2"]["trend_features"]) == set(TREND_FEATURE_NAMES)
+    assert set(cfg["parameters"]["qqq_btc_v2"]["open30_features"]) == set(OPEN30_FEATURE_NAMES)
 
 
 def test_qqq_config_v2_wiring():
@@ -774,7 +809,7 @@ def test_replay_governance_resets_per_day():
 
 
 def test_loss_call_put_term():
-    """call/put 双腿损失:提供双腿标签且权重 > 0 时参与总损失。"""
+    """call/put 双腿损失:有符号标签 + rank 项参与总损失。"""
     import pytest
 
     torch = pytest.importorskip("torch")
@@ -790,8 +825,8 @@ def test_loss_call_put_term():
         "net_edge_q10": torch.randn(B, 1) * 0.02,
         "net_edge_q50": torch.randn(B, 1) * 0.02,
         "net_edge_q90": torch.randn(B, 1) * 0.02,
-        "call_net_edge": torch.rand(B, 1) * 0.03,
-        "put_net_edge": torch.rand(B, 1) * 0.03,
+        "call_net_edge": torch.randn(B, 1) * 0.03,
+        "put_net_edge": torch.randn(B, 1) * 0.03,
     }
     target = {
         "direction": torch.randint(0, 3, (B,)),
@@ -801,12 +836,34 @@ def test_loss_call_put_term():
         "call_return_fwd": torch.randn(B) * 0.02,
         "put_return_fwd": torch.randn(B) * 0.02,
     }
-    cfg_on = {"loss_weights": {"call_put_edge": 0.5}}
-    cfg_off = {"loss_weights": {"call_put_edge": 0.0}}
+    cfg_on = {"loss_weights": {"call_put_edge": 0.5, "rank_net": 1.0}}
+    cfg_off = {"loss_weights": {"call_put_edge": 0.0, "rank_net": 0.0}}
     loss_on, _ = NetEdgeLoss(cfg_on)(out, target)
     loss_off, _ = NetEdgeLoss(cfg_off)(out, target)
     assert torch.isfinite(loss_on) and torch.isfinite(loss_off)
-    assert loss_on.item() >= loss_off.item()  # 双腿项非负
+    assert loss_on.item() >= loss_off.item()
+
+    # 负 label 不再被截断为 0:高预测 + 负 label 的回归损失应大于贴近 label 的预测
+    cfg_cp_only = {
+        "loss_weights": {
+            "direction_net": 0.0,
+            "return_fwd_net": 0.0,
+            "return_fwd_gross": 0.0,
+            "execution_cost": 0.0,
+            "net_edge_quantile": 0.0,
+            "rank_net": 0.0,
+            "call_put_edge": 1.0,
+        }
+    }
+    out_neg = dict(out)
+    target_neg = dict(target)
+    target_neg["call_return_fwd"] = torch.full((B,), -0.10)
+    target_neg["put_return_fwd"] = torch.zeros(B)
+    out_neg["call_net_edge"] = torch.full((B, 1), 0.05)
+    loss_high, _ = NetEdgeLoss(cfg_cp_only)(out_neg, target_neg)
+    out_neg["call_net_edge"] = torch.full((B, 1), -0.08)
+    loss_low, _ = NetEdgeLoss(cfg_cp_only)(out_neg, target_neg)
+    assert loss_high.item() > loss_low.item()
 
     # 缺双腿标签时自动跳过,不报错
     target_no_legs = {k: v for k, v in target.items() if k not in ("call_return_fwd", "put_return_fwd")}
@@ -1068,8 +1125,11 @@ def test_choose_entry_q10_blocks_call():
     from qqq_btc.common.entry_decision import choose_entry
 
     rc = ReplayConfig(entry_threshold=0.01)
-    d = choose_entry(rc, session_bar=0, edge=0.05, spread_pct=0.01, edge_q10=-0.01)
+    # floor 语义:q10 低于 edge_q10_floor(-0.20)才拦截,轻度为负放行
+    d = choose_entry(rc, session_bar=0, edge=0.05, spread_pct=0.01, edge_q10=-0.25)
     assert d is None
+    d2 = choose_entry(rc, session_bar=0, edge=0.05, spread_pct=0.01, edge_q10=-0.01)
+    assert d2 is not None
 
 
 def test_choose_entry_session_window():
@@ -1084,6 +1144,300 @@ def test_choose_entry_session_window():
 
     rc_end = ReplayConfig(entry_threshold=0.01, session_entry_start_bar=0, session_entry_end_bar=360)
     assert choose_entry(rc_end, session_bar=361, edge=0.05, spread_pct=0.01) is None
+
+
+def test_choose_entry_morning_fade_put_gate():
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02,
+        long_only=False,
+        max_spread_pct=0.06,
+        put_gate_min=0.25,
+        morning_fade_min_ret=0.004,
+        morning_fade_max_peak_dd=-0.003,
+        morning_fade_session_end_bar=60,
+    )
+    # vix 不足,无 fade 形态 → PUT 被拒
+    d = choose_entry(
+        rc, session_bar=20, dual_mode=True,
+        call_edge=0.01, put_edge=0.05,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        put_gate=0.10,
+        open30_max_ret=0.002,
+        open30_peak_dd=-0.001,
+    )
+    assert d is None or d.leg != "PUT"
+    # fade 形态满足 → PUT 允许
+    d2 = choose_entry(
+        rc, session_bar=20, dual_mode=True,
+        call_edge=0.01, put_edge=0.05,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        put_gate=0.10,
+        open30_max_ret=0.005,
+        open30_peak_dd=-0.004,
+    )
+    assert d2 is not None and d2.leg == "PUT"
+    # fade 路径仅早盘:bar>60 不再豁免 vix
+    d3 = choose_entry(
+        rc, session_bar=90, dual_mode=True,
+        call_edge=0.01, put_edge=0.05,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        put_gate=0.10,
+        open30_max_ret=0.005,
+        open30_peak_dd=-0.004,
+    )
+    assert d3 is None or d3.leg != "PUT"
+
+
+def test_choose_entry_rapid_drop_blocks_call():
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02,
+        long_only=False,
+        max_spread_pct=0.06,
+        rapid_drop_ret=-0.004,
+        block_call_on_rapid_drop=True,
+    )
+    d = choose_entry(
+        rc, session_bar=20, dual_mode=True,
+        call_edge=0.05, put_edge=0.01,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        spot_ret_5bar=-0.005,
+    )
+    assert d is None or d.leg == "PUT"
+    d2 = choose_entry(
+        rc, session_bar=20, edge=0.05, spread_pct=0.02,
+        spot_ret_5bar=-0.005,
+    )
+    assert d2 is None
+
+
+def test_choose_entry_put_trend_gate():
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02,
+        long_only=False,
+        max_spread_pct=0.06,
+        put_gate_min=0.25,
+        put_trend_max_ret=0.0,
+    )
+    common = dict(
+        session_bar=20, dual_mode=True,
+        call_edge=0.01, put_edge=0.05,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        put_gate=0.40,
+    )
+    # 趋势向上 → PUT 被拦截(即使 vix 门控已通过)
+    d = choose_entry(rc, **common, trend_ret_30m=0.002)
+    assert d is None or d.leg != "PUT"
+    # 趋势向下 → PUT 允许
+    d2 = choose_entry(rc, **common, trend_ret_30m=-0.001)
+    assert d2 is not None and d2.leg == "PUT"
+    # 趋势缺失 → 不拦截(减法保护,缺数据不误杀)
+    d3 = choose_entry(rc, **common, trend_ret_30m=None)
+    assert d3 is not None and d3.leg == "PUT"
+
+
+def test_choose_entry_call_trend_r2_gate():
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02,
+        long_only=False,
+        max_spread_pct=0.06,
+        call_trend_r2_min=0.15,
+        put_gate_min=0.25,
+    )
+    common = dict(
+        session_bar=20, dual_mode=True,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        put_gate=0.40,
+    )
+    # 低 r2 震荡 → CALL 被拦截,仍可开 PUT
+    d = choose_entry(
+        rc, **common, trend_r2_30m=0.05, call_edge=0.05, put_edge=0.05,
+    )
+    assert d is not None and d.leg == "PUT"
+    # 高 r2 → CALL 允许(且分数更高时选 CALL)
+    d2 = choose_entry(
+        rc, **common, trend_r2_30m=0.30, call_edge=0.06, put_edge=0.05,
+    )
+    assert d2 is not None and d2.leg == "CALL"
+    # r2 缺失 → 不拦截
+    d3 = choose_entry(
+        rc, **common, trend_r2_30m=None, call_edge=0.06, put_edge=0.05,
+    )
+    assert d3 is not None and d3.leg == "CALL"
+
+
+def test_choose_entry_vix_regime_gate():
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02,
+        long_only=False,
+        max_spread_pct=0.06,
+        regime_vix_reversal_max=6,
+    )
+    common = dict(
+        session_bar=20, dual_mode=True,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        call_edge=0.05, put_edge=0.05,
+    )
+    assert choose_entry(rc, **common, vix_reversal_count_30m=6) is not None
+    assert choose_entry(rc, **common, vix_reversal_count_30m=7) is None
+    assert choose_entry(rc, **common, vix_reversal_count_30m=None) is not None
+
+
+def test_choose_entry_put_late_session_gate():
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02,
+        long_only=False,
+        max_spread_pct=0.06,
+        put_gate_min=0.25,
+        put_late_session_bar=240,
+    )
+    common = dict(
+        session_bar=241, dual_mode=True,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        put_gate=0.40, call_edge=0.04, put_edge=0.05,
+    )
+    d = choose_entry(rc, **common)
+    assert d is not None and d.leg == "CALL"
+    only_put = {**common, "call_edge": 0.01}
+    assert choose_entry(rc, **only_put) is None
+
+
+def test_choose_entry_call_chase_gate():
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02,
+        long_only=False,
+        max_spread_pct=0.06,
+        put_gate_min=0.25,
+        call_chase_vix_rev_min=6,
+        call_chase_spot_day_ret_min=0.0,
+    )
+    common = dict(
+        session_bar=80, dual_mode=True,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        put_gate=0.40, call_edge=0.06, put_edge=0.05,
+        spot_day_ret=0.01, vix_reversal_count_30m=6,
+    )
+    d = choose_entry(rc, **common)
+    assert d is not None and d.leg == "PUT"
+    d2 = choose_entry(
+        rc, session_bar=80, dual_mode=True,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        put_gate=0.40, call_edge=0.06, put_edge=0.05,
+        spot_day_ret=0.01, vix_reversal_count_30m=5,
+    )
+    assert d2 is not None and d2.leg == "CALL"
+
+
+def test_choose_entry_call_spike_range_gate():
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02, long_only=False, max_spread_pct=0.06,
+        put_gate_min=0.25, call_spike_range30_min=0.020,
+    )
+    common = dict(
+        session_bar=20, dual_mode=True,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        put_gate=0.40, call_edge=0.06, put_edge=0.05,
+    )
+    blocked = {**common, "spot_range_30m": 0.025, "put_edge": 0.01}
+    assert choose_entry(rc, **blocked) is None
+    allowed = {**common, "spot_range_30m": 0.015}
+    d = choose_entry(rc, **allowed)
+    assert d is not None and d.leg == "CALL"
+
+
+def test_choose_entry_call_timing_gate():
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02, long_only=False, max_spread_pct=0.06,
+        put_gate_min=0.25,
+        call_timing_spot_min=0.003,
+        call_timing_max_bar=200,
+        call_timing_vix_min=5,
+    )
+    common = dict(
+        session_bar=160, dual_mode=True,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        put_gate=0.40, call_edge=0.06, put_edge=0.05,
+        spot_day_ret=0.0048, vix_reversal_count_30m=7,
+    )
+    blocked = {**common, "put_edge": 0.01}
+    d = choose_entry(rc, **blocked)
+    assert d is None
+    late = {**blocked, "session_bar": 210}
+    d2 = choose_entry(rc, **late)
+    assert d2 is not None and d2.leg == "CALL"
+    low_vix = {**blocked, "vix_reversal_count_30m": 4}
+    d3 = choose_entry(rc, **low_vix)
+    assert d3 is not None and d3.leg == "CALL"
+
+
+def test_choose_entry_put_spot_day_ret_gate():
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02, long_only=False, max_spread_pct=0.06,
+        put_gate_min=0.25, put_spot_day_ret_min=0.008,
+    )
+    common = dict(
+        session_bar=200, dual_mode=True,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        put_gate=0.40, call_edge=0.01, put_edge=0.05,
+    )
+    assert choose_entry(rc, **common, spot_day_ret=0.01) is None
+    d = choose_entry(rc, **common, spot_day_ret=0.005)
+    assert d is not None and d.leg == "PUT"
+
+
+def test_regime_features_reversal_count():
+    import pandas as pd
+    from qqq_btc.common.regime_features import add_vix_regime_features, count_reversals
+
+    prices = [100.0, 100.2, 100.0, 100.2, 100.0]
+    assert count_reversals(np.array(prices), threshold=0.0015) == 3
+
+    ts = pd.date_range("2026-06-10 09:30", periods=5, freq="1min", tz="America/New_York")
+    df = pd.DataFrame({"timestamp": ts, "vix_proxy_close": prices})
+    out = add_vix_regime_features(df)
+    assert "vix_reversal_count_30m" in out.columns
+    assert out["vix_reversal_count_30m"].iloc[-1] == 3.0
+
+
+def test_replay_session_immediate_entry():
+    """immediate_entry=True 时信号当根 bar 即 ENTER,不 pending 下一 bar。"""
+    from dataclasses import replace
+    from qqq_btc.common.replay_session import ReplaySession, SessionQuotes, SessionSignal
+    from qqq_btc.common.exit_rails import ExitRailsConfig
+    from qqq_btc.common.fill_model import OptionSpreadFillModel
+    from qqq_btc.common.replay_types import ReplayConfig
+
+    cfg = replace(
+        ReplayConfig(entry_threshold=0.01, max_spread_pct=1.0, cooldown_bars=999),
+        entry_delay_bars=0,
+        immediate_entry=True,
+    )
+    sess = ReplaySession(cfg, ExitRailsConfig(), OptionSpreadFillModel(), is_option=True)
+    sq = SessionQuotes(call_bid=1.98, call_ask=2.02, call_spread_pct=0.02)
+    sig = SessionSignal(edge=0.05)
+    evs = sess.on_minute_bar(0, "2026-06-02 10:00:00", 30, sq, sig)
+    assert len(evs) == 1 and evs[0].kind == "ENTER"
+    assert sess.position is not None
+    assert sess.pending_entry_bar is None
 
 
 def test_replay_session_bar_zero_can_signal():
@@ -1121,6 +1475,41 @@ def test_session_carryover_augment_multiday():
     stock_map, option_map, ns, no = build_feature_maps({"features": [{"name": "feat_a", "resolution": "1min"}]})
     x_s, x_o = row_to_tensors(aug, idx, stock_map, option_map, ns, no)
     assert np.count_nonzero(x_s[:, 0]) == SEQ_LEN
+
+
+def test_row_to_tensors_5min_repeat_matches_dataset():
+    """5min 特征须 repeat×5 铺满 30 窗,与 LMDBAlphaDataset 一致。"""
+    from qqq_btc.common.inference_tensors import (
+        FIVE_MIN_STRIDE,
+        SEQ_LEN,
+        WINDOW_5M_BARS,
+        build_feature_maps,
+        row_to_tensors,
+    )
+
+    n = 60
+    ts = pd.date_range("2026-06-10 09:30", periods=n, freq="1min", tz="America/New_York")
+    f5 = np.full(n, np.nan)
+    f5[::FIVE_MIN_STRIDE] = np.arange(n // FIVE_MIN_STRIDE, dtype=float)
+    f5 = pd.Series(f5).ffill().to_numpy()  # 模拟 merge_asof 前向填充
+    df = pd.DataFrame({"timestamp": ts, "feat_1m": np.arange(n, dtype=float), "feat_5m": f5})
+    cfg = {
+        "features": [
+            {"name": "feat_1m", "resolution": "1min"},
+            {"name": "feat_5m", "resolution": "5min"},
+        ]
+    }
+    stock_map, option_map, ns, no = build_feature_maps(cfg)
+    x_s, _ = row_to_tensors(df, 59, stock_map, option_map, ns, no)
+    col5 = x_s[:, 1]
+    # 6 锚点 × repeat 5 = 30;同一 5min bucket 内 5 个值相同
+    tail = col5[-30:]
+    for block in range(WINDOW_5M_BARS):
+        seg = tail[block * FIVE_MIN_STRIDE : (block + 1) * FIVE_MIN_STRIDE]
+        assert seg.size == FIVE_MIN_STRIDE
+        assert np.allclose(seg, seg[0])
+    assert col5[-30] < col5[-1]
+    assert list(x_s[-30:, 0]) == list(range(30, 60))
 
 
 def test_session_prepend_carryover():
@@ -1168,11 +1557,20 @@ def test_qqq_config_governance_wiring():
     assert qcfg.CALL_EDGE_COL == "call_net_edge"
     assert qcfg.PUT_EDGE_COL == "put_net_edge"
     assert qcfg.STRADDLE_EDGE_COL == "straddle_net_edge"
-    # 跨式门槛必须显著高于单腿(双份权利金 + 双份 theta)
-    assert qcfg.REPLAY.straddle_entry_threshold >= 2 * qcfg.REPLAY.entry_threshold
+    # 跨式门槛不得低于单腿(双份权利金 + 双份 theta;单腿基础阈值已提至 0.03)
+    assert qcfg.REPLAY.straddle_entry_threshold >= qcfg.REPLAY.entry_threshold
     assert qcfg.REPLAY.max_straddles_per_day is not None
-    # long_only 默认仍为 True:双腿开启前必须先用双腿标签重训 + strict replay 验证
-    assert qcfg.REPLAY.long_only is True
+    # 双腿已开启(2026-07 三时期验证);PUT 受 vix 门控 + 趋势对齐双重保护
+    assert qcfg.REPLAY.long_only is False
+    assert qcfg.REPLAY.put_gate_min is not None
+    assert qcfg.REPLAY.put_trend_max_ret is not None
+    assert qcfg.REPLAY.call_trend_r2_min is not None
+    # 尾盘禁入:14:30 后不新开仓(theta 尾段衰减 + Q2 时段审计)
+    assert qcfg.REPLAY.session_entry_end_bar <= 300
+    # live 立即入场 vs replay 延迟 1 bar(标签 60s)
+    assert qcfg.LIVE_REPLAY.immediate_entry is True
+    assert qcfg.LIVE_REPLAY.entry_delay_bars == 0
+    assert qcfg.REPLAY.entry_delay_bars == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1392,9 +1790,10 @@ def test_strategy_entry_bridge_call_with_q10(monkeypatch):
         "cooldown_until": 0.0,
         "curr_ts": 1_700_000_000.0,
         "time": datetime(2026, 6, 2, 10, 0, tzinfo=ny),
-        "net_edge_raw": 0.025,
+        # bar30 静态阈值 0.03(entry_threshold_schedule),需高于阈值才触发
+        "net_edge_raw": 0.035,
         "net_edge_q10": 0.005,
-        "alpha_z": 0.025,
+        "alpha_z": 0.035,
         "vol_z": 0.5,
         "bid": 1.98,
         "ask": 2.02,
@@ -1414,7 +1813,8 @@ def test_strategy_entry_bridge_call_with_q10(monkeypatch):
     assert "QQQ_BTC_ENTRY" in sig.get("reason", "")
 
     blocked = dict(base_ctx)
-    blocked["net_edge_q10"] = -0.01
+    # floor 语义:q10 需低于 edge_q10_floor(-0.20)才拦截
+    blocked["net_edge_q10"] = -0.25
     assert core.decide_entry(blocked) is None
 
 
@@ -1455,6 +1855,8 @@ def test_bootstrap_gate_convergence_env():
     bootstrap_qqq_btc_live(patch_oms=False)
     assert os.environ.get("FAST_GATE_ENABLED") == "0"
     assert os.environ.get("COOLDOWN_MINUTES") == "5"
+    assert os.environ.get("EXECUTION_DELAY_BARS") == "0"
+    assert os.environ.get("OMS_SIGNAL_DELAY_BARS") == "0"
     os.environ.pop("QQQ_BTC_LIVE", None)
 
 

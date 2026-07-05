@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 
 SEQ_LEN = 30
+WINDOW_5M_BARS = 6
+FIVE_MIN_STRIDE = 5
 
 
 def build_feature_maps(config: dict) -> tuple[list[dict], list[dict], int, int]:
@@ -24,6 +26,33 @@ def build_feature_maps(config: dict) -> tuple[list[dict], list[dict], int, int]:
     return stock_map, option_map, idx["stock"], idx["option"]
 
 
+def _fill_1m_column(mat: np.ndarray, col_idx: int, values: np.ndarray) -> None:
+    l = min(len(values), SEQ_LEN)
+    if l > 0:
+        mat[-l:, col_idx] = values[-l:]
+
+
+def _fill_5m_column(mat: np.ndarray, col_idx: int, chunk: pd.DataFrame, col: str) -> None:
+    """
+    与 LMDBAlphaDataset._fill_matrix 一致:取 6 个 5min 锚点(在 1min 网格上每隔 5 bar),
+    每个值 repeat 5 次填满 30×1min 窗口。
+    """
+    if col not in chunk.columns or chunk.empty:
+        return
+    n = len(chunk)
+    anchors = []
+    for k in range(WINDOW_5M_BARS - 1, -1, -1):
+        pos = n - 1 - FIVE_MIN_STRIDE * k
+        pos = max(0, min(pos, n - 1))
+        anchors.append(float(pd.to_numeric(chunk[col].iloc[pos], errors="coerce") or 0.0))
+    v = np.asarray(anchors, dtype=np.float32)
+    l = min(len(v), SEQ_LEN // FIVE_MIN_STRIDE)
+    if l <= 0:
+        return
+    up = np.repeat(v[-l:], FIVE_MIN_STRIDE)
+    mat[-len(up):, col_idx] = up
+
+
 def row_to_tensors(
     df: pd.DataFrame,
     i: int,
@@ -39,12 +68,14 @@ def row_to_tensors(
 
     def _fill(mat, fmap):
         for item in fmap:
-            if item["name"] not in chunk.columns:
+            col = item["name"]
+            if col not in chunk.columns:
                 continue
-            v = pd.to_numeric(chunk[item["name"]], errors="coerce").fillna(0.0).values.astype(np.float32)
-            l = len(v)
-            if l > 0:
-                mat[-l:, item["target_idx"]] = v
+            if item.get("source") == "5min":
+                _fill_5m_column(mat, item["target_idx"], chunk, col)
+            else:
+                v = pd.to_numeric(chunk[col], errors="coerce").fillna(0.0).values.astype(np.float32)
+                _fill_1m_column(mat, item["target_idx"], v)
 
     _fill(x_stock, stock_map)
     _fill(x_option, option_map)

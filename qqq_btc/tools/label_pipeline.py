@@ -28,7 +28,12 @@ _REPO = Path(__file__).resolve().parent.parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from qqq_btc.common.labels import build_dual_leg_net_labels, label_quality_report
+from qqq_btc.common.labels import (
+    LabelHorizon,
+    build_dual_leg_net_labels,
+    build_dual_leg_net_labels_subminute,
+    label_quality_report,
+)
 from qqq_btc.common.time_features import add_time_features
 from qqq_btc.common.trend_features import add_trend_features
 from qqq_btc.qqq import anchor
@@ -50,7 +55,13 @@ LABEL_COLS = [
 ]
 
 
-def process_dataframe(df: pd.DataFrame, symbol: str, anchor_cfg: dict) -> pd.DataFrame:
+def process_dataframe(
+    df: pd.DataFrame,
+    symbol: str,
+    anchor_cfg: dict,
+    *,
+    horizon: LabelHorizon | None = None,
+) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
@@ -99,13 +110,35 @@ def process_dataframe(df: pd.DataFrame, symbol: str, anchor_cfg: dict) -> pd.Dat
         raise ValueError("缺 close/price 列,无法计算 trend 特征")
     if "trend_fit_ret_30m" not in df.columns:
         df = add_trend_features(df, price_col=price_col)
-    df = build_dual_leg_net_labels(df, qcfg.FILL_MODEL, qcfg.LABEL_HORIZON)
+    hz = horizon or qcfg.LABEL_HORIZON
+    if hz.entry_delay_seconds is not None:
+        legs = anchor_cfg.get("dual_leg_buckets") or anchor.DUAL_LEG_BUCKETS
+        call_q = anchor.load_bucket_second_quotes(
+            symbol, df["timestamp"], int(legs["exec_call"]), anchor_cfg, prefix="exec_call"
+        )
+        put_q = anchor.load_bucket_second_quotes(
+            symbol, df["timestamp"], int(legs["exec_put"]), anchor_cfg, prefix="exec_put"
+        )
+        if call_q.empty or put_q.empty:
+            raise ValueError("1s 报价为空,无法构建子分钟标签")
+        df = build_dual_leg_net_labels_subminute(
+            df, qcfg.FILL_MODEL, hz, call_quotes_1s=call_q, put_quotes_1s=put_q
+        )
+    else:
+        df = build_dual_leg_net_labels(df, qcfg.FILL_MODEL, hz)
     return df
 
 
-def process_file(src: Path, dst: Path, symbol: str, anchor_cfg: dict) -> dict:
+def process_file(
+    src: Path,
+    dst: Path,
+    symbol: str,
+    anchor_cfg: dict,
+    *,
+    horizon: LabelHorizon | None = None,
+) -> dict:
     df = pd.read_parquet(src)
-    out = process_dataframe(df, symbol, anchor_cfg)
+    out = process_dataframe(df, symbol, anchor_cfg, horizon=horizon)
     dst.parent.mkdir(parents=True, exist_ok=True)
     out.to_parquet(dst, index=False)
     rep = label_quality_report(out)
@@ -120,18 +153,36 @@ def main() -> None:
     parser.add_argument("--symbol", default="QQQ")
     parser.add_argument("--anchor-config", default=None)
     parser.add_argument("--report", default=None, help="汇总 JSON 报告路径")
+    parser.add_argument(
+        "--entry-delay-seconds",
+        type=int,
+        default=None,
+        help="子分钟入场延迟(如 30);设置后用 databento 1s 报价构建标签",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     cfg_path = Path(args.anchor_config) if args.anchor_config else anchor.ANCHOR_CONFIG_PATH
     anchor_cfg = anchor.load_anchor_config(cfg_path)
+    horizon = qcfg.LABEL_HORIZON
+    if args.entry_delay_seconds is not None:
+        horizon = LabelHorizon(
+            entry_delay_bars=0,
+            entry_delay_seconds=int(args.entry_delay_seconds),
+            hold_bars=qcfg.LABEL_HORIZON.hold_bars,
+            flat_margin=qcfg.LABEL_HORIZON.flat_margin,
+            min_entry_premium=qcfg.LABEL_HORIZON.min_entry_premium,
+            net_clip=qcfg.LABEL_HORIZON.net_clip,
+            signal_offset_seconds=qcfg.LABEL_HORIZON.signal_offset_seconds,
+        )
+        logger.info("subminute labels: entry_delay_seconds=%d", args.entry_delay_seconds)
 
     src = Path(args.input).expanduser()
     dst = Path(args.output).expanduser()
     reports = []
 
     if src.is_file():
-        reports.append(process_file(src, dst, args.symbol, anchor_cfg))
+        reports.append(process_file(src, dst, args.symbol, anchor_cfg, horizon=horizon))
     else:
         files = sorted(src.glob("**/*.parquet"))
         if not files:
@@ -140,7 +191,7 @@ def main() -> None:
             rel = fp.relative_to(src)
             out_fp = dst / rel
             logger.info("processing %s", fp)
-            reports.append(process_file(fp, out_fp, args.symbol, anchor_cfg))
+            reports.append(process_file(fp, out_fp, args.symbol, anchor_cfg, horizon=horizon))
 
     summary = {
         "files": len(reports),

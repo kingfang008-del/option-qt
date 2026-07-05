@@ -1,0 +1,2 @@
+label,month,month_return_pct,trading_days,n_trades,position_frac,config,data
+Q2_total,4+5+6,697.6306,48,121,0.25,"REPLAY R1+R2 gates, call_timing=off",/tmp/qqq_btc_test_eval_v4/test_infer.parquet

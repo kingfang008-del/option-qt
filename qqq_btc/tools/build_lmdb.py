@@ -37,14 +37,35 @@ _REPO = Path(__file__).resolve().parent.parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
+from qqq_btc.common.trend_features import add_trend_features
+
 msgpack_numpy.patch()
 logger = logging.getLogger("qqq_btc.build_lmdb")
 
+
+def enrich_trend_features(df: pd.DataFrame) -> pd.DataFrame:
+    """LMDB 建库前补齐 trend/chop 列(calc=raw,不依赖 rolling_norm)。"""
+    need = ("spot_range_30m", "trend_strength_30m")
+    if all(c in df.columns for c in need):
+        return df
+    price_col = "close" if "close" in df.columns else None
+    if price_col is None:
+        for c in ("price", "vwap"):
+            if c in df.columns:
+                price_col = c
+                break
+    if price_col is None:
+        return df
+    out = df.sort_values("timestamp").copy()
+    add_trend_features(out, price_col=price_col)
+    return out
+
+
 WINDOW_1M = 30
 WINDOW_5M = 6
-WINDOW_STEP = 5
+WINDOW_STEP = 1  # 1min 滑动窗口(与旧模式一致);训练/推理每分钟一个样本
 # 与 ReplayConfig.session_entry_* 对齐:只写入可新开仓时段样本
-SESSION_ENTRY_START_BAR = 30  # 10:00;跳过开盘半小时
+SESSION_ENTRY_START_BAR = 15  # 09:45;open30 在 bar29 冻结
 SESSION_ENTRY_END_BAR = 330  # 15:00;hold=30min 时保证持有窗可走完
 
 REQUIRED_LABELS = [
@@ -120,8 +141,9 @@ def build_samples_for_pair(
     feats_1m: list[str],
     feats_5m: list[str],
     label_cols: list[str],
+    window_step: int = WINDOW_STEP,
 ) -> list[tuple[bytes, bytes]]:
-    df_1m = pd.read_parquet(f_1m)
+    df_1m = enrich_trend_features(pd.read_parquet(f_1m))
     df_5m = pd.read_parquet(f_5m)
     for col in REQUIRED_LABELS:
         if col not in df_1m.columns:
@@ -132,7 +154,7 @@ def build_samples_for_pair(
 
     df_1m = align_timestamp_ny(df_1m, shift_minutes=1)
     df_5m = align_timestamp_ny(df_5m, shift_minutes=5)
-    ts_5m_map = {int(t): i for i, t in enumerate(df_5m["timestamp"].values)}
+    ts_5m_arr = df_5m["timestamp"].values.astype(np.int64)
     ts_1m = df_1m["timestamp"].values.astype(np.int64)
 
     arr_1m = to_np(df_1m, feats_1m)
@@ -143,21 +165,14 @@ def build_samples_for_pair(
     cctx = zstd.ZstdCompressor(level=3)
     out: list[tuple[bytes, bytes]] = []
     start_idx = WINDOW_1M - 1
-    for temp_i in range(start_idx, min(start_idx + WINDOW_STEP, len(df_1m))):
-        if int(ts_1m[temp_i]) in ts_5m_map:
-            start_idx = temp_i
-            break
-    else:
-        return out
 
     # label_net_valid 列索引(若存在)
     valid_j = active_labels.index("label_net_valid") if "label_net_valid" in active_labels else None
 
-    for i in range(start_idx, len(df_1m), WINDOW_STEP):
+    for i in range(start_idx, len(df_1m), window_step):
         t = int(ts_1m[i])
-        if t not in ts_5m_map:
-            continue
-        idx_5 = ts_5m_map[t]
+        # 5min 窗口:asof 对齐(每分钟推理,不要求 1m/5m 时间戳精确相等)
+        idx_5 = int(np.searchsorted(ts_5m_arr, t, side="right") - 1)
         if idx_5 < WINDOW_5M - 1:
             continue
         idx_start_1m = i - (WINDOW_1M - 1)
@@ -198,6 +213,12 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--symbols", default="QQQ", help="逗号分隔")
     parser.add_argument("--map-size-gb", type=int, default=50)
+    parser.add_argument(
+        "--window-step",
+        type=int,
+        default=WINDOW_STEP,
+        help="LMDB 采样步长(分钟)。1=每分钟滑动;5=旧 5min 步进。",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -237,6 +258,7 @@ def main() -> None:
                     build_samples_for_pair(
                         f_1m, f_5m, symbol, stock_id, sector_id, feats_1m, feats_5m,
                         REQUIRED_LABELS + OPTIONAL_LABELS,
+                        window_step=args.window_step,
                     )
                 )
 

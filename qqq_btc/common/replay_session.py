@@ -148,6 +148,19 @@ class SessionSignal:
     edge_q10: Optional[float] = None
     # PUT 腿行情开关信号(如归一化 vix_level);None=缺失,门控开启时视为不通过
     put_gate: Optional[float] = None
+    open30_max_ret: Optional[float] = None
+    open30_peak_dd: Optional[float] = None
+    spot_ret_5bar: Optional[float] = None
+    # 30min 拟合趋势收益(trend_fit_ret_30m);PUT 趋势对齐门控输入
+    trend_ret_30m: Optional[float] = None
+    # 30min 拟合优度(trend_fit_r2_30m);CALL 震荡过滤门控输入
+    trend_r2_30m: Optional[float] = None
+    # vix_proxy 30min 方向反转次数;V0 regime 弃权门控输入
+    vix_reversal_count_30m: Optional[float] = None
+    # 当日开盘至当前 bar 现货收益;CALL 追涨洗盘门控输入
+    spot_day_ret: Optional[float] = None
+    # 30min 现货振幅;CALL 局部尖刺门控输入
+    spot_range_30m: Optional[float] = None
 
 
 @dataclass
@@ -260,10 +273,92 @@ class ReplaySession:
                     if self.dual_mode and signal.call_edge is not None
                     else signal.edge
                 )
-                if main_edge is not None and np.isfinite(main_edge):
+                _call_r2_min = self.replay_cfg.call_trend_r2_min
+                _call_r2_blocked = (
+                    _call_r2_min is not None
+                    and signal.trend_r2_30m is not None
+                    and np.isfinite(signal.trend_r2_30m)
+                    and signal.trend_r2_30m < float(_call_r2_min)
+                )
+                _chase_vix = self.replay_cfg.call_chase_vix_rev_min
+                _chase_ret = self.replay_cfg.call_chase_spot_day_ret_min
+                _call_chase_blocked = (
+                    _chase_vix is not None
+                    and signal.spot_day_ret is not None
+                    and np.isfinite(signal.spot_day_ret)
+                    and signal.spot_day_ret > float(_chase_ret)
+                    and signal.vix_reversal_count_30m is not None
+                    and np.isfinite(signal.vix_reversal_count_30m)
+                    and signal.vix_reversal_count_30m >= float(_chase_vix)
+                )
+                _spike_min = self.replay_cfg.call_spike_range30_min
+                _call_spike_blocked = (
+                    _spike_min is not None
+                    and signal.spot_range_30m is not None
+                    and np.isfinite(signal.spot_range_30m)
+                    and signal.spot_range_30m >= float(_spike_min)
+                )
+                _t_spot = self.replay_cfg.call_timing_spot_min
+                _t_bar = self.replay_cfg.call_timing_max_bar
+                _t_vix = self.replay_cfg.call_timing_vix_min
+                _call_timing_blocked = (
+                    _t_bar is not None
+                    and _t_spot is not None
+                    and _t_vix is not None
+                    and session_bar is not None
+                    and session_bar < int(_t_bar)
+                    and signal.spot_day_ret is not None
+                    and np.isfinite(signal.spot_day_ret)
+                    and signal.spot_day_ret > float(_t_spot)
+                    and signal.vix_reversal_count_30m is not None
+                    and np.isfinite(signal.vix_reversal_count_30m)
+                    and signal.vix_reversal_count_30m >= float(_t_vix)
+                )
+                _regime_max = self.replay_cfg.regime_vix_reversal_max
+                _regime_blocked = (
+                    _regime_max is not None
+                    and signal.vix_reversal_count_30m is not None
+                    and np.isfinite(signal.vix_reversal_count_30m)
+                    and signal.vix_reversal_count_30m > float(_regime_max)
+                )
+                if (
+                    main_edge is not None
+                    and np.isfinite(main_edge)
+                    and not _call_r2_blocked
+                    and not _call_chase_blocked
+                    and not _call_spike_blocked
+                    and not _call_timing_blocked
+                    and not _regime_blocked
+                ):
                     self._edge_buf.append(float(main_edge))
+                # 趋势门控拦截的 bar 不进 PUT 分位缓冲:这些 bar 的 put 分数
+                # 不代表可交易机会,混入会虚高 p80 动态阈值、误杀顺势 PUT
+                _pt_max = self.replay_cfg.put_trend_max_ret
+                _put_trend_blocked = (
+                    _pt_max is not None
+                    and signal.trend_ret_30m is not None
+                    and np.isfinite(signal.trend_ret_30m)
+                    and signal.trend_ret_30m > float(_pt_max)
+                )
+                _put_late_bar = self.replay_cfg.put_late_session_bar
+                _put_late_blocked = (
+                    _put_late_bar is not None
+                    and session_bar is not None
+                    and session_bar > int(_put_late_bar)
+                )
+                _put_spot_min = self.replay_cfg.put_spot_day_ret_min
+                _put_spot_blocked = (
+                    _put_spot_min is not None
+                    and signal.spot_day_ret is not None
+                    and np.isfinite(signal.spot_day_ret)
+                    and signal.spot_day_ret > float(_put_spot_min)
+                )
                 if (
                     self._put_edge_buf is not None
+                    and not _put_trend_blocked
+                    and not _put_late_blocked
+                    and not _put_spot_blocked
+                    and not _regime_blocked
                     and signal.put_edge is not None
                     and np.isfinite(signal.put_edge)
                 ):
@@ -325,7 +420,15 @@ class ReplaySession:
         sp = quotes.spread_pct(decision.leg)
         if not (np.isfinite(sp) and sp <= self.replay_cfg.max_spread_pct):
             return []
-        self.pending_entry_bar = bar_index + self.replay_cfg.entry_delay_bars
+        delay = int(self.replay_cfg.entry_delay_bars or 0)
+        if bool(getattr(self.replay_cfg, "immediate_entry", False)):
+            self.pending_edge = decision.edge
+            self.pending_leg = decision.leg
+            ent = self._try_entry(bar_index, ts, quotes)
+            if ent:
+                return [ent]
+            return []
+        self.pending_entry_bar = bar_index + delay
         self.pending_edge = decision.edge
         self.pending_leg = decision.leg
         ev = ReplayEvent(
@@ -426,6 +529,14 @@ class ReplaySession:
             dynamic_threshold=dyn_th,
             put_dynamic_threshold=put_dyn_th,
             put_gate=signal.put_gate,
+            open30_max_ret=signal.open30_max_ret,
+            open30_peak_dd=signal.open30_peak_dd,
+            spot_ret_5bar=signal.spot_ret_5bar,
+            trend_ret_30m=signal.trend_ret_30m,
+            trend_r2_30m=signal.trend_r2_30m,
+            vix_reversal_count_30m=signal.vix_reversal_count_30m,
+            spot_day_ret=signal.spot_day_ret,
+            spot_range_30m=signal.spot_range_30m,
         )
 
     def _quantile_threshold(self, buf: Optional[deque]) -> Optional[float]:

@@ -62,7 +62,7 @@ class LiveSignalEngine:
         self.model.eval()
         self.stock_map, self.option_map, self.n_stock, self.n_opt = build_feature_maps(self.config)
 
-        self.replay_cfg = qcfg.REPLAY
+        self.replay_cfg = qcfg.LIVE_REPLAY
         self.rails_cfg = qcfg.EXIT_RAILS
         self.fill_model = qcfg.FILL_MODEL
         self.dual_mode = True  # 推理始终产出全部头;是否启用由 replay_cfg.long_only 控制
@@ -189,12 +189,22 @@ class LiveSignalEngine:
             return None
 
         preds = self._infer_row(df, i)
+        row = df.iloc[i]
         signal = SessionSignal(
             edge=preds.get("net_edge"),
             call_edge=preds.get(qcfg.CALL_EDGE_COL),
             put_edge=preds.get(qcfg.PUT_EDGE_COL),
             straddle_edge=preds.get(qcfg.STRADDLE_EDGE_COL),
             edge_q10=preds.get(qcfg.EDGE_Q10_COL),
+            put_gate=preds.get(qcfg.PUT_GATE_COL),
+            open30_max_ret=preds.get("open30_max_ret") or row.get("open30_max_ret"),
+            open30_peak_dd=preds.get("open30_peak_dd") or row.get("open30_peak_dd"),
+            spot_ret_5bar=preds.get("spot_ret_5bar") or row.get("spot_ret_5bar"),
+            trend_ret_30m=preds.get("trend_fit_ret_30m") or row.get("trend_fit_ret_30m"),
+            trend_r2_30m=preds.get("trend_fit_r2_30m") or row.get("trend_fit_r2_30m"),
+            vix_reversal_count_30m=row.get("vix_reversal_count_30m"),
+            spot_day_ret=row.get("spot_day_ret"),
+            spot_range_30m=row.get("spot_range_30m"),
         )
         evs = self.session.on_minute_bar(
             self.bar_index, ts, sess, sq, signal, day_key=day_key

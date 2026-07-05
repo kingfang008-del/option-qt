@@ -16,6 +16,26 @@ import numpy as np
 from .replay_types import ReplayConfig
 
 
+def _morning_fade_ok(
+    replay_cfg: ReplayConfig,
+    session_bar: Optional[int],
+    open30_max_ret: Optional[float],
+    open30_peak_dd: Optional[float],
+) -> bool:
+    mn = replay_cfg.morning_fade_min_ret
+    md = replay_cfg.morning_fade_max_peak_dd
+    if mn is None or md is None:
+        return False
+    end = replay_cfg.morning_fade_session_end_bar
+    if end is not None and session_bar is not None and session_bar > int(end):
+        return False
+    if open30_max_ret is None or open30_peak_dd is None:
+        return False
+    if not (np.isfinite(open30_max_ret) and np.isfinite(open30_peak_dd)):
+        return False
+    return float(open30_max_ret) >= float(mn) and float(open30_peak_dd) <= float(md)
+
+
 @dataclass
 class EntryDecision:
     leg: str           # CALL / PUT / STRADDLE / PERP
@@ -43,6 +63,14 @@ def choose_entry(
     dynamic_threshold: Optional[float] = None,
     put_dynamic_threshold: Optional[float] = None,
     put_gate: Optional[float] = None,
+    open30_max_ret: Optional[float] = None,
+    open30_peak_dd: Optional[float] = None,
+    spot_ret_5bar: Optional[float] = None,
+    trend_ret_30m: Optional[float] = None,
+    trend_r2_30m: Optional[float] = None,
+    vix_reversal_count_30m: Optional[float] = None,
+    spot_day_ret: Optional[float] = None,
+    spot_range_30m: Optional[float] = None,
 ) -> Optional[EntryDecision]:
     """
     单 bar 入场决策。spread 门控在调用方二次校验(各腿 spread 不同)。
@@ -55,13 +83,101 @@ def choose_entry(
     if not replay_cfg.session_allows_entry(session_bar):
         return None
 
+    if replay_cfg.regime_vix_reversal_max is not None:
+        if (
+            vix_reversal_count_30m is not None
+            and np.isfinite(vix_reversal_count_30m)
+            and vix_reversal_count_30m > float(replay_cfg.regime_vix_reversal_max)
+        ):
+            return None
+
     put_gate_ok = True
     if replay_cfg.put_gate_min is not None:
-        put_gate_ok = (
+        vix_ok = (
             put_gate is not None
             and np.isfinite(put_gate)
             and put_gate >= float(replay_cfg.put_gate_min)
         )
+        fade_ok = _morning_fade_ok(
+            replay_cfg, session_bar, open30_max_ret, open30_peak_dd
+        )
+        put_gate_ok = vix_ok or fade_ok
+
+    call_blocked = False
+    if replay_cfg.block_call_on_rapid_drop and replay_cfg.rapid_drop_ret is not None:
+        if (
+            spot_ret_5bar is not None
+            and np.isfinite(spot_ret_5bar)
+            and spot_ret_5bar <= float(replay_cfg.rapid_drop_ret)
+        ):
+            call_blocked = True
+    if replay_cfg.call_trend_r2_min is not None:
+        if (
+            trend_r2_30m is not None
+            and np.isfinite(trend_r2_30m)
+            and trend_r2_30m < float(replay_cfg.call_trend_r2_min)
+        ):
+            call_blocked = True
+    if replay_cfg.call_chase_vix_rev_min is not None:
+        chase_floor = replay_cfg.call_chase_spot_day_ret_min
+        if (
+            spot_day_ret is not None
+            and np.isfinite(spot_day_ret)
+            and spot_day_ret > float(chase_floor)
+            and vix_reversal_count_30m is not None
+            and np.isfinite(vix_reversal_count_30m)
+            and vix_reversal_count_30m >= float(replay_cfg.call_chase_vix_rev_min)
+        ):
+            call_blocked = True
+    if replay_cfg.call_spike_range30_min is not None:
+        if (
+            spot_range_30m is not None
+            and np.isfinite(spot_range_30m)
+            and spot_range_30m >= float(replay_cfg.call_spike_range30_min)
+        ):
+            call_blocked = True
+    if (
+        replay_cfg.call_timing_max_bar is not None
+        and replay_cfg.call_timing_spot_min is not None
+        and replay_cfg.call_timing_vix_min is not None
+    ):
+        t_spot = replay_cfg.call_timing_spot_min
+        t_bar = int(replay_cfg.call_timing_max_bar)
+        t_vix = int(replay_cfg.call_timing_vix_min)
+        if (
+            session_bar is not None
+            and session_bar < t_bar
+            and spot_day_ret is not None
+            and np.isfinite(spot_day_ret)
+            and spot_day_ret > float(t_spot)
+            and vix_reversal_count_30m is not None
+            and np.isfinite(vix_reversal_count_30m)
+            and vix_reversal_count_30m >= float(t_vix)
+        ):
+            call_blocked = True
+
+    # 趋势对齐:30min 趋势仍向上时禁开 PUT(强于 vix/fade 门控,减法保护)
+    put_blocked = False
+    if replay_cfg.put_trend_max_ret is not None:
+        if (
+            trend_ret_30m is not None
+            and np.isfinite(trend_ret_30m)
+            and trend_ret_30m > float(replay_cfg.put_trend_max_ret)
+        ):
+            put_blocked = True
+    if replay_cfg.put_late_session_bar is not None:
+        if (
+            session_bar is not None
+            and session_bar > int(replay_cfg.put_late_session_bar)
+        ):
+            put_blocked = True
+    if replay_cfg.put_spot_day_ret_min is not None:
+        if (
+            spot_day_ret is not None
+            and np.isfinite(spot_day_ret)
+            and spot_day_ret > float(replay_cfg.put_spot_day_ret_min)
+        ):
+            put_blocked = True
 
     th_static = replay_cfg.threshold_at(session_bar)
     th = th_static
@@ -80,19 +196,19 @@ def choose_entry(
     if dual_mode and call_edge is not None and put_edge is not None:
         ec = call_edge if np.isfinite(call_edge) else -np.inf
         ep = put_edge if np.isfinite(put_edge) else -np.inf
-        if replay_cfg.long_only or not has_put or not put_gate_ok:
+        if replay_cfg.long_only or not has_put or not put_gate_ok or put_blocked:
             ep = -np.inf
         candidates = [
             (v, leg)
             for v, leg, t in ((ec, "CALL", th), (ep, "PUT", th_put))
-            if v >= t
+            if v >= t and not (leg == "CALL" and call_blocked)
         ]
         if candidates:
             chosen_edge, chosen_leg = max(candidates)
     elif edge is not None and np.isfinite(edge):
-        if edge >= th:
+        if edge >= th and not call_blocked:
             chosen_leg, chosen_edge = default_leg, float(edge)
-        elif edge <= -th and not replay_cfg.long_only and has_put and put_gate_ok:
+        elif edge <= -th and not replay_cfg.long_only and has_put and put_gate_ok and not put_blocked:
             chosen_leg, chosen_edge = "PUT", float(edge)
 
     if straddle_enabled and straddle_edge is not None and np.isfinite(straddle_edge):
@@ -101,7 +217,7 @@ def choose_entry(
             replay_cfg.max_straddles_per_day is None
             or straddles_today < replay_cfg.max_straddles_per_day
         )
-        if allowed and straddle_edge >= th_s and (chosen_leg is None or straddle_edge > abs(chosen_edge)):
+        if allowed and straddle_edge >= th_s and not call_blocked and (chosen_leg is None or straddle_edge > abs(chosen_edge)):
             if straddle_spread_pct is not None and (
                 not np.isfinite(straddle_spread_pct) or straddle_spread_pct > replay_cfg.max_spread_pct
             ):

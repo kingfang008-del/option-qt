@@ -36,7 +36,8 @@ from qqq_btc.common.session_history import (
     session_tail,
 )
 from qqq_btc.common.time_features import add_time_features, session_minute
-from qqq_btc.common.trend_features import add_trend_features
+from qqq_btc.common.regime_features import add_vix_regime_features
+from qqq_btc.common.trend_features import add_trend_features, add_open30_features, add_spot_day_ret
 
 logger = logging.getLogger("qqq_btc.inference")
 
@@ -82,8 +83,16 @@ def run_inference_df(
     if "time_session_sin" not in work.columns:
         work = add_time_features(work)
     price_col = next((c for c in ("close", "price", "vwap") if c in work.columns), None)
-    if price_col and "trend_fit_ret_30m" not in work.columns:
+    if price_col and (
+        "trend_fit_ret_30m" not in work.columns or "spot_range_30m" not in work.columns
+    ):
         work = add_trend_features(work, price_col=price_col)
+    if price_col and "open30_ret" not in work.columns:
+        work = add_open30_features(work, price_col=price_col)
+    if "vix_proxy_close" in work.columns and "vix_reversal_count_30m" not in work.columns:
+        work = add_vix_regime_features(work)
+    if price_col and "spot_day_ret" not in work.columns:
+        work = add_spot_day_ret(work, price_col=price_col)
 
     stock_map, option_map, n_stock, n_opt = build_feature_maps(config)
     if not work.empty:

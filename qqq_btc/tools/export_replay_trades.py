@@ -39,6 +39,9 @@ def main() -> None:
         qcfg.EXIT_RAILS,
         edge_col=args.edge_col,
         edge_q10_col=qcfg.EDGE_Q10_COL,
+        call_edge_col=qcfg.CALL_EDGE_COL,
+        put_edge_col=qcfg.PUT_EDGE_COL,
+        put_gate_col=qcfg.PUT_GATE_COL,
     )
     rows = []
     for t in result.trades:
@@ -51,7 +54,7 @@ def main() -> None:
                 "exit_price": t.exit_price,
                 "net_return": t.net_return,
                 "exit_reason": t.exit_reason,
-                "max_drawdown": t.max_drawdown,
+                "bars_held": t.bars_held,
             }
         )
     out = pd.DataFrame(rows)

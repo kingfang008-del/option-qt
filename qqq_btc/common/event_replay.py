@@ -26,6 +26,8 @@ import numpy as np
 import pandas as pd
 
 from .fill_model import OptionSpreadFillModel, PerpFillModel
+from .regime_features import add_vix_regime_features
+from .trend_features import add_spot_day_ret, add_trend_features
 from .replay_session import BarPhase, ReplaySession, SessionQuotes, SessionSignal
 from .replay_types import ReplayConfig, ReplayResult
 
@@ -73,6 +75,14 @@ def prepare_minute_frame(df: pd.DataFrame) -> pd.DataFrame:
             out["session_bar"] = np.arange(len(out), dtype=int)
     out["_day"] = out["timestamp"].dt.date
     out["_minute_key"] = out["timestamp"].map(_minute_key)
+    if "close" in out.columns and "spot_ret_5bar" not in out.columns:
+        out["spot_ret_5bar"] = out.groupby("_day", sort=False)["close"].pct_change(5)
+    if "vix_proxy_close" in out.columns and "vix_reversal_count_30m" not in out.columns:
+        out = add_vix_regime_features(out)
+    if "close" in out.columns and "spot_day_ret" not in out.columns:
+        out = add_spot_day_ret(out)
+    if "close" in out.columns and "spot_range_30m" not in out.columns:
+        out = add_trend_features(out, price_col="close")
     return out
 
 
@@ -111,6 +121,14 @@ def _signal_from_row(
         straddle_edge=_f(straddle_edge_col),
         edge_q10=_f(edge_q10_col),
         put_gate=_f(put_gate_col),
+        open30_max_ret=_f("open30_max_ret"),
+        open30_peak_dd=_f("open30_peak_dd"),
+        spot_ret_5bar=_f("spot_ret_5bar"),
+        trend_ret_30m=_f("trend_fit_ret_30m"),
+        trend_r2_30m=_f("trend_fit_r2_30m"),
+        vix_reversal_count_30m=_f("vix_reversal_count_30m"),
+        spot_day_ret=_f("spot_day_ret"),
+        spot_range_30m=_f("spot_range_30m"),
     )
 
 

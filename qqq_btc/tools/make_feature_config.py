@@ -9,7 +9,7 @@
    由 feature_merge_option_raw.FeatureEngineer 在 merge 阶段写入;
    label_pipeline / live 侧同口径补算作为兜底。
 2. labels / labeling 参数与 process_labels_file 对齐(30min horizon + net 标签)。
-3. loss_weights:rank_net=0, net_edge_quantile=1.0;双腿/跨式权重保留,
+3. loss_weights:rank_net=1.0(成对排序), net_edge_quantile=1.0;双腿/跨式权重保留,
    仅当 parquet 含对应列时 loss 生效。
 
 用生成器而非手拷贝,保证 New_Pro 基底特征演进时可一键重新同步:
@@ -140,12 +140,31 @@ TREND_FEATURES = [
      "description": "过去 120 bar 波段级拟合收益"},
     {"name": "trend_fit_r2_120m", "type": "real", "calc": "raw", "resolution": "1min",
      "description": "120 bar 波段级拟合优度 R^2"},
+    {"name": "spot_range_30m", "type": "real", "calc": "raw", "resolution": "1min",
+     "description": "过去 30 bar 现货振幅 (high-low)/close"},
+    {"name": "trend_strength_30m", "type": "real", "calc": "raw", "resolution": "1min",
+     "description": "|trend_fit_ret_30m| * trend_fit_r2_30m,方向确信度"},
     {"name": "day_range_pos", "type": "real", "calc": "raw", "resolution": "1min",
      "description": "当前价在当日已实现高低区间的位置,[0,1]"},
     {"name": "drawdown_from_day_high", "type": "real", "calc": "raw", "resolution": "1min",
      "description": "距当日已实现最高点的回撤,<=0"},
     {"name": "drawup_from_day_low", "type": "real", "calc": "raw", "resolution": "1min",
      "description": "距当日已实现最低点的反弹,>=0"},
+]
+
+OPEN30_FEATURES = [
+    {"name": "open30_ret", "type": "real", "calc": "raw", "resolution": "1min",
+     "description": "开盘至当前(或10:00冻结)的收益"},
+    {"name": "open30_max_ret", "type": "real", "calc": "raw", "resolution": "1min",
+     "description": "开盘窗内最高收益(冲高幅度)"},
+    {"name": "open30_peak_dd", "type": "real", "calc": "raw", "resolution": "1min",
+     "description": "距开盘窗内最高点的回撤,<=0"},
+    {"name": "open30_reversal", "type": "real", "calc": "raw", "resolution": "1min",
+     "description": "前15min收益减后15min收益,倒V为正"},
+    {"name": "open30_range_pos", "type": "real", "calc": "raw", "resolution": "1min",
+     "description": "当前价在开盘窗高低区间位置,[0,1]"},
+    {"name": "bars_since_open30_high_norm", "type": "real", "calc": "raw", "resolution": "1min",
+     "description": "距开盘窗高点经过的bar数/30,归一化"},
 ]
 
 
@@ -188,7 +207,7 @@ def build_config() -> dict:
         cfg = json.load(f)
 
     existing = {f["name"] for f in cfg["features"]}
-    for feat in TIME_FEATURES + TREND_FEATURES:
+    for feat in TIME_FEATURES + TREND_FEATURES + OPEN30_FEATURES:
         if feat["name"] not in existing:
             cfg["features"].append(feat)
 
@@ -196,7 +215,7 @@ def build_config() -> dict:
     cfg["labels"] = {**PROCESS_LABELS, **OPTIONAL_DUAL_LEG_LABELS}
     _sync_labeling_params(cfg)
 
-    cfg["loss_weights"]["rank_net"] = 0.0
+    cfg["loss_weights"]["rank_net"] = 1.0
     cfg["loss_weights"]["net_edge_quantile"] = 1.0
     # 双腿/跨式:仅当 LMDB 含对应列时生效,缺列 loss 自动跳过
     cfg["loss_weights"]["call_put_edge"] = 0.5
@@ -234,6 +253,7 @@ def build_config() -> dict:
         "label_horizon_k": LABEL_HORIZON_K,
         "time_features": [f["name"] for f in TIME_FEATURES],
         "trend_features": [f["name"] for f in TREND_FEATURES],
+        "open30_features": [f["name"] for f in OPEN30_FEATURES],
         "quantiles": [0.1, 0.5, 0.9],
         "embedding_caps": {"stock": 20000, "sector": 256},
     }

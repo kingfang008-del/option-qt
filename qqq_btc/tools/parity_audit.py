@@ -41,7 +41,10 @@ from qqq_btc.qqq import config as qcfg
 TIME_TREND = [
     "time_session_sin", "time_session_cos", "time_session_progress", "time_to_expiry_norm",
     "trend_fit_ret_30m", "trend_fit_r2_30m", "trend_fit_ret_120m", "trend_fit_r2_120m",
+    "spot_range_30m", "trend_strength_30m",
     "day_range_pos", "drawdown_from_day_high", "drawup_from_day_low",
+    "open30_ret", "open30_max_ret", "open30_peak_dd", "open30_reversal",
+    "open30_range_pos", "bars_since_open30_high_norm",
 ]
 
 

@@ -226,6 +226,21 @@ class FeatureEngineer:
         df["drawdown_from_day_high"] = (px / day_high.replace(0, np.nan) - 1.0).fillna(0.0)
         df["drawup_from_day_low"] = (px / day_low.replace(0, np.nan) - 1.0).fillna(0.0)
 
+    def _add_open30_features(
+        self,
+        df: pd.DataFrame,
+        timestamps: pd.Series,
+        price_col: str = "close",
+    ) -> None:
+        """开盘 30 分钟形态特征;与 qqq_btc.common.trend_features.add_open30_features 对齐。"""
+        import sys
+        repo_root = Path(CONFIG_FILE).resolve().parent.parent.parent
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from qqq_btc.common.trend_features import add_open30_features
+
+        add_open30_features(df, price_col=price_col, ts_col="timestamp")
+
     def _robust_scaler(self, series: pd.Series):
         # --- 加固点 ---
         if series.isnull().all():
@@ -730,8 +745,9 @@ class FeatureEngineer:
         try:
             self._add_time_features(df, timestamps)
             self._add_trend_features(df, timestamps, price_col="close")
+            self._add_open30_features(df, timestamps, price_col="close")
         except Exception as e:
-            logging.warning(f"time/trend 特征计算失败: {e}")
+            logging.warning(f"time/trend/open30 特征计算失败: {e}")
 
         # 阶段3: 循环计算
         for feature in self.config['features']: 

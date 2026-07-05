@@ -37,6 +37,17 @@ def _spread_pct_from_ctx(ctx: dict) -> float:
     return 0.0
 
 
+def _f_ctx(ctx: dict, key: str) -> Optional[float]:
+    raw = ctx.get(key)
+    if raw is None:
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) else None
+
+
 def _edge_q10_from_ctx(ctx: dict) -> Optional[float]:
     raw = ctx.get("net_edge_q10")
     if raw is None:
@@ -90,6 +101,15 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         dual_mode=False,
         has_put=False,
         default_leg="CALL",
+        put_gate=_f_ctx(ctx, "vix_level"),
+        open30_max_ret=_f_ctx(ctx, "open30_max_ret"),
+        open30_peak_dd=_f_ctx(ctx, "open30_peak_dd"),
+        spot_ret_5bar=_f_ctx(ctx, "spot_ret_5bar"),
+        trend_ret_30m=_f_ctx(ctx, "trend_fit_ret_30m"),
+        trend_r2_30m=_f_ctx(ctx, "trend_fit_r2_30m"),
+        vix_reversal_count_30m=_f_ctx(ctx, "vix_reversal_count_30m"),
+        spot_day_ret=_f_ctx(ctx, "spot_day_ret"),
+        spot_range_30m=_f_ctx(ctx, "spot_range_30m"),
     )
 
     if decision is None:

@@ -298,4 +298,35 @@ def apply_oms_patches(*, tick_exits_mode: str = "disaster_only") -> None:
     except ImportError as e:
         logger.warning("fill_audit patch skipped: %s", e)
 
+    _orig_submit = eex.ExecutionEngineV8._submit_strategy_order
+
+    async def _patched_submit_strategy_order(
+        self,
+        action,
+        sym,
+        sig,
+        stock_price,
+        curr_ts,
+        batch_idx,
+        frame_id=None,
+        allow_delay_queue=True,
+    ):
+        # ALPHA_FRAME 决策后立刻下单;BUY 不走 OMS 延迟队列(与 replay 标签 60s 延迟解耦)
+        if str(action).upper() == "BUY":
+            allow_delay_queue = False
+        return await _orig_submit(
+            self,
+            action,
+            sym,
+            sig,
+            stock_price,
+            curr_ts,
+            batch_idx,
+            frame_id=frame_id,
+            allow_delay_queue=allow_delay_queue,
+        )
+
+    eex.ExecutionEngineV8._submit_strategy_order = _patched_submit_strategy_order
+    logger.info("patched ExecutionEngineV8._submit_strategy_order → BUY immediate (no delay queue)")
+
     _PATCHED = True

@@ -181,9 +181,19 @@
         "trend_fit_r2_30m",
         "trend_fit_ret_120m",
         "trend_fit_r2_120m",
+        "spot_range_30m",
+        "trend_strength_30m",
         "day_range_pos",
         "drawdown_from_day_high",
         "drawup_from_day_low"
+      ],
+      "open30_features": [
+        "open30_ret",
+        "open30_max_ret",
+        "open30_peak_dd",
+        "open30_reversal",
+        "open30_range_pos",
+        "bars_since_open30_high_norm"
       ],
       "quantiles": [
         0.1,
@@ -287,7 +297,7 @@
     "return_fwd_net": 3.0,
     "return_fwd_gross": 0.5,
     "execution_cost": 0.5,
-    "rank_net": 0.0,
+    "rank_net": 0.5,
     "volatility": 0.1,
     "event": 0.5,
     "net_edge_quantile": 1.0,
@@ -538,6 +548,20 @@
       "description": "120 bar 波段级拟合优度 R^2"
     },
     {
+      "name": "spot_range_30m",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "过去 30 bar 现货振幅 (high-low)/close"
+    },
+    {
+      "name": "trend_strength_30m",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "|trend_fit_ret_30m| * trend_fit_r2_30m,方向确信度"
+    },
+    {
       "name": "day_range_pos",
       "type": "real",
       "calc": "raw",
@@ -557,6 +581,48 @@
       "calc": "raw",
       "resolution": "1min",
       "description": "距当日已实现最低点的反弹,>=0"
+    },
+    {
+      "name": "open30_ret",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "开盘至当前(或10:00冻结)的收益"
+    },
+    {
+      "name": "open30_max_ret",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "开盘窗内最高收益(冲高幅度)"
+    },
+    {
+      "name": "open30_peak_dd",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "距开盘窗内最高点的回撤,<=0"
+    },
+    {
+      "name": "open30_reversal",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "前15min收益减后15min收益,倒V为正"
+    },
+    {
+      "name": "open30_range_pos",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "当前价在开盘窗高低区间位置,[0,1]"
+    },
+    {
+      "name": "bars_since_open30_high_norm",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "距开盘窗高点经过的bar数/30,归一化"
     }
   ]
 }

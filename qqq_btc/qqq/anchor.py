@@ -12,11 +12,14 @@ qqq_btc 不再依赖 New_Pro。选约逻辑逐行保留(已验证正确),清理�
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 
 _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "CONFIG" / "anchor_qqq_0dte.json"
@@ -100,6 +103,76 @@ def bucket_targets(cfg: dict) -> List[Tuple[int, bool, bool, float]]:
     return list(_FRONT_4_BUCKET_TARGETS)
 
 
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _bs_price(S: float, K: float, T: float, sigma: float, is_call: bool, r: float = 0.045) -> float:
+    if T <= 0 or sigma <= 0:
+        return max(S - K, 0.0) if is_call else max(K - S, 0.0)
+    d1 = (math.log(S / K) + (r + sigma * sigma / 2.0) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    if is_call:
+        return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+    return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
+
+def _delta_from_premium(
+    S: float, K: float, T: float, premium: float, is_call: bool, r: float = 0.045
+) -> float:
+    """
+    premium+现货 反解 IV(二分)再求 delta。
+    动机:nq_options_day_iv 存储的 greeks 在 2026 年段损坏(3DTE 被当 0DTE
+    计算,IV/delta 系统性偏离),但 premium 与 stock_close 是新鲜的 ——
+    锁约不再信任存储 delta,现场重算。失败返回 NaN(调用方回退存储值)。
+    """
+    if not (S > 0 and K > 0 and T > 0 and premium > 0):
+        return float("nan")
+    intrinsic = max(S - K, 0.0) if is_call else max(K - S, 0.0)
+    if premium <= intrinsic + 1e-9:
+        return 1.0 if is_call else -1.0
+    lo, hi = 1e-3, 5.0
+    if _bs_price(S, K, T, hi, is_call, r) < premium:
+        return float("nan")
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        if _bs_price(S, K, T, mid, is_call, r) < premium:
+            lo = mid
+        else:
+            hi = mid
+    sigma = (lo + hi) / 2.0
+    d1 = (math.log(S / K) + (r + sigma * sigma / 2.0) * T) / (sigma * math.sqrt(T))
+    return _norm_cdf(d1) if is_call else _norm_cdf(d1) - 1.0
+
+
+def _recompute_open_deltas(subset: pd.DataFrame, target_dte: int, is_call: bool) -> pd.DataFrame:
+    """
+    每合约取窗内最后一条快照,并用 premium+现货 重算 abs_delta。
+    存储 greeks 在部分时段损坏(如 2026 年段 3DTE 被按 0DTE 定价),
+    premium 与 stock_close 是新鲜的,重算失败时回退存储值。
+    """
+    subset = subset.sort_values("timestamp")
+    last = subset.groupby("contract_symbol", as_index=False).last()
+    strike_col = "strike" if "strike" in last.columns else "strike_price"
+    if (
+        "stock_close" not in last.columns
+        or "close" not in last.columns
+        or strike_col not in last.columns
+    ):
+        return last
+    T = max(float(target_dte), 0.5) / 365.0
+    recomputed = last.apply(
+        lambda r: _delta_from_premium(
+            float(r["stock_close"]), float(r[strike_col]), T, float(r["close"]), is_call
+        ),
+        axis=1,
+    )
+    last["abs_delta"] = np.where(
+        np.isfinite(recomputed), np.abs(recomputed), last["abs_delta"]
+    )
+    return last
+
+
 def get_daily_locked_contracts(df: pd.DataFrame, cfg: dict) -> Optional[pd.DataFrame]:
     """按日锁定 front expiry 上的 4/6 个 bucket 合约。"""
     work = df.copy()
@@ -152,15 +225,36 @@ def get_daily_locked_contracts(df: pd.DataFrame, cfg: dict) -> Optional[pd.DataF
                 daily_group["contract_type"].astype(str).str.upper().str.startswith(type_str[0])
             )
             subset = daily_group[mask].copy()
-            if subset.empty:
-                continue
+            best_ticker = None
+            best_dist = float("inf")
+            if not subset.empty:
+                subset = _recompute_open_deltas(subset, target_dte, is_call)
+                subset["delta_dist"] = (subset["abs_delta"] - target_delta).abs()
+                top = subset.sort_values("delta_dist").iloc[0]
+                best_ticker, best_dist = top["contract_symbol"], float(top["delta_dist"])
 
-            subset["delta_dist"] = (subset["abs_delta"] - target_delta).abs()
-            delta_candidates = subset[subset["delta_dist"] < delta_tol]
-            if delta_candidates.empty:
-                best_ticker = subset.sort_values("delta_dist").iloc[0]["contract_symbol"]
-            else:
-                best_ticker = delta_candidates.sort_values("delta_dist").iloc[0]["contract_symbol"]
+            # CALL 链在开盘窗常缺 ATM 行权价(跳空日尤甚,如只剩深虚值 720+):
+            # 用同到期 PUT 链(通常密得多)按 put-call parity 反推目标行权价,
+            # 合成 CALL 合约代码。call_delta = 1 + put_delta(同行权价)。
+            if is_call and best_dist >= delta_tol:
+                put_mask = (daily_group["dte"] == target_dte) & (
+                    daily_group["contract_type"].astype(str).str.upper().str.startswith("P")
+                )
+                puts = daily_group[put_mask].copy()
+                if not puts.empty:
+                    puts = _recompute_open_deltas(puts, target_dte, is_call=False)
+                    # abs_delta 为 |put_delta|;目标 |put_delta| = 1 - call_delta
+                    puts["delta_dist"] = (puts["abs_delta"] - (1.0 - target_delta)).abs()
+                    cand = puts.sort_values("delta_dist").iloc[0]
+                    if float(cand["delta_dist"]) < best_dist:
+                        synth = re.sub(
+                            r"P(\d{8})$", r"C\1", str(cand["contract_symbol"])
+                        )
+                        if synth != cand["contract_symbol"]:
+                            best_ticker = synth
+
+            if best_ticker is None:
+                continue
 
             locked_map.append(
                 {
@@ -363,3 +457,77 @@ def merge_dual_leg_exec_quotes(
             tolerance=tol,
         )
     return merged
+
+
+# Databento 1s 期权报价(标签子分钟延迟用)
+DATABENTO_1S_OPTION_DIR = Path("/mnt/s990/data/raw_1s/options_databento")
+
+
+def load_bucket_second_quotes(
+    symbol: str,
+    timestamps: pd.Series,
+    bucket_id: int,
+    anchor_cfg: dict,
+    prefix: str = "exec_call",
+    *,
+    raw_1s_dir: Optional[Path] = None,
+) -> pd.DataFrame:
+    """
+    从 databento 1s parquet 加载指定 bucket 的秒级报价。
+    返回列: timestamp, {prefix}_mid, {prefix}_bid, {prefix}_ask
+    """
+    if timestamps.empty:
+        return pd.DataFrame()
+
+    root = raw_1s_dir or DATABENTO_1S_OPTION_DIR
+    root = Path(root).expanduser()
+    sym_dir = root / symbol
+    if not sym_dir.exists():
+        return pd.DataFrame()
+
+    ts = pd.to_datetime(timestamps)
+    if ts.dt.tz is None:
+        ts = ts.dt.tz_localize("America/New_York", ambiguous="infer")
+    else:
+        ts = ts.dt.tz_convert("America/New_York")
+
+    date_range = pd.date_range(ts.min().normalize(), ts.max().normalize(), freq="D")
+    frames = []
+    for day in date_range:
+        day_str = day.strftime("%Y-%m-%d")
+        fp = sym_dir / f"{symbol}_{day_str}.parquet"
+        if not fp.exists():
+            continue
+        day_df = pd.read_parquet(fp, columns=["timestamp", "bucket_id", "bid", "ask"])
+        if day_df.empty:
+            continue
+        day_df = day_df[day_df["bucket_id"] == int(bucket_id)].copy()
+        if day_df.empty:
+            continue
+        if not pd.api.types.is_datetime64_any_dtype(day_df["timestamp"]):
+            day_df["timestamp"] = pd.to_datetime(day_df["timestamp"])
+        if day_df["timestamp"].dt.tz is None:
+            day_df["timestamp"] = day_df["timestamp"].dt.tz_localize(
+                "America/New_York", ambiguous="infer"
+            )
+        else:
+            day_df["timestamp"] = day_df["timestamp"].dt.tz_convert("America/New_York")
+        bid = pd.to_numeric(day_df["bid"], errors="coerce")
+        ask = pd.to_numeric(day_df["ask"], errors="coerce")
+        mid = (bid + ask) / 2.0
+        frames.append(
+            pd.DataFrame(
+                {
+                    "timestamp": day_df["timestamp"],
+                    f"{prefix}_mid": mid,
+                    f"{prefix}_bid": bid,
+                    f"{prefix}_ask": ask,
+                }
+            )
+        )
+
+    if not frames:
+        return pd.DataFrame()
+
+    quotes = pd.concat(frames, ignore_index=True)
+    return quotes.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")

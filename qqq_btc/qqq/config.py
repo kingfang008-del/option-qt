@@ -9,6 +9,7 @@ QQQ 0DTE 路径的全部运行参数 —— 标签、回放、实盘共用一份
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 _PKG_ROOT = Path(__file__).resolve().parent.parent
@@ -59,7 +60,7 @@ REPLAY = ReplayConfig(
     # 2026Q1 +10%→+100% / 2026Q2 +10%→+102%;fill 压力(0.90)下仍全正。
     long_only=False,
     entry_threshold_schedule=(
-        (30, 0.03),      # 10:00-14:00(开盘半小时禁入)
+        (15, 0.03),      # 09:45 起可新开仓(open30 在 bar29 冻结,早盘用滚动形态)
         (270, 0.036),    # 14:00 之后抬高
         (330, 0.042),    # 15:00 之后(通常已禁开仓)
     ),
@@ -73,10 +74,11 @@ REPLAY = ReplayConfig(
     # 跨式是低频武器(事件日/挤压日),日内最多 2 次,防止在盘整日反复买波动
     straddle_entry_threshold=0.030,
     max_straddles_per_day=2,
-    # 开盘 30min 噪声大、尾部风险高;10:00 起可新开仓
-    session_entry_start_bar=30,
-    # hold=30 → 最晚 15:00 开仓,保证 15:30 前可走完标签持有窗
-    session_entry_end_bar=330,
+    # 09:45 起可新开仓;open30 形态在 bar29(10:00)冻结,早盘 fade 门控用滚动值
+    session_entry_start_bar=15,
+    # 14:30 后禁新开仓:尾盘 theta 衰减最快且 Q2 该时段胜率仅 17%(6笔 -0.46 ROI);
+    # 双时期验证收紧到 300 后 Q2 4.17x→4.52x / H2 94.7x→124.3x,MDD 同步下降
+    session_entry_end_bar=300,
     # 0DTE 标签 p10≈-10%,高 edge 时预测 q10 中位≈-15%;floor=-20% 过滤极端悲观
     edge_q10_floor=-0.20,
     # 滚动分位阈值:实际阈值 = max(静态调度, 近 1500 入场窗bar edge 的 p80)。
@@ -91,9 +93,44 @@ REPLAY = ReplayConfig(
     # PUT 持续放血(2026Q1 无门控 PUT 腿 -31%,门控后 +95%)。0.2/0.25/0.3
     # 三档门槛全时期均为正,对门槛不敏感;取居中的 0.25。
     put_gate_min=0.25,
+    # 早盘冲高回落 PUT:open30_max_ret>=0.4% 且 peak_dd<=-0.3% 时允许 PUT(与 vix 门控 OR)
+    morning_fade_min_ret=0.004,
+    morning_fade_max_peak_dd=-0.003,
+    morning_fade_session_end_bar=60,   # 仅 09:45–10:30 适用 fade 路径
+    # 近 5min 现货跌超 0.4% 禁新开 CALL/跨式,防早盘急转下追多
+    rapid_drop_ret=-0.004,
+    rapid_drop_bars=5,
+    block_call_on_rapid_drop=True,
+    # PUT 趋势对齐:30min 拟合趋势 > 0 时禁开 PUT(即使 vix/fade 门控通过)。
+    # 双时期审计:逆势 PUT 系统性亏损(Q2 -0.18 vs 顺势 +2.54;H2 单笔均值 1/3),
+    # 启用后 Q2 4.17x→4.42x / H2 94.7x→146.9x,6 月最长连亏 5 天→3 天
+    put_trend_max_ret=0.0,
+    # 低 trend r2 震荡市禁 CALL:CALL 头 IC 转负时减法保护。
+    # 双时期验证 Q2 6.94→5.98x / 6 月 1.64→1.95x,连亏 5→3 天。
+    call_trend_r2_min=0.15,
+    # R1 网格: spot_day_ret>0.5% 且 vix_rev>=5 禁 CALL → Q2 565→572% / 6月 86→88%
+    call_chase_vix_rev_min=5,
+    call_chase_spot_day_ret_min=0.005,
+    # R2 网格(strict replay 150组):
+    #   put_spot_day_ret>0.8% 禁 PUT → 拦 6/29 尾盘逆势 PUT
+    #   spot_range_30m>=2.0% 禁 CALL → 6/15 局部尖刺 -4.5%→-1.4%
+    # 合并后 Q2 572→698% / 6月 88→97%(f=0.25,V4 eval)
+    put_spot_day_ret_min=0.008,
+    call_spike_range30_min=0.020,
+    put_late_session_bar=None,
+    # 6/11 型早盘追涨时点门控(默认关闭;strict replay 网格见下):
+    #   spot>0.3% & sb<200 & vix_rev>=5 → 6/11 -6.5%→+1.9%,但 Q2 -64pp / 6月 -8pp
+    #   spot>0.4% 无法拦住 6/11(第二笔 sb=160 刚好在边界)
+    call_timing_spot_min=None,
+    call_timing_max_bar=None,
+    call_timing_vix_min=None,
     # 半 Kelly(~0.45 的一半):单笔权利金 ROI ±30% 时禁止全仓复利
     position_frac=0.25,
 )
+
+# 实盘入场:bar 收盘决策后立即下单(不 pending 下一根 bar,不 OMS 延迟队列)。
+# strict replay 仍用 REPLAY.entry_delay_bars=1 与 60s 标签对齐;live 刻意不等满 1min。
+LIVE_REPLAY = replace(REPLAY, entry_delay_bars=0, immediate_entry=True)
 
 # 分布头门控列;阈值见 ReplayConfig.edge_q10_floor(不再要求 q10>0)
 EDGE_Q10_COL = "net_edge_q10"
@@ -162,7 +199,7 @@ EXIT_RAILS = ExitRailsConfig(
 )
 
 # 交易时段(分钟序号,自 09:30 开盘起算) —— 与 REPLAY.session_entry_* 同步
-SESSION_ENTRY_START_BAR = 30    # 10:00;跳过开盘半小时噪声
+SESSION_ENTRY_START_BAR = 15    # 09:45;open30 在 bar29 冻结
 SESSION_ENTRY_END_BAR = 330     # 15:00 后禁新开仓(hold=30min)
 SESSION_FORCE_CLOSE_BAR = 380   # 15:50 强平
 
