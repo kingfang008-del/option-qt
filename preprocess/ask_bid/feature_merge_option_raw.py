@@ -52,6 +52,53 @@ OVERWRITE_EXISTING = True
 MAX_WORKERS = 30
 DB_PATH = Path.home() / "notebook/stocks.db"
 
+_LOCKED_DATES_CACHE: dict[tuple[str, str], set[str]] = {}
+
+
+def _load_locked_trade_dates(symbol: str) -> set[str] | None:
+    """
+    若设置 LOCKED_TARGETS_MAP，则 feature 只保留 locked map 中的交易日。
+    避免无 1DTE/无锁约日仍保留正股行、期权列填 0。
+    """
+    map_path = os.environ.get("LOCKED_TARGETS_MAP")
+    if not map_path:
+        return None
+    key = (symbol.upper(), str(Path(map_path).expanduser()))
+    if key in _LOCKED_DATES_CACHE:
+        return _LOCKED_DATES_CACHE[key]
+    p = Path(map_path).expanduser()
+    if not p.exists():
+        logging.warning("LOCKED_TARGETS_MAP not found: %s", p)
+        return None
+    m = pd.read_parquet(p, columns=["date_str", "symbol"])
+    sym = symbol.upper()
+    if "symbol" in m.columns:
+        m = m[m["symbol"].astype(str).str.upper() == sym]
+    dates = set(m["date_str"].astype(str).unique())
+    _LOCKED_DATES_CACHE[key] = dates
+    logging.info("locked-date filter: %s -> %d days from %s", sym, len(dates), p)
+    return dates
+
+
+def _filter_to_locked_trade_dates(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    locked = _load_locked_trade_dates(symbol)
+    if not locked or df.empty or "timestamp" not in df.columns:
+        return df
+    ts = pd.to_datetime(df["timestamp"])
+    if ts.dt.tz is None:
+        ts = ts.dt.tz_localize("America/New_York", ambiguous="infer")
+    else:
+        ts = ts.dt.tz_convert("America/New_York")
+    mask = ts.dt.strftime("%Y-%m-%d").isin(locked)
+    dropped = int((~mask).sum())
+    if dropped:
+        logging.info(
+            "%s: drop %d rows on non-locked trade dates (%.1f%%)",
+            symbol,
+            dropped,
+            100.0 * dropped / len(df),
+        )
+    return df.loc[mask].copy()
 
 
 @numba.njit
@@ -1400,6 +1447,9 @@ def process_stock_month(symbol: str, year_month: str, config: dict ):
                     # 计算特征和标签
                     feature_engineer = FeatureEngineer(config)
                     merged_df = feature_engineer.compute_features_raw(merged_df, resolution=res)
+
+                    # 仅保留 locked map 中的交易日（无锁约日不写零期权行）
+                    merged_df = _filter_to_locked_trade_dates(merged_df, symbol)
 
                     # 合并 VIX 数据
                     if vix_df is not None:

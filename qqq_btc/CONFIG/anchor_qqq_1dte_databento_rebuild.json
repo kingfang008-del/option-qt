@@ -1,0 +1,26 @@
+{
+  "profile": "qqq_1dte_databento_rebuild",
+  "description": "V4 Apr-Jun rebuild from options_databento; day_iv points to experiment folder",
+  "front_allowed_dte": [1],
+  "front_prefer_dte": 1,
+  "front_min_dte": 1,
+  "front_max_dte": 1,
+  "allow_front_dte_fallback": false,
+  "use_next_buckets": true,
+  "use_trading_dte": true,
+  "min_volume": 0,
+  "atm_center": 0.50,
+  "otm_center": 0.25,
+  "delta_tolerance": 0.15,
+  "label_trade_bucket_id": 2,
+  "label_dte_min": 1,
+  "label_dte_max": 1,
+  "dual_leg_buckets": {"exec_call": 2, "exec_put": 0},
+  "symbols": ["QQQ"],
+  "paths": {
+    "raw_iv_dir": "/home/kingfang007/train_data/v4_databento_rebuild_apr_jun/quote_options_day_iv",
+    "sniper_option_dir": "/mnt/s990/data/v4_original_jul5/databento_verify/raw_1s",
+    "day_iv_dir": "/home/kingfang007/train_data/v4_databento_rebuild_apr_jun/quote_options_day_iv",
+    "locked_targets_output": "/home/kingfang007/train_data/locked_targets_map_v4_replay_apr_jun_databento.parquet"
+  }
+}

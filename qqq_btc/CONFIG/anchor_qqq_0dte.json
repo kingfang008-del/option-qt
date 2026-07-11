@@ -1,11 +1,12 @@
 {
   "profile": "qqq_0dte",
-  "description": "QQQ 当日/隔日期权专版：4-bucket front expiry，训练/标签/实盘对齐",
+  "description": "QQQ strict 0DTE only：4-bucket front expiry；无 0DTE 则跳过当天",
 
-  "front_allowed_dte": [0, 1, 2],
+  "front_allowed_dte": [0],
   "front_prefer_dte": 0,
   "front_min_dte": 0,
-  "front_max_dte": 2,
+  "front_max_dte": 0,
+  "allow_front_dte_fallback": false,
   "use_next_buckets": false,
 
   "min_volume": 0,
@@ -15,7 +16,7 @@
 
   "label_trade_bucket_id": 2,
   "label_dte_min": 0,
-  "label_dte_max": 2,
+  "label_dte_max": 0,
 
   "symbols": ["QQQ"],
 

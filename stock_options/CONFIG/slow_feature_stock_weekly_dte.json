@@ -1,0 +1,683 @@
+{
+  "comment": "qqq_btc v2:基于 New_Pro slow_feature.json 生成(make_feature_config.py)。特征含日内 time/trend(feature_merge 写入)。主标签由 feature_merge_option_raw.process_labels_file 写入(k_slow=30, opt_fill_spread_frac=0.775);可选双腿/跨式列由 label_pipeline(build_dual_leg_net_labels)补齐。再跑 rolling_norm 与 LMDB。",
+  "comment_keys": "键名在所有部分(labels, loss_weights)中保持一致，并与H5数据集内部路径匹配。",
+  "parameters": {
+    "slow_channel": {
+      "window_duration_minutes": {
+        "regular": 30,
+        "pre_market": 5,
+        "after_hours": 5
+      },
+      "step_duration_minutes": {
+        "regular": 5,
+        "pre_market": 5,
+        "after_hours": 5
+      },
+      "label_horizon_k": 30
+    },
+    "labeling": {
+      "method": "multi_task",
+      "targets": [
+        "direction",
+        "direction_net",
+        "volatility",
+        "event",
+        "return_fwd",
+        "return_fwd_gross",
+        "return_fwd_net",
+        "execution_cost"
+      ],
+      "volatility_k": 30,
+      "event_k": 30,
+      "k_option": 10,
+      "resolutions": {
+        "5s": {
+          "horizon": 60,
+          "entry_threshold": 0.0005,
+          "upper_threshold": 0.0005,
+          "lower_threshold": -0.0005,
+          "vol_multiplier": 2.0
+        },
+        "10s": {
+          "horizon": 45,
+          "entry_threshold": 0.0007,
+          "upper_threshold": 0.0007,
+          "lower_threshold": -0.0007,
+          "vol_multiplier": 2.0
+        },
+        "15s": {
+          "horizon": 30,
+          "entry_threshold": 0.0008,
+          "upper_threshold": 0.0008,
+          "lower_threshold": -0.0008,
+          "vol_multiplier": 2.0
+        },
+        "30s": {
+          "horizon": 20,
+          "entry_threshold": 0.001,
+          "upper_threshold": 0.001,
+          "lower_threshold": -0.001,
+          "vol_multiplier": 2.0
+        },
+        "1min": {
+          "horizon": 30,
+          "entry_threshold": 0.0015,
+          "upper_threshold": 0.0015,
+          "lower_threshold": -0.0015,
+          "vol_multiplier": 2.0
+        },
+        "5min": {
+          "horizon": 6,
+          "entry_threshold": 0.0025,
+          "upper_threshold": 0.0025,
+          "lower_threshold": -0.0025,
+          "vol_multiplier": 2.0
+        }
+      },
+      "k_slow": 30,
+      "vol_window": 120,
+      "opt_fill_spread_frac": 0.775,
+      "executable_cost_margin": 0.0025,
+      "executable_flat_margin": 0.0005
+    },
+    "option_exec_label": {
+      "entry_delay_seconds": [
+        60,
+        120,
+        300
+      ],
+      "holding_seconds": [
+        900,
+        1800,
+        2700
+      ],
+      "primary_entry_delay_seconds": 60,
+      "primary_seconds": 1800,
+      "min_edge": 0.02,
+      "min_profit_buffer": 0.02,
+      "max_spread_pct": 0.1,
+      "max_quote_age_seconds": 90
+    },
+    "anchor_profile": "stock_weekly_dte",
+    "anchor_config_path": "/home/kingfang007/文档/GitHub/option-qt/stock_options/CONFIG/anchor_stock_weekly_dte.json",
+    "training": {
+      "return_huber_beta": 0.001,
+      "rank_temperature": 0.002,
+      "rank_min_delta": 0.0002
+    },
+    "pre_post_dropout_rate": 0.1,
+    "expert_dropout_rate": 0.25,
+    "backbone_dropout_rate": 0.3,
+    "5s": {
+      "sequence_length": 36,
+      "hidden_dim": 32,
+      "learning_rate": 0.001,
+      "epochs": 20
+    },
+    "10s": {
+      "sequence_length": 30,
+      "hidden_dim": 48,
+      "learning_rate": 0.0008,
+      "epochs": 30
+    },
+    "15s": {
+      "sequence_length": 30,
+      "hidden_dim": 48,
+      "learning_rate": 0.0007,
+      "epochs": 35
+    },
+    "30s": {
+      "sequence_length": 20,
+      "hidden_dim": 48,
+      "learning_rate": 0.0005,
+      "epochs": 40
+    },
+    "1min": {
+      "sequence_length": 30,
+      "hidden_dim": 64,
+      "learning_rate": 0.0005,
+      "epochs": 50
+    },
+    "5min": {
+      "sequence_length": 15,
+      "hidden_dim": 80,
+      "learning_rate": 0.0001,
+      "epochs": 45
+    },
+    "qqq_btc_v2": {
+      "fill_model": {
+        "entry_frac": 0.775,
+        "exit_frac": 0.775,
+        "commission_per_contract": 0.65
+      },
+      "label_source": "preprocess.ask_bid.feature_merge_option_raw.process_labels_file",
+      "label_columns": [
+        "label_direction",
+        "label_direction_net",
+        "label_volatility",
+        "label_event",
+        "label_return_fwd",
+        "label_return_fwd_gross",
+        "label_return_fwd_net",
+        "label_execution_cost"
+      ],
+      "optional_label_columns": [
+        "label_call_return_fwd_net",
+        "label_put_return_fwd_net",
+        "label_straddle_return_fwd_net",
+        "label_net_valid",
+        "label_put_net_valid",
+        "label_straddle_valid"
+      ],
+      "label_horizon_k": 30,
+      "time_features": [
+        "time_session_sin",
+        "time_session_cos",
+        "time_session_progress",
+        "time_to_expiry_norm"
+      ],
+      "trend_features": [
+        "trend_fit_ret_30m",
+        "trend_fit_r2_30m",
+        "trend_fit_ret_120m",
+        "trend_fit_r2_120m",
+        "day_range_pos",
+        "drawdown_from_day_high",
+        "drawup_from_day_low"
+      ],
+      "open30_features": [
+        "open30_ret",
+        "open30_max_ret",
+        "open30_peak_dd",
+        "open30_reversal",
+        "open30_range_pos",
+        "bars_since_open30_high_norm"
+      ],
+      "quantiles": [
+        0.1,
+        0.5,
+        0.9
+      ],
+      "embedding_caps": {
+        "stock": 20000,
+        "sector": 256
+      }
+    },
+    "stock_weekly_dte": {
+      "allowed_dte": [
+        1,
+        2,
+        3,
+        4,
+        7
+      ],
+      "train_weekdays": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "deploy_weekdays": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "exclude_0dte": true
+    }
+  },
+  "labels": {
+    "direction": {
+      "type": "classification",
+      "output_dim": 3,
+      "column": "label_direction",
+      "description": "三重障碍方向 0/1/2(先触下/盘整/先触上),horizon=k_slow"
+    },
+    "direction_net": {
+      "type": "classification",
+      "output_dim": 3,
+      "column": "label_direction_net",
+      "description": "扣执行成本后的净方向 0/1/2"
+    },
+    "volatility": {
+      "type": "regression",
+      "column": "label_volatility",
+      "description": "未来 k_slow bar 已实现波动(log_ret std)"
+    },
+    "event": {
+      "type": "classification",
+      "output_dim": 1,
+      "column": "label_event",
+      "description": "未来窗口极端行情事件 0/1"
+    },
+    "return_fwd": {
+      "type": "regression",
+      "column": "label_return_fwd",
+      "description": "未来 k_slow bar 毛收益(mid/close 口径)"
+    },
+    "return_fwd_gross": {
+      "type": "regression",
+      "column": "label_return_fwd_gross",
+      "description": "毛收益副本,与 return_fwd 同口径"
+    },
+    "return_fwd_net": {
+      "type": "regression",
+      "column": "label_return_fwd_net",
+      "description": "扣往返点差摩擦后的净收益(主训练目标)"
+    },
+    "execution_cost": {
+      "type": "regression",
+      "column": "label_execution_cost",
+      "description": "估计往返执行成本(fill_frac 点差摩擦,含 floor)"
+    },
+    "call_return_fwd_net": {
+      "type": "regression",
+      "column": "label_call_return_fwd_net",
+      "optional": true,
+      "description": "CALL 腿 fill 价净收益"
+    },
+    "put_return_fwd_net": {
+      "type": "regression",
+      "column": "label_put_return_fwd_net",
+      "optional": true,
+      "description": "PUT 腿 fill 价净收益"
+    },
+    "straddle_return_fwd_net": {
+      "type": "regression",
+      "column": "label_straddle_return_fwd_net",
+      "optional": true,
+      "description": "跨式合成净收益(有符号)"
+    },
+    "net_valid": {
+      "type": "classification",
+      "output_dim": 1,
+      "column": "label_net_valid",
+      "optional": true,
+      "description": "CALL 腿标签有效掩码"
+    },
+    "put_net_valid": {
+      "type": "classification",
+      "output_dim": 1,
+      "column": "label_put_net_valid",
+      "optional": true,
+      "description": "PUT 腿标签有效掩码"
+    },
+    "straddle_valid": {
+      "type": "classification",
+      "output_dim": 1,
+      "column": "label_straddle_valid",
+      "optional": true,
+      "description": "跨式标签有效掩码"
+    }
+  },
+  "loss_weights": {
+    "direction": 4.0,
+    "direction_net": 4.0,
+    "return_fwd": 1.0,
+    "return_fwd_net": 3.0,
+    "return_fwd_gross": 0.5,
+    "execution_cost": 0.5,
+    "rank_net": 0.0,
+    "volatility": 0.1,
+    "event": 0.5,
+    "net_edge_quantile": 1.0,
+    "call_put_edge": 0.5,
+    "straddle_edge": 0.5
+  },
+  "resample_freq": {
+    "regular": {
+      "09:30-16:00": [
+        "1min",
+        "5min"
+      ]
+    }
+  },
+  "OHLV": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "vwap"
+  ],
+  "features": [
+    {
+      "name": "close_log_return",
+      "type": "real",
+      "calc": "custom",
+      "resolution": "1min"
+    },
+    {
+      "name": "vwap_log_return",
+      "type": "real",
+      "calc": "custom",
+      "resolution": "1min"
+    },
+    {
+      "name": "volume_log",
+      "type": "real",
+      "calc": "custom",
+      "resolution": "1min"
+    },
+    {
+      "name": "volume_ratio",
+      "type": "real",
+      "calc": "volume_ratio",
+      "resolution": "1min"
+    },
+    {
+      "name": "vwap_diff",
+      "type": "real",
+      "calc": "zscore",
+      "alpha_sign": -1,
+      "resolution": "1min"
+    },
+    {
+      "name": "return_divergence",
+      "type": "real",
+      "calc": "zscore",
+      "alpha_sign": -1,
+      "resolution": "1min"
+    },
+    {
+      "name": "garman_klass_vol",
+      "type": "real",
+      "calc": "leading",
+      "use_for_anomaly": false,
+      "resolution": "5min"
+    },
+    {
+      "name": "bb_width",
+      "type": "real",
+      "calc": "BollingerBands(close, window=20, window_dev=2).bollinger_width()",
+      "description": "Normalized Bollinger Band width",
+      "resolution": "5min"
+    },
+    {
+      "name": "adx_smooth_10",
+      "type": "real",
+      "calc": "adx_smooth_10",
+      "resolution": "5min"
+    },
+    {
+      "name": "vix_level",
+      "type": "real",
+      "calc": "vix_gate",
+      "resolution": "5min"
+    },
+    {
+      "name": "poc_deviation",
+      "type": "real",
+      "calc": "leading",
+      "use_for_anomaly": false,
+      "alpha_sign": -1,
+      "resolution": "5min"
+    },
+    {
+      "name": "options_vw_spread",
+      "type": "real",
+      "calc": "options",
+      "use_for_anomaly": false,
+      "resolution": "1min"
+    },
+    {
+      "name": "options_vw_imbalance",
+      "type": "real",
+      "calc": "options",
+      "use_for_anomaly": false,
+      "resolution": "1min"
+    },
+    {
+      "name": "options_vw_iv",
+      "type": "real",
+      "calc": "options",
+      "use_for_anomaly": false,
+      "resolution": "1min"
+    },
+    {
+      "name": "options_vw_delta",
+      "type": "real",
+      "calc": "options",
+      "use_for_anomaly": false,
+      "resolution": "1min"
+    },
+    {
+      "name": "options_vw_gamma",
+      "type": "real",
+      "calc": "options",
+      "use_for_anomaly": false,
+      "resolution": "1min"
+    },
+    {
+      "name": "options_vw_vega",
+      "type": "real",
+      "calc": "options",
+      "use_for_anomaly": false,
+      "resolution": "1min"
+    },
+    {
+      "name": "options_vw_theta",
+      "type": "real",
+      "calc": "options",
+      "use_for_anomaly": false,
+      "resolution": "1min"
+    },
+    {
+      "name": "options_pcr_volume",
+      "type": "real",
+      "calc": "options",
+      "use_for_anomaly": false,
+      "resolution": "1min"
+    },
+    {
+      "name": "options_iv_momentum",
+      "type": "real",
+      "calc": "options",
+      "use_for_anomaly": false,
+      "resolution": "1min"
+    },
+    {
+      "name": "options_iv_divergence",
+      "type": "real",
+      "calc": "options",
+      "use_for_anomaly": false,
+      "resolution": "1min"
+    },
+    {
+      "name": "options_gamma_accel",
+      "type": "real",
+      "calc": "options",
+      "use_for_anomaly": false,
+      "resolution": "1min"
+    },
+    {
+      "name": "options_flow_skew",
+      "type": "real",
+      "calc": "options",
+      "use_for_anomaly": false,
+      "resolution": "1min"
+    },
+    {
+      "name": "options_struc_atm_iv",
+      "type": "real",
+      "calc": "options",
+      "use_for_anomaly": false,
+      "resolution": "5min"
+    },
+    {
+      "name": "options_struc_skew",
+      "type": "real",
+      "calc": "options",
+      "use_for_anomaly": false,
+      "resolution": "5min"
+    },
+    {
+      "name": "time_session_sin",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "会话内位置 sin 编码,[-1,1],feature_merge 写入"
+    },
+    {
+      "name": "time_session_cos",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "会话内位置 cos 编码,[-1,1]"
+    },
+    {
+      "name": "time_session_progress",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "会话进度 0->1 (09:30->16:00)"
+    },
+    {
+      "name": "time_to_expiry_norm",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "0DTE 距 16:00 到期剩余时间归一化 1->0"
+    },
+    {
+      "name": "trend_fit_ret_30m",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "过去 30 bar 对数价线性拟合总变化(拟合收益)"
+    },
+    {
+      "name": "trend_fit_r2_30m",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "30 bar 拟合优度 R^2,[0,1],趋势规则程度"
+    },
+    {
+      "name": "trend_fit_ret_120m",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "过去 120 bar 波段级拟合收益"
+    },
+    {
+      "name": "trend_fit_r2_120m",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "120 bar 波段级拟合优度 R^2"
+    },
+    {
+      "name": "day_range_pos",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "当前价在当日已实现高低区间的位置,[0,1]"
+    },
+    {
+      "name": "drawdown_from_day_high",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "距当日已实现最高点的回撤,<=0"
+    },
+    {
+      "name": "drawup_from_day_low",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "距当日已实现最低点的反弹,>=0"
+    },
+    {
+      "name": "open30_ret",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "开盘至当前(或10:00冻结)的收益"
+    },
+    {
+      "name": "open30_max_ret",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "开盘窗内最高收益(冲高幅度)"
+    },
+    {
+      "name": "open30_peak_dd",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "距开盘窗内最高点的回撤,<=0"
+    },
+    {
+      "name": "open30_reversal",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "前15min收益减后15min收益,倒V为正"
+    },
+    {
+      "name": "open30_range_pos",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "当前价在开盘窗高低区间位置,[0,1]"
+    },
+    {
+      "name": "bars_since_open30_high_norm",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "距开盘窗高点经过的bar数/30,归一化"
+    },
+    {
+      "name": "stock_dte",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "Integer days from trade date to selected option expiration."
+    },
+    {
+      "name": "stock_dte_norm",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "stock_dte normalized by the weekly-DTE max bucket."
+    },
+    {
+      "name": "stock_trade_weekday",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "Trade weekday, 0=Monday ... 4=Friday."
+    },
+    {
+      "name": "stock_expiry_weekday",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "Selected option expiration weekday, usually 4 for weekly Friday."
+    },
+    {
+      "name": "stock_days_to_friday",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "Calendar-day distance from trade date to nearest Friday."
+    },
+    {
+      "name": "stock_is_weekly_dte",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "1 if selected DTE is in the weekly-DTE profile bucket."
+    },
+    {
+      "name": "stock_is_0dte",
+      "type": "real",
+      "calc": "raw",
+      "resolution": "1min",
+      "description": "1 if selected option expires on the trade date."
+    }
+  ]
+}

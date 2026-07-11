@@ -10,6 +10,8 @@ SYM="qqq_btc/CONFIG/symbol_map.json"
 CKPT_V4="checkpoints_qqq_v4/best.pth"
 CKPT_V5="checkpoints_qqq_v5"
 EVAL_OUT="/tmp/qqq_btc_test_eval_v5"
+SEED="${SEED:-42}"
+export QQQ_BTC_SEED="$SEED"
 
 echo "=== [1/3] 重建 v5 LMDB (含 chop 特征) ==="
 for stage in train val test; do
@@ -22,7 +24,7 @@ for stage in train val test; do
 done
 
 mkdir -p "$CKPT_V5"
-echo "=== [2/3] v5 finetune (init=$CKPT_V4, 仅训 stock塔+主头) ==="
+echo "=== [2/3] v5 finetune (init=$CKPT_V4, seed=$SEED, 仅训 stock塔+主头) ==="
 mkdir -p "$CKPT_V5"
 "$PY" -m qqq_btc.model.train \
   --mode finetune \
@@ -33,6 +35,7 @@ mkdir -p "$CKPT_V5"
   --checkpoint-dir "$CKPT_V5" \
   --init-checkpoint "$CKPT_V4" \
   --epochs 20 \
+  --seed "$SEED" \
   --device auto 2>&1 | tee "$CKPT_V5/train.log"
 
 echo "=== [3/3] test 推理 + strict replay ==="
@@ -41,6 +44,7 @@ echo "=== [3/3] test 推理 + strict replay ==="
   --feature-root "$HOME/train_data/quote_features_test" \
   --option-1m-root /mnt/s990/data/raw_1m/options_databento \
   --output-dir "$EVAL_OUT" \
+  --seed "$SEED" \
   --device auto
 
 echo "done -> $CKPT_V5/best.pth"

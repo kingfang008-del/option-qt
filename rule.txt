@@ -1,0 +1,309 @@
+正确做法是问：
+
+这个规则到底在哪类市场状态下有效？
+
+例如继续拆成：
+
+call + stock_trend_down + positive_gamma
+call + stock_trend_down + negative_gamma
+
+call + stock_trend_down + high_iv
+call + stock_trend_down + low_iv
+
+call + stock_trend_down + qqq_recovering
+call + stock_trend_down + qqq_breaking_down
+
+call + stock_trend_down + put_flow_exhaustion
+call + stock_trend_down + put_flow_continuation
+
+如果你发现只有：
+
+call + stock_trend_down + positive_gamma + put_flow_exhaustion + qqq_recovering
+
+稳定赚钱，那这才是规则真正的本体。
+
+3. 现在应该从“规则交易”升级成“规则池 + 状态选择”
+
+不要让某条规则一直生效。
+
+应该变成：
+
+当前 State
+    ↓
+选择适合这个 State 的规则组
+    ↓
+只交易该 State 下历史稳定的规则
+
+例如：
+
+Trend + Negative Gamma
+→ 启用 Momentum Rules
+
+Range + Positive Gamma
+→ 启用 Reversal Rules
+
+Opening Vol Expansion
+→ 启用 Breakout Rules
+
+Gamma Pin + Low Vol
+→ 禁止买方期权
+
+也就是说：
+
+规则不是常驻的
+规则必须被 State Gate 激活
+4. 要把“月份差异”转成“State 差异”
+
+你现在看到的是：
+
+1月规则有效
+2月规则无效
+3月又有效
+
+下一步要做的是，把每个月打标签：
+
+MonthProfile {
+  avg_intraday_vol
+  trend_day_ratio
+  range_day_ratio
+  positive_gamma_days
+  negative_gamma_days
+  open_gap_frequency
+  power_hour_move_ratio
+  macro_event_days
+  qqq_beta_strength
+}
+
+然后看：
+
+规则有效的月份
+到底共同特征是什么？
+
+例如可能发现：
+
+call + stock_trend_down
+只在：
+    trend_day_ratio 低
+    positive_gamma_days 高
+    qqq_recovery_strength 高
+    put_flow_exhaustion 明显
+的月份有效
+
+这样你就不再说：
+
+这个规则 3 月有效
+
+而是说：
+
+这个规则在 Positive Gamma Reversal Regime 有效
+
+这才是可迁移的。
+
+5. 最重要的是加一层“规则稳定性评分”
+
+每条规则都不要只看收益，要看稳定性。
+
+可以给每条规则一个评分：
+
+RuleScore =
+  mean_return
+  × win_rate
+  × positive_month_ratio
+  × state_consistency
+  × sample_size_penalty
+  × drawdown_penalty
+
+你重点看：
+
+positive_month_ratio
+state_consistency
+
+例如两条规则：
+
+规则 A：
+某个月 +40%
+其他月份全部亏
+→ 不稳定，可能过拟合
+
+规则 B：
+多数月份小赚
+只在某个 State 下明显赚钱
+→ 更值得保留
+6. 推荐你用三层规则结构
+第一层：永久过滤规则
+
+这些应该跨期稳定，不追求赚钱，只负责避坑。
+
+spread 太宽 → 不交易
+volume 太低 → 不交易
+quote 不稳定 → 不交易
+宏观数据前后 → 降仓或不交易
+gamma pin + low vol → 不买 0DTE
+
+这类规则应该很稳定。
+
+第二层：State Gate 规则
+
+负责判断当前市场状态。
+
+Trend State
+Range State
+Positive Gamma
+Negative Gamma
+Vol Expansion
+Vol Compression
+Power Hour
+Opening Drive
+
+这层不直接交易，只决定：
+
+现在允许什么策略？
+第三层：Alpha 规则
+
+这些才是交易规则。
+
+Momentum Rule
+Reversal Rule
+Breakout Rule
+Flow Exhaustion Rule
+Relative Strength Rule
+
+Alpha 规则允许不稳定，因为它们本来就是状态依赖的。
+
+关键是：
+
+不能让 Alpha 规则脱离 State 独立生效
+7. 你现在最应该做的测试
+
+我建议你不要继续按月看单条规则收益，而是做这个矩阵：
+
+Rule × State × Month
+
+例如：
+
+Rule	State	Jan	Feb	Mar	Apr	Positive Month Ratio
+Call after stock_trend_down	Positive Gamma + Flow Exhaustion	+	+	-	+	75%
+Call after stock_trend_down	Negative Gamma + Put Flow Continuing	-	-	-	+	25%
+Momentum Call	Trend Up + Vol Expansion	+	+	+	-	75%
+Breakout Call	Opening Drive + High RV	-	+	+	+	75%
+
+你要找的不是：
+
+哪个 Rule 最赚钱
+
+而是：
+
+哪个 Rule 在哪个 State 下跨月最稳定
+8. 这时候深度学习反而可以派上用场
+
+你现在发现规则跨期不稳定，这正是深度学习可以辅助的地方。
+
+但它不是直接预测 Call / Put，而是做：
+
+State Recognition
+
+也就是：
+
+过去 30-120 分钟市场序列
+        ↓
+模型
+        ↓
+当前更像哪种历史 Regime？
+
+输出：
+
+P(momentum_regime)
+P(reversal_regime)
+P/chop_regime
+P/vol_expansion_regime
+P/gamma_pin_regime
+
+然后规则根据概率启用。
+
+例如：
+
+P(reversal_regime) > 0.75
+且 call + stock_trend_down 规则历史在 reversal regime 稳定
+→ 才允许交易
+
+这比固定规则跨月硬跑稳定得多。
+
+9. 如果规则每个月都变，最终系统应该怎么设计？
+
+最终不是：
+
+固定规则 A
+固定规则 B
+固定规则 C
+
+而是：
+
+Regime Detector
+        ↓
+Rule Pool
+        ↓
+Rule Selector
+        ↓
+Edge Scoring
+        ↓
+TopK
+
+结构如下：
+
+Market Data
+    ↓
+State / Regime Detection
+    ↓
+Allowed Rule Set
+    ↓
+Rule-level Edge Score
+    ↓
+Cross-symbol TopK
+    ↓
+Position Sizing
+    ↓
+Execution
+
+例如：
+
+当前：
+QQQ = Range + Positive Gamma + Low Vol
+
+启用：
+Reversal Rule
+VWAP Mean Reversion Rule
+Flow Exhaustion Rule
+
+禁用：
+Momentum Breakout Rule
+Trend Following Rule
+
+下个月市场变了，系统不是换规则，而是换激活的规则组。
+
+10. 我的判断
+
+你目前的测试结果其实是正常的，甚至是好事。
+
+它说明：
+
+1. 单条规则没有全局稳定性
+2. 市场每个月 State 差异很大
+3. 固定规则系统不够
+4. 需要 State-adaptive Rule Selection
+5. Alpha 可能存在，但必须条件化
+
+所以你下一步不要追求：
+
+找到一条跨所有月份都赚钱的规则
+
+这在 0DTE / 短期期权里很难。
+
+你应该追求：
+
+找到 5-20 条规则
+每条只在特定 State 下启用
+最终由 State Engine 选择当前该用哪一组
+
+最核心的一句话：
+
+规则跨期不稳定，说明你不能做固定规则系统；你要做的是“状态识别 + 规则池 + 动态激活”的自适应系统。 

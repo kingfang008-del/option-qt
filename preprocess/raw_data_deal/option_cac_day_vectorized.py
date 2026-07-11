@@ -534,7 +534,9 @@ if __name__ == "__main__":
     # 修改此处路径配置，对齐你的 S3 下载数据
     calculator = OptionIVCalculator(
         db_path="/home/kingfang007/notebook/stocks.db",
-        # option_root 是 S3 清洗出来的路径，包含按天存的 [AAPL_2026-01-01.parquet] 等文件
+        # option_root 是 S3 清洗出来的路径，包含按天存的 [AAPL_2026-01-01.parquet] 等文件,
+        #下载每日全量期权交易数据， 再通过交易数据来定位需要下载的合约，
+        #
         option_root="/home/kingfang007/data/new_option_data_s3", 
         data_root="/home/kingfang007/train_data/spnq_train_resampled",
         # 结果输出路径

@@ -52,6 +52,7 @@ class NetEdgeLoss(nn.Module):
     def __init__(self, config=None):
         super().__init__()
         self.ce = nn.CrossEntropyLoss(reduction="none")
+        self.route_class_weights = ((config or {}).get("route_class_weights") or {})
         lw = (config or {}).get("loss_weights", {})
         train_cfg = (config or {}).get("parameters", {}).get("training", {})
         self.w_dir = float(lw.get("direction_net", lw.get("direction", 4.0)))
@@ -62,6 +63,10 @@ class NetEdgeLoss(nn.Module):
         self.w_rank = float(lw.get("rank_net", 0.0))
         self.w_call_put = float(lw.get("call_put_edge", 0.0))
         self.w_straddle = float(lw.get("straddle_edge", 0.0))
+        self.w_best_side = float(lw.get("best_side", 0.0))
+        self.w_best_bucket = float(lw.get("best_bucket", 0.0))
+        self.w_spot_direction = float(lw.get("spot_direction", 0.0))
+        self.w_spot_return = float(lw.get("spot_return", 0.0))
         self.beta = float(train_cfg.get("return_huber_beta", 0.001))
         self.rank_temp = float(train_cfg.get("rank_temperature", 0.002))
         self.rank_min_delta = float(train_cfg.get("rank_min_delta", 0.0002))
@@ -119,13 +124,40 @@ class NetEdgeLoss(nn.Module):
         )
 
         if self.w_call_put > 0 and "call_return_fwd" in target and "put_return_fwd" in target:
-            call_r = torch.clamp(torch.nan_to_num(target["call_return_fwd"], nan=0.0), min=0.0)
-            put_r = torch.clamp(torch.nan_to_num(target["put_return_fwd"], nan=0.0), min=0.0)
+            call_r = torch.nan_to_num(target["call_return_fwd"], nan=0.0)
+            put_r = torch.nan_to_num(target["put_return_fwd"], nan=0.0)
             call_pred = out["call_net_edge"].squeeze(-1)
             put_pred = out["put_net_edge"].squeeze(-1)
+            leg_gap = call_r - put_r
+            leg_rank_mask = torch.abs(leg_gap) > self.rank_min_delta
+            if leg_rank_mask.any():
+                leg_rank = F.softplus(
+                    -torch.sign(leg_gap[leg_rank_mask])
+                    * (call_pred[leg_rank_mask] - put_pred[leg_rank_mask])
+                    / self.rank_temp
+                ).mean()
+            else:
+                leg_rank = call_pred.new_zeros(())
+            call_w = (
+                1.0
+                + 5.0 * (call_r > 0.015).float()
+                + 3.0 * ((call_r > put_r) & (call_r > 0.0)).float()
+            )
+            put_w = (
+                1.0
+                + 5.0 * (put_r > 0.015).float()
+                + 3.0 * ((put_r > call_r) & (put_r > 0.0)).float()
+            )
             l_cp = (
-                F.smooth_l1_loss(call_pred, call_r, beta=self.beta)
-                + F.smooth_l1_loss(put_pred, put_r, beta=self.beta)
+                (
+                    F.smooth_l1_loss(call_pred, call_r, beta=self.beta, reduction="none")
+                    * call_w
+                ).mean()
+                + (
+                    F.smooth_l1_loss(put_pred, put_r, beta=self.beta, reduction="none")
+                    * put_w
+                ).mean()
+                + leg_rank
             )
             loss = loss + self.w_call_put * l_cp
 
@@ -133,5 +165,64 @@ class NetEdgeLoss(nn.Module):
             strad_r = torch.nan_to_num(target["straddle_return_fwd"], nan=0.0)
             l_strad = F.smooth_l1_loss(out["straddle_net_edge"].squeeze(-1), strad_r, beta=self.beta)
             loss = loss + self.w_straddle * l_strad
+
+        if self.w_best_side > 0 and "best_side" in target and "logits_best_side" in out:
+            route_w = torch.clamp(torch.abs(net_r) * 10.0 + 1.0, max=8.0)
+            side_weights = self.route_class_weights.get("best_side")
+            if side_weights is not None:
+                side_weights = torch.as_tensor(
+                    side_weights,
+                    dtype=out["logits_best_side"].dtype,
+                    device=out["logits_best_side"].device,
+                )
+                side_ce = F.cross_entropy(
+                    out["logits_best_side"],
+                    target["best_side"],
+                    weight=side_weights,
+                    reduction="none",
+                )
+            else:
+                side_ce = self.ce(out["logits_best_side"], target["best_side"])
+            l_side = (side_ce * route_w).mean()
+            loss = loss + self.w_best_side * l_side
+
+        if self.w_best_bucket > 0 and "best_bucket" in target and "logits_best_bucket" in out:
+            route_w = torch.clamp(torch.abs(net_r) * 10.0 + 1.0, max=8.0)
+            bucket_weights = self.route_class_weights.get("best_bucket")
+            if bucket_weights is not None:
+                bucket_weights = torch.as_tensor(
+                    bucket_weights,
+                    dtype=out["logits_best_bucket"].dtype,
+                    device=out["logits_best_bucket"].device,
+                )
+            else:
+                bucket_weights = None
+            l_bucket = (
+                F.cross_entropy(
+                    out["logits_best_bucket"],
+                    target["best_bucket"],
+                    weight=bucket_weights,
+                    reduction="none",
+                )
+                * route_w
+            ).mean()
+            loss = loss + self.w_best_bucket * l_bucket
+
+        if self.w_spot_direction > 0 and "spot_direction" in target and "logits_spot_dir" in out:
+            spot_r = torch.nan_to_num(target.get("spot_return_fwd", torch.zeros_like(net_r)), nan=0.0)
+            spot_w = torch.clamp(torch.abs(spot_r) * 500.0 + 1.0, max=8.0)
+            l_spot_dir = (
+                self.ce(out["logits_spot_dir"], target["spot_direction"]) * spot_w
+            ).mean()
+            loss = loss + self.w_spot_direction * l_spot_dir
+
+        if self.w_spot_return > 0 and "spot_return_fwd" in target and "spot_return" in out:
+            spot_r = torch.nan_to_num(target["spot_return_fwd"], nan=0.0)
+            l_spot_ret = F.smooth_l1_loss(
+                out["spot_return"].squeeze(-1),
+                spot_r,
+                beta=max(self.beta, 0.0005),
+            )
+            loss = loss + self.w_spot_return * l_spot_ret
 
         return loss, l_q.item()

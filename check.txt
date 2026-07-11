@@ -1,0 +1,209 @@
+现在应该换成什么？
+
+我建议你把系统从：
+
+Frozen Rule System
+
+改成：
+
+Online Regime-Adaptive System
+
+也就是不再问：
+
+哪条规则跨月稳定？
+
+而是问：
+
+当前这一分钟，市场是否和历史上某类可交易状态足够相似？
+
+结构要改成：
+
+实时状态识别
+        ↓
+规则池只作为候选
+        ↓
+Rule Selector 判断当前规则是否可用
+        ↓
+RightTail / Execution / Exit 模型过滤
+        ↓
+TopK 交易
+更直接一点：固定规则应该只保留三类
+1. 永久风控规则
+
+这些可以冻结：
+
+spread 太宽不交易
+volume 不足不交易
+quote 不稳定不交易
+宏观事件前后降仓
+午盘低波不追 0DTE 买方
+当日连续亏损后降频
+
+这些不是 Alpha，是防止死掉的规则。
+
+2. 执行规则
+
+这些也可以冻结：
+
+entry ask / limit
+exit bid
+1-bar delay
+spread filter
+max position
+max daily loss
+3. Alpha 规则不能冻结
+
+这些不能长期冻结：
+
+call + stock_trend_down
+hot-score top percentile
+IC-weighted topk
+某个 state 下买 call / put
+
+Alpha 规则必须由 regime 动态激活。
+
+下一步最关键的改法
+
+你现在不要继续优化 4-6 月规则，而应该做一个失败归因表。
+
+把 7 月第一周所有失败交易拆成：
+
+1. 是方向错？
+2. 是方向对但期权没涨？
+3. 是最大浮盈出现过但没卖？
+4. 是 spread / slippage 吃掉收益？
+5. 是 State 判断错？
+6. 是 DTE 选错？
+7. 是进场太晚？
+8. 是本来应该不交易？
+
+这一步非常重要，因为“全部失败”可能有三种完全不同的含义。
+
+三种失败类型
+A. 方向错
+
+例如买 Call 后股票继续跌。
+
+这说明：
+
+Rule / State 本身失效
+
+应该删除或降权。
+
+B. 方向对，但期权不赚钱
+
+例如股票反弹了，但 0DTE Call 没怎么涨，甚至亏。
+
+这说明：
+
+DTE / IV / theta / spread 选择错
+
+可能应该用 1DTE，而不是 0DTE。
+
+C. 最大浮盈出现过，但最终亏
+
+这说明：
+
+入场可能没错
+退出系统失败
+
+应该优化 Edge decay / MFE capture，而不是删掉规则。
+
+如果不做这个归因，你会误杀一些本来有价值的信号。
+
+我对路线的修正判断
+
+之前我们说：
+
+State + Rule + Edge + TopK
+
+现在要改成：
+
+State Detection + Rule Selector + No-Trade Model + Execution Model + Exit Model
+
+其中最重要的是 No-Trade Model。
+
+因为 0DTE 买方策略里，真正赚钱的不是“多交易”，而是：
+
+大多数时候不交易
+少数时候重点击中
+
+如果 7 月第一周全部失败，说明你的系统现在最大问题不是“收益不够高”，而是：
+
+不会识别什么时候不该交易
+深度学习现在更有必要，但位置要对
+
+这次失败反而说明，深度学习可以上场了。
+
+但不是：
+
+Transformer → Buy Call
+
+而是：
+
+Deep Regime Detector → 当前是否像历史可交易状态？
+Rule Selector → 当前规则是否应该激活？
+No-Trade Model → 当前是否应该完全空仓？
+Exit Model → 当前浮盈是否应该锁定？
+
+尤其是 No-Trade Model，我认为现在优先级要提升到第一。
+
+标签可以这样设计：
+
+label_tradeable = 1：
+    规则触发后未来 5-15 分钟 bid/ask 可执行收益为正
+    且 MAE 可控
+    且 spread 没恶化
+
+label_tradeable = 0：
+    规则触发后方向错
+    或期权收益不足
+    或最大回撤过大
+    或 spread 恶化
+
+然后你不是预测涨跌，而是预测：
+
+这类信号现在是否值得交易？
+现在的策略结论
+
+我会非常明确地说：
+
+如果 4-6 月冻结规则验证 7 月第一周全部失败，这套固定规则模式暂时不能实盘。
+
+但这不等于整个项目失败。它说明你需要从“找规则”切到“识别规则生效条件”。
+
+下一步路线应该是：
+
+第一步：
+停止继续调冻结规则。
+
+第二步：
+做 7 月第一周失败归因：
+方向错 / 期权不涨 / 退出失败 / 执行失败 / DTE 错。
+
+第三步：
+建立 tradeable / no-trade 标签。
+
+第四步：
+训练轻量 Rule Selector / No-Trade Model。
+
+第五步：
+只允许模型判断 tradeable probability 高的规则进入 TopK。
+
+第六步：
+重新做 walk-forward：
+4月训练 → 5月验证
+4-5月训练 → 6月验证
+4-6月训练 → 7月验证
+逐步滚动，不再只看单次冻结。
+最重要的一句话
+
+这次失败不是让你继续找更复杂规则，而是告诉你：固定规则在 0DTE 上不可靠，系统必须升级成“动态判断当前是否可交易”的自适应系统。
+
+也就是说，下一阶段的核心不是：
+
+如何找到一条更好的规则？
+
+而是：
+
+如何让系统知道这条规则今天不该用？

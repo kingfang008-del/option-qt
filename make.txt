@@ -1,0 +1,104 @@
+我觉得下一步应该验证什么？
+
+我不会继续调模型。
+
+我会开始做 Alpha Attribution（Alpha 归因）。
+
+建立一张矩阵：
+
+State	TopK 收益	Call	Put	胜率	Sharpe
+Trend Up					
+Trend Down					
+High IV					
+Low IV					
+Gamma Pin					
+Opening					
+Lunch					
+Power Hour					
+
+然后：
+
+继续：
+
+拆。
+
+例如：
+
+Trend Down：
+
+再拆：
+
+Trend Down
+
++
+
+Opening
+
+Trend Down
+
++
+
+Power Hour
+
+Trend Down
+
++
+
+High IV
+
+你会发现：
+
+真正：
+
+赚钱：
+
+其实：
+
+可能：
+
+只有：
+
+几个：
+
+State。
+
+我真正关注的是一句话
+
+你提到：
+
+按日 TopK + State 后开始出现正收益。
+
+这在我看来，比 IC 从 0.03 提高到 0.05 更有价值。
+
+因为它说明：
+
+你的系统已经开始从寻找"全局预测器"，转向寻找"局部优势（Local Edge）"。
+
+这正是我们前面讨论的 State → Factor → Edge 架构的核心思想。
+
+我甚至建议你下一步不要再计算一个全局 IC，而是计算：
+
+Conditional IC（条件 IC）
+
+即：
+
+IC(State=s)
+
+对于每一个 State 单独计算：
+
+IC
+TopK 收益
+Sharpe
+胜率
+最大回撤
+
+如果你最终发现：
+
+只有 20% 的 State 有明显 Alpha，而另外 80% 没有甚至为负。
+
+那你的交易系统就应该设计成：
+
+只交易那 20% 的 State；
+其余时间全部空仓。
+
+对于 0DTE 和短期期权来说，这种“少交易、只做高 Edge 状态”的设计，往往比追求一个在所有市场环境都有效的预测模型更符合实际。

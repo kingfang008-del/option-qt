@@ -1,0 +1,10 @@
+{
+  "comment": "个股 LMDB stock_id/sector_id — 与 QQQ/SPY 独立编号",
+  "NVDA": {"stock_id": 101, "sector_id": 10},
+  "AAPL": {"stock_id": 102, "sector_id": 10},
+  "META": {"stock_id": 103, "sector_id": 10},
+  "TSLA": {"stock_id": 104, "sector_id": 10},
+  "MSFT": {"stock_id": 105, "sector_id": 10},
+  "GOOGL": {"stock_id": 106, "sector_id": 10},
+  "AMZN": {"stock_id": 107, "sector_id": 10}
+}

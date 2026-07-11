@@ -84,9 +84,12 @@ def select_front_dte(available_dtes: Sequence[int], cfg: dict) -> Optional[int]:
     prefer = int(cfg.get("front_prefer_dte", 0))
     dte_min = int(cfg.get("front_min_dte", 0))
     dte_max = int(cfg.get("front_max_dte", 2))
+    allow_fallback = bool(cfg.get("allow_front_dte_fallback", True))
 
     candidates = sorted({int(d) for d in available_dtes if dte_min <= int(d) <= dte_max and int(d) in allowed})
     if not candidates:
+        if not allow_fallback:
+            return None
         fallbacks = sorted({int(d) for d in available_dtes if int(d) >= dte_min})
         if not fallbacks:
             return None
@@ -180,7 +183,9 @@ def get_daily_locked_contracts(df: pd.DataFrame, cfg: dict) -> Optional[pd.DataF
     work["abs_delta"] = work["delta"].abs()
 
     dte_min = int(cfg.get("front_min_dte", 0))
-    dte_max = max(int(cfg.get("front_max_dte", 2)), 90 if cfg.get("use_next_buckets") else 2)
+    dte_max = int(cfg.get("front_max_dte", 2))
+    if cfg.get("use_next_buckets"):
+        dte_max = max(dte_max, 90)
     candidates = work[(work["dte"] >= dte_min) & (work["dte"] <= dte_max)].copy()
     if candidates.empty:
         return None
@@ -275,9 +280,12 @@ def select_front_expiration(exp_dtes: Sequence[Tuple[str, int]], cfg: dict) -> O
     dte_min = int(cfg.get("front_min_dte", 0))
     dte_max = int(cfg.get("front_max_dte", 2))
     allowed = set(cfg.get("front_allowed_dte") or [0, 1, 2])
+    allow_fallback = bool(cfg.get("allow_front_dte_fallback", True))
 
     valid = [(s, d) for s, d in exp_dtes if d >= dte_min and d in allowed and dte_min <= d <= dte_max]
     if not valid:
+        if not allow_fallback:
+            return None
         valid = [(s, d) for s, d in exp_dtes if d >= dte_min]
     if not valid:
         return None

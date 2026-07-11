@@ -195,6 +195,20 @@ class LMDBAlphaDataset(Dataset):
             target["put_return_fwd"] = float(np.nan_to_num(lbl["label_put_return_fwd_net"], nan=0.0))
         if "label_straddle_return_fwd_net" in lbl:
             target["straddle_return_fwd"] = float(np.nan_to_num(lbl["label_straddle_return_fwd_net"], nan=0.0))
+        if "label_spot_return_fwd_30m" in lbl and "label_spot_direction_30m" in lbl:
+            target["spot_return_fwd"] = float(np.nan_to_num(lbl["label_spot_return_fwd_30m"], nan=0.0))
+            target["spot_direction"] = int(np.nan_to_num(lbl["label_spot_direction_30m"], nan=1))
+        if "label_best_bucket_id" in lbl:
+            raw_bucket = int(np.nan_to_num(lbl["label_best_bucket_id"], nan=-1))
+            best_bucket = raw_bucket if 0 <= raw_bucket <= 7 else 8
+            if 0 <= raw_bucket <= 3:
+                best_side = 0  # PUT
+            elif 4 <= raw_bucket <= 7:
+                best_side = 2  # CALL
+            else:
+                best_side = 1  # NONE/flat
+            target["best_bucket"] = int(best_bucket)
+            target["best_side"] = int(best_side)
         return x_stock, x_option, static, target, ts
 
 
@@ -210,7 +224,9 @@ def collate_fn(batch):
     target = {
         k: torch.tensor(
             [b[3][k] for b in batch],
-            dtype=torch.long if k == "direction" else torch.float32,
+            dtype=torch.long
+            if k in {"direction", "best_side", "best_bucket", "spot_direction"}
+            else torch.float32,
         )
         for k in batch[0][3]
     }

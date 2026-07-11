@@ -171,10 +171,20 @@ production/preprocess/backtest/tools/archive.zip
 **/.DS_Store
 
 # --- qqq_btc / baseline 本地训练与验证产物（大文件，不入库） ---
+# 根目录模型权重与训练日志（含各实验子目录、train.log 等）
+/checkpoint/
+checkpoint/
 checkpoints_*/
+**/checkpoints_*/
 *.pth
 *.pt
 *.ckpt
+**/train.log
+**/events.out.tfevents.*
+wandb/
+runs/
+tb_logs/
+tensorboard/
 
 # baseline 规则/TFT 验证报告（JSON/CSV + 日明细子目录）
 New_Pro/baseline_qqq/reports/
@@ -189,3 +199,24 @@ qqq_wf_*/
 *.lmdb/
 *.lmdb-data
 *.lmdb-lock
+
+# --- 实验产物 / 大数据缓存（不入库，约 13GB+ parquet） ---
+# factor_lab / qqq_btc / stock_options 回测与 gate 结果
+factor_lab/results/
+qqq_btc/results/
+stock_options/results/
+
+# production 本地数据 dump
+production/*.parquet
+
+# 通用大体积数据产物（小配置类 parquet 用下方例外保留）
+*.parquet
+!risk_free_rates.parquet
+!**/risk_free_rates.parquet
+
+# 模型/数值缓存常见大文件
+*.pkl
+*.joblib
+*.feather
+*.h5
+*.hdf5

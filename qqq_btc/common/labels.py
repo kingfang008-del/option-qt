@@ -301,6 +301,54 @@ def _leg_net_arrays_subminute(
     return gross, net, valid, entry_premium
 
 
+def _entry_quote_arrays_subminute(
+    df: pd.DataFrame,
+    quotes_1s: pd.DataFrame,
+    fill_model: OptionSpreadFillModel,
+    horizon: LabelHorizon,
+    prefix: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return entry fill premium, spread pct, and entry quote validity."""
+    n = len(df)
+    if quotes_1s.empty or n == 0:
+        return np.zeros(n), np.ones(n), np.zeros(n, dtype=bool)
+
+    ts = pd.to_datetime(df["timestamp"])
+    if ts.dt.tz is None:
+        ts = ts.dt.tz_localize("America/New_York", ambiguous="infer")
+    else:
+        ts = ts.dt.tz_convert("America/New_York")
+
+    delay = int(horizon.entry_delay_seconds or 0)
+    sig_off = int(horizon.signal_offset_seconds)
+    entry_ts = ts + pd.to_timedelta(sig_off + delay, unit="s")
+    entry_q = _quotes_at_timestamps(
+        quotes_1s,
+        entry_ts,
+        tolerance_seconds=int(horizon.quote_tolerance_seconds),
+    )
+    if entry_q.empty:
+        return np.zeros(n), np.ones(n), np.zeros(n, dtype=bool)
+
+    bid = pd.to_numeric(entry_q[f"{prefix}_bid"], errors="coerce").to_numpy(dtype=np.float64)
+    ask = pd.to_numeric(entry_q[f"{prefix}_ask"], errors="coerce").to_numpy(dtype=np.float64)
+    mid = pd.to_numeric(entry_q.get(f"{prefix}_mid", (bid + ask) / 2.0), errors="coerce").to_numpy(dtype=np.float64)
+    entry_px = fill_model.entry_fill(bid, ask)
+    spread_pct = np.divide(
+        np.maximum(ask - bid, 0.0),
+        np.maximum(mid, 1e-9),
+        out=np.ones(n, dtype=np.float64),
+        where=np.isfinite(mid) & (mid > 0),
+    )
+    valid = (
+        np.isfinite(entry_px)
+        & (entry_px >= float(horizon.min_entry_premium))
+        & np.isfinite(spread_pct)
+        & (spread_pct >= 0)
+    )
+    return np.nan_to_num(entry_px, nan=0.0), np.nan_to_num(spread_pct, nan=1.0), valid
+
+
 def build_dual_leg_net_labels_subminute(
     df: pd.DataFrame,
     fill_model: OptionSpreadFillModel,
@@ -344,6 +392,115 @@ def build_dual_leg_net_labels_subminute(
     direction = np.ones(len(df), dtype=np.int8)
     direction[(call_net > m) & (call_net >= put_net)] = 2
     direction[(put_net > m) & (put_net > call_net)] = 0
+    df["label_direction_net"] = direction
+    return df
+
+
+def build_dynamic_ladder_net_labels_subminute(
+    df: pd.DataFrame,
+    fill_model: OptionSpreadFillModel,
+    horizon: LabelHorizon,
+    *,
+    quotes_by_bucket: dict[int, pd.DataFrame],
+    put_buckets: tuple[int, ...] = (0, 1, 2, 3),
+    call_buckets: tuple[int, ...] = (4, 5, 6, 7),
+    selection_mode: str = "oracle",
+) -> pd.DataFrame:
+    """
+    8 合约 ladder 标签。
+
+    selection_mode="oracle":每侧选择未来 fill 净收益最高的 bucket。
+    selection_mode="value_score":每侧只用入场时盘口 + delta ladder 选择 bucket,
+    再用被选 bucket 的未来收益做标签,避免 bucket 选择本身前视。
+    """
+    if horizon.entry_delay_seconds is None:
+        raise ValueError("build_dynamic_ladder_net_labels_subminute 需要 entry_delay_seconds")
+
+    n = len(df)
+    neg_inf = np.full(n, -np.inf, dtype=np.float64)
+    zero = np.zeros(n, dtype=np.float64)
+
+    def collect(bucket_ids: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        nets: list[np.ndarray] = []
+        grosses: list[np.ndarray] = []
+        valids: list[np.ndarray] = []
+        bucket_arrs: list[np.ndarray] = []
+        scores: list[np.ndarray] = []
+        # Ladder map convention: buckets inside each side are target |delta| 0.25/0.40/0.55/0.70.
+        target_deltas = np.linspace(0.25, 0.70, max(1, len(bucket_ids)))
+        for pos, bucket_id in enumerate(bucket_ids):
+            q = quotes_by_bucket.get(int(bucket_id), pd.DataFrame())
+            prefix = f"exec_b{int(bucket_id)}"
+            gross, net, valid, _prem = _leg_net_arrays_subminute(df, q, fill_model, horizon, prefix)
+            usable_net = np.where(valid, net, -np.inf)
+            entry_px, spread_pct, entry_valid = _entry_quote_arrays_subminute(df, q, fill_model, horizon, prefix)
+            delta_pref = 1.0 - np.minimum(np.abs(float(target_deltas[pos]) - 0.55) / 0.45, 1.0)
+            # Conservative ex-ante value proxy: prefer tradable 0.40-0.55 delta contracts,
+            # penalize wide spread and very expensive premium. No future return is used.
+            value_score = (
+                delta_pref
+                - 3.0 * np.clip(spread_pct, 0.0, 1.0)
+                - 0.02 * np.clip(entry_px, 0.0, 50.0)
+            )
+            value_score = np.where(valid & entry_valid & (spread_pct <= 0.15), value_score, -np.inf)
+            nets.append(usable_net)
+            grosses.append(np.where(valid, gross, 0.0))
+            valids.append(valid)
+            bucket_arrs.append(np.full(n, int(bucket_id), dtype=np.int16))
+            scores.append(value_score)
+
+        if not nets:
+            return neg_inf.copy(), zero.copy(), np.zeros(n, dtype=bool), np.full(n, -1, dtype=np.int16)
+
+        net_mat = np.vstack(nets)
+        gross_mat = np.vstack(grosses)
+        valid_mat = np.vstack(valids)
+        bucket_mat = np.vstack(bucket_arrs)
+        any_valid = valid_mat.any(axis=0)
+        if selection_mode == "value_score":
+            score_mat = np.vstack(scores)
+            any_valid = np.isfinite(score_mat).any(axis=0)
+            best_idx = np.argmax(score_mat, axis=0)
+        else:
+            best_idx = np.argmax(net_mat, axis=0)
+        col = np.arange(n)
+        best_net = net_mat[best_idx, col]
+        best_gross = gross_mat[best_idx, col]
+        best_bucket = bucket_mat[best_idx, col]
+        best_net = np.where(any_valid, best_net, 0.0)
+        best_gross = np.where(any_valid, best_gross, 0.0)
+        best_bucket = np.where(any_valid, best_bucket, -1)
+        return best_net, best_gross, any_valid, best_bucket.astype(np.int16)
+
+    put_net, put_gross, put_valid, put_bucket = collect(tuple(int(x) for x in put_buckets))
+    call_net, call_gross, call_valid, call_bucket = collect(tuple(int(x) for x in call_buckets))
+
+    call_wins = call_valid & (~put_valid | (call_net >= put_net))
+    put_wins = put_valid & (~call_valid | (put_net > call_net))
+    any_valid = call_wins | put_wins
+
+    best_net = np.where(call_wins, call_net, np.where(put_wins, put_net, 0.0))
+    best_gross = np.where(call_wins, call_gross, np.where(put_wins, put_gross, 0.0))
+    best_bucket = np.where(call_wins, call_bucket, np.where(put_wins, put_bucket, -1))
+
+    df["label_return_fwd_gross"] = best_gross
+    df["label_return_fwd_net"] = best_net
+    df["label_execution_cost"] = np.where(any_valid, best_gross - best_net, 0.0)
+    df["label_net_valid"] = any_valid
+
+    df["label_call_return_fwd_net"] = np.where(call_valid, call_net, 0.0)
+    df["label_put_return_fwd_net"] = np.where(put_valid, put_net, 0.0)
+    df["label_put_net_valid"] = put_valid
+
+    df["label_straddle_return_fwd_net"] = 0.0
+    df["label_straddle_valid"] = False
+    df["label_best_bucket_id"] = best_bucket.astype(np.int16)
+    df["label_best_side"] = np.where(call_wins, "CALL", np.where(put_wins, "PUT", "NONE"))
+
+    m = horizon.flat_margin
+    direction = np.ones(n, dtype=np.int8)
+    direction[(call_net > m) & call_wins] = 2
+    direction[(put_net > m) & put_wins] = 0
     df["label_direction_net"] = direction
     return df
 

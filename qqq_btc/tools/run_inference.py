@@ -109,6 +109,15 @@ def run_inference_df(
         "call_net_edge": np.zeros(n),
         "put_net_edge": np.zeros(n),
         "straddle_net_edge": np.zeros(n),
+        "best_side_put_prob": np.zeros(n),
+        "best_side_none_prob": np.zeros(n),
+        "best_side_call_prob": np.zeros(n),
+        "best_bucket_id": np.full(n, -1),
+        "best_bucket_conf": np.zeros(n),
+        "spot_down_prob": np.zeros(n),
+        "spot_flat_prob": np.zeros(n),
+        "spot_up_prob": np.zeros(n),
+        "spot_return_pred": np.zeros(n),
     }
 
     for start in range(0, n, batch_size):
@@ -127,9 +136,34 @@ def run_inference_df(
         }
         with torch.no_grad():
             out = model(x_stk, x_opt, static)
-        for k in preds:
+        for k in (
+            "net_edge",
+            "net_edge_q10",
+            "net_edge_q50",
+            "net_edge_q90",
+            "call_net_edge",
+            "put_net_edge",
+            "straddle_net_edge",
+            "spot_return",
+        ):
             if k in out:
-                preds[k][start:end] = out[k].squeeze(-1).cpu().numpy()
+                out_key = "spot_return_pred" if k == "spot_return" else k
+                preds[out_key][start:end] = out[k].squeeze(-1).cpu().numpy()
+        if "logits_best_side" in out:
+            p_side = torch.softmax(out["logits_best_side"], dim=-1).cpu().numpy()
+            preds["best_side_put_prob"][start:end] = p_side[:, 0]
+            preds["best_side_none_prob"][start:end] = p_side[:, 1]
+            preds["best_side_call_prob"][start:end] = p_side[:, 2]
+        if "logits_best_bucket" in out:
+            p_bucket = torch.softmax(out["logits_best_bucket"], dim=-1).cpu().numpy()
+            bucket_id = np.argmax(p_bucket, axis=1)
+            preds["best_bucket_id"][start:end] = np.where(bucket_id <= 7, bucket_id, -1)
+            preds["best_bucket_conf"][start:end] = np.max(p_bucket, axis=1)
+        if "logits_spot_dir" in out:
+            p_spot = torch.softmax(out["logits_spot_dir"], dim=-1).cpu().numpy()
+            preds["spot_down_prob"][start:end] = p_spot[:, 0]
+            preds["spot_flat_prob"][start:end] = p_spot[:, 1]
+            preds["spot_up_prob"][start:end] = p_spot[:, 2]
 
     for k, v in preds.items():
         work[k] = v
@@ -147,6 +181,7 @@ def run_inference_df(
 def main() -> None:
     import torch
 
+    from qqq_btc.common.seed_utils import resolve_seed, set_global_seed
     from qqq_btc.model.backbone import DualStreamAlphaNet, resolve_embedding_caps  # noqa: F401
 
     parser = argparse.ArgumentParser(description="qqq_btc 模型推理")
@@ -158,6 +193,7 @@ def main() -> None:
     parser.add_argument("--symbol-map", default="qqq_btc/CONFIG/symbol_map.json")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=None, help="默认 42 或环境变量 QQQ_BTC_SEED")
     parser.add_argument(
         "--no-carryover",
         action="store_true",
@@ -166,6 +202,9 @@ def main() -> None:
     parser.add_argument("--carryover-bars", type=int, default=DEFAULT_CARRYOVER_BARS)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    seed = set_global_seed(resolve_seed(args.seed), deterministic=True)
+    logger.info("global seed=%s", seed)
 
     device = torch.device(
         args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")

@@ -30,6 +30,7 @@ if str(_REPO) not in sys.path:
 
 from qqq_btc.common.labels import (
     LabelHorizon,
+    build_dynamic_ladder_net_labels_subminute,
     build_dual_leg_net_labels,
     build_dual_leg_net_labels_subminute,
     label_quality_report,
@@ -52,6 +53,8 @@ LABEL_COLS = [
     "label_put_net_valid",
     "label_straddle_return_fwd_net",
     "label_straddle_valid",
+    "label_best_bucket_id",
+    "label_best_side",
 ]
 
 
@@ -111,13 +114,42 @@ def process_dataframe(
     if "trend_fit_ret_30m" not in df.columns:
         df = add_trend_features(df, price_col=price_col)
     hz = horizon or qcfg.LABEL_HORIZON
-    if hz.entry_delay_seconds is not None:
+    if hz.entry_delay_seconds is not None and bool(anchor_cfg.get("dynamic_ladder_label", False)):
+        raw_1s_value = str(anchor_cfg.get("paths", {}).get("sniper_option_dir", "")).strip()
+        raw_1s_dir = Path(raw_1s_value).expanduser() if raw_1s_value else None
+        put_buckets = tuple(int(x) for x in anchor_cfg.get("dynamic_put_buckets", [0, 1, 2, 3]))
+        call_buckets = tuple(int(x) for x in anchor_cfg.get("dynamic_call_buckets", [4, 5, 6, 7]))
+        quotes_by_bucket = {}
+        for bucket_id in put_buckets + call_buckets:
+            q = anchor.load_bucket_second_quotes(
+                symbol,
+                df["timestamp"],
+                int(bucket_id),
+                anchor_cfg,
+                prefix=f"exec_b{int(bucket_id)}",
+                raw_1s_dir=raw_1s_dir,
+            )
+            if q.empty:
+                raise ValueError(f"1s 报价为空,无法构建 dynamic ladder 标签: bucket={bucket_id}")
+            quotes_by_bucket[int(bucket_id)] = q
+        df = build_dynamic_ladder_net_labels_subminute(
+            df,
+            qcfg.FILL_MODEL,
+            hz,
+            quotes_by_bucket=quotes_by_bucket,
+            put_buckets=put_buckets,
+            call_buckets=call_buckets,
+            selection_mode=str(anchor_cfg.get("dynamic_ladder_selection", "oracle")),
+        )
+    elif hz.entry_delay_seconds is not None:
         legs = anchor_cfg.get("dual_leg_buckets") or anchor.DUAL_LEG_BUCKETS
+        raw_1s_value = str(anchor_cfg.get("paths", {}).get("sniper_option_dir", "")).strip()
+        raw_1s_dir = Path(raw_1s_value).expanduser() if raw_1s_value else None
         call_q = anchor.load_bucket_second_quotes(
-            symbol, df["timestamp"], int(legs["exec_call"]), anchor_cfg, prefix="exec_call"
+            symbol, df["timestamp"], int(legs["exec_call"]), anchor_cfg, prefix="exec_call", raw_1s_dir=raw_1s_dir
         )
         put_q = anchor.load_bucket_second_quotes(
-            symbol, df["timestamp"], int(legs["exec_put"]), anchor_cfg, prefix="exec_put"
+            symbol, df["timestamp"], int(legs["exec_put"]), anchor_cfg, prefix="exec_put", raw_1s_dir=raw_1s_dir
         )
         if call_q.empty or put_q.empty:
             raise ValueError("1s 报价为空,无法构建子分钟标签")

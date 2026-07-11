@@ -37,14 +37,16 @@ def _round4(x: float) -> float:
 
 def resolve_raw1s_option_dir(raw_dir: Path, symbol: str) -> Path:
     """
-    兼容两种布局:
+    兼容多种布局:
       {raw_dir}/options/{symbol}/              # 旧 polygon/raw_1s
       {raw_dir}/options_databento/{symbol}/    # 0DTE databento
-      {raw_dir}/{symbol}/                      # 直接指向 options_databento 根
+      {raw_dir}/dte1_options/{symbol}/         # 1DTE polygon
+      {raw_dir}/{symbol}/                      # 直接指向 options 根
     """
     candidates = [
         raw_dir / "options" / symbol,
         raw_dir / "options_databento" / symbol,
+        raw_dir / "dte1_options" / symbol,
         raw_dir / symbol,
     ]
     for p in candidates:

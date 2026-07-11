@@ -1,0 +1,44 @@
+{
+  "name": "weekly_finetune_v1",
+  "description": "生产周更微调规范：V4 底座 + 近月微调 + OOS 门禁 + 产物归档。不通过门禁不替换生产权重。",
+  "seed": 42,
+  "base_checkpoint": "checkpoint/checkpoints_qqq_v4/best.pth",
+  "production_checkpoint_link": "checkpoint/checkpoints_qqq_prod/best.pth",
+  "config": "qqq_btc/CONFIG/slow_feature_qqq_v4.json",
+  "symbol_map": "qqq_btc/CONFIG/symbol_map.json",
+  "symbol": "QQQ",
+  "device": "cuda",
+  "windows": {
+    "train_lookback_months": 2,
+    "val_lookback_months": 1,
+    "note": "train=最近 N 个完整月特征；val=最近 M 个月（通常含在 train 内）；OOS=单独指定的最近一周特征根"
+  },
+  "train": {
+    "epochs": 20,
+    "batch_size": 512,
+    "num_workers": 4,
+    "window_step": 1
+  },
+  "paths": {
+    "feature_train_root": "~/train_data/_bak_pre4c/quote_features_test_QQQ/regular/09:30-16:00",
+    "feature_oos_root": "~/train_data/july_w1_v4_databento/quote_features_test",
+    "option_1m_oos_root": "~/train_data/july_w1_v4_databento/options_1m_july_w1",
+    "lmdb_root": "~/train_data/lmdb",
+    "runs_root": "~/train_data/weekly_finetune_runs",
+    "results_root": "qqq_btc/results/weekly_finetune"
+  },
+  "gate": {
+    "min_trades": 3,
+    "require_not_worse_return": true,
+    "min_return_delta": 0.0,
+    "max_drawdown_worse_tol": 0.05,
+    "require_hit_rate_floor": 0.0,
+    "promote_on_pass": true,
+    "note": "候选相对 baseline：收益不低于旧版；回撤恶化不超过 tol；成交笔数 >= min_trades。否则保留旧生产权重。"
+  },
+  "archive": {
+    "copy_infer": true,
+    "copy_replay_summary": true,
+    "write_manifest": true
+  }
+}

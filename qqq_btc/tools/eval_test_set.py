@@ -211,10 +211,18 @@ def main() -> None:
     parser.add_argument("--symbol-map", default="qqq_btc/CONFIG/symbol_map.json")
     parser.add_argument("--output-dir", default="/tmp/qqq_btc_test_eval")
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--seed", type=int, default=None, help="默认 42 或环境变量 QQQ_BTC_SEED")
+    parser.add_argument("--call-bucket", type=int, default=qcfg.TRADE_BUCKET_ID)
+    parser.add_argument("--put-bucket", type=int, default=0)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     import torch
+
+    from qqq_btc.common.seed_utils import resolve_seed, set_global_seed
+
+    seed = set_global_seed(resolve_seed(args.seed), deterministic=True)
+    logger.info("global seed=%s", seed)
 
     device = torch.device(
         args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -254,8 +262,8 @@ def main() -> None:
             pred,
             Path(args.option_1m_root),
             args.symbol,
-            call_bucket=qcfg.TRADE_BUCKET_ID,
-            put_bucket=0,
+            call_bucket=args.call_bucket,
+            put_bucket=args.put_bucket,
         )
         all_parts.append(pred)
 
@@ -282,8 +290,11 @@ def main() -> None:
     summary["label_metrics"] = metrics
     summary["n_rows"] = int(len(full))
     summary["checkpoint"] = str(args.checkpoint)
+    summary["seed"] = int(seed)
     summary["session_entry_start_bar"] = qcfg.REPLAY.session_entry_start_bar
     summary["session_entry_end_bar"] = qcfg.REPLAY.session_entry_end_bar
+    summary["call_bucket"] = int(args.call_bucket)
+    summary["put_bucket"] = int(args.put_bucket)
 
     summary_path = out_dir / "replay_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:

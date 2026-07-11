@@ -1,0 +1,28 @@
+{
+  "profile": "qqq_9dte_legacy",
+  "description": "Legacy ~9DTE front + next month, 6-bucket; 数据源 /mnt/s990/data/raw_1s/options/QQQ",
+
+  "front_allowed_dte": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+  "front_prefer_dte": 9,
+  "front_min_dte": 5,
+  "front_max_dte": 16,
+  "use_next_buckets": true,
+
+  "min_volume": 0,
+  "atm_center": 0.50,
+  "otm_center": 0.25,
+  "delta_tolerance": 0.15,
+
+  "label_trade_bucket_id": 2,
+  "label_dte_min": 5,
+  "label_dte_max": 16,
+
+  "symbols": ["QQQ"],
+
+  "paths": {
+    "raw_iv_dir": "~/train_data/nq_options_day_iv",
+    "sniper_option_dir": "~/train_data/option_quote_sniper",
+    "day_iv_dir": "~/train_data/quote_options_day_iv_9dte_legacy",
+    "locked_targets_output": "~/train_data/locked_targets_map.parquet"
+  }
+}

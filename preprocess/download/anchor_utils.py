@@ -8,10 +8,11 @@ step1 锚点配置加载 —— profile / JSON 参数化，选约逻辑复用 qq
   preprocess/CONFIG/anchor_legacy_9dte.json
 
 内置 profile:
-  qqq_0dte     → 0/1/2 DTE, 4 bucket (与 qqq_btc 对齐)
+  qqq_0dte     → strict 0 DTE only;无 0DTE 则跳过当天
+  qqq_1dte     → strict 1 DTE only;无 1DTE 则跳过当天
   legacy_9dte  → ~9 DTE + 次月, 6 bucket
 
-也可 --config 指定任意 JSON(字段与 qqq_btc/CONFIG/anchor_qqq_0dte.json 同 schema)。
+也可 --profile 任意名称(自动查找 CONFIG/anchor_{profile}.json)，或 --config 指定 JSON。
 """
 from __future__ import annotations
 
@@ -48,8 +49,20 @@ _CONFIG_DIR = _config_dir()
 
 BUILTIN_PROFILES = {
     "qqq_0dte": _CONFIG_DIR / "anchor_qqq_0dte.json",
+    "qqq_1dte": _CONFIG_DIR / "anchor_qqq_1dte.json",
     "legacy_9dte": _CONFIG_DIR / "anchor_legacy_9dte.json",
 }
+
+
+def _profile_config_path(profile: str) -> Path | None:
+    """按 profile 名解析 anchor JSON：内置表 → CONFIG/anchor_{profile}.json。"""
+    if profile in BUILTIN_PROFILES:
+        return BUILTIN_PROFILES[profile]
+    for d in _CONFIG_CANDIDATES:
+        p = d / f"anchor_{profile}.json"
+        if p.exists():
+            return p
+    return None
 
 
 def resolve_anchor_config(
@@ -65,12 +78,14 @@ def resolve_anchor_config(
 
     prof = profile or os.environ.get("OPTION_ANCHOR_PROFILE")
     if prof:
-        if prof not in BUILTIN_PROFILES:
+        path = _profile_config_path(prof)
+        if path is None or not path.exists():
             known = ", ".join(BUILTIN_PROFILES)
-            raise ValueError(f"未知 profile {prof!r},可选: {known}")
-        path = BUILTIN_PROFILES[prof]
-        if not path.exists():
-            raise FileNotFoundError(f"profile {prof!r} 配置文件不存在: {path}")
+            raise FileNotFoundError(
+                f"未知 profile {prof!r}，且未找到 anchor_{prof}.json\n"
+                f"内置可选: {known}\n"
+                f"或在 {_CONFIG_DIR} 下创建 anchor_{prof}.json"
+            )
         return load_anchor_config(path)
 
     env_path = os.environ.get("ANCHOR_CONFIG_PATH")

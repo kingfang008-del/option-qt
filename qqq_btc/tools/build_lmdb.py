@@ -82,6 +82,9 @@ OPTIONAL_LABELS = [
     "label_net_valid",
     "label_put_net_valid",
     "label_straddle_valid",
+    "label_best_bucket_id",
+    "label_spot_return_fwd_30m",
+    "label_spot_direction_30m",
 ]
 
 
@@ -132,6 +135,32 @@ def to_np(df: pd.DataFrame, cols: list[str]) -> np.ndarray:
     return df[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values.astype(np.float32)
 
 
+def add_spot_forward_labels(
+    df: pd.DataFrame,
+    *,
+    horizon_bars: int = 30,
+    flat_threshold: float = 0.0015,
+) -> pd.DataFrame:
+    """Add same-session future spot return/direction labels for route training."""
+    price_col = next((c for c in ("close", "vwap", "price") if c in df.columns), None)
+    if price_col is None:
+        return df
+    out = df.sort_values("timestamp").copy()
+    ts = pd.to_datetime(out["timestamp"])
+    if ts.dt.tz is None:
+        ts = ts.dt.tz_localize("UTC")
+    day = ts.dt.tz_convert("America/New_York").dt.date
+    px = pd.to_numeric(out[price_col], errors="coerce")
+    fwd = px.groupby(day).shift(-int(horizon_bars))
+    ret = (fwd / px.replace(0, np.nan)) - 1.0
+    direction = np.ones(len(out), dtype=np.int8)
+    direction[ret > float(flat_threshold)] = 2
+    direction[ret < -float(flat_threshold)] = 0
+    out["label_spot_return_fwd_30m"] = ret.fillna(0.0).astype(float)
+    out["label_spot_direction_30m"] = direction
+    return out
+
+
 def build_samples_for_pair(
     f_1m: Path,
     f_5m: Path,
@@ -143,7 +172,7 @@ def build_samples_for_pair(
     label_cols: list[str],
     window_step: int = WINDOW_STEP,
 ) -> list[tuple[bytes, bytes]]:
-    df_1m = enrich_trend_features(pd.read_parquet(f_1m))
+    df_1m = add_spot_forward_labels(enrich_trend_features(pd.read_parquet(f_1m)))
     df_5m = pd.read_parquet(f_5m)
     for col in REQUIRED_LABELS:
         if col not in df_1m.columns:

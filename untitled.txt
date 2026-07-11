@@ -1,0 +1,15 @@
+PY=/home/kingfang007/anaconda3/envs/ibkr/bin/python
+OUT1S=/mnt/s990/data/v4_original_jul5/massive_verify/raw_1s
+OUT1M=/mnt/s990/data/v4_original_jul5/massive_verify/raw_1m
+MAP=/mnt/s990/data/v4_original_jul5/locked_maps/massive_redownload_apr_jun_2026.parquet
+LOG=/mnt/s990/data/v4_original_jul5/manifest/massive_redownload.log
+mkdir -p "$OUT1S" "$OUT1M" "$(dirname "$LOG")"
+export PYTHONPATH="$REPO"
+: > "$LOG"
+echo "[$(date)] start polygon redownload Apr-Jun" | tee -a "$LOG"
+$PY "$REPO/preprocess/download/step2_polygon_second_sniper_v1.py" \
+  --target-map "$MAP" \
+  --output-dir "$OUT1S" \
+  --no-download-stock \
+  --max-workers 12 2>&1 | tee -a "$LOG"
+echo "[$(date)] step3 aggregate" | tee -a "$LOG"

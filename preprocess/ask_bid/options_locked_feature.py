@@ -76,15 +76,31 @@ def calculate_locked_features(df: pd.DataFrame) -> pd.DataFrame:
     df_wide = df_wide.fillna(0.0)
 
     # --- 4. 华尔街级微观结构特征计算 (严谨物理隔离版) ---
-    # 获取底层数据字典，0: PUT_ATM, 1: PUT_OTM, 2: CALL_ATM, 3: CALL_OTM
-    v = {i: df_wide.get(f'volume_{i}', 0) for i in range(6)}
-    iv = {i: df_wide.get(f'iv_{i}', 0) for i in range(6)}
-    vega = {i: df_wide.get(f'vega_{i}', 0) for i in range(6)}
-    gamma = {i: df_wide.get(f'gamma_{i}', 0) for i in range(6)}
-    delta = {i: df_wide.get(f'delta_{i}', 0) for i in range(6)}
-    theta = {i: df_wide.get(f'theta_{i}', 0) for i in range(6)}  # 👈 [新增] 补上 Theta 字典
-    
-    total_vol_front = v[0] + v[1] + v[2] + v[3]
+    max_bucket = max(
+        [int(c.rsplit('_', 1)[1]) for c in df_wide.columns if c.startswith('volume_') and c.rsplit('_', 1)[-1].isdigit()],
+        default=5,
+    )
+    n_buckets = max(6, max_bucket + 1)
+    v = {i: df_wide.get(f'volume_{i}', 0) for i in range(n_buckets)}
+    iv = {i: df_wide.get(f'iv_{i}', 0) for i in range(n_buckets)}
+    vega = {i: df_wide.get(f'vega_{i}', 0) for i in range(n_buckets)}
+    gamma = {i: df_wide.get(f'gamma_{i}', 0) for i in range(n_buckets)}
+    delta = {i: df_wide.get(f'delta_{i}', 0) for i in range(n_buckets)}
+    theta = {i: df_wide.get(f'theta_{i}', 0) for i in range(n_buckets)}
+
+    is_ladder8 = max_bucket >= 7
+    if is_ladder8:
+        put_ids, call_ids = [0, 1, 2, 3], [4, 5, 6, 7]
+        put_atm, put_otm = 2, 0
+        call_atm, call_otm = 6, 4
+        front_ids = put_ids + call_ids
+    else:
+        put_ids, call_ids = [0, 1], [2, 3]
+        put_atm, put_otm = 0, 1
+        call_atm, call_otm = 2, 3
+        front_ids = [0, 1, 2, 3]
+
+    total_vol_front = sum(v[i] for i in front_ids)
     mask_no_vol = (total_vol_front < 1.0)
     
     # ---------------------------------------------------------
@@ -92,34 +108,33 @@ def calculate_locked_features(df: pd.DataFrame) -> pd.DataFrame:
     # ---------------------------------------------------------
     # 1. 真实基准 IV (Baseline IV): 绝对不混合 Call 和 Put！
     # 业界标准：只取平值期权 (ATM) 的均值，因为 ATM 流动性最好，Skew 扭曲最小。
-    df_wide['options_vw_iv'] = (iv[0] + iv[2]) / 2.0 
+    df_wide['options_vw_iv'] = (iv[put_atm] + iv[call_atm]) / 2.0 
     
     # 2. 净 Delta 敞口 (Net Delta Exposure) - 按成交量加权是合理的！
     # 因为 Put 的 Delta 是负数，Call 是正数，按成交量加总正好代表了市场资金的“净做多/做空方向”
-    net_delta_vol = delta[0]*v[0] + delta[1]*v[1] + delta[2]*v[2] + delta[3]*v[3]
+    net_delta_vol = sum(delta[i] * v[i] for i in front_ids)
     df_wide['options_vw_delta'] = np.where(mask_no_vol, 0.0, net_delta_vol / (total_vol_front + epsilon))
 
     # 3. 净 Gamma/Vega 敞口 (Market Maker Exposure)
     # 既然是测算做市商敞口，用简单的算术平均毫无意义。有量才有敞口。
-    net_gamma = gamma[0]*v[0] + gamma[1]*v[1] + gamma[2]*v[2] + gamma[3]*v[3]
-    net_vega = vega[0]*v[0] + vega[1]*v[1] + vega[2]*v[2] + vega[3]*v[3]
-    net_theta = theta[0]*v[0] + theta[1]*v[1] + theta[2]*v[2] + theta[3]*v[3] # 👈 [新增] 净 Theta 敞口
+    net_gamma = sum(gamma[i] * v[i] for i in front_ids)
+    net_vega = sum(vega[i] * v[i] for i in front_ids)
+    net_theta = sum(theta[i] * v[i] for i in front_ids)
     
-    df_wide['options_vw_gamma'] = np.where(mask_no_vol, (gamma[0]+gamma[2])/2.0, net_gamma / (total_vol_front + epsilon))
-    df_wide['options_vw_vega']  = np.where(mask_no_vol, (vega[0]+vega[2])/2.0, net_vega / (total_vol_front + epsilon))
-    df_wide['options_vw_theta'] = np.where(mask_no_vol, (theta[0]+theta[2])/2.0, net_theta / (total_vol_front + epsilon)) # 👈 [新增] 净 Theta 敞口
+    df_wide['options_vw_gamma'] = np.where(mask_no_vol, (gamma[put_atm]+gamma[call_atm])/2.0, net_gamma / (total_vol_front + epsilon))
+    df_wide['options_vw_vega']  = np.where(mask_no_vol, (vega[put_atm]+vega[call_atm])/2.0, net_vega / (total_vol_front + epsilon))
+    df_wide['options_vw_theta'] = np.where(mask_no_vol, (theta[put_atm]+theta[call_atm])/2.0, net_theta / (total_vol_front + epsilon))
     
     # Vanna 和 Charm 取 ATM 的平均 (因为 OTM 经常失真)
-    df_wide['options_vw_vanna'] = (df_wide.get('vanna_0',0) + df_wide.get('vanna_2',0)) / 2.0
-    df_wide['options_vw_charm'] = (df_wide.get('charm_0',0) + df_wide.get('charm_2',0)) / 2.0
+    df_wide['options_vw_vanna'] = (df_wide.get(f'vanna_{put_atm}',0) + df_wide.get(f'vanna_{call_atm}',0)) / 2.0
+    df_wide['options_vw_charm'] = (df_wide.get(f'charm_{put_atm}',0) + df_wide.get(f'charm_{call_atm}',0)) / 2.0
 
     # ---------------------------------------------------------
     # B. 流动性与微观失衡特征 (Microstructure)
     # ---------------------------------------------------------
     def calc_vw_pure(metric):
         """纯量加权，断流时给 0，绝不用算术平均糊弄"""
-        m0, m1, m2, m3 = [df_wide.get(f'{metric}_{i}', 0) for i in range(4)]
-        weighted_sum = m0*v[0] + m1*v[1] + m2*v[2] + m3*v[3]
+        weighted_sum = sum(df_wide.get(f'{metric}_{i}', 0) * v[i] for i in front_ids)
         return np.where(mask_no_vol, 0.0, weighted_sum / (total_vol_front + epsilon))
 
     # 做市商恐慌度: Spread 突然拉大是暴跌前兆
@@ -132,21 +147,21 @@ def calculate_locked_features(df: pd.DataFrame) -> pd.DataFrame:
     # C. 偏斜与期限结构 (Skew & Term Structure)
     # ---------------------------------------------------------
     # 真实资金倾向 (Put/Call Ratio)
-    denom_call_vol = v[2] + v[3]
-    df_wide['options_pcr_volume'] = np.where(denom_call_vol > 0, (v[0] + v[1]) / denom_call_vol, 1.0) 
+    denom_call_vol = sum(v[i] for i in call_ids)
+    df_wide['options_pcr_volume'] = np.where(denom_call_vol > 0, sum(v[i] for i in put_ids) / denom_call_vol, 1.0) 
     
     # 偏斜 (Volatility Skew): 严格遵守物理法则！
     # 1. Flow Skew: 虚值 Put 溢价 vs 虚值 Call 溢价 (衡量暴跌恐慌)
-    df_wide['options_flow_skew'] = np.where(iv[3] > 0.01, iv[1] / (iv[3] + epsilon), 1.0)
+    df_wide['options_flow_skew'] = np.where(iv[call_otm] > 0.01, iv[put_otm] / (iv[call_otm] + epsilon), 1.0)
     
     # 2. Struc Skew: 虚值 Put 溢价 vs 平值 Put 溢价 (衡量护盘成本)
-    df_wide['options_struc_skew'] = np.where(iv[0] > 0.01, iv[1] / (iv[0] + epsilon), 1.0)
+    df_wide['options_struc_skew'] = np.where(iv[put_atm] > 0.01, iv[put_otm] / (iv[put_atm] + epsilon), 1.0)
 
     # 期限结构: 次月 ATM vs 近月 ATM (Contango / Backwardation)
     front_atm = df_wide['options_vw_iv']
-    next_atm = (iv[4] + iv[5]) / 2.0
+    next_atm = (iv[4] + iv[5]) / 2.0 if not is_ladder8 else 0.0
     df_wide['options_struc_atm_iv'] = front_atm
-    df_wide['options_struc_term'] = np.where((next_atm > 0.01) & (front_atm > 0.01), next_atm - front_atm, 0.0)
+    df_wide['options_struc_term'] = np.where((next_atm > 0.01) & (front_atm > 0.01), next_atm - front_atm, 0.0) if not is_ladder8 else 0.0
 
     # ---------------------------------------------------------
     # D. 时序导数特征

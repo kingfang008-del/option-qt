@@ -1,11 +1,12 @@
 {
   "profile": "qqq_0dte",
-  "description": "QQQ 0DTE/1DTE front expiry，4-bucket，训练/标签/实盘对齐",
+  "description": "QQQ strict 0DTE only，4-bucket；当天无 0DTE 合约则跳过",
 
-  "front_allowed_dte": [0, 1, 2],
+  "front_allowed_dte": [0],
   "front_prefer_dte": 0,
   "front_min_dte": 0,
-  "front_max_dte": 2,
+  "front_max_dte": 0,
+  "allow_front_dte_fallback": false,
   "use_next_buckets": false,
 
   "delta_tolerance": 0.15,

@@ -267,8 +267,8 @@ class DualStreamAlphaNet(nn.Module):
     输出:logits_dir / gross_return / execution_cost / net_edge(_raw)
          / net_edge_q10/q50/q90 / call_net_edge / put_net_edge / straddle_net_edge。
 
-    call_net_edge / put_net_edge 经 softplus 保证非负;训练用有符号标签 + 负样本压零,
-    不再 clamp(label,min=0)。rank 损失提升 bar 级排序。
+    call_net_edge / put_net_edge 经 softplus 保证非负;与 V4 训练/归档 infer 一致。
+    训练用有符号标签 + 负样本压零,不再 clamp(label,min=0)。
     straddle_net_edge 为有符号输出:跨式大多数交易日净收益为负(双份 theta),
     负值区分度("-2% 还是 -30%")本身就是信息,不能截断。
     """
@@ -317,6 +317,10 @@ class DualStreamAlphaNet(nn.Module):
         self.head_call_net_edge = head()
         self.head_put_net_edge = head()
         self.head_straddle_net_edge = head()
+        self.head_best_side = head(3)
+        self.head_best_bucket = head(9)
+        self.head_spot_dir = head(3)
+        self.head_spot_return = head()
         self.head_net_edge_quantile = MonotoneQuantileHead(hidden_dim)
         self.symbol_calibrator = PerSymbolCalibrator(caps["stock"], hidden_dim)
 
@@ -360,6 +364,10 @@ class DualStreamAlphaNet(nn.Module):
             "call_net_edge": F.softplus(self.head_call_net_edge(fused)),
             "put_net_edge": F.softplus(self.head_put_net_edge(fused)),
             "straddle_net_edge": self.head_straddle_net_edge(fused),
+            "logits_best_side": self.head_best_side(fused),
+            "logits_best_bucket": self.head_best_bucket(fused),
+            "logits_spot_dir": self.head_spot_dir(fused),
+            "spot_return": self.head_spot_return(fused),
         }
 
 
@@ -376,6 +384,10 @@ FINETUNE_TRAINABLE_PREFIXES = (
     "head_call_net_edge",
     "head_put_net_edge",
     "head_straddle_net_edge",
+    "head_best_side",
+    "head_best_bucket",
+    "head_spot_dir",
+    "head_spot_return",
     "symbol_calibrator",
 )
 

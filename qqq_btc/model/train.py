@@ -50,16 +50,30 @@ from .losses import NetEdgeLoss
 logger = logging.getLogger("qqq_btc.train")
 
 
-def set_seed(seed: int = 42) -> None:
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+def set_seed(seed: int = 42) -> int:
+    from qqq_btc.common.seed_utils import set_global_seed
+
+    return set_global_seed(seed, deterministic=True)
+
+
+def _validation_columns(config: dict) -> tuple[str, str, str | None]:
+    target = str(config.get("validation_target", "net")).lower()
+    if target == "call":
+        return "call_net_edge", "call_return_fwd", None
+    if target == "put":
+        return "put_net_edge", "put_return_fwd", None
+    if target == "straddle":
+        return "straddle_net_edge", "straddle_return_fwd", None
+    if target == "net_q90":
+        return "net_edge_q90", "return_fwd", None
+    return "net_edge", "return_fwd", "net_edge_q10"
 
 
 @torch.no_grad()
-def validate(model, loader, device) -> dict:
+def validate(model, loader, device, config=None) -> dict:
     """per-symbol IC + top 分位净收益 + q10 校准率。"""
+    pred_key, target_key, q10_key = _validation_columns(config or {})
+    target_mode = str((config or {}).get("validation_target", "net")).lower()
     model.eval()
     preds, q10s, rets, sids = [], [], [], []
     for b in loader:
@@ -69,9 +83,72 @@ def validate(model, loader, device) -> dict:
         out = model(
             x_stk.to(device), x_opt.to(device), {k: v.to(device) for k, v in s.items()}
         )
-        preds.extend(out["net_edge"].cpu().numpy().flatten())
-        q10s.extend(out["net_edge_q10"].cpu().numpy().flatten())
-        rets.extend(t["return_fwd"].numpy().flatten())
+        if target_mode in {"dual", "best_leg", "call_put"}:
+            if (
+                "call_net_edge" not in out
+                or "put_net_edge" not in out
+                or "call_return_fwd" not in t
+                or "put_return_fwd" not in t
+            ):
+                logger.warning("验证目标缺失: dual call/put head or target")
+                continue
+            pred_v = torch.maximum(
+                out["call_net_edge"].squeeze(-1),
+                out["put_net_edge"].squeeze(-1),
+            )
+            target_v = torch.maximum(
+                t["call_return_fwd"].to(device),
+                t["put_return_fwd"].to(device),
+            )
+            preds.extend(pred_v.cpu().numpy().flatten())
+            q10s.extend([np.nan] * len(target_v))
+            rets.extend(target_v.cpu().numpy().flatten())
+            sids.extend(s["stock_id"].numpy().flatten())
+            continue
+        if target_mode in {"best_side", "side", "route_side"}:
+            if "logits_best_side" not in out or "best_side" not in t:
+                logger.warning("验证目标缺失: logits_best_side or best_side")
+                continue
+            prob = torch.softmax(out["logits_best_side"], dim=-1)
+            score = prob[:, 2] - prob[:, 0]
+            target_side = t["best_side"].to(device)
+            side_value = torch.where(
+                target_side == 2,
+                torch.ones_like(score),
+                torch.where(target_side == 0, -torch.ones_like(score), torch.zeros_like(score)),
+            )
+            pred_side = torch.argmax(prob, dim=-1)
+            preds.extend(score.cpu().numpy().flatten())
+            q10s.extend([np.nan] * len(target_side))
+            rets.extend(side_value.cpu().numpy().flatten())
+            sids.extend(s["stock_id"].numpy().flatten())
+            continue
+        if target_mode in {"spot_direction", "spot", "spot_route"}:
+            if "logits_spot_dir" not in out or "spot_direction" not in t:
+                logger.warning("验证目标缺失: logits_spot_dir or spot_direction")
+                continue
+            prob = torch.softmax(out["logits_spot_dir"], dim=-1)
+            score = prob[:, 2] - prob[:, 0]
+            target_side = t["spot_direction"].to(device)
+            side_value = torch.where(
+                target_side == 2,
+                torch.ones_like(score),
+                torch.where(target_side == 0, -torch.ones_like(score), torch.zeros_like(score)),
+            )
+            preds.extend(score.cpu().numpy().flatten())
+            q10s.extend([np.nan] * len(target_side))
+            rets.extend(side_value.cpu().numpy().flatten())
+            sids.extend(s["stock_id"].numpy().flatten())
+            continue
+        if pred_key not in out or target_key not in t:
+            logger.warning("验证目标缺失: pred=%s target=%s", pred_key, target_key)
+            continue
+        preds.extend(out[pred_key].cpu().numpy().flatten())
+        if q10_key and q10_key in out:
+            q10s.extend(out[q10_key].cpu().numpy().flatten())
+        else:
+            q10s.extend([np.nan] * len(t[target_key]))
+        rets.extend(t[target_key].numpy().flatten())
         sids.extend(s["stock_id"].numpy().flatten())
 
     df = pd.DataFrame({"p": preds, "q10": q10s, "r": rets, "sid": sids})
@@ -91,7 +168,7 @@ def validate(model, loader, device) -> dict:
     n_top = max(10, int(len(df) * 0.05))
     top = df.nlargest(n_top, "p")
     # q10 校准:真实收益低于预测 q10 的比例应接近 10%
-    q10_coverage = float((df["r"] < df["q10"]).mean())
+    q10_coverage = float((df["r"] < df["q10"]).mean()) if df["q10"].notna().any() else 0.0
 
     metrics = {
         "ic": 0.0 if np.isnan(ic) else ic,
@@ -99,9 +176,17 @@ def validate(model, loader, device) -> dict:
         "top_hit": float((top["r"] > 0).mean()),
         "q10_coverage": q10_coverage,
     }
+    if target_mode in {"dual", "best_leg", "call_put"}:
+        log_pred, log_target = "max(call_net_edge,put_net_edge)", "max(call_return,put_return)"
+    elif target_mode in {"best_side", "side", "route_side"}:
+        log_pred, log_target = "P(CALL)-P(PUT)", "best_side"
+    elif target_mode in {"spot_direction", "spot", "spot_route"}:
+        log_pred, log_target = "P(UP)-P(DOWN)", "spot_direction"
+    else:
+        log_pred, log_target = pred_key, target_key
     logger.info(
-        "[Val] IC=%.4f Top5Mean=%.6f Top5Hit=%.2f%% q10_cov=%.3f",
-        metrics["ic"], metrics["top_mean"], metrics["top_hit"] * 100, q10_coverage,
+        "[Val:%s->%s] IC=%.4f Top5Mean=%.6f Top5Hit=%.2f%% q10_cov=%.3f",
+        log_pred, log_target, metrics["ic"], metrics["top_mean"], metrics["top_hit"] * 100, q10_coverage,
     )
     return metrics
 
@@ -123,20 +208,28 @@ def build_loaders(args, config):
     if not val_sets:
         raise FileNotFoundError("没有可用的验证 LMDB。")
 
+    from qqq_btc.common.seed_utils import make_dataloader_generator, seed_worker
+
     pin = torch.cuda.is_available()
+    seed = int(getattr(args, "seed", 42))
+    g = make_dataloader_generator(seed)
     train_dl = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn,
         num_workers=args.num_workers, pin_memory=pin,
+        worker_init_fn=seed_worker if args.num_workers > 0 else None,
+        generator=g,
     )
     val_dl = DataLoader(
         ConcatDataset(val_sets), batch_size=args.batch_size, shuffle=False,
         collate_fn=collate_fn, num_workers=max(1, args.num_workers // 2), pin_memory=pin,
+        worker_init_fn=seed_worker if args.num_workers > 0 else None,
     )
     return train_dl, val_dl
 
 
 def run(args) -> None:
-    set_seed(args.seed)
+    seed = set_seed(args.seed)
+    logger.info("global seed=%s (deterministic cudnn)", seed)
     with open(args.config, "r", encoding="utf-8") as f:
         config = json.load(f)
 
@@ -222,7 +315,7 @@ def run(args) -> None:
             scheduler.step()
             losses.append(loss.item())
 
-        metrics = validate(model, val_dl, device)
+        metrics = validate(model, val_dl, device, config)
         logger.info("Ep %d: loss=%.4f ic=%.4f", ep, float(np.mean(losses) if losses else 0.0), metrics["ic"])
 
         state = {
@@ -232,6 +325,7 @@ def run(args) -> None:
             "best_ic": max(best_ic, metrics["ic"]),
             "config": config,
             "mode": args.mode,
+            "seed": seed,
         }
         torch.save(state, ckpt_dir / "latest.pth")
         if metrics["ic"] > best_ic:

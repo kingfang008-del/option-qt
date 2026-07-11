@@ -1,0 +1,33 @@
+{
+  "profile": "qqq_5dte_ladder_conservative",
+  "description": "QQQ 5DTE 8-bucket ladder; bucket choice uses entry-time value score, not future best bucket.",
+
+  "front_allowed_dte": [5],
+  "front_prefer_dte": 5,
+  "front_min_dte": 5,
+  "front_max_dte": 5,
+  "allow_front_dte_fallback": false,
+  "use_trading_dte": true,
+
+  "dynamic_ladder_label": true,
+  "dynamic_ladder_selection": "value_score",
+  "dynamic_put_buckets": [0, 1, 2, 3],
+  "dynamic_call_buckets": [4, 5, 6, 7],
+  "dual_leg_buckets": {
+    "exec_put": 2,
+    "exec_call": 6
+  },
+
+  "label_trade_bucket_id": 6,
+  "label_dte_min": 5,
+  "label_dte_max": 5,
+
+  "symbols": ["QQQ"],
+
+  "paths": {
+    "raw_iv_dir": "~/train_data/nq_options_day_iv",
+    "sniper_option_dir": "/mnt/s990/data/raw_1s/dte5_options",
+    "day_iv_dir": "~/train_data/quote_options_day_iv_dte5_ladder",
+    "locked_targets_output": "~/train_data/locked_targets_map_5dte_ladder_202204_202606.parquet"
+  }
+}

@@ -3,13 +3,18 @@
 """
 合约锁定雷达 — 按 anchor profile 生成 locked_targets_map.parquet。
 
-默认 profile=qqq_0dte (0/1/2 DTE, 4-bucket)。Legacy 9DTE 用 --profile legacy_9dte。
+默认 profile=qqq_0dte (strict 0 DTE only;无 0DTE 则跳过当天)。
+1DTE 管线用 --profile qqq_1dte。Legacy 9DTE 用 --profile legacy_9dte。
 
 用法:
   cd preprocess/download
 
-  # QQQ 0DTE/1DTE (推荐,与 qqq_btc 对齐)
+  # QQQ strict 0DTE (V4 主路径)
   python step1_build_target_map.py --profile qqq_0dte \\
+      --start-date 2022-09-01 --end-date 2026-03-01
+
+  # QQQ strict 1DTE (独立 locked map / 独立训练链)
+  python step1_build_target_map.py --profile qqq_1dte \\
       --start-date 2022-09-01 --end-date 2026-03-01
 
   # 旧 ~9DTE + 次月 6-bucket
@@ -44,9 +49,89 @@ from anchor_utils import (
     resolve_paths,
     resolve_symbols,
 )
+from dte_utils import compute_dte_series
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+NY = "America/New_York"
+
+
+def _normalize_contract_symbol(value: object) -> str:
+    """Normalize OCC symbols for existence checks while preserving output format."""
+    return str(value).replace("O:", "")
+
+
+def _active_bucket_ids(cfg: dict) -> set[int]:
+    n_buckets = 6 if cfg.get("use_next_buckets") else 4
+    return set(range(n_buckets))
+
+
+def _validate_locked_contracts(
+    locked_df: pd.DataFrame,
+    source_df: pd.DataFrame,
+    cfg: dict,
+) -> pd.DataFrame:
+    """
+    Keep only locked rows that are backed by real same-day source contracts.
+
+    For 6-bucket profiles, a day is usable only if all active buckets are present.
+    This prevents step2 from receiving synthetic/non-tradable contracts or partial
+    daily maps that later show up as missing quote buckets.
+    """
+    if locked_df.empty:
+        return locked_df
+
+    validated = locked_df.copy()
+    if bool(cfg.get("validate_contract_exists", True)):
+        source = source_df.copy()
+        if "date_str" not in source.columns:
+            source["date_str"] = source["timestamp"].dt.date.astype(str)
+        available_by_day = (
+            source.groupby("date_str")["contract_symbol"]
+            .apply(lambda s: {_normalize_contract_symbol(x) for x in s.dropna().unique()})
+            .to_dict()
+        )
+
+        exists_mask = []
+        for _, row in validated.iterrows():
+            day_contracts = available_by_day.get(str(row["date_str"]), set())
+            exists_mask.append(_normalize_contract_symbol(row["contract_symbol"]) in day_contracts)
+        validated = validated.loc[exists_mask].copy()
+
+    require_complete = bool(cfg.get("require_complete_buckets", cfg.get("use_next_buckets", False)))
+    if require_complete and not validated.empty:
+        expected = _active_bucket_ids(cfg)
+        keep_parts = []
+        for _, day_group in validated.groupby("date_str"):
+            day_buckets = set(day_group["bucket_id"].astype(int))
+            if day_buckets != expected:
+                continue
+            # One row per bucket. If duplicates ever appear, keep the first stable choice.
+            day_group = day_group.sort_values("bucket_id").drop_duplicates("bucket_id", keep="first")
+            if set(day_group["bucket_id"].astype(int)) == expected:
+                keep_parts.append(day_group)
+        if not keep_parts:
+            return validated.iloc[0:0].copy()
+        validated = pd.concat(keep_parts, ignore_index=True)
+
+    return validated
+
+
+def _to_ny_quote_time(series: pd.Series) -> pd.Series:
+    """Quote timestamp: naive → UTC, tz-aware → NY."""
+    ts = pd.to_datetime(series, errors="coerce")
+    if ts.dt.tz is None:
+        return ts.dt.tz_localize("UTC").dt.tz_convert(NY)
+    return ts.dt.tz_convert(NY)
+
+
+def _to_ny_expiration(series: pd.Series) -> pd.Series:
+    """Expiration calendar date: naive midnight must NOT be treated as UTC."""
+    exp = pd.to_datetime(series, errors="coerce")
+    if exp.dt.tz is None:
+        return exp.dt.tz_localize(NY, ambiguous="infer")
+    return exp.dt.tz_convert(NY)
 
 
 def process_single_file(args):
@@ -67,18 +152,20 @@ def process_single_file(args):
         }
         df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-        for col in ["timestamp", "expiration"]:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-            if df[col].dt.tz is None:
-                df[col] = df[col].dt.tz_localize("UTC").dt.tz_convert("America/New_York")
-            else:
-                df[col] = df[col].dt.tz_convert("America/New_York")
+        df["timestamp"] = _to_ny_quote_time(df["timestamp"])
+        if "expiration" in df.columns:
+            df["expiration"] = _to_ny_expiration(df["expiration"])
 
-        df["dte"] = (
-            df["expiration"].dt.normalize() - df["timestamp"].dt.normalize()
-        ).dt.days.fillna(-1).astype(int)
+        use_trading_dte = bool(cfg.get("use_trading_dte", False))
+        df["dte"] = compute_dte_series(
+            df["timestamp"],
+            df["expiration"],
+            use_trading_dte=use_trading_dte,
+        )
 
         locked_df = get_daily_locked_contracts(df, cfg)
+        if locked_df is not None and not locked_df.empty:
+            locked_df = _validate_locked_contracts(locked_df, df, cfg)
         if locked_df is not None and not locked_df.empty:
             locked_df["symbol"] = sym
             return locked_df, None
@@ -90,13 +177,15 @@ def process_single_file(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build locked target map (anchor profile: qqq_0dte / legacy_9dte / custom JSON)",
+        description="Build locked target map (profile: qqq_0dte / qqq_1dte / legacy_9dte / custom JSON)",
     )
     parser.add_argument(
         "--profile",
-        choices=list(BUILTIN_PROFILES.keys()),
         default=None,
-        help=f"内置锚点 profile (默认 qqq_0dte)。可选: {', '.join(BUILTIN_PROFILES)}",
+        help=(
+            "锚点 profile 名，加载 CONFIG/anchor_{profile}.json。"
+            f"内置: {', '.join(BUILTIN_PROFILES)}"
+        ),
     )
     parser.add_argument(
         "--config",
