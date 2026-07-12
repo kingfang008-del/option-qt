@@ -1,0 +1,74 @@
+{
+  "seed": 42,
+  "finetune": {
+    "train": "2026-05+06 bak",
+    "val": "2026-06 bak",
+    "init": "checkpoint/checkpoints_qqq_v4/best.pth",
+    "ckpt": "checkpoint/checkpoints_qqq_ft56_julw1/best.pth"
+  },
+  "july_feat": "/home/kingfang007/train_data/july_w1_v4_databento/quote_features_test",
+  "july_option_1m": "/home/kingfang007/train_data/july_w1_v4_databento/options_1m_july_w1",
+  "july_w1_days": [
+    "2026-07-01",
+    "2026-07-02",
+    "2026-07-06",
+    "2026-07-07",
+    "2026-07-08",
+    "2026-07-09"
+  ],
+  "results": [
+    {
+      "label": "v4_base",
+      "trades": 7,
+      "acct25": -0.07474376937076344,
+      "hit": 0.2857142857142857,
+      "sum_net": -0.28335315202296846,
+      "legs": {
+        "CALL": 7
+      },
+      "by_day": {
+        "2026-07-07": {
+          "n": 3,
+          "acct25": -0.07202656296635435,
+          "sum_net": -0.2937606244281016
+        },
+        "2026-07-08": {
+          "n": 3,
+          "acct25": 0.0624723782847707,
+          "sum_net": 0.25662746862512925
+        },
+        "2026-07-09": {
+          "n": 1,
+          "acct25": -0.06155499905499906,
+          "sum_net": -0.24621999621999616
+        }
+      },
+      "ic": 0.13038916841116863,
+      "replay_summary_acct": -0.07474376937076344
+    },
+    {
+      "label": "v4_ft56",
+      "trades": 3,
+      "acct25": -0.018348339064185204,
+      "hit": 0.3333333333333333,
+      "sum_net": -0.07344381204288176,
+      "legs": {
+        "CALL": 3
+      },
+      "by_day": {
+        "2026-07-08": {
+          "n": 1,
+          "acct25": 0.0006865886353233375,
+          "sum_net": 0.0027463545412934223
+        },
+        "2026-07-09": {
+          "n": 2,
+          "acct25": -0.0190218675014594,
+          "sum_net": -0.07619016658417518
+        }
+      },
+      "ic": 0.15699292359240313,
+      "replay_summary_acct": -0.018348339064185204
+    }
+  ]
+}

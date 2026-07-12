@@ -1,0 +1,538 @@
+{
+  "step": 1,
+  "gate": "debug_slow_vs_offline_normed_features",
+  "offline": "/home/kingfang007/train_data/july_w1_v4_experiment/quote_features_test_clean/QQQ/regular/09:30-16:00/1min/2026-07.parquet",
+  "symbol": "QQQ",
+  "med_tol": 0.05,
+  "corr_min": 0.95,
+  "ts_shift_sec": 60,
+  "n_feats": 32,
+  "overall_pass": true,
+  "by_day": [
+    {
+      "date": "2026-07-01",
+      "ts_shift_sec": 60,
+      "n_matched": 389,
+      "n_feats": 32,
+      "n_pass": 32,
+      "pass_rate": 1.0,
+      "pass": true,
+      "failed_features": [],
+      "worst": [
+        {
+          "feature": "options_struc_atm_iv",
+          "n": 389,
+          "med_abs_err": 0.004694121609550267,
+          "max_abs_err": 0.06210436461477005,
+          "corr": 0.983265570751377,
+          "pass": true
+        },
+        {
+          "feature": "volume_ratio",
+          "n": 389,
+          "med_abs_err": 0.002989548381852475,
+          "max_abs_err": 0.7464175097861254,
+          "corr": 0.9625026848815917,
+          "pass": true
+        },
+        {
+          "feature": "time_to_expiry_norm",
+          "n": 389,
+          "med_abs_err": 0.0025641057735834583,
+          "max_abs_err": 0.0025641322135925293,
+          "corr": 0.9999999999999994,
+          "pass": true
+        },
+        {
+          "feature": "time_session_progress",
+          "n": 389,
+          "med_abs_err": 0.0025640993546217072,
+          "max_abs_err": 0.0025641319079277025,
+          "corr": 0.9999999999999994,
+          "pass": true
+        },
+        {
+          "feature": "options_struc_skew",
+          "n": 389,
+          "med_abs_err": 0.0025015068902640714,
+          "max_abs_err": 0.0577567973998287,
+          "corr": 0.9662563783880412,
+          "pass": true
+        },
+        {
+          "feature": "options_vw_imbalance",
+          "n": 389,
+          "med_abs_err": 0.0012331693661972263,
+          "max_abs_err": 0.4156140787702637,
+          "corr": 0.9820923370136423,
+          "pass": true
+        },
+        {
+          "feature": "options_iv_divergence",
+          "n": 389,
+          "med_abs_err": 0.0007898235840638618,
+          "max_abs_err": 0.28522921943963536,
+          "corr": 0.9516006089702579,
+          "pass": true
+        },
+        {
+          "feature": "garman_klass_vol",
+          "n": 389,
+          "med_abs_err": 0.000506946105756384,
+          "max_abs_err": 0.0024191033794849215,
+          "corr": 0.9999919961988675,
+          "pass": true
+        },
+        {
+          "feature": "options_iv_momentum",
+          "n": 389,
+          "med_abs_err": 0.0004875297833891554,
+          "max_abs_err": 0.2670933161625958,
+          "corr": 0.9536000344056016,
+          "pass": true
+        },
+        {
+          "feature": "return_divergence",
+          "n": 389,
+          "med_abs_err": 0.00027486986169145133,
+          "max_abs_err": 0.0004225338886160168,
+          "corr": 0.9999999957801642,
+          "pass": true
+        },
+        {
+          "feature": "bb_width",
+          "n": 389,
+          "med_abs_err": 0.00027359533851464835,
+          "max_abs_err": 0.0004964576698138212,
+          "corr": 0.9999999987773737,
+          "pass": true
+        },
+        {
+          "feature": "vwap_log_return",
+          "n": 389,
+          "med_abs_err": 0.0002361952547884072,
+          "max_abs_err": 0.0003921751262010442,
+          "corr": 0.9999999971425138,
+          "pass": true
+        },
+        {
+          "feature": "options_vw_gamma",
+          "n": 389,
+          "med_abs_err": 0.00017988424038817286,
+          "max_abs_err": 0.00019161932753164468,
+          "corr": 0.9999999943243244,
+          "pass": true
+        },
+        {
+          "feature": "close_log_return",
+          "n": 389,
+          "med_abs_err": 0.00012622652198568396,
+          "max_abs_err": 0.0005918652327611129,
+          "corr": 0.9999999956910752,
+          "pass": true
+        },
+        {
+          "feature": "options_flow_skew",
+          "n": 389,
+          "med_abs_err": 0.00010562891534410257,
+          "max_abs_err": 0.00011843416707824073,
+          "corr": 0.9999999998993928,
+          "pass": true
+        }
+      ]
+    }
+  ],
+  "note": "Step-2 entry/exit 仅在 overall_pass=true 后进行",
+  "by_day_full": [
+    {
+      "date": "2026-07-01",
+      "ts_shift_sec": 60,
+      "n_matched": 389,
+      "n_feats": 32,
+      "n_pass": 32,
+      "pass_rate": 1.0,
+      "pass": true,
+      "failed_features": [],
+      "worst": [
+        {
+          "feature": "options_struc_atm_iv",
+          "n": 389,
+          "med_abs_err": 0.004694121609550267,
+          "max_abs_err": 0.06210436461477005,
+          "corr": 0.983265570751377,
+          "pass": true
+        },
+        {
+          "feature": "volume_ratio",
+          "n": 389,
+          "med_abs_err": 0.002989548381852475,
+          "max_abs_err": 0.7464175097861254,
+          "corr": 0.9625026848815917,
+          "pass": true
+        },
+        {
+          "feature": "time_to_expiry_norm",
+          "n": 389,
+          "med_abs_err": 0.0025641057735834583,
+          "max_abs_err": 0.0025641322135925293,
+          "corr": 0.9999999999999994,
+          "pass": true
+        },
+        {
+          "feature": "time_session_progress",
+          "n": 389,
+          "med_abs_err": 0.0025640993546217072,
+          "max_abs_err": 0.0025641319079277025,
+          "corr": 0.9999999999999994,
+          "pass": true
+        },
+        {
+          "feature": "options_struc_skew",
+          "n": 389,
+          "med_abs_err": 0.0025015068902640714,
+          "max_abs_err": 0.0577567973998287,
+          "corr": 0.9662563783880412,
+          "pass": true
+        },
+        {
+          "feature": "options_vw_imbalance",
+          "n": 389,
+          "med_abs_err": 0.0012331693661972263,
+          "max_abs_err": 0.4156140787702637,
+          "corr": 0.9820923370136423,
+          "pass": true
+        },
+        {
+          "feature": "options_iv_divergence",
+          "n": 389,
+          "med_abs_err": 0.0007898235840638618,
+          "max_abs_err": 0.28522921943963536,
+          "corr": 0.9516006089702579,
+          "pass": true
+        },
+        {
+          "feature": "garman_klass_vol",
+          "n": 389,
+          "med_abs_err": 0.000506946105756384,
+          "max_abs_err": 0.0024191033794849215,
+          "corr": 0.9999919961988675,
+          "pass": true
+        },
+        {
+          "feature": "options_iv_momentum",
+          "n": 389,
+          "med_abs_err": 0.0004875297833891554,
+          "max_abs_err": 0.2670933161625958,
+          "corr": 0.9536000344056016,
+          "pass": true
+        },
+        {
+          "feature": "return_divergence",
+          "n": 389,
+          "med_abs_err": 0.00027486986169145133,
+          "max_abs_err": 0.0004225338886160168,
+          "corr": 0.9999999957801642,
+          "pass": true
+        },
+        {
+          "feature": "bb_width",
+          "n": 389,
+          "med_abs_err": 0.00027359533851464835,
+          "max_abs_err": 0.0004964576698138212,
+          "corr": 0.9999999987773737,
+          "pass": true
+        },
+        {
+          "feature": "vwap_log_return",
+          "n": 389,
+          "med_abs_err": 0.0002361952547884072,
+          "max_abs_err": 0.0003921751262010442,
+          "corr": 0.9999999971425138,
+          "pass": true
+        },
+        {
+          "feature": "options_vw_gamma",
+          "n": 389,
+          "med_abs_err": 0.00017988424038817286,
+          "max_abs_err": 0.00019161932753164468,
+          "corr": 0.9999999943243244,
+          "pass": true
+        },
+        {
+          "feature": "close_log_return",
+          "n": 389,
+          "med_abs_err": 0.00012622652198568396,
+          "max_abs_err": 0.0005918652327611129,
+          "corr": 0.9999999956910752,
+          "pass": true
+        },
+        {
+          "feature": "options_flow_skew",
+          "n": 389,
+          "med_abs_err": 0.00010562891534410257,
+          "max_abs_err": 0.00011843416707824073,
+          "corr": 0.9999999998993928,
+          "pass": true
+        }
+      ],
+      "columns": [
+        {
+          "feature": "options_struc_atm_iv",
+          "n": 389,
+          "med_abs_err": 0.004694121609550267,
+          "max_abs_err": 0.06210436461477005,
+          "corr": 0.983265570751377,
+          "pass": true
+        },
+        {
+          "feature": "volume_ratio",
+          "n": 389,
+          "med_abs_err": 0.002989548381852475,
+          "max_abs_err": 0.7464175097861254,
+          "corr": 0.9625026848815917,
+          "pass": true
+        },
+        {
+          "feature": "time_to_expiry_norm",
+          "n": 389,
+          "med_abs_err": 0.0025641057735834583,
+          "max_abs_err": 0.0025641322135925293,
+          "corr": 0.9999999999999994,
+          "pass": true
+        },
+        {
+          "feature": "time_session_progress",
+          "n": 389,
+          "med_abs_err": 0.0025640993546217072,
+          "max_abs_err": 0.0025641319079277025,
+          "corr": 0.9999999999999994,
+          "pass": true
+        },
+        {
+          "feature": "options_struc_skew",
+          "n": 389,
+          "med_abs_err": 0.0025015068902640714,
+          "max_abs_err": 0.0577567973998287,
+          "corr": 0.9662563783880412,
+          "pass": true
+        },
+        {
+          "feature": "options_vw_imbalance",
+          "n": 389,
+          "med_abs_err": 0.0012331693661972263,
+          "max_abs_err": 0.4156140787702637,
+          "corr": 0.9820923370136423,
+          "pass": true
+        },
+        {
+          "feature": "options_iv_divergence",
+          "n": 389,
+          "med_abs_err": 0.0007898235840638618,
+          "max_abs_err": 0.28522921943963536,
+          "corr": 0.9516006089702579,
+          "pass": true
+        },
+        {
+          "feature": "garman_klass_vol",
+          "n": 389,
+          "med_abs_err": 0.000506946105756384,
+          "max_abs_err": 0.0024191033794849215,
+          "corr": 0.9999919961988675,
+          "pass": true
+        },
+        {
+          "feature": "options_iv_momentum",
+          "n": 389,
+          "med_abs_err": 0.0004875297833891554,
+          "max_abs_err": 0.2670933161625958,
+          "corr": 0.9536000344056016,
+          "pass": true
+        },
+        {
+          "feature": "return_divergence",
+          "n": 389,
+          "med_abs_err": 0.00027486986169145133,
+          "max_abs_err": 0.0004225338886160168,
+          "corr": 0.9999999957801642,
+          "pass": true
+        },
+        {
+          "feature": "bb_width",
+          "n": 389,
+          "med_abs_err": 0.00027359533851464835,
+          "max_abs_err": 0.0004964576698138212,
+          "corr": 0.9999999987773737,
+          "pass": true
+        },
+        {
+          "feature": "vwap_log_return",
+          "n": 389,
+          "med_abs_err": 0.0002361952547884072,
+          "max_abs_err": 0.0003921751262010442,
+          "corr": 0.9999999971425138,
+          "pass": true
+        },
+        {
+          "feature": "options_vw_gamma",
+          "n": 389,
+          "med_abs_err": 0.00017988424038817286,
+          "max_abs_err": 0.00019161932753164468,
+          "corr": 0.9999999943243244,
+          "pass": true
+        },
+        {
+          "feature": "close_log_return",
+          "n": 389,
+          "med_abs_err": 0.00012622652198568396,
+          "max_abs_err": 0.0005918652327611129,
+          "corr": 0.9999999956910752,
+          "pass": true
+        },
+        {
+          "feature": "options_flow_skew",
+          "n": 389,
+          "med_abs_err": 0.00010562891534410257,
+          "max_abs_err": 0.00011843416707824073,
+          "corr": 0.9999999998993928,
+          "pass": true
+        },
+        {
+          "feature": "options_gamma_accel",
+          "n": 389,
+          "med_abs_err": 0.00010085402599481486,
+          "max_abs_err": 0.05703478537669423,
+          "corr": 0.9842292925402469,
+          "pass": true
+        },
+        {
+          "feature": "options_vw_theta",
+          "n": 389,
+          "med_abs_err": 8.827323381299657e-05,
+          "max_abs_err": 0.00011240401461298788,
+          "corr": 0.9999999996707871,
+          "pass": true
+        },
+        {
+          "feature": "vwap_diff",
+          "n": 389,
+          "med_abs_err": 8.455694661316238e-05,
+          "max_abs_err": 0.00020145239283153593,
+          "corr": 0.9999999998132774,
+          "pass": true
+        },
+        {
+          "feature": "adx_smooth_10",
+          "n": 389,
+          "med_abs_err": 6.250141799701847e-05,
+          "max_abs_err": 0.004013792228042379,
+          "corr": 0.999993386873823,
+          "pass": true
+        },
+        {
+          "feature": "options_vw_spread",
+          "n": 389,
+          "med_abs_err": 6.246209684265813e-05,
+          "max_abs_err": 0.00014316820496584892,
+          "corr": 0.9999999956183814,
+          "pass": true
+        },
+        {
+          "feature": "options_vw_iv",
+          "n": 389,
+          "med_abs_err": 5.510135875999578e-05,
+          "max_abs_err": 6.398773143506675e-05,
+          "corr": 0.9999999999109013,
+          "pass": true
+        },
+        {
+          "feature": "volume_log",
+          "n": 389,
+          "med_abs_err": 5.396372970417618e-05,
+          "max_abs_err": 0.00011354289293152853,
+          "corr": 0.9999999995594279,
+          "pass": true
+        },
+        {
+          "feature": "options_vw_delta",
+          "n": 389,
+          "med_abs_err": 4.6905029518845565e-05,
+          "max_abs_err": 0.00011178266252243052,
+          "corr": 0.9999999998787769,
+          "pass": true
+        },
+        {
+          "feature": "options_vw_vega",
+          "n": 389,
+          "med_abs_err": 4.253277744067918e-05,
+          "max_abs_err": 7.715470471919561e-05,
+          "corr": 0.9999999999697502,
+          "pass": true
+        },
+        {
+          "feature": "options_pcr_volume",
+          "n": 389,
+          "med_abs_err": 1.4055792278970525e-05,
+          "max_abs_err": 9.381429535743058e-05,
+          "corr": 0.99999999995612,
+          "pass": true
+        },
+        {
+          "feature": "day_range_pos",
+          "n": 389,
+          "med_abs_err": 9.520215171754387e-09,
+          "max_abs_err": 2.978372248829686e-08,
+          "corr": 0.999999999999998,
+          "pass": true
+        },
+        {
+          "feature": "open30_reversal",
+          "n": 389,
+          "med_abs_err": 8.49003090053202e-11,
+          "max_abs_err": 2.2249979636512762e-10,
+          "corr": 1.0,
+          "pass": true
+        },
+        {
+          "feature": "drawdown_from_day_high",
+          "n": 389,
+          "med_abs_err": 7.268174950780804e-11,
+          "max_abs_err": 4.020902499846102e-10,
+          "corr": 0.9999999999999986,
+          "pass": true
+        },
+        {
+          "feature": "drawup_from_day_low",
+          "n": 389,
+          "med_abs_err": 6.91122714613357e-11,
+          "max_abs_err": 4.4817283217923887e-10,
+          "corr": 0.9999999999999984,
+          "pass": true
+        },
+        {
+          "feature": "open30_max_ret",
+          "n": 389,
+          "med_abs_err": 3.153188821158892e-11,
+          "max_abs_err": 3.153188821158892e-11,
+          "corr": 1.0,
+          "pass": true
+        },
+        {
+          "feature": "open30_peak_dd",
+          "n": 389,
+          "med_abs_err": 0.0,
+          "max_abs_err": 1.5976697742559054e-10,
+          "corr": 1.0,
+          "pass": true
+        },
+        {
+          "feature": "open30_range_pos",
+          "n": 389,
+          "med_abs_err": 0.0,
+          "max_abs_err": 2.954316291603476e-08,
+          "corr": 0.9999999999999993,
+          "pass": true
+        }
+      ]
+    }
+  ]
+}

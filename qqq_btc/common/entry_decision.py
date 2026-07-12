@@ -92,6 +92,7 @@ def choose_entry(
             return None
 
     put_gate_ok = True
+    fade_ok = False
     if replay_cfg.put_gate_min is not None:
         vix_ok = (
             put_gate is not None
@@ -102,6 +103,21 @@ def choose_entry(
             replay_cfg, session_bar, open30_max_ret, open30_peak_dd
         )
         put_gate_ok = vix_ok or fade_ok
+
+    # 早盘 PUT 加强:更高 VIX / 开盘结构 / 波动结构(July1 型)
+    early_bar = replay_cfg.put_early_session_bar
+    in_early = (
+        early_bar is not None
+        and session_bar is not None
+        and session_bar < int(early_bar)
+    )
+    if in_early and replay_cfg.put_early_vix_min is not None:
+        early_vix_ok = (
+            put_gate is not None
+            and np.isfinite(put_gate)
+            and put_gate >= float(replay_cfg.put_early_vix_min)
+        )
+        put_gate_ok = bool(early_vix_ok or fade_ok)
 
     call_blocked = False
     if replay_cfg.block_call_on_rapid_drop and replay_cfg.rapid_drop_ret is not None:
@@ -176,6 +192,20 @@ def choose_entry(
             spot_day_ret is not None
             and np.isfinite(spot_day_ret)
             and spot_day_ret > float(replay_cfg.put_spot_day_ret_min)
+        ):
+            put_blocked = True
+    if in_early and replay_cfg.put_early_open30_max_min is not None:
+        if (
+            open30_max_ret is None
+            or not np.isfinite(open30_max_ret)
+            or float(open30_max_ret) < float(replay_cfg.put_early_open30_max_min)
+        ):
+            put_blocked = True
+    if in_early and replay_cfg.put_early_range30_min is not None:
+        if (
+            spot_range_30m is None
+            or not np.isfinite(spot_range_30m)
+            or float(spot_range_30m) < float(replay_cfg.put_early_range30_min)
         ):
             put_blocked = True
 

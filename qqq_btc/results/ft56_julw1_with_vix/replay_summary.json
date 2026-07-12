@@ -1,0 +1,40 @@
+{
+  "trades": 10,
+  "position_frac": 0.25,
+  "total_net_return": 0.3767942218288456,
+  "avg_net_return": 0.14122703068330494,
+  "sum_net_return": 1.4122703068330493,
+  "full_size_compound": 1.628146133515009,
+  "hit_rate": 0.7,
+  "profit_factor": 3.700872252244507,
+  "max_drawdown_mtm": -0.04778021479352584,
+  "avg_bars_held": 32.6,
+  "worst_trade": -0.28754168261083474,
+  "exit_reasons": {
+    "MAX_HOLD": 3,
+    "TRAILING": 2,
+    "TIME_STOP": 2,
+    "HARD_STOP": 1,
+    "STEP_PROTECT": 1,
+    "EARLY_STOP": 1
+  },
+  "trades_by_leg": {
+    "PUT": 10
+  },
+  "label_metrics": {
+    "ic": 0.0792294105769838,
+    "n": 2340,
+    "top5_mean_net": -0.01711788851132638,
+    "top5_hit": 0.5213675213675214,
+    "pred_std": 0.07706913845003746,
+    "label_std": 1.0684328200781026,
+    "q10_coverage": 0.11837606837606837
+  },
+  "n_rows": 2340,
+  "checkpoint": "checkpoint/checkpoints_qqq_ft56_julw1/best.pth",
+  "seed": 42,
+  "session_entry_start_bar": 15,
+  "session_entry_end_bar": 300,
+  "call_bucket": 2,
+  "put_bucket": 0
+}

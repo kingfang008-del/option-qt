@@ -28,7 +28,8 @@ class ReplayConfig:
     session_entry_start_bar: Optional[int] = 0
     session_entry_end_bar: Optional[int] = 360
     # 0DTE 权利金 ROI 的经验 p10 约 -10%;高 edge bar 的预测 q10 中位约 -15%。
-    # 默认 floor=-0.20:过滤极端悲观分位,但不要求 q10>0。None=不检查 q10。
+    # 默认 floor=-0.20(rolling/eval 口径)。QQQ frozen_norm 生产栈见 qqq.config.REPLAY(-0.25)。
+    # None=不检查 q10。
     edge_q10_floor: Optional[float] = -0.20
     # 账户仓位比例:权益复利用 (1 + f * option_roi)。
     # 0DTE 单笔 ROI 波动大,f=1 远超 Kelly、波动拖累会把正期望复利打成大亏。
@@ -100,6 +101,16 @@ class ReplayConfig:
     call_timing_spot_min: Optional[float] = None
     call_timing_max_bar: Optional[int] = None
     call_timing_vix_min: Optional[int] = None
+    # --- 早盘 PUT 加强门控(July1 HARD_STOP 型,None=关闭) ---
+    # session_bar < put_early_session_bar 时额外约束(不影响午盘/尾盘 PUT):
+    #   1) put_early_vix_min: 早盘要求更高 vix_level(或 morning_fade),防 VIX 已回落的假恐慌;
+    #   2) put_early_open30_max_min: 要求 open30 曾翻红(结构),挡「阴跌无结构」开盘;
+    #   3) put_early_range30_min: 要求 30m 波动结构,挡空洞盘口日。
+    # W1 金标网格: vix≥0.6 + open30_max>0 @ sb<30 可去掉 July1 -28.8% 且保留 July7 +69%。
+    put_early_session_bar: Optional[int] = None
+    put_early_vix_min: Optional[float] = None
+    put_early_open30_max_min: Optional[float] = None
+    put_early_range30_min: Optional[float] = None
 
     def threshold_at(self, session_bar: Optional[int]) -> float:
         if self.entry_threshold_schedule is None or session_bar is None:

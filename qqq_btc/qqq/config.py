@@ -79,8 +79,10 @@ REPLAY = ReplayConfig(
     # 14:30 后禁新开仓:尾盘 theta 衰减最快且 Q2 该时段胜率仅 17%(6笔 -0.46 ROI);
     # 双时期验证收紧到 300 后 Q2 4.17x→4.52x / H2 94.7x→124.3x,MDD 同步下降
     session_entry_end_bar=300,
-    # 0DTE 标签 p10≈-10%,高 edge 时预测 q10 中位≈-15%;floor=-20% 过滤极端悲观
-    edge_q10_floor=-0.20,
+    # frozen_norm + 1m5m 栈下 CALL 偏好 bar 的 q10 中位约 -26%(rolling/eval 约 -21%)。
+    # 原 floor=-0.20 在 rolling 上放行 ~38% call_pref;frozen 上仅 ~3%,CALL 被系统性关掉。
+    # 按 2026-06 frozen_1m5m 重标定到 -0.25,使 call_pref 通过率回到 ~38%。
+    edge_q10_floor=-0.25,
     # 滚动分位阈值:实际阈值 = max(静态调度, 近 1500 入场窗bar edge 的 p80)。
     # 动机:打分分布漂移(2026-04→06 过阈bar 607→2113 而均值 +0.15→+0.04),
     # 固定绝对阈值选择性失控。q=0.80 在 2025H2 与 2026Q2 双段验证:
@@ -93,6 +95,11 @@ REPLAY = ReplayConfig(
     # PUT 持续放血(2026Q1 无门控 PUT 腿 -31%,门控后 +95%)。0.2/0.25/0.3
     # 三档门槛全时期均为正,对门槛不敏感;取居中的 0.25。
     put_gate_min=0.25,
+    # 早盘 PUT 加强(July1 HARD_STOP 型):session_bar<30 要求更高 vix(或 morning_fade)。
+    # W1 网格:拦 09:47 HARD_STOP(-28.8%),保留 July7 大赢家;@25% +35.8%→+51.1%。
+    # apr–jun 中性(0pp);2025H2 略正(+3pp)。open30/range 同效但语义弱于 vix。
+    put_early_session_bar=30,
+    put_early_vix_min=0.6,
     # 早盘冲高回落 PUT:open30_max_ret>=0.4% 且 peak_dd<=-0.3% 时允许 PUT(与 vix 门控 OR)
     morning_fade_min_ret=0.004,
     morning_fade_max_peak_dd=-0.003,
@@ -145,8 +152,8 @@ PUT_GATE_COL = "vix_level"
 # 跨式头(有符号:预测"同时买两腿"的净收益,大多数日子为负 = 双份 theta)
 STRADDLE_EDGE_COL = "straddle_net_edge"
 
-# v2 特征配置(含日内时间/趋势特征)与模型(底座已内化,不依赖 New_Pro)
-FEATURE_CONFIG_PATH = Path(__file__).resolve().parent.parent / "CONFIG" / "slow_feature_qqq_v2.json"
+# 与 v4 checkpoint 内嵌特征表对齐(42 列);v2 多 spot_range_30m/trend_strength_30m
+FEATURE_CONFIG_PATH = Path(__file__).resolve().parent.parent / "CONFIG" / "slow_feature_qqq_v4.json"
 MODEL_MODULE = "qqq_btc.model.backbone"
 
 # 退出轨道(bar = 1 分钟) —— val 上 calibrate_rails(max_hold=45, hold=30) 重标
