@@ -52,6 +52,7 @@ def events_to_signal_frame(
             ts = ts.tz_localize("UTC")
         sb = _event_session_bar(ts, minute_df)
         extra = getattr(ev, "extra", {}) or {}
+        nr = getattr(ev, "net_return", None)
         rows.append(
             {
                 "source": source,
@@ -64,6 +65,8 @@ def events_to_signal_frame(
                 "threshold": float(extra.get("threshold", np.nan))
                 if extra.get("threshold") is not None
                 else np.nan,
+                "reason": str(getattr(ev, "reason", "") or ""),
+                "net_return": float(nr) if nr is not None and np.isfinite(float(nr)) else np.nan,
             }
         )
     return pd.DataFrame(rows)
@@ -76,6 +79,7 @@ def collect_replay_signals(
     rails_cfg: Optional[ExitRailsConfig] = None,
     fill_model: Optional[Union[OptionSpreadFillModel, PerpFillModel]] = None,
     warmup_through_day: Optional[str] = None,
+    warmup_from_day: Optional[str] = None,
     target_day: Optional[str] = None,
     edge_col: str = "net_edge",
     edge_q10_col: Optional[str] = None,
@@ -88,6 +92,9 @@ def collect_replay_signals(
 ) -> pd.DataFrame:
     """跑 event replay 并导出指定 kind 的入场信号(默认 strict replay 的 SIGNAL)。"""
     minute_df = prepare_minute_frame(df)
+    if warmup_from_day:
+        start = pd.Timestamp(warmup_from_day).date()
+        minute_df = minute_df[minute_df["_day"] >= start].copy()
     if warmup_through_day:
         cutoff = pd.Timestamp(warmup_through_day).date()
         minute_df = minute_df[minute_df["_day"] <= cutoff].copy()
@@ -121,6 +128,7 @@ def collect_decision_signals(
     df: pd.DataFrame,
     *,
     warmup_through_day: Optional[str] = None,
+    warmup_from_day: Optional[str] = None,
     target_day: Optional[str] = None,
     replay_cfg: Optional[ReplayConfig] = None,
 ) -> pd.DataFrame:
@@ -129,6 +137,7 @@ def collect_decision_signals(
         df,
         replay_cfg=replay_cfg or qcfg.REPLAY,
         warmup_through_day=warmup_through_day,
+        warmup_from_day=warmup_from_day,
         target_day=target_day,
         signal_kinds=("SIGNAL",),
         source="decision",
@@ -140,6 +149,7 @@ def collect_live_sim_signals(
     df: pd.DataFrame,
     *,
     warmup_through_day: Optional[str] = None,
+    warmup_from_day: Optional[str] = None,
     target_day: Optional[str] = None,
 ) -> pd.DataFrame:
     """Live 路径: LIVE_REPLAY(immediate_entry) → ENTER 事件即同 bar 决策。"""
@@ -147,6 +157,7 @@ def collect_live_sim_signals(
         df,
         replay_cfg=qcfg.LIVE_REPLAY,
         warmup_through_day=warmup_through_day,
+        warmup_from_day=warmup_from_day,
         target_day=target_day,
         signal_kinds=("ENTER",),
         source="live_sim",
@@ -246,3 +257,103 @@ def diff_signal_frames(
         "match_rate_live": len(pairs) / n_l if n_l else 1.0,
     }
     return {"matched": pairs, "replay_only": replay_only, "live_only": live_only, "summary": summary}
+
+
+def first_entry_diff(
+    offline_enters: pd.DataFrame,
+    stream_passes: pd.DataFrame,
+    *,
+    time_tolerance_bars: int = 0,
+) -> dict:
+    """
+    占仓感知 OMS 对拍:只比当日首笔 ENTER / PASS。
+
+    offline_enters: live_sim ENTER(已含持仓状态机)
+    stream_passes: dry-run OMS audit PASS
+    """
+    empty = {
+        "matched": [],
+        "replay_only": [],
+        "live_only": [],
+        "summary": {
+            "n_replay": 0,
+            "n_live": 0,
+            "n_matched": 0,
+            "match_rate_replay": 1.0,
+            "match_rate_live": 1.0,
+            "mode": "first_entry",
+            "session_bar_offline": None,
+            "session_bar_stream": None,
+            "leg_offline": None,
+            "leg_stream": None,
+            "bar_delta": None,
+        },
+    }
+    off = offline_enters.copy() if offline_enters is not None else pd.DataFrame()
+    st = stream_passes.copy() if stream_passes is not None else pd.DataFrame()
+    if off.empty and st.empty:
+        return empty
+
+    def _first(df: pd.DataFrame) -> Optional[pd.Series]:
+        if df is None or df.empty:
+            return None
+        work = df.copy()
+        if "session_bar" in work.columns:
+            work["session_bar"] = pd.to_numeric(work["session_bar"], errors="coerce")
+            work = work.sort_values("session_bar", kind="mergesort")
+        elif "ts" in work.columns:
+            work = work.sort_values("ts", kind="mergesort")
+        return work.iloc[0]
+
+    o = _first(off)
+    s = _first(st)
+    summary = {
+        "n_replay": 0 if o is None else 1,
+        "n_live": 0 if s is None else 1,
+        "n_matched": 0,
+        "match_rate_replay": 1.0,
+        "match_rate_live": 1.0,
+        "mode": "first_entry",
+        "session_bar_offline": None if o is None else int(o.get("session_bar")) if pd.notna(o.get("session_bar")) else None,
+        "session_bar_stream": None if s is None else int(s.get("session_bar")) if pd.notna(s.get("session_bar")) else None,
+        "leg_offline": None if o is None else str(o.get("leg", "") or ""),
+        "leg_stream": None if s is None else str(s.get("leg", "") or ""),
+        "bar_delta": None,
+    }
+    if o is None and s is None:
+        return empty
+    if o is None:
+        return {"matched": [], "replay_only": [], "live_only": [s.to_dict()], "summary": summary}
+    if s is None:
+        return {"matched": [], "replay_only": [o.to_dict()], "live_only": [], "summary": summary}
+
+    o_sb = float(o.get("session_bar")) if pd.notna(o.get("session_bar")) else np.nan
+    s_sb = float(s.get("session_bar")) if pd.notna(s.get("session_bar")) else np.nan
+    o_leg = str(o.get("leg", "") or "")
+    s_leg = str(s.get("leg", "") or "")
+    bar_delta = abs(o_sb - s_sb) if np.isfinite(o_sb) and np.isfinite(s_sb) else np.inf
+    summary["bar_delta"] = None if not np.isfinite(bar_delta) else float(bar_delta)
+    ok = o_leg == s_leg and bar_delta <= float(time_tolerance_bars)
+    if ok:
+        summary["n_matched"] = 1
+        summary["match_rate_replay"] = 1.0
+        summary["match_rate_live"] = 1.0
+        pair = {
+            "session_bar_replay": int(o_sb),
+            "session_bar_live": int(s_sb),
+            "leg": o_leg,
+            "edge_replay": float(o.get("edge", 0.0) or 0.0),
+            "edge_live": float(s.get("edge", 0.0) or 0.0),
+            "ts_replay": o.get("ts"),
+            "ts_live": s.get("ts"),
+        }
+        return {"matched": [pair], "replay_only": [], "live_only": [], "summary": summary}
+
+    summary["match_rate_replay"] = 0.0
+    summary["match_rate_live"] = 0.0
+    return {
+        "matched": [],
+        "replay_only": [o.to_dict()],
+        "live_only": [s.to_dict()],
+        "summary": summary,
+    }

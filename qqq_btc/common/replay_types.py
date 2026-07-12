@@ -111,6 +111,14 @@ class ReplayConfig:
     put_early_vix_min: Optional[float] = None
     put_early_open30_max_min: Optional[float] = None
     put_early_range30_min: Optional[float] = None
+    # --- CALL TREND_SPENT 禁开(None=关闭) ---
+    # 日振幅已走到高位 + 波动压缩 + 午后时点 → 禁 CALL(不碰 PUT)。
+    # July10 型:上午慢爬后追涨 CALL 系统性亏;W1+7/10 消融推荐
+    #   day_range_pos>=0.85 & bb_width<=0 & session_bar>=210。
+    # 字段缺失时不拦截(减法保护)。
+    call_spent_day_range_pos_min: Optional[float] = None
+    call_spent_bb_width_max: Optional[float] = None
+    call_spent_min_session_bar: Optional[int] = None
 
     def threshold_at(self, session_bar: Optional[int]) -> float:
         if self.entry_threshold_schedule is None or session_bar is None:

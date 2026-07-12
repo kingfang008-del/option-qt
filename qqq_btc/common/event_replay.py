@@ -129,6 +129,8 @@ def _signal_from_row(
         vix_reversal_count_30m=_f("vix_reversal_count_30m"),
         spot_day_ret=_f("spot_day_ret"),
         spot_range_30m=_f("spot_range_30m"),
+        day_range_pos=_f("day_range_pos"),
+        bb_width=_f("bb_width"),
     )
 
 

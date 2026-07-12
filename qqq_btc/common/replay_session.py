@@ -161,6 +161,9 @@ class SessionSignal:
     spot_day_ret: Optional[float] = None
     # 30min 现货振幅;CALL 局部尖刺门控输入
     spot_range_30m: Optional[float] = None
+    # 当日振幅位置 / BB 宽度;CALL TREND_SPENT 门控输入
+    day_range_pos: Optional[float] = None
+    bb_width: Optional[float] = None
 
 
 @dataclass
@@ -316,6 +319,23 @@ class ReplaySession:
                     and np.isfinite(signal.vix_reversal_count_30m)
                     and signal.vix_reversal_count_30m >= float(_t_vix)
                 )
+                _spent_drp = self.replay_cfg.call_spent_day_range_pos_min
+                _spent_bb = self.replay_cfg.call_spent_bb_width_max
+                _spent_min_bar = self.replay_cfg.call_spent_min_session_bar
+                _call_spent_blocked = (
+                    _spent_drp is not None
+                    and _spent_bb is not None
+                    and (
+                        _spent_min_bar is None
+                        or (session_bar is not None and session_bar >= int(_spent_min_bar))
+                    )
+                    and signal.day_range_pos is not None
+                    and np.isfinite(signal.day_range_pos)
+                    and signal.bb_width is not None
+                    and np.isfinite(signal.bb_width)
+                    and float(signal.day_range_pos) >= float(_spent_drp)
+                    and float(signal.bb_width) <= float(_spent_bb)
+                )
                 _regime_max = self.replay_cfg.regime_vix_reversal_max
                 _regime_blocked = (
                     _regime_max is not None
@@ -330,6 +350,7 @@ class ReplaySession:
                     and not _call_chase_blocked
                     and not _call_spike_blocked
                     and not _call_timing_blocked
+                    and not _call_spent_blocked
                     and not _regime_blocked
                 ):
                     self._edge_buf.append(float(main_edge))
@@ -550,6 +571,8 @@ class ReplaySession:
             vix_reversal_count_30m=signal.vix_reversal_count_30m,
             spot_day_ret=signal.spot_day_ret,
             spot_range_30m=signal.spot_range_30m,
+            day_range_pos=signal.day_range_pos,
+            bb_width=signal.bb_width,
         )
 
     def _quantile_threshold(self, buf: Optional[deque]) -> Optional[float]:

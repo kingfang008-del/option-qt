@@ -39,7 +39,14 @@ class FCSPersistenceHandler:
         svc.frozen_option_snapshot[sym] = current_snap.copy() if current_snap is not None else np.zeros((6, 12), dtype=np.float32)
         current_snap_5m = getattr(svc, 'option_snapshot_5m', {}).get(sym, current_snap)
         svc.frozen_option_snapshot_5m[sym] = current_snap_5m.copy() if current_snap_5m is not None else np.zeros((6, 12), dtype=np.float32)
-        if isinstance(prev_enriched, np.ndarray) and prev_enriched.size > 0:
+        # 发球机已注入有效 minute IV 时，直接用本分钟 agg 快照，避免 stale
+        # latest_opt_buckets 在 merge 时盖住新 IV（见 merge_option_snapshot_with_greeks）。
+        snap_has_iv = False
+        if isinstance(current_snap, np.ndarray) and current_snap.ndim == 2 and current_snap.shape[1] > 7:
+            snap_has_iv = bool(np.nanmax(np.abs(current_snap[:4, 7])) > 0.01)
+        if snap_has_iv:
+            svc.frozen_latest_opt_buckets[sym] = current_snap.copy()
+        elif isinstance(prev_enriched, np.ndarray) and prev_enriched.size > 0:
             svc.frozen_latest_opt_buckets[sym] = prev_enriched.copy()
         elif isinstance(prev_enriched, list) and len(prev_enriched) > 0:
             svc.frozen_latest_opt_buckets[sym] = list(prev_enriched)
@@ -117,7 +124,11 @@ class FCSPersistenceHandler:
             l = min(min(gvx(b, 'low', 'l', c_raw), gvx(b, 'close', 'c', c_raw)) for b in valid_ticks)
             v = sum(max(0.0, gvx(b, 'volume', 'v', 0.0)) for b in valid_ticks)
             pv_sum = sum(gvx(b, 'close', 'c', c_raw) * max(0.0, gvx(b, 'volume', 'v', 0.0)) for b in valid_ticks)
-            vwap = pv_sum / (v + 1e-10) if v > 0 else c_raw
+            minute_vwap = pv_sum / (v + 1e-10) if v > 0 else c_raw
+            # 优先用行情 tick 自带的会话/交易所 VWAP(与 offline spnq wap 同源);
+            # 否则退回分钟内 PV/V(会接近 close,导致 vwap_diff≈0)。
+            exch_vwap = gvx(last_tick, 'vwap', 'vw', 0.0)
+            vwap = exch_vwap if exch_vwap > 0.0 else minute_vwap
 
         raw_buckets = getattr(svc, 'frozen_option_snapshot', svc.option_snapshot).get(sym)
         enriched_buckets = getattr(svc, 'frozen_latest_opt_buckets', svc.latest_opt_buckets).get(sym)
@@ -216,6 +227,30 @@ class FCSPersistenceHandler:
             else:
                 df_5m['vwap'] = df_5m['close']
             df_5m = df_5m.dropna(subset=['open', 'close'])
+            # 发球机可提前注入「完整」5m bar(全日 resample)。1m 派生在桶未走完时
+            # 只有部分分钟,volume 更小。优先保留更完整的外部 5m,避免 POC 等窗口被
+            # 残缺尾盘 K 线(如缺 15:59)或盘中半桶污染。
+            prev_5m = getattr(svc, 'history_5min', {}).get(sym)
+            if isinstance(prev_5m, pd.DataFrame) and not prev_5m.empty:
+                keep_cols = [c for c in ('open', 'high', 'low', 'close', 'volume', 'vwap') if c in df_5m.columns]
+                for ts_5 in list(df_5m.index):
+                    if ts_5 not in prev_5m.index:
+                        continue
+                    try:
+                        prev_vol = float(prev_5m.loc[ts_5, 'volume']) if 'volume' in prev_5m.columns else 0.0
+                        cur_vol = float(df_5m.loc[ts_5, 'volume']) if 'volume' in df_5m.columns else 0.0
+                    except Exception:
+                        continue
+                    if np.isfinite(prev_vol) and prev_vol > cur_vol + 1.0:
+                        for c in keep_cols:
+                            if c in prev_5m.columns:
+                                df_5m.loc[ts_5, c] = prev_5m.loc[ts_5, c]
+                # 保留尚未被 1m 派生覆盖、但已由外部注入的更早 5m 桶
+                extra = prev_5m[[c for c in keep_cols if c in prev_5m.columns]].copy()
+                extra = extra[~extra.index.isin(df_5m.index)]
+                if not extra.empty:
+                    df_5m = pd.concat([extra, df_5m]).sort_index()
+                    df_5m = df_5m[~df_5m.index.duplicated(keep='last')]
             svc.committed_history_5min[sym] = df_5m.iloc[-100:]
             svc.history_5min[sym] = svc.committed_history_5min[sym].copy()
             if not df_5m.empty:

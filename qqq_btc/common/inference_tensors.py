@@ -32,6 +32,32 @@ def _fill_1m_column(mat: np.ndarray, col_idx: int, values: np.ndarray) -> None:
         mat[-l:, col_idx] = values[-l:]
 
 
+def apply_5m_stair_step(seq: np.ndarray) -> np.ndarray:
+    """
+    将已按 1min 对齐的 5min 特征序列重排为训练同款 stair-step:
+    在序列上取 6 个 stride-5 锚点,各 repeat×5 → 长度 SEQ_LEN。
+
+    接受 shape (T,) 或 (B, T)。
+    """
+    arr = np.asarray(seq, dtype=np.float32)
+    if arr.ndim == 2:
+        return np.stack([apply_5m_stair_step(row) for row in arr], axis=0)
+    if arr.ndim != 1:
+        raise ValueError(f"apply_5m_stair_step expects 1d/2d, got shape {arr.shape}")
+    t = int(arr.shape[0])
+    if t <= 0:
+        return np.zeros(SEQ_LEN, dtype=np.float32)
+    anchors = []
+    for k in range(WINDOW_5M_BARS - 1, -1, -1):
+        pos = t - 1 - FIVE_MIN_STRIDE * k
+        pos = max(0, min(pos, t - 1))
+        anchors.append(arr[pos])
+    up = np.repeat(np.asarray(anchors, dtype=np.float32), FIVE_MIN_STRIDE)
+    out = np.zeros(SEQ_LEN, dtype=np.float32)
+    out[-min(len(up), SEQ_LEN) :] = up[-SEQ_LEN:]
+    return out
+
+
 def _fill_5m_column(mat: np.ndarray, col_idx: int, chunk: pd.DataFrame, col: str) -> None:
     """
     与 LMDBAlphaDataset._fill_matrix 一致:取 6 个 5min 锚点(在 1min 网格上每隔 5 bar),

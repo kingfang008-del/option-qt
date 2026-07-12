@@ -1,0 +1,97 @@
+{
+  "name": "qqq_0dte_prefer_primary",
+  "version": "1.0",
+  "status": "canonical",
+  "summary": "QQQ 0DTE 期权分钟特征必须以 dynamic lock map + prefer_primary_gapfill 构建；单合约 v3 map 仅作对照，不得作为训练/审计默认。",
+  "why_correct": [
+    "0DTE 盘中同一 bucket 常出现主约缺报价；secondary 只在 gap 分钟补洞，保持结构特征连续。",
+    "_bak_pre4c monthly 与 dynamic map 合约日集合一致；重叠行 IV 与 v3 同源，差异几乎全是 coverage（secondary 行）。",
+    "同一 V4 ckpt：bak_train（该规则血缘）IC≈0.22 / @25%≈208×；单合约重建 IC≈0.04 / 大亏 —— 断点在覆盖规则，不在模型。",
+    "同分钟 primary/secondary 不重叠；不是盘中按 delta 主动换仓，而是缺报价补洞。"
+  ],
+  "lock_map": {
+    "path": "~/train_data/locked_targets_map_0dte_dynamic.parquet",
+    "primary_rule": "per (date_str, bucket_id): contract with max n_rows",
+    "secondary_rule": "remaining contracts in same (date, bucket), typically one",
+    "anti_patterns": [
+      "locked_targets_map_0dte_v3.parquet as sole source (1 contract/bucket, no gapfill)",
+      "remap bucket_id by ticker alone (same ticker can sit in multiple buckets)"
+    ]
+  },
+  "assemble_1m": {
+    "logic": "prefer_primary_gapfill",
+    "sources_priority": [
+      "/mnt/s990/data/raw_1m/options_databento_v3",
+      "/mnt/s990/data/raw_1m/options_databento",
+      "/mnt/s990/data/raw_1m/options_databento_old",
+      "/mnt/s990/data/raw_1m/options_databento_fixed8_corrected"
+    ],
+    "match_key": ["ticker", "bucket_id"],
+    "rule": "Keep all primary minutes; keep secondary only when timestamp not in primary set."
+  },
+  "pipeline": [
+    "assemble prefer_primary 1m",
+    "day_iv (option_cac_day_vectorized_day)",
+    "monthly (iv_day2month)",
+    "bucketed (options_locked_feature; input already prefer-primary filtered)",
+    "feature_merge_option_raw",
+    "split_raw_features (train/val/test)",
+    "apply_rolling_norm_standalone (each stage independent buffer)",
+    "label_pipeline"
+  ],
+  "splits": {
+    "train": ["2023-03-01", "2025-12-31"],
+    "val": ["2026-01-01", "2026-03-31"],
+    "test": ["2026-04-01", "2026-06-30"]
+  },
+  "reproducibility": {
+    "status": "CRACKED_2026-07-12",
+    "detail_doc": "~/train_data/_bak_pre4c/LINEAGE_CRACKED.json",
+    "rolling_norm": {
+      "status": "bit_exact",
+      "ROLLING_WINDOW": 2000,
+      "MIN_PERIODS": 100,
+      "formula": "tanh(((x-roll_mean)/(roll_std+1e-6))/3); fat log1p on options_iv_momentum/gamma_accel/iv_divergence before zscore"
+    },
+    "bak_train_parents": {
+      "options_day_iv": "~/train_data/_bak_pre4c/dayiv_old_dirs/standard_old_v2 (2026-07-04 15:53)",
+      "options_raw_reproduced": "~/train_data/_bak_pre4c/quote_features_raw_QQQ_from_old_v2_jul4",
+      "stock_raw": "~/train_data/_bak_pre4c/quote_features_raw_QQQ (stock cols unchanged across 7/4–7/6)",
+      "NOT_options_parent": "~/train_data/_bak_pre4c/quote_features_raw_QQQ options cols (overwritten 2026-07-06 18:40 by v3 rebuild)"
+    },
+    "evidence": {
+      "old_v2_raw_norm_vs_bak_train_options": "33/33 months corr=1.0 max_abs=0",
+      "bak_raw_norm_vs_bak_train_stock": "H2 corr=1.0 max_abs=0",
+      "bak_train_options_vs_train_wf": "33/33 months exact (july4 sibling)"
+    },
+    "bak_raw_from_prefer_primary": {
+      "status": "reproducible",
+      "evidence": "builds/0dte_prefer_primary raw vs _bak_pre4c/quote_features_raw_QQQ: median corr=1.0",
+      "note": "这是 7/6 之后的 raw 血缘，可作新模型；不是 V4 bak_train 期权父代"
+    },
+    "retrain_ceiling_on_prefer_primary": {
+      "prefer_primary_multiseed_val_ic_max": 0.132,
+      "v4_ckpt_on_bak_train_ic": 0.224,
+      "note": "prefer_primary 是另一条（更好覆盖）血缘；要复现 0.2 IC 必须用 old_v2→norm 的 bak_train，或按其配方重生"
+    }
+  },
+  "acceptance": {
+    "vs_bak_monthly": {
+      "reference": "~/train_data/_bak_pre4c/quote_options_monthly_iv_QQQ/standard",
+      "key": ["timestamp", "bucket_id", "ticker"],
+      "min_coverage_bak": 0.98,
+      "min_iv_eq_on_overlap": 0.999
+    },
+    "vs_bak_bucketed": {
+      "reference": "~/train_data/_bak_pre4c/quote_options_bucketed_v7_QQQ",
+      "min_median_options_corr": 0.98
+    },
+    "audit_note": "历史 208× / IC≈0.22 可用 bak_train 冻住特征；也可按 LINEAGE_CRACKED.json 从 dayiv standard_old_v2 + rolling_norm 重生。勿对 7/6 的 bak_raw 期权列 renorm 冒充 bak_train。"
+  },
+  "tools": {
+    "logic": "qqq_btc/tools/bak_monthly_switch_logic.py",
+    "reproduce": "qqq_btc/tools/reproduce_bak_lineage.py",
+    "ab": "qqq_btc/tools/ab_prefer_primary_vs_single.py",
+    "rebuild": "qqq_btc/tools/rebuild_0dte_prefer_primary.sh"
+  }
+}

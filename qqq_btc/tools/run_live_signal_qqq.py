@@ -57,15 +57,30 @@ logger = logging.getLogger("LiveRunnerSignalQqqBtc")
 def _default_paths():
     home = Path.home()
     repo_cfg = _REPO / "qqq_btc" / "CONFIG"
-    ckpt = _REPO / "checkpoints_qqq_v4" / "best.pth"
-    if not ckpt.exists():
-        ckpt = home / "quant_project/checkpoints_qqq_v4/best.pth"
-    if not ckpt.exists():
-        ckpt = home / "quant_project/checkpoints_qqq_net_edge_v2/best.pth"
+    # Prefer in-repo V4 layout; fall back to legacy flat / home paths.
+    ckpt_candidates = [
+        _REPO / "checkpoint" / "checkpoints_qqq_v4" / "best.pth",
+        _REPO / "checkpoints_qqq_v4" / "best.pth",
+        home / "quant_project/checkpoints_qqq_v4/best.pth",
+        home / "quant_project/checkpoints_qqq_net_edge_v2/best.pth",
+    ]
+    ckpt = next((p for p in ckpt_candidates if p.exists()), ckpt_candidates[0])
+    v4_slow = repo_cfg / "slow_feature_qqq_v4.json"
     v2_slow = repo_cfg / "slow_feature_qqq_v2.json"
-    slow_cfg = str(v2_slow) if v2_slow.exists() else str(_REPO / "New_Pro" / "CONFIG" / "slow_feature.json")
+    if v4_slow.exists():
+        slow_cfg = str(v4_slow)
+    elif v2_slow.exists():
+        slow_cfg = str(v2_slow)
+    else:
+        slow_cfg = str(_REPO / "New_Pro" / "CONFIG" / "slow_feature.json")
+    fast_candidates = [
+        repo_cfg / "fast_feature_qqq.json",
+        home / "quant_project/config/fast_feature.json",
+        _REPO / "New_Pro" / "CONFIG" / "fast_feature.json",
+    ]
+    fast_cfg = next((str(p) for p in fast_candidates if p.exists()), str(fast_candidates[1]))
     return {
-        "fast": str(repo_cfg.parent / "CONFIG" / "fast_feature_qqq.json"),
+        "fast": fast_cfg,
         "slow": slow_cfg,
     }, str(ckpt)
 
@@ -75,12 +90,12 @@ async def main() -> None:
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument(
         "--feature-config",
-        default=str(_REPO / "qqq_btc" / "CONFIG" / "slow_feature_qqq_v2.json"),
+        default=str(_REPO / "qqq_btc" / "CONFIG" / "slow_feature_qqq_v4.json"),
     )
     args, _ = parser.parse_known_args()
 
     config_paths, default_ckpt = _default_paths()
-    checkpoint = args.checkpoint or default_ckpt
+    checkpoint = str(Path(args.checkpoint or default_ckpt).expanduser().resolve())
 
     print("\n" + "=" * 60)
     print("🚀 qqq_btc Signal Engine (SignalEngineV8 shell + v4 model)")

@@ -158,6 +158,44 @@ class FCSRealtimePipeline:
                             mask = profile.history_keep_mask(idx, dt_ny)
                             history_map[sym] = df[mask].sort_index()
 
+                    def _normalize_minute_ts(ts_val):
+                        if ts_val is None:
+                            return None
+                        ts_obj = ts_val if isinstance(ts_val, pd.Timestamp) else pd.Timestamp(ts_val)
+                        if getattr(ts_obj, "tz", None) is None:
+                            ts_obj = ts_obj.tz_localize(NY_TZ)
+                        else:
+                            ts_obj = ts_obj.tz_convert(NY_TZ)
+                        return ts_obj.replace(second=0, microsecond=0)
+
+                    prev_global_last_minute = _normalize_minute_ts(getattr(svc, 'global_last_minute', None))
+                    prev_committed_last_minute = _normalize_minute_ts(getattr(svc, 'committed_last_minute', None))
+                    preserve_same_day_watermark = (
+                        prev_global_last_minute is not None
+                        and prev_global_last_minute.date() == dt_ny.date()
+                    )
+
+                    # 跨日：必须在清空 current_bars 之前冲刷上一日尾分钟(常见缺 15:59)。
+                    if not preserve_same_day_watermark and prev_global_last_minute is not None:
+                        try:
+                            end_t = getattr(profile, "rth_end_time", None)
+                            prior_rth_end = prev_global_last_minute.replace(
+                                hour=end_t.hour if end_t is not None else 16,
+                                minute=end_t.minute if end_t is not None else 0,
+                                second=0,
+                                microsecond=0,
+                            )
+                            if prior_rth_end.date() == prev_global_last_minute.date():
+                                flushed = svc.commit_ready_minutes(prior_rth_end)
+                                if flushed:
+                                    logger.info(
+                                        "🧹 Cross-day EOD flush committed %d prior-session minute(s) through %s",
+                                        len(flushed),
+                                        prior_rth_end.strftime("%Y-%m-%d %H:%M"),
+                                    )
+                        except Exception as e:
+                            logger.warning("⚠️ Cross-day EOD minute flush failed: %s", e)
+
                     _trim_history_map(getattr(svc, 'history_1min', {}))
                     _trim_history_map(getattr(svc, 'committed_history_1min', {}))
                     _trim_history_map(getattr(svc, 'history_5min', {}))
@@ -205,26 +243,6 @@ class FCSRealtimePipeline:
                         second=0,
                         microsecond=0,
                     ) - pd.Timedelta(minutes=1)
-
-                    prev_global_last_minute = getattr(svc, 'global_last_minute', None)
-                    prev_committed_last_minute = getattr(svc, 'committed_last_minute', None)
-
-                    def _normalize_minute_ts(ts_val):
-                        if ts_val is None:
-                            return None
-                        ts_obj = ts_val if isinstance(ts_val, pd.Timestamp) else pd.Timestamp(ts_val)
-                        if getattr(ts_obj, "tz", None) is None:
-                            ts_obj = ts_obj.tz_localize(NY_TZ)
-                        else:
-                            ts_obj = ts_obj.tz_convert(NY_TZ)
-                        return ts_obj.replace(second=0, microsecond=0)
-
-                    prev_global_last_minute = _normalize_minute_ts(prev_global_last_minute)
-                    prev_committed_last_minute = _normalize_minute_ts(prev_committed_last_minute)
-                    preserve_same_day_watermark = (
-                        prev_global_last_minute is not None
-                        and prev_global_last_minute.date() == dt_ny.date()
-                    )
 
                     if preserve_same_day_watermark:
                         svc.global_last_minute = rth_anchor_minute

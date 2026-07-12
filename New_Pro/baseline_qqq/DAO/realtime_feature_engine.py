@@ -19,6 +19,7 @@ import pandas as pd
 import logging
 import json
 import math
+import os
 from typing import Dict, List, Optional, Tuple
 import pytz
 from datetime import datetime, timedelta
@@ -128,7 +129,7 @@ class RealTimeFeatureEngine:
         self.PANDAS_FEATS = [
             'close_log_return', 'open_log_return', 'price_z_score','volume_ratio', 'vwap_diff',
              'vwap_log_return', 'return_divergence', # 🚀 [核心修复 3] 补齐特征注册表
-            'rsi', 'garman_klass_vol', 'adx_smooth_10', 'k', 'cci',
+            'rsi', 'garman_klass_vol', 'adx_smooth_10', 'bb_width', 'k', 'cci',
             'price_slope_norm_by_atr', 'price_dist_from_ma_atr', 'poc_deviation'
         ]
 
@@ -325,7 +326,14 @@ class RealTimeFeatureEngine:
         open_ff = df['open'].replace(0, np.nan).ffill()
         
         # 1. 基础差分收益率 (对齐离线：分母统一使用 prev_close)
+        # 离线按月/日文件冷启动：跨日 prev_close 不存在 → log_return=0。
+        # Deep Warmup 带入上日收盘会产生巨型隔夜收益，污染 rolling 与门控。
         prev_close = close_ff.shift(1).replace(0, np.nan)
+        if isinstance(df.index, pd.DatetimeIndex):
+            same_day = pd.Series(df.index.date, index=df.index) == pd.Series(
+                df.index.date, index=df.index
+            ).shift(1)
+            prev_close = prev_close.where(same_day, np.nan)
         
         if 'close_log_return' in active_feats:
             df['close_log_return'] = np.log(close_ff / prev_close).fillna(0.0)
@@ -335,7 +343,20 @@ class RealTimeFeatureEngine:
 
         needs_vwap = any(f in active_feats for f in ['vwap_diff', 'vwap_log_return', 'return_divergence', 'poc_deviation'])
         if needs_vwap:
-            vol_nonneg = df['volume'].clip(lower=0).fillna(0.0)
+            # offline feature_merge 两套 VWAP 口径:
+            # 1) 列上的交易所分钟 wap → vwap_log_return / return_divergence
+            # 2) 按日 cumsum(close*vol) → 仅用于 vwap_diff(会覆写训练表里的 vwap 列)
+            if "vwap" in df.columns:
+                exch_vwap = (
+                    pd.to_numeric(df["vwap"], errors="coerce")
+                    .replace(0, np.nan)
+                    .ffill()
+                    .fillna(close_ff)
+                )
+            else:
+                exch_vwap = close_ff
+
+            vol_nonneg = df["volume"].clip(lower=0).fillna(0.0)
             if isinstance(df.index, pd.DatetimeIndex):
                 session_key = pd.Series(df.index.date, index=df.index)
                 cum_value = (close_ff * vol_nonneg).groupby(session_key).cumsum()
@@ -343,25 +364,33 @@ class RealTimeFeatureEngine:
             else:
                 cum_value = (close_ff * vol_nonneg).cumsum()
                 cum_volume = vol_nonneg.cumsum()
-            vwap = cum_value / (cum_volume + 1e-9)
-            vwap = vwap.replace([np.inf, -np.inf], np.nan).ffill().fillna(close_ff)
-            
-            if 'vwap_diff' in active_feats: 
-                df['vwap_diff'] = (df['close'] - vwap) / (vwap + 1e-9)
-            
-            # 🚀 [核心修复 4] 安全的 Log 运算，杜绝产生 -inf 或 NaN
-            if 'vwap_log_return' in active_feats:
-                df['vwap_log_return'] = np.log(vwap / prev_close).fillna(0.0)
-                
-            if 'return_divergence' in active_feats:
-                # 确保依赖项已计算（即使用户没选 close_log_return，也要在内部计算出用于相减）
-                c_log_ret = df['close_log_return'] if 'close_log_return' in df.columns else np.log(close_ff / prev_close).fillna(0.0)
-                v_log_ret = df['vwap_log_return'] if 'vwap_log_return' in df.columns else np.log(vwap / prev_close).fillna(0.0)
-                df['return_divergence'] = c_log_ret - v_log_ret
-            
-            # [🔥 修正] 重新对齐训练集 POC 逻辑：50窗口 + 50价格桶
-            if 'poc_deviation' in active_feats:
-                df['poc_deviation'] = self._calculate_poc_realtime(df)
+            sess_vwap = cum_value / (cum_volume + 1e-9)
+            sess_vwap = sess_vwap.replace([np.inf, -np.inf], np.nan).ffill().fillna(close_ff)
+
+            if "vwap_diff" in active_feats:
+                df["vwap_diff"] = (df["close"] - sess_vwap) / (sess_vwap + 1e-9)
+
+            if "vwap_log_return" in active_feats:
+                # 对齐 offline feature_merge: vwap 列在算 log_return 前已被
+                # 日内 cumsum(close*vol) 口径覆盖 → vwap_log_return=log(sess_vwap/prev_close)。
+                # 若用交易所分钟 wap(/close 占位)，会退化成 ≈close_log_return，与离线近零相关。
+                df["vwap_log_return"] = np.log(sess_vwap / prev_close).fillna(0.0)
+
+            if "return_divergence" in active_feats:
+                c_log_ret = (
+                    df["close_log_return"]
+                    if "close_log_return" in df.columns
+                    else np.log(close_ff / prev_close).fillna(0.0)
+                )
+                v_log_ret = (
+                    df["vwap_log_return"]
+                    if "vwap_log_return" in df.columns
+                    else np.log(sess_vwap / prev_close).fillna(0.0)
+                )
+                df["return_divergence"] = c_log_ret - v_log_ret
+
+            if "poc_deviation" in active_feats:
+                df["poc_deviation"] = self._calculate_poc_realtime(df)
         
         # 3. 量比 (Volume Ratio)
         if 'volume_ratio' in active_feats:
@@ -392,16 +421,83 @@ class RealTimeFeatureEngine:
                 raw_adx = ta.trend.ADXIndicator(
                     high=df['high'], low=df['low'], close=df['close'], window=14
                 ).adx()
-                df['adx_smooth_10'] = raw_adx.ewm(span=10).mean().fillna(20.0)
-            except:
-                df['adx_smooth_10'] = 20.0
+                # 对齐 feature_merge / price_features: adx ffill 后再 ewm(span=10)
+                adx_ff = raw_adx.ffill().fillna(0.0)
+                df['adx_smooth_10'] = adx_ff.ewm(span=10).mean().fillna(0.0)
+            except Exception:
+                df['adx_smooth_10'] = 0.0
+
+        if 'bb_width' in active_feats:
+            try:
+                bb = ta.volatility.BollingerBands(close=df['close'], window=20, window_dev=2)
+                df['bb_width'] = (bb.bollinger_wband() / df['close']).ffill().fillna(0.0)
+            except Exception:
+                df['bb_width'] = 0.0
 
         # 5. Garman-Klass Volatility (带 20 周期平滑)
         if 'garman_klass_vol' in active_feats:
             log_hl = np.log((df['high'] + self.epsilon) / (df['low'] + self.epsilon))
             log_co = np.log((df['close'] + self.epsilon) / (df['open'] + self.epsilon))
             gk = 0.5 * log_hl**2 - (2 * math.log(2) - 1) * log_co**2
+            # 对齐 offline: sqrt(max(0, gk)).rolling(20).mean()
             df['garman_klass_vol'] = np.sqrt(gk.clip(lower=0)).rolling(20).mean().fillna(0.0)
+
+        # 离线月 parquet 冷启动 TA；Deep Warmup 带上月 K 线会系统性偏离金标。
+        # FCS_TA_MONTH_ISOLATED=1：强制按当前日历月重算。
+        # 默认：若 history 跨月，自动月隔离（对齐月文件金标）；单月 history 不改。
+        # 生产连续 lookback 金标：FCS_TA_MONTH_ISOLATED=0。
+        _iso_env = os.environ.get("FCS_TA_MONTH_ISOLATED", "").strip().lower()
+        if _iso_env in {"1", "true", "yes", "on"}:
+            month_iso = True
+        elif _iso_env in {"0", "false", "no", "off"}:
+            month_iso = False
+        else:
+            month_iso = (
+                isinstance(df.index, pd.DatetimeIndex)
+                and len(df) > 0
+                and (
+                    (df.index[0].year, df.index[0].month)
+                    != (df.index[-1].year, df.index[-1].month)
+                )
+            )
+        ta_month_feats = [f for f in ('adx_smooth_10', 'bb_width', 'garman_klass_vol') if f in active_feats]
+        if month_iso and ta_month_feats and isinstance(df.index, pd.DatetimeIndex) and len(df) > 0:
+            last_ts = df.index[-1]
+            month_mask = (df.index.year == last_ts.year) & (df.index.month == last_ts.month)
+            df_m = df.loc[month_mask]
+            if len(df_m) > 0:
+                if 'adx_smooth_10' in ta_month_feats:
+                    # 月内不足 ADX window 时必须写 0，禁止 except:pass 残留跨月连续 ADX
+                    if len(df_m) < 14:
+                        df.loc[month_mask, 'adx_smooth_10'] = 0.0
+                    else:
+                        try:
+                            raw_adx = ta.trend.ADXIndicator(
+                                high=df_m['high'], low=df_m['low'], close=df_m['close'], window=14
+                            ).adx()
+                            df.loc[month_mask, 'adx_smooth_10'] = (
+                                raw_adx.ffill().fillna(0.0).ewm(span=10).mean().fillna(0.0).values
+                            )
+                        except Exception:
+                            df.loc[month_mask, 'adx_smooth_10'] = 0.0
+                if 'bb_width' in ta_month_feats:
+                    if len(df_m) < 20:
+                        df.loc[month_mask, 'bb_width'] = 0.0
+                    else:
+                        try:
+                            bb = ta.volatility.BollingerBands(close=df_m['close'], window=20, window_dev=2)
+                            df.loc[month_mask, 'bb_width'] = (
+                                (bb.bollinger_wband() / df_m['close']).ffill().fillna(0.0).values
+                            )
+                        except Exception:
+                            df.loc[month_mask, 'bb_width'] = 0.0
+                if 'garman_klass_vol' in ta_month_feats:
+                    log_hl = np.log((df_m['high'] + self.epsilon) / (df_m['low'] + self.epsilon))
+                    log_co = np.log((df_m['close'] + self.epsilon) / (df_m['open'] + self.epsilon))
+                    gk = 0.5 * log_hl**2 - (2 * math.log(2) - 1) * log_co**2
+                    df.loc[month_mask, 'garman_klass_vol'] = (
+                        np.sqrt(gk.clip(lower=0)).rolling(20).mean().fillna(0.0).values
+                    )
 
         # 6. ATR 相关归一化特征
         if 'price_slope_norm_by_atr' in active_feats or 'price_dist_from_ma_atr' in active_feats:
@@ -672,12 +768,18 @@ class RealTimeFeatureEngine:
                       #            raw_snap 里的 price/bid/ask 由上游 pipeline 更新，Delta/IV 等结构性特征
                       #            在下一分钟翻页时再统一重算。
                       if recalc_greeks and is_new_minute and option_contracts and s in option_contracts:
-                          # 🚀 [Parity Fix] 显式透传 current_ts (或 fallback 到 last_ts) 确保到期时间计算正确
-                          target_ts = current_ts if current_ts else last_ts.timestamp()
-                          raw_snap = self.supplement_greeks(
-                              s, raw_snap, option_contracts[s], 
-                              float(last_row['close']), target_ts
-                          )
+                          # 与 5m 路径一致：已有有效 IV(发球机 minute_ref 注入)时不再 BSM 抹除重算，
+                          # 否则 options_flow_skew 等 IV 比值特征会系统性偏离离线 locked_feature。
+                          force_recalc = os.environ.get("FCS_FORCE_RECALC_GREEKS", "0").strip().lower() in {
+                              "1", "true", "yes", "on",
+                          }
+                          iv_missing = raw_snap.shape[1] > 7 and float(np.nanmax(np.abs(raw_snap[:4, 7]))) <= 0.01
+                          if force_recalc or iv_missing:
+                              target_ts = current_ts if current_ts else last_ts.timestamp()
+                              raw_snap = self.supplement_greeks(
+                                  s, raw_snap, option_contracts[s],
+                                  float(last_row['close']), target_ts
+                              )
 
                   if raw_snap.shape[0] < 6:
                       raw_snap = np.vstack([raw_snap, np.zeros((6-raw_snap.shape[0], raw_snap.shape[1]), dtype=raw_snap.dtype)])
@@ -693,12 +795,32 @@ class RealTimeFeatureEngine:
             option_snapshot=opts_bh, skip_scaling=skip_scaling, global_ctx=global_ctx,
         )
 
-        # --- B. 计算 5min 特征 (从 1min master timeline 派生) ---
+        # --- B. 计算 5min 特征 ---
+        # 优先使用上游已提交/发球机注入的 5m 历史(可含完整桶)；不足时再从 1m 派生。
         batch_res_5m = {}
         opts_bh_5m = None
         updated_buckets_5m = {}
         if slow_feats_5m:
-            derived_history_5m, master_index_5m = self._derive_5m_from_1m_history(history_1min, ready_syns)
+            prefer_ext = os.environ.get("FCS_PREFER_EXTERNAL_5M", "1").strip().lower() not in {
+                "0", "false", "no", "off",
+            }
+            derived_history_5m, master_index_5m = None, None
+            if prefer_ext and history_5min:
+                ext = {}
+                for s in ready_syns:
+                    df5 = history_5min.get(s)
+                    if isinstance(df5, pd.DataFrame) and not df5.empty:
+                        cols = [c for c in ('open', 'high', 'low', 'close', 'volume', 'vwap') if c in df5.columns]
+                        if len(cols) >= 5:
+                            ext[s] = df5[cols].sort_index()
+                if ext:
+                    master = None
+                    for df5 in ext.values():
+                        master = df5.index if master is None else master.union(df5.index)
+                    if master is not None and len(master) > 0:
+                        derived_history_5m, master_index_5m = ext, master.sort_values()
+            if not derived_history_5m:
+                derived_history_5m, master_index_5m = self._derive_5m_from_1m_history(history_1min, ready_syns)
             if derived_history_5m and master_index_5m is not None and len(master_index_5m) > 0:
                 prices_bh_5m, feat_idx_map_5m = self._prepare_hybrid_tensors(
                     derived_history_5m, ready_syns, master_index_5m, slow_feats_5m
@@ -764,11 +886,23 @@ class RealTimeFeatureEngine:
                 for idx, f in enumerate(slow_feats):
                     if f in slow_feats_5m:
                         if s_slow_5m is not None and k5 < s_slow_5m.shape[0]:
-                            merged_slow[idx] = s_slow_5m[k5]
+                            src = s_slow_5m[k5]
+                            if src.shape[-1] == 30:
+                                merged_slow[idx] = src
+                            elif src.shape[-1] > 30:
+                                merged_slow[idx] = src[..., -30:]
+                            else:
+                                merged_slow[idx, -src.shape[-1] :] = src
                         k5 += 1
                     else:
                         if s_slow_1m is not None and k1 < s_slow_1m.shape[0]:
-                            merged_slow[idx] = s_slow_1m[k1]
+                            src = s_slow_1m[k1]
+                            if src.shape[-1] == 30:
+                                merged_slow[idx] = src
+                            elif src.shape[-1] > 30:
+                                merged_slow[idx] = src[..., -30:]
+                            else:
+                                merged_slow[idx, -src.shape[-1] :] = src
                         k1 += 1
                 output_slow = merged_slow.unsqueeze(0)
 
@@ -852,9 +986,13 @@ class RealTimeFeatureEngine:
             ratio = volume / (sma20_vol + self.epsilon)
             res['vol_contraction_ratio'] = ratio
             
-        if 'bb_width' in all_feats:
+        if 'bb_width' in all_feats and 'bb_width' not in res:
+            # 仅当 Pandas 预计算缺失时兜底；有月隔离结果时禁止用全历史 torch BB 覆盖
             u, l_ = self._bbands(close, 20, 2)
-            res['bb_width'] = (u - l_) / (close + self.epsilon)
+            # 对齐 ta.bollinger_wband()/close: wband = 100*(u-l)/sma
+            sma20 = self._sma(close, 20)
+            wband = 100.0 * (u - l_) / (sma20 + self.epsilon)
+            res['bb_width'] = wband / (close + self.epsilon)
             
         if 'fast_mom' in all_feats:
             prev_close = torch.roll(close, 5, dims=1)
@@ -952,6 +1090,35 @@ class RealTimeFeatureEngine:
         return final_results
     
 
+    def _calc_opt_feats_from_snap(self, snap, spot):
+        """单帧期权快照 → 特征 dict（与 options_locked_feature 同口径）。
+
+        FCS `_calc_and_inject_option_features` 入口；内部复用 batch 路径。
+        snap: [6, C] 或 [B, 6, C]；C>=8（缺 bid/ask 时补 0）。
+        """
+        if snap is None:
+            return {}
+        x = snap
+        if not torch.is_tensor(x):
+            x = torch.tensor(x, dtype=torch.float32, device=self.device)
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+            squeeze = True
+        else:
+            squeeze = False
+        if x.shape[-1] < 12:
+            pad = torch.zeros(*x.shape[:-1], 12 - x.shape[-1], device=x.device, dtype=x.dtype)
+            x = torch.cat([x, pad], dim=-1)
+        if not torch.is_tensor(spot):
+            spot = torch.tensor(spot, dtype=torch.float32, device=self.device)
+        spot = spot.reshape(-1).to(device=x.device, dtype=x.dtype)
+        if spot.numel() == 1 and x.shape[0] > 1:
+            spot = spot.expand(x.shape[0])
+        out = self._calc_opt_feats_batch(x, spot)
+        if squeeze:
+            return {k: v.reshape(()) for k, v in out.items()}
+        return out
+
     def _calc_opt_feats_batch(self, snap, spot):
         out = {}
         if snap is None: return out
@@ -963,76 +1130,96 @@ class RealTimeFeatureEngine:
         theta_vec = snap[:, :, 4]
         gamma_vec = snap[:, :, 2]
         delta_vec = snap[:, :, 1]
-        bid_vec = snap[:, :, 8]
-        ask_vec = snap[:, :, 9]
+        # bid/ask 仅在 C>=10 时可用；from_snap 注入路径常只切前 8 列
+        if snap.shape[-1] >= 10:
+            bid_vec = snap[:, :, 8]
+            ask_vec = snap[:, :, 9]
+        else:
+            bid_vec = torch.zeros_like(vol_vec)
+            ask_vec = torch.zeros_like(vol_vec)
         
-        # 提取前4个档位 (ATM/OTM)
+        # 4-bucket: put_atm=0, put_otm=1, call_atm=2, call_otm=3（对齐 options_locked_feature）
         vol_front = vol_vec[:, 0:4] # [B, 4]
         total_vol = torch.sum(vol_front, dim=1)
         use_equal = total_vol < 1.0
+        zero = torch.zeros_like(total_vol)
 
-        def calc_vw_offline(vec_all):
+        def calc_vw_net(vec_all, fill_zero: bool = True, atm_avg: bool = False):
+            """成交量加权；断流时: fill_zero→0, atm_avg→(ATM put+call)/2。"""
             weighted = torch.sum(vec_all[:, 0:4] * vol_front, dim=1) / (total_vol + eps)
-            simple_avg = torch.mean(vec_all[:, 0:4], dim=1)
-            return torch.where(use_equal, simple_avg, weighted)
+            if atm_avg:
+                fill = (vec_all[:, 0] + vec_all[:, 2]) / 2.0
+            elif fill_zero:
+                fill = zero
+            else:
+                fill = torch.mean(vec_all[:, 0:4], dim=1)
+            return torch.where(use_equal, fill, weighted)
 
         # ==========================================================
-        # 🚀 [特征对齐 1] 对齐离线 options_locked_feature.py: Front 4 桶成交量加权
+        # 对齐 options_locked_feature: vw_iv = (put_atm + call_atm) / 2，非量权
         # ==========================================================
-        out['options_vw_iv'] = calc_vw_offline(iv_vec)
+        out['options_vw_iv'] = (iv_vec[:, 0] + iv_vec[:, 2]) / 2.0
 
         # ==========================================================
-        # 🚀 [特征对齐 2] 净 Delta / Gamma / Vega / Theta 敞口
+        # 净 Delta: 量权；断流 → 0。Gamma/Vega/Theta: 量权；断流 → ATM 均值
         # ==========================================================
-        out['options_vw_delta'] = calc_vw_offline(delta_vec)
-        out['options_vw_gamma'] = calc_vw_offline(gamma_vec)
-        out['options_vw_vega'] = calc_vw_offline(vega_vec)
-        out['options_vw_theta'] = calc_vw_offline(theta_vec)
+        out['options_vw_delta'] = calc_vw_net(delta_vec, fill_zero=True)
+        out['options_vw_gamma'] = calc_vw_net(gamma_vec, atm_avg=True)
+        out['options_vw_vega'] = calc_vw_net(vega_vec, atm_avg=True)
+        out['options_vw_theta'] = calc_vw_net(theta_vec, atm_avg=True)
         
-        # 实时 bucket 无独立 vanna/charm 列，沿用近似值，但使用离线同款 front-4 VW 聚合。
-        out['options_vw_vanna'] = calc_vw_offline(vega_vec) / (spot + eps)
-        out['options_vw_charm'] = calc_vw_offline(theta_vec) / (spot + eps)
+        out['options_vw_vanna'] = out['options_vw_vega'] / (spot + eps)
+        out['options_vw_charm'] = out['options_vw_theta'] / (spot + eps)
 
         # ==========================================================
-        # 🚀 [特征对齐 3] 微观失衡 (断流时严格给 0.0，杜绝幻觉)
+        # 微观失衡 (断流时严格给 0.0)
         # ==========================================================
-        def calc_pure_vw(vec_all):
-            net_val = torch.sum(vec_all[:, 0:4] * vol_front, dim=1) / (total_vol + eps)
-            return torch.where(use_equal, torch.tensor(0.0, device=self.device), net_val)
+        # 对齐 options_locked_feature: 量权 spread_pct=(ask-bid)/mid，非绝对价差
+        mid_vec = snap[:, :, 0]
+        spread_pct_vec = (ask_vec - bid_vec) / (mid_vec + eps)
+        out['options_vw_spread'] = calc_vw_net(spread_pct_vec, fill_zero=True)
+        if snap.shape[-1] >= 12:
+            imb_vec = (snap[:, 0:4, 10] - snap[:, 0:4, 11]) / (snap[:, 0:4, 10] + snap[:, 0:4, 11] + eps)
+            out['options_vw_imbalance'] = calc_vw_net(imb_vec, fill_zero=True)
+        else:
+            out['options_vw_imbalance'] = zero
 
-        out['options_vw_spread'] = calc_pure_vw(ask_vec - bid_vec)
-        imb_vec = (snap[:, 0:4, 10] - snap[:, 0:4, 11]) / (snap[:, 0:4, 10] + snap[:, 0:4, 11] + eps)
-        out['options_vw_imbalance'] = calc_pure_vw(imb_vec)
-
         # ==========================================================
-        # 🚀 [特征对齐 3.1] [🆕 新增] Gamma 失衡 (Gamma Squeeze Fuel)
+        # Gamma 失衡
         # ==========================================================
-        # (Call_Gamma - Put_Gamma) 
         g_imb = (gamma_vec[:, 2] + gamma_vec[:, 3]) - (gamma_vec[:, 0] + gamma_vec[:, 1])
-        out['options_gamma_imbalance'] = g_imb  # 这个特征通常在末日期权引爆时极度有效
+        out['options_gamma_imbalance'] = g_imb
         
-        # Gamma 比例 (相对于总 Gamma)
         total_g = torch.sum(gamma_vec[:, 0:4], dim=1)
         out['options_gamma_ratio'] = g_imb / (total_g + eps)
 
         # ==========================================================
-        # 🚀 [特征对齐 4] 偏斜与期限结构 (严格遵守物理法则)
+        # 偏斜与期限结构
         # ==========================================================
         denom_call_vol = vol_vec[:, 2] + vol_vec[:, 3]
         pcr = (vol_vec[:, 0] + vol_vec[:, 1]) / (denom_call_vol + eps)
-        out['options_pcr_volume'] = torch.where(denom_call_vol > 0, pcr, torch.tensor(0.7, device=self.device))
+        # 离线断流默认 1.0（非 0.7）
+        out['options_pcr_volume'] = torch.where(denom_call_vol > 0, pcr, torch.ones_like(pcr))
 
-        avg_iv_put = (iv_vec[:, 0] + iv_vec[:, 1]) / 2.0
-        avg_iv_call = (iv_vec[:, 2] + iv_vec[:, 3]) / 2.0
-        out['options_flow_skew'] = torch.where(avg_iv_call > 0.01, avg_iv_put / (avg_iv_call + eps), torch.tensor(1.0, device=self.device))
+        out['options_flow_skew'] = torch.where(
+            iv_vec[:, 3] > 0.01,
+            iv_vec[:, 1] / (iv_vec[:, 3] + eps),
+            torch.ones_like(iv_vec[:, 0]),
+        )
         
-        out['options_struc_skew'] = torch.where(iv_vec[:, 3] > 0.01, iv_vec[:, 1] / (iv_vec[:, 3] + eps), torch.tensor(1.0, device=self.device))
+        out['options_struc_skew'] = torch.where(
+            iv_vec[:, 0] > 0.01,
+            iv_vec[:, 1] / (iv_vec[:, 0] + eps),
+            torch.ones_like(iv_vec[:, 0]),
+        )
 
         front_atm = (iv_vec[:, 0] + iv_vec[:, 2]) / 2.0
         out['options_struc_atm_iv'] = front_atm
         next_atm = (iv_vec[:, 4] + iv_vec[:, 5]) / 2.0
         term_val = next_atm - front_atm
-        out['options_struc_term'] = torch.where((next_atm > 0.01) & (front_atm > 0.01), term_val, torch.tensor(0.0, device=self.device))
+        out['options_struc_term'] = torch.where(
+            (next_atm > 0.01) & (front_atm > 0.01), term_val, torch.zeros_like(term_val)
+        )
 
         return out
 

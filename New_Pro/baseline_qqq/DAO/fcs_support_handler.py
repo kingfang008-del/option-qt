@@ -656,12 +656,20 @@ class FCSSupportHandler:
         merged = np.zeros((out_rows, out_cols), dtype=np.float32)
         merged[:raw_arr.shape[0], :raw_arr.shape[1]] = raw_arr
         rows = min(out_rows, enriched_arr.shape[0])
+        # Greeks/IV: 仅当 raw 缺失时用 enriched 补洞。
+        # 旧逻辑 `where(isfinite(enriched), enriched, raw)` 会让上一分钟的
+        # latest_opt_buckets 永久覆盖发球机新注入的 minute IV/Greeks，
+        # 造成 options_vw_iv 全日冻结，而 volume(col6) 仍在更新。
         for col in (1, 2, 3, 4, 7):
             if col >= out_cols or col >= enriched_arr.shape[1]:
                 continue
             src = enriched_arr[:rows, col]
             dst = merged[:rows, col]
-            merged[:rows, col] = np.where(np.isfinite(src), src, dst)
+            if col == 7:
+                raw_ok = np.isfinite(dst) & (dst > 0.01)
+            else:
+                raw_ok = np.isfinite(dst) & (np.abs(dst) > 1e-8)
+            merged[:rows, col] = np.where(raw_ok, dst, np.where(np.isfinite(src), src, dst))
         # 强约束：价格列统一由 bid/ask 重建为 mid，避免沿用成交价。
         if out_cols > 9:
             bid = merged[:rows, 8]

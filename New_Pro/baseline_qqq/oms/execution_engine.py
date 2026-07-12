@@ -819,10 +819,20 @@ class ExecutionEngineV8:
         print("DEBUG: Redis Initialized.")
         
         # IBKR backend selection:
-        # - REALTIME / REALTIME_DRY: real connector
-        # - BACKTEST: mock connector
+        # - REALTIME (live money): real connector
+        # - REALTIME_DRY / BACKTEST: mock by default
+        # - OMS_MOCK_IBKR=1 强制 mock(Redis 对拍 / 无 Gateway)
+        # - OMS_MOCK_IBKR=0 且非 SIMULATED 时走真连
         try:
-            if self.mode == 'realtime' and not IS_SIMULATED:
+            mock_env = os.environ.get("OMS_MOCK_IBKR", "").strip().lower()
+            force_mock = mock_env in ("1", "true", "yes", "on")
+            force_real = mock_env in ("0", "false", "no", "off")
+            use_mock = (
+                force_mock
+                or IS_SIMULATED
+                or (IS_REALTIME_DRY and not force_real)
+            )
+            if self.mode == "realtime" and not use_mock:
                 self.ibkr = IBKRConnectorFinal(client_id=999)
                 logger.info(
                     "🔌 [OMS] IBKR backend=REAL | RUN_MODE=%s | IS_REALTIME_DRY=%s | TRADING_ENABLED=%s",
@@ -830,7 +840,11 @@ class ExecutionEngineV8:
                 )
             else:
                 self.ibkr = MockIBKRHistorical()
-                logger.info("🧪 [OMS] IBKR backend=MOCK | RUN_MODE=%s", RUN_MODE)
+                logger.info(
+                    "🧪 [OMS] IBKR backend=MOCK | RUN_MODE=%s | OMS_MOCK_IBKR=%s",
+                    RUN_MODE,
+                    mock_env or "(default)",
+                )
         except Exception as e:
             logger.error(f"❌ [OMS] IBKR backend init failed: {e}")
             self.ibkr = None
@@ -1815,6 +1829,7 @@ class ExecutionEngineV8:
         curr_ts = ny_now.timestamp()
         # 👇 [🔥 修复: 全局保存逻辑时间，供高频tick备用，绝不让物理时间渗透！]
         self.last_curr_ts = curr_ts
+        self._maybe_reset_day_boundary(ny_now)
         # 👆
         
         # 周期性保存状态 (每60秒)
@@ -1841,6 +1856,28 @@ class ExecutionEngineV8:
                 return None, None
             
         return ny_now, curr_ts
+
+    def _maybe_reset_day_boundary(self, ny_now) -> None:
+        """跨日回放时清零熔断/冷却，避免 warmup 日 HARD_STOP 污染目标日入场。"""
+        current_date = ny_now.date()
+        last = getattr(self, "last_date", None)
+        if last is not None and current_date > last:
+            self.consecutive_stop_losses = 0
+            self.global_cooldown_until = 0.0
+            for st in self.states.values():
+                try:
+                    st.cooldown_until = 0.0
+                except Exception:
+                    pass
+            try:
+                if getattr(self, "r", None) is not None:
+                    self.r.delete("meta:circuit_breaker")
+            except Exception as _cb_del_e:
+                logger.warning(f"⚠️ [CB Sync] day-boundary DEL meta:circuit_breaker failed: {_cb_del_e}")
+            logger.warning(
+                f"🧹 [Day Boundary] reset CB/cooldown | {last} → {current_date}"
+            )
+        self.last_date = current_date
 
     # === Execution Delegations ===
     async def _execute_entry(self, sym, sig, stock_price, curr_ts, batch_idx):
@@ -2659,6 +2696,7 @@ class ExecutionEngineV8:
         self.last_curr_ts = curr_ts
         await self._flush_delayed_signals(curr_ts)
         ny_now = datetime.fromtimestamp(curr_ts, timezone('America/New_York'))
+        self._maybe_reset_day_boundary(ny_now)
         items = frame.get('items') or []
         spy_rocs = frame.get('spy_roc_5min') or []
         qqq_rocs = frame.get('qqq_roc_5min') or []

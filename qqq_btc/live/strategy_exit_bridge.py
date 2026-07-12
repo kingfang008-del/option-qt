@@ -50,7 +50,12 @@ def check_exit_via_rails(
 
     held_mins = float(ctx.get("held_mins", 0.0) or 0.0)
     entry_bar = int(pos.get("entry_bar", 0) or 0)
-    current_bar = entry_bar + max(0, int(round(held_mins)))
+    session_bar = _session_bar_from_ctx(ctx)
+    # 优先用绝对 session_bar(与 offline replay 一致);held_mins 仅作 fallback
+    if session_bar > 0 and entry_bar >= 0:
+        current_bar = int(session_bar)
+    else:
+        current_bar = entry_bar + max(0, int(round(held_mins)))
 
     ps = PositionState(entry_price=entry_price, entry_bar=entry_bar)
     ps.max_roi = float(pos.get("max_roi", 0.0) or 0.0)
@@ -65,7 +70,7 @@ def check_exit_via_rails(
         ps,
         curr_price,
         current_bar,
-        session_bar_index=_session_bar_from_ctx(ctx),
+        session_bar_index=session_bar if session_bar > 0 else None,
     )
     if reason:
         return {"action": "SELL", "reason": f"QQQ_BTC_{reason}", "dir": pos.get("dir", 1)}

@@ -364,20 +364,20 @@
       "type": "real",
       "calc": "leading",
       "use_for_anomaly": false,
-      "resolution": "5min"
+      "resolution": "1min"
     },
     {
       "name": "bb_width",
       "type": "real",
       "calc": "BollingerBands(close, window=20, window_dev=2).bollinger_width()",
       "description": "Normalized Bollinger Band width",
-      "resolution": "5min"
+      "resolution": "1min"
     },
     {
       "name": "adx_smooth_10",
       "type": "real",
       "calc": "adx_smooth_10",
-      "resolution": "5min"
+      "resolution": "1min"
     },
     {
       "name": "vix_level",
@@ -482,14 +482,14 @@
       "type": "real",
       "calc": "options",
       "use_for_anomaly": false,
-      "resolution": "5min"
+      "resolution": "1min"
     },
     {
       "name": "options_struc_skew",
       "type": "real",
       "calc": "options",
       "use_for_anomaly": false,
-      "resolution": "5min"
+      "resolution": "1min"
     },
     {
       "name": "time_session_sin",

@@ -41,6 +41,7 @@ _HEADER = (
     "net_edge_raw",
     "net_edge_q10",
     "spread_pct",
+    "trend_fit_ret_30m",
     "dyn_threshold",
     "put_dyn_threshold",
     "block_reason",
@@ -120,6 +121,21 @@ def record_entry_signal_audit(
     ask = float(ctx.get("ask", 0.0) or 0.0)
     mid = float(ctx.get("curr_price", 0.0) or 0.0)
     spread_pct = (ask - bid) / mid if mid > 0.01 and ask >= bid > 0 else ""
+    # 优先记录腿别 spread / trend，便于对拍 offline put_trend / put_spread
+    put_sp = ctx.get("put_spread_pct")
+    call_sp = ctx.get("call_spread_pct")
+    try:
+        if decision is not None and str(getattr(decision, "leg", "")).upper() == "PUT" and put_sp is not None:
+            spread_pct = float(put_sp)
+        elif call_sp is not None and (spread_pct == "" or spread_pct is None):
+            spread_pct = float(call_sp)
+    except (TypeError, ValueError):
+        pass
+    trend_v = ctx.get("trend_fit_ret_30m", "")
+    try:
+        trend_v = float(trend_v) if trend_v != "" and trend_v is not None else ""
+    except (TypeError, ValueError):
+        trend_v = ""
 
     if decision is not None:
         leg = str(getattr(decision, "leg", "") or "")
@@ -155,6 +171,7 @@ def record_entry_signal_audit(
         "net_edge_raw": edge_raw,
         "net_edge_q10": q10_f,
         "spread_pct": spread_pct,
+        "trend_fit_ret_30m": trend_v,
         "dyn_threshold": dyn_threshold if dyn_threshold is not None else "",
         "put_dyn_threshold": put_dyn_threshold if put_dyn_threshold is not None else "",
         "block_reason": block_reason,

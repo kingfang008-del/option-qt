@@ -138,22 +138,30 @@ def trading_dates(symbol: str, start: str, end: str, client: RESTClient | None =
 
 def get_contract_rows(client: RESTClient, symbol: str, date_str: str) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    for c in client.list_options_contracts(
-        underlying_ticker=symbol,
-        expiration_date=date_str,
-        expired="true",
-        limit=1000,
-        sort="strike_price",
-        order="asc",
-    ):
-        rows.append(
-            {
-                "ticker": getattr(c, "ticker", ""),
-                "contract_type": str(getattr(c, "contract_type", "")).lower(),
-                "expiration_date": str(getattr(c, "expiration_date", date_str)),
-                "strike_price": float(getattr(c, "strike_price", 0.0)),
-            }
-        )
+    # Prefer expired=true for history; fall back to false for live/near expiries.
+    for expired_flag in ("true", "false"):
+        rows = []
+        try:
+            for c in client.list_options_contracts(
+                underlying_ticker=symbol,
+                expiration_date=date_str,
+                expired=expired_flag,
+                limit=1000,
+                sort="strike_price",
+                order="asc",
+            ):
+                rows.append(
+                    {
+                        "ticker": getattr(c, "ticker", ""),
+                        "contract_type": str(getattr(c, "contract_type", "")).lower(),
+                        "expiration_date": str(getattr(c, "expiration_date", date_str)),
+                        "strike_price": float(getattr(c, "strike_price", 0.0)),
+                    }
+                )
+        except Exception:
+            rows = []
+        if rows:
+            break
     return pd.DataFrame(rows)
 
 

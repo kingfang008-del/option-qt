@@ -109,6 +109,8 @@ class LiveSessionGovernor:
         vix_reversal_count_30m: Optional[float] = None,
         spot_range_30m: Optional[float] = None,
         trend_ret_30m: Optional[float] = None,
+        day_range_pos: Optional[float] = None,
+        bb_width: Optional[float] = None,
     ) -> None:
         st = self._state(symbol)
         maybe_append_edge_buffers(
@@ -124,6 +126,8 @@ class LiveSessionGovernor:
             vix_reversal_count_30m=vix_reversal_count_30m,
             spot_range_30m=spot_range_30m,
             trend_ret_30m=trend_ret_30m,
+            day_range_pos=day_range_pos,
+            bb_width=bb_width,
         )
 
     def dynamic_thresholds(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
@@ -161,7 +165,7 @@ class LiveSessionGovernor:
         curr_ts: float,
         leg: str = "CALL",
     ) -> float:
-        """平仓后更新日内统计;返回 streak 冷却截止时间(供写入 st.cooldown_until)。"""
+        """平仓后更新日内统计;返回冷却截止时间(含 cooldown_bars + 连亏冷却)。"""
         self.maybe_reset_day(symbol, curr_ts)
         st = self._state(symbol)
         rc = self.replay_cfg
@@ -170,19 +174,24 @@ class LiveSessionGovernor:
         if leg == "STRADDLE":
             st.straddles_today += 1
         st.day_pnl += nr
-        streak_until = 0.0
+        cool_until = 0.0
+        # 与 ReplaySession 一致:每笔平仓后冷却 cooldown_bars 分钟
+        bars = int(getattr(rc, "cooldown_bars", 0) or 0)
+        if bars > 0 and curr_ts > 0:
+            cool_until = float(curr_ts) + bars * 60.0
         if nr < 0:
             st.loss_streak += 1
             if rc.loss_streak_n is not None and st.loss_streak >= int(rc.loss_streak_n):
-                bars = int(rc.loss_streak_cooldown_bars)
-                streak_until = float(curr_ts) + bars * 60.0
+                streak_bars = int(rc.loss_streak_cooldown_bars)
+                streak_until = float(curr_ts) + streak_bars * 60.0
                 st.streak_cooldown_until_ts = streak_until
+                cool_until = max(cool_until, streak_until)
                 st.loss_streak = 0
         else:
             st.loss_streak = 0
         if rc.daily_loss_stop is not None and st.day_pnl <= float(rc.daily_loss_stop):
             st.day_halted = True
-        return streak_until
+        return cool_until
 
     def straddles_today_for(self, symbol: str) -> int:
         return self._state(symbol).straddles_today

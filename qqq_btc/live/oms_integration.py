@@ -199,6 +199,80 @@ async def evaluate_disaster_tick_exits(engine, curr_ts: float, rails: ExitRailsC
         )
 
 
+def realtime_dry_fill_price_qqq_btc(
+    self,
+    sym: str,
+    sig: dict,
+    fallback_price: float,
+    curr_ts: float,
+    *,
+    side: str = "BUY",
+    orig_fn=None,
+) -> float:
+    """
+    REALTIME_DRY 成交价对齐 offline FillModel(0.775)，不用 mid。
+    仍优先用 fresh 1s bid/ask；缺失时回退 limit/fallback。
+    """
+    import os
+
+    # 显式要求 mid 链路验证时保持旧行为
+    if os.environ.get("QQQ_BTC_REALTIME_DRY_FILL_MID", "").strip().lower() in ("1", "true", "yes"):
+        if orig_fn is not None:
+            return float(orig_fn(sym, sig, fallback_price, curr_ts))
+        return float(fallback_price or 0.0)
+
+    bid = float((sig.get("meta") or {}).get("bid", 0.0) or sig.get("bid", 0.0) or 0.0)
+    ask = float((sig.get("meta") or {}).get("ask", 0.0) or sig.get("ask", 0.0) or 0.0)
+
+    try:
+        freshness = getattr(self.orch, "_execution_quote_freshness", None)
+        if freshness is not None:
+            is_fresh, lag, wall_lag, quote = freshness(sym, curr_ts)
+            if is_fresh and quote:
+                leg = str((sig.get("meta") or {}).get("leg", "") or "").upper()
+                tag = str(sig.get("tag", "") or "").upper()
+                opt_type = "put"
+                if "CALL" in leg or "CALL" in tag or int(sig.get("dir", 0) or 0) == 1:
+                    opt_type = "call"
+                if "PUT" in leg or "PUT" in tag or int(sig.get("dir", 0) or 0) == -1:
+                    opt_type = "put"
+                qb = float(quote.get(f"{opt_type}_bid", 0.0) or 0.0)
+                qa = float(quote.get(f"{opt_type}_ask", 0.0) or 0.0)
+                if qb > 0.0 and qa > 0.0 and qa >= qb:
+                    bid, ask = qb, qa
+                    meta = dict(sig.get("meta", {}) or {})
+                    meta["bid"] = bid
+                    meta["ask"] = ask
+                    meta["realtime_dry_fill_source"] = "fill_model_0.775"
+                    meta["realtime_dry_quote_lag_sec"] = float(lag)
+                    meta["realtime_dry_quote_wall_lag_sec"] = float(wall_lag)
+                    sig["meta"] = meta
+                    mid = 0.5 * (bid + ask)
+                    sig["price"] = mid
+                    sig["market_price"] = mid
+                    sig["bid"] = bid
+                    sig["ask"] = ask
+    except Exception:
+        pass
+
+    if bid > 0.0 and ask > 0.0 and ask >= bid:
+        raw = limit_price_from_quote(bid, ask, side, qcfg.FILL_MODEL)
+        # 对拍用两位四舍五入；勿 floor-tick，否则窄价差 0.775 会塌成 mid
+        return float(round(raw, 2))
+    return float(fallback_price or 0.0)
+
+
+def _should_use_fill_model_dry() -> bool:
+    import os
+
+    if os.environ.get("QQQ_BTC_REALTIME_DRY_FILL_MID", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    return (
+        os.environ.get("QQQ_BTC_LIVE", "").strip().lower() in ("1", "true", "yes")
+        or os.environ.get("REDIS_STREAM_SIM", "").strip().lower() in ("1", "true", "yes")
+    )
+
+
 def apply_oms_patches(*, tick_exits_mode: str = "disaster_only") -> None:
     global _PATCHED, _ORIG_ENTRY, _ORIG_EXIT, _ORIG_TICK_EXITS, _ORIG_SELECT_ENTRY
     if _PATCHED:
@@ -245,6 +319,77 @@ def apply_oms_patches(*, tick_exits_mode: str = "disaster_only") -> None:
     oex.OrchestratorExecution._get_entry_limit_price = _patched_entry
     oex.OrchestratorExecution._get_exit_limit_price = _patched_exit
     logger.info("patched OrchestratorExecution entry/exit limit → fill_model 0.775")
+
+    _ORIG_RT_DRY_FILL = oex.OrchestratorExecution._realtime_dry_entry_fill_price
+
+    def _patched_rt_dry_fill(self, sym, sig, fallback_price, curr_ts):
+        return realtime_dry_fill_price_qqq_btc(
+            self,
+            sym,
+            sig,
+            fallback_price,
+            curr_ts,
+            side="BUY",
+            orig_fn=_ORIG_RT_DRY_FILL.__get__(self, oex.OrchestratorExecution),
+        )
+
+    oex.OrchestratorExecution._realtime_dry_entry_fill_price = _patched_rt_dry_fill
+    logger.info("patched OrchestratorExecution REALTIME_DRY entry fill → fill_model 0.775")
+
+    _orig_execute_exit = oex.OrchestratorExecution._execute_exit
+
+    async def _patched_execute_exit(self, sym, sig, stock_price, curr_ts, batch_idx):
+        """REALTIME_DRY 平仓价用 FillModel 0.775，避免 fair-mid 与离线 exit_fill 分叉。"""
+        if not _should_use_fill_model_dry():
+            return await _orig_execute_exit(self, sym, sig, stock_price, curr_ts, batch_idx)
+
+        orch = self.orch
+        orig_gfm = orch._get_fair_market_price
+
+        # 尽量用 fresh 1s bid/ask 覆写信号盘口
+        try:
+            freshness = getattr(orch, "_execution_quote_freshness", None)
+            if freshness is not None:
+                is_fresh, _lag, _wall, quote = freshness(sym, curr_ts)
+                if is_fresh and quote:
+                    st = orch.states.get(sym)
+                    pos = int(getattr(st, "position", 0) or 0) if st is not None else 0
+                    opt_type = "put" if pos < 0 else "call"
+                    leg = str((sig.get("meta") or {}).get("leg", "") or "").upper()
+                    if "PUT" in leg:
+                        opt_type = "put"
+                    elif "CALL" in leg:
+                        opt_type = "call"
+                    qb = float(quote.get(f"{opt_type}_bid", 0.0) or 0.0)
+                    qa = float(quote.get(f"{opt_type}_ask", 0.0) or 0.0)
+                    if qb > 0.0 and qa >= qb:
+                        sig = dict(sig)
+                        sig["bid"] = qb
+                        sig["ask"] = qa
+                        meta = dict(sig.get("meta") or {})
+                        meta["bid"] = qb
+                        meta["ask"] = qa
+                        meta["realtime_dry_exit_fill_source"] = "fill_model_0.775"
+                        sig["meta"] = meta
+        except Exception:
+            pass
+
+        def _sell_fill_model(base_price, bid, ask, prev_price=0.0):
+            b = float(bid or 0.0)
+            a = float(ask or 0.0)
+            if b > 0.0 and a >= b:
+                raw = limit_price_from_quote(b, a, "SELL", qcfg.FILL_MODEL)
+                return float(round(raw, 2))
+            return float(orig_gfm(base_price, bid, ask, prev_price))
+
+        orch._get_fair_market_price = _sell_fill_model
+        try:
+            return await _orig_execute_exit(self, sym, sig, stock_price, curr_ts, batch_idx)
+        finally:
+            orch._get_fair_market_price = orig_gfm
+
+    oex.OrchestratorExecution._execute_exit = _patched_execute_exit
+    logger.info("patched OrchestratorExecution REALTIME_DRY exit fill → fill_model 0.775")
 
     if tick_exits_mode != "legacy":
         _ORIG_TICK_EXITS = eex.ExecutionEngineV8._evaluate_second_dynamic_exits
@@ -302,6 +447,25 @@ def apply_oms_patches(*, tick_exits_mode: str = "disaster_only") -> None:
             result = _orig_build_ctx(self, item, opt_data, frame, ny_now, curr_ts, spy_roc, qqq_roc)
             ctx, market_opt_price, ctx_curr_price, ctx_bid, ctx_ask = result
             merge_regime_into_ctx(ctx, item)
+            # 双腿盘口注入:choose_entry 需 CALL/PUT 各自 spread(空仓 ctx.bid/ask 常为 CALL)
+            od = opt_data if isinstance(opt_data, dict) else {}
+            try:
+                call_bid = float(od.get("call_bid", 0.0) or 0.0)
+                call_ask = float(od.get("call_ask", 0.0) or 0.0)
+                put_bid = float(od.get("put_bid", 0.0) or 0.0)
+                put_ask = float(od.get("put_ask", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                call_bid = call_ask = put_bid = put_ask = 0.0
+            if call_bid > 0 and call_ask >= call_bid:
+                ctx["call_bid"] = call_bid
+                ctx["call_ask"] = call_ask
+                mid_c = 0.5 * (call_bid + call_ask)
+                ctx["call_spread_pct"] = (call_ask - call_bid) / mid_c if mid_c > 0 else 0.0
+            if put_bid > 0 and put_ask >= put_bid:
+                ctx["put_bid"] = put_bid
+                ctx["put_ask"] = put_ask
+                mid_p = 0.5 * (put_bid + put_ask)
+                ctx["put_spread_pct"] = (put_ask - put_bid) / mid_p if mid_p > 0 else 0.0
             sym = str(item.get("symbol", "") or "")
             if sym and ctx_curr_price > 0.01:
                 from qqq_btc.live.session_governor import get_session_governor
@@ -341,9 +505,57 @@ def apply_oms_patches(*, tick_exits_mode: str = "disaster_only") -> None:
         frame_id=None,
         allow_delay_queue=True,
     ):
-        # ALPHA_FRAME 决策后立刻下单;BUY 不走 OMS 延迟队列(与 replay 标签 60s 延迟解耦)
-        if str(action).upper() == "BUY":
+        # 默认: ALPHA_FRAME 后立刻下单(与实盘 immediate_entry 一致)。
+        # REDIS_STREAM_SIM 对拍时若 OMS_SIGNAL_DELAY_BARS>0，保留延迟队列。
+        import os
+
+        delay_bars = int(
+            os.environ.get("OMS_SIGNAL_DELAY_BARS")
+            or os.environ.get("EXECUTION_DELAY_BARS")
+            or "0"
+        )
+        if str(action).upper() == "BUY" and delay_bars <= 0:
             allow_delay_queue = False
+
+        # 对齐 offline entry_delay=1:_try_entry 用「下一分钟」盘口再验 max_spread。
+        # FCS alpha 标签已滞后 1min(=delay), 决策用 last_tick 分钟盘口;成交秒级盘口
+        # 往往已是下一分钟 —— 必须再验一次,否则会吃进 offline 因 spread 拒单的第二笔。
+        if str(action).upper() == "BUY" and (
+            os.environ.get("REDIS_STREAM_SIM", "").strip().lower() in ("1", "true", "yes")
+            or os.environ.get("QQQ_BTC_ENTRY_SPREAD_RECHECK", "").strip().lower()
+            in ("1", "true", "yes")
+        ):
+            try:
+                freshness = getattr(self, "_execution_quote_freshness", None)
+                if freshness is not None:
+                    is_fresh, _lag, _wall, quote = freshness(sym, curr_ts)
+                    if is_fresh and quote:
+                        leg = str((sig.get("meta") or {}).get("leg", "") or "").upper()
+                        tag = str(sig.get("tag", "") or "").upper()
+                        opt_type = "put"
+                        if "CALL" in leg or "CALL" in tag or int(sig.get("dir", 0) or 0) == 1:
+                            opt_type = "call"
+                        if "PUT" in leg or "PUT" in tag or int(sig.get("dir", 0) or 0) == -1:
+                            opt_type = "put"
+                        qb = float(quote.get(f"{opt_type}_bid", 0.0) or 0.0)
+                        qa = float(quote.get(f"{opt_type}_ask", 0.0) or 0.0)
+                        if qb > 0.0 and qa >= qb:
+                            mid = 0.5 * (qb + qa)
+                            sp = (qa - qb) / mid if mid > 0 else float("inf")
+                            max_sp = float(qcfg.REPLAY.max_spread_pct)
+                            if sp > max_sp:
+                                logger.info(
+                                    "🚫 [OMS] BUY blocked by exec-bar spread recheck %s "
+                                    "%s sp=%.4f > max=%.4f (offline entry_delay parity)",
+                                    sym,
+                                    opt_type.upper(),
+                                    sp,
+                                    max_sp,
+                                )
+                                return None
+            except Exception as exc:
+                logger.warning("entry spread recheck skipped: %s", exc)
+
         return await _orig_submit(
             self,
             action,
@@ -357,6 +569,8 @@ def apply_oms_patches(*, tick_exits_mode: str = "disaster_only") -> None:
         )
 
     eex.ExecutionEngineV8._submit_strategy_order = _patched_submit_strategy_order
-    logger.info("patched ExecutionEngineV8._submit_strategy_order → BUY immediate (no delay queue)")
+    logger.info(
+        "patched ExecutionEngineV8._submit_strategy_order → BUY delay + exec-bar spread recheck"
+    )
 
     _PATCHED = True

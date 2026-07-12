@@ -205,6 +205,8 @@ class LiveSignalEngine:
             vix_reversal_count_30m=row.get("vix_reversal_count_30m"),
             spot_day_ret=row.get("spot_day_ret"),
             spot_range_30m=row.get("spot_range_30m"),
+            day_range_pos=row.get("day_range_pos"),
+            bb_width=row.get("bb_width"),
         )
         evs = self.session.on_minute_bar(
             self.bar_index, ts, sess, sq, signal, day_key=day_key

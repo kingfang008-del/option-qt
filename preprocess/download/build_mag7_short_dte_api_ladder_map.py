@@ -102,18 +102,24 @@ def resolve_expiry_for_dte(
     hits: list[str] = []
     for exp in candidate_expiries(trade_date):
         if exp not in expiry_cache:
-            try:
-                hit = next(
-                    client.list_options_contracts(
-                        underlying_ticker=symbol,
-                        expiration_date=exp,
-                        expired="true",
-                        limit=1,
-                    ),
-                    None,
-                )
-            except Exception:
-                hit = None
+            hit = None
+            # Live/near-dated expiries are listed under expired=false;
+            # historical ones under expired=true. Try both.
+            for expired_flag in ("true", "false"):
+                try:
+                    hit = next(
+                        client.list_options_contracts(
+                            underlying_ticker=symbol,
+                            expiration_date=exp,
+                            expired=expired_flag,
+                            limit=1,
+                        ),
+                        None,
+                    )
+                except Exception:
+                    hit = None
+                if hit is not None:
+                    break
             expiry_cache[exp] = hit is not None
         if not expiry_cache[exp]:
             continue

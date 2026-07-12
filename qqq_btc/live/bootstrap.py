@@ -48,9 +48,11 @@ def bootstrap_qqq_btc_live(*, patch_oms: bool = True) -> bool:
         return False
 
     repo = Path(__file__).resolve().parents[2]
+    v4_cfg = repo / "qqq_btc" / "CONFIG" / "slow_feature_qqq_v4.json"
     v2_cfg = repo / "qqq_btc" / "CONFIG" / "slow_feature_qqq_v2.json"
-    if v2_cfg.exists() and not os.environ.get("SLOW_FEATURE_CONFIG", "").strip():
-        os.environ["SLOW_FEATURE_CONFIG"] = str(v2_cfg)
+    default_cfg = v4_cfg if v4_cfg.exists() else v2_cfg
+    if default_cfg.exists() and not os.environ.get("SLOW_FEATURE_CONFIG", "").strip():
+        os.environ["SLOW_FEATURE_CONFIG"] = str(default_cfg)
     os.environ.setdefault("ALPHA_ZSCORE_MODE", "absolute")
     os.environ.setdefault("USE_NET_EDGE_ALPHA", "1")
     os.environ.setdefault("BIDIRECTIONAL_ENABLED", "1")
@@ -60,8 +62,16 @@ def bootstrap_qqq_btc_live(*, patch_oms: bool = True) -> bool:
     os.environ.setdefault("OMS_SIGNAL_DELAY_BARS", "0")
     # 门控收敛: spread/q10/阈值由 choose_entry 负责;FAST_GATE 与 replay 6% 重复
     os.environ.setdefault("FAST_GATE_ENABLED", "0")
-    # 冷却与 replay cooldown_bars=5 对齐(分钟 bar)
-    os.environ.setdefault("COOLDOWN_MINUTES", "5")
+    # 冷却与 replay cooldown_bars=10 对齐(分钟 bar)
+    os.environ.setdefault("COOLDOWN_MINUTES", "10")
+    # put_gate 与训练同用冻结归一化 vix(若存在)
+    default_frozen = repo / "qqq_btc" / "CONFIG" / "frozen_norm_qqq_daily.npz"
+    if default_frozen.exists():
+        os.environ.setdefault("FCS_FROZEN_NORM_PATH", str(default_frozen))
+    default_sym_map = repo / "qqq_btc" / "CONFIG" / "symbol_map.json"
+    if default_sym_map.exists():
+        # FCS stock_id/sector_id 与 LMDB/infer 同源(QQQ→1),避免 enumerate→0 导致 edge 翻转
+        os.environ.setdefault("FCS_SYMBOL_MAP", str(default_sym_map))
 
     if patch_oms:
         from qqq_btc.live.oms_integration import apply_oms_patches

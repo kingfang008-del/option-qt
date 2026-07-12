@@ -14,11 +14,11 @@ import numpy as np
 import pandas as pd
 
 from qqq_btc.common.time_features import TIME_FEATURE_NAMES
-from qqq_btc.common.trend_features import TREND_FEATURE_NAMES
+from qqq_btc.common.trend_features import OPEN30_FEATURE_NAMES, TREND_FEATURE_NAMES
 from qqq_btc.live.fcs_adapter import enrich_fcs_bars
 
 SEQ_LEN = 30
-DERIVED_NAMES = frozenset(TIME_FEATURE_NAMES + TREND_FEATURE_NAMES)
+DERIVED_NAMES = frozenset(TIME_FEATURE_NAMES + TREND_FEATURE_NAMES + OPEN30_FEATURE_NAMES)
 
 
 class _SymbolBarHistory:
@@ -94,11 +94,15 @@ def inject_qqq_btc_features(
             arr = fd.get(fname)
             if arr is None:
                 arr = np.zeros((n_sym, seq_len), dtype=np.float32)
-            elif not isinstance(arr, np.ndarray):
-                arr = np.asarray(arr, dtype=np.float32)
+            else:
+                arr = np.asarray(arr, dtype=np.float32).copy()
             if arr.shape[0] < n_sym:
                 pad = np.zeros((n_sym - arr.shape[0], seq_len), dtype=np.float32)
                 arr = np.vstack([arr, pad])
+            # FCS enrich 已写入非零时保留,避免 SE 短历史覆盖正确值
+            existing = arr[i, :]
+            if np.nanmax(np.abs(existing)) > 1e-8:
+                continue
             arr[i, :] = seq
             fd[fname] = arr
 

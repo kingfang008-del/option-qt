@@ -58,10 +58,11 @@ async def main() -> None:
     print("🚀 qqq_btc Execution Engine (OMS + fill_model 0.775)")
     print("=" * 60 + "\n")
     logger.info(
-        "RUN_MODE=%s | TRADING_ENABLED=%s | QQQ_BTC_TICK_EXITS=%s",
+        "RUN_MODE=%s | TRADING_ENABLED=%s | QQQ_BTC_TICK_EXITS=%s | OMS_MOCK_IBKR=%s",
         RUN_MODE,
         TRADING_ENABLED,
         os.environ.get("QQQ_BTC_TICK_EXITS", "disaster_only"),
+        os.environ.get("OMS_MOCK_IBKR", "0"),
     )
     try:
         from startup_state_hygiene import run_startup_cleanup

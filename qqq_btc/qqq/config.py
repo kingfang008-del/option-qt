@@ -131,6 +131,11 @@ REPLAY = ReplayConfig(
     call_timing_spot_min=None,
     call_timing_max_bar=None,
     call_timing_vix_min=None,
+    # CALL TREND_SPENT:高位+波动压缩+午后禁追涨 CALL。
+    # W1+7/10 消融:挡 7/10 两笔与 7/9 小亏 CALL;W1 +51.1%→+51.5%,整段 +48.2%→+51.5%。
+    call_spent_day_range_pos_min=0.85,
+    call_spent_bb_width_max=0.0,
+    call_spent_min_session_bar=210,
     # 半 Kelly(~0.45 的一半):单笔权利金 ROI ±30% 时禁止全仓复利
     position_frac=0.25,
 )

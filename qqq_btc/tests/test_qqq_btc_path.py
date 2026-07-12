@@ -337,11 +337,12 @@ def test_replay_afternoon_threshold_blocks_weak_edge():
 
 
 def test_replay_q10_gate():
-    """q10 低于 edge_q10_floor(-0.20)时即使均值 edge 过阈值也不入场;轻度为负放行。"""
+    """q10 不高于 edge_q10_floor 时即使均值 edge 过阈值也不入场;轻度为负放行。"""
     fm = OptionSpreadFillModel()
     df = _make_option_df(n=40, drift=0.02)
     df["net_edge"] = 0.0
     df.loc[0, "net_edge"] = 0.05
+    # ReplayConfig 默认 floor=-0.20: -0.25 拦截, -0.01 放行
     df["net_edge_q10"] = -0.25
     result = run_strict_replay(
         df, fm, ReplayConfig(), ExitRailsConfig(), edge_q10_col="net_edge_q10"
@@ -1125,7 +1126,7 @@ def test_choose_entry_q10_blocks_call():
     from qqq_btc.common.entry_decision import choose_entry
 
     rc = ReplayConfig(entry_threshold=0.01)
-    # floor 语义:q10 低于 edge_q10_floor(-0.20)才拦截,轻度为负放行
+    # floor 语义:q10 须严格高于 edge_q10_floor(默认 -0.20)才放行 CALL
     d = choose_entry(rc, session_bar=0, edge=0.05, spread_pct=0.01, edge_q10=-0.25)
     assert d is None
     d2 = choose_entry(rc, session_bar=0, edge=0.05, spread_pct=0.01, edge_q10=-0.01)
@@ -1188,6 +1189,79 @@ def test_choose_entry_morning_fade_put_gate():
         open30_peak_dd=-0.004,
     )
     assert d3 is None or d3.leg != "PUT"
+
+
+def test_choose_entry_early_put_vix_gate():
+    """早盘 PUT 要求更高 vix;午盘仍用 put_gate_min;fade 可豁免早盘加强。"""
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02,
+        long_only=False,
+        max_spread_pct=0.06,
+        put_gate_min=0.25,
+        put_early_session_bar=30,
+        put_early_vix_min=0.6,
+        morning_fade_min_ret=0.004,
+        morning_fade_max_peak_dd=-0.003,
+        morning_fade_session_end_bar=60,
+    )
+    common = dict(
+        dual_mode=True,
+        call_edge=0.01, put_edge=0.05,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        trend_ret_30m=-0.001,
+    )
+    # July1 型:早盘 vix=0.55 介于 put_gate_min 与 early_vix 之间 → 拒 PUT
+    d = choose_entry(rc, session_bar=17, put_gate=0.55, **common)
+    assert d is None or d.leg != "PUT"
+    # July7 型:早盘 vix=0.74 → 允许
+    d2 = choose_entry(rc, session_bar=17, put_gate=0.74, **common)
+    assert d2 is not None and d2.leg == "PUT"
+    # 午盘:vix=0.55 仍过普通 put_gate
+    d3 = choose_entry(rc, session_bar=90, put_gate=0.55, **common)
+    assert d3 is not None and d3.leg == "PUT"
+    # 早盘 fade 豁免 early_vix
+    d4 = choose_entry(
+        rc, session_bar=17, put_gate=0.40, **common,
+        open30_max_ret=0.005, open30_peak_dd=-0.004,
+    )
+    assert d4 is not None and d4.leg == "PUT"
+
+
+def test_choose_entry_early_put_open30_range_blocks():
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02,
+        long_only=False,
+        max_spread_pct=0.06,
+        put_gate_min=0.25,
+        put_early_session_bar=30,
+        put_early_open30_max_min=1e-12,
+        put_early_range30_min=0.003,
+    )
+    common = dict(
+        dual_mode=True,
+        call_edge=0.01, put_edge=0.05,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        put_gate=0.70, trend_ret_30m=-0.001,
+    )
+    # 空洞开盘:open30_max=0 / range=0 → 拒
+    d = choose_entry(
+        rc, session_bar=17, open30_max_ret=0.0, spot_range_30m=0.0, **common,
+    )
+    assert d is None or d.leg != "PUT"
+    # 有结构 → 允许
+    d2 = choose_entry(
+        rc, session_bar=17, open30_max_ret=0.001, spot_range_30m=0.01, **common,
+    )
+    assert d2 is not None and d2.leg == "PUT"
+    # 午盘不受 early open30/range 约束
+    d3 = choose_entry(
+        rc, session_bar=90, open30_max_ret=0.0, spot_range_30m=0.0, **common,
+    )
+    assert d3 is not None and d3.leg == "PUT"
 
 
 def test_choose_entry_rapid_drop_blocks_call():
@@ -1360,6 +1434,42 @@ def test_choose_entry_call_spike_range_gate():
     assert d is not None and d.leg == "CALL"
 
 
+def test_choose_entry_call_spent_gate():
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02, long_only=False, max_spread_pct=0.06,
+        put_gate_min=0.25,
+        call_spent_day_range_pos_min=0.85,
+        call_spent_bb_width_max=0.0,
+        call_spent_min_session_bar=210,
+    )
+    common = dict(
+        session_bar=238, dual_mode=True,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        put_gate=0.40, call_edge=0.06, put_edge=0.05,
+        day_range_pos=0.98, bb_width=-0.07,
+    )
+    # spent → CALL 被挡,可转 PUT
+    d = choose_entry(rc, **common)
+    assert d is not None and d.leg == "PUT"
+    only_call = {**common, "put_edge": 0.01}
+    assert choose_entry(rc, **only_call) is None
+    # 早于 min_bar 不拦
+    early = {**only_call, "session_bar": 180}
+    d2 = choose_entry(rc, **early)
+    assert d2 is not None and d2.leg == "CALL"
+    # bb 未压缩不拦
+    wide = {**only_call, "bb_width": 0.05}
+    d3 = choose_entry(rc, **wide)
+    assert d3 is not None and d3.leg == "CALL"
+    # 缺字段不拦
+    miss = {**only_call}
+    miss.pop("bb_width")
+    d4 = choose_entry(rc, **miss)
+    assert d4 is not None and d4.leg == "CALL"
+
+
 def test_choose_entry_call_timing_gate():
     from qqq_btc.common.entry_decision import choose_entry
 
@@ -1475,6 +1585,34 @@ def test_session_carryover_augment_multiday():
     stock_map, option_map, ns, no = build_feature_maps({"features": [{"name": "feat_a", "resolution": "1min"}]})
     x_s, x_o = row_to_tensors(aug, idx, stock_map, option_map, ns, no)
     assert np.count_nonzero(x_s[:, 0]) == SEQ_LEN
+
+
+def test_apply_5m_stair_step_matches_fill_column():
+    """FCS payload 用的 stair-step 须与 row_to_tensors 锚点一致。"""
+    from qqq_btc.common.inference_tensors import (
+        FIVE_MIN_STRIDE,
+        SEQ_LEN,
+        WINDOW_5M_BARS,
+        apply_5m_stair_step,
+        build_feature_maps,
+        row_to_tensors,
+    )
+
+    n = 60
+    ts = pd.date_range("2026-06-10 09:30", periods=n, freq="1min", tz="America/New_York")
+    f5 = np.full(n, np.nan)
+    f5[::FIVE_MIN_STRIDE] = np.arange(n // FIVE_MIN_STRIDE, dtype=float)
+    f5 = pd.Series(f5).ffill().to_numpy()
+    df = pd.DataFrame({"timestamp": ts, "feat_5m": f5})
+    cfg = {"features": [{"name": "feat_5m", "resolution": "5min"}]}
+    stock_map, option_map, ns, no = build_feature_maps(cfg)
+    x_s, _ = row_to_tensors(df, 59, stock_map, option_map, ns, no)
+    stepped = apply_5m_stair_step(f5[-SEQ_LEN:])
+    assert stepped.shape == (SEQ_LEN,)
+    assert np.allclose(stepped, x_s[:, 0])
+    for block in range(WINDOW_5M_BARS):
+        seg = stepped[block * FIVE_MIN_STRIDE : (block + 1) * FIVE_MIN_STRIDE]
+        assert np.allclose(seg, seg[0])
 
 
 def test_row_to_tensors_5min_repeat_matches_dataset():
@@ -1813,9 +1951,13 @@ def test_strategy_entry_bridge_call_with_q10(monkeypatch):
     assert "QQQ_BTC_ENTRY" in sig.get("reason", "")
 
     blocked = dict(base_ctx)
-    # floor 语义:q10 需低于 edge_q10_floor(-0.20)才拦截
+    # QQQ LIVE_REPLAY floor=-0.25:q10 须严格高于 floor;相等或更低拦截
     blocked["net_edge_q10"] = -0.25
     assert core.decide_entry(blocked) is None
+    # frozen 重标定后轻度悲观(>-0.25)应放行
+    mild = dict(base_ctx)
+    mild["net_edge_q10"] = -0.24
+    assert core.decide_entry(mild) is not None
 
 
 def test_minimal_stack_session_config():
@@ -1909,6 +2051,10 @@ def test_strategy_entry_bridge_put_dual(monkeypatch):
         "bid": 1.98,
         "ask": 2.02,
         "curr_price": 2.0,
+        "call_bid": 1.98,
+        "call_ask": 2.02,
+        "put_bid": 1.98,
+        "put_ask": 2.02,
         "options_vw_spread": 0.02,
         "options_iv_momentum": 0.0,
         "symbol": "QQQ",
@@ -1922,6 +2068,65 @@ def test_strategy_entry_bridge_put_dual(monkeypatch):
     assert sig is not None
     assert sig["dir"] == -1
     assert "PUT" in sig.get("reason", "")
+
+
+def test_strategy_entry_bridge_put_blocked_by_put_spread(monkeypatch):
+    """空仓 ctx.bid/ask 为紧 CALL 时,宽 PUT spread 仍应挡 PUT(对齐 offline)。"""
+    import sys
+    from datetime import datetime
+    from pathlib import Path
+
+    from pytz import timezone
+
+    baseline = Path(__file__).resolve().parents[2] / "New_Pro" / "baseline_qqq"
+    if str(baseline) not in sys.path:
+        sys.path.insert(0, str(baseline))
+    import baseline_paths  # noqa: E402,F401
+
+    from strategy.core_v0 import StrategyCoreV0
+    from strategy.config0 import StrategyConfig
+    from qqq_btc.live.strategy_entry_bridge import apply_strategy_entry_patch
+
+    apply_strategy_entry_patch(StrategyCoreV0)
+    core = StrategyCoreV0(StrategyConfig())
+
+    ny = timezone("America/New_York")
+    # CALL spread ~1.2%; PUT spread ~6.6% > max_spread 0.06
+    ctx = {
+        "is_ready": True,
+        "is_banned": False,
+        "position": 0,
+        "cooldown_until": 0.0,
+        "curr_ts": 1_700_000_000.0,
+        "time": datetime(2026, 7, 7, 10, 40, tzinfo=ny),
+        "net_edge_raw": 0.06,
+        "call_edge": 0.05,
+        "put_edge": 0.06,
+        "alpha_z": 0.06,
+        "vol_z": 0.5,
+        "bid": 1.65,
+        "ask": 1.67,
+        "curr_price": 1.66,
+        "call_bid": 1.65,
+        "call_ask": 1.67,
+        "put_bid": 8.21,
+        "put_ask": 8.77,
+        "options_vw_spread": 0.02,
+        "options_iv_momentum": 0.0,
+        "symbol": "QQQ",
+        "spy_roc": -0.001,
+        "qqq_roc": -0.001,
+        "spread_divergence": 0.0,
+        "vix_level": 0.76,
+        "trend_fit_ret_30m": -0.001,
+        "trend_fit_r2_30m": 0.5,
+    }
+    assert core.decide_entry(dict(ctx)) is None
+    # 收窄 PUT 后应放行
+    ctx["put_ask"] = 8.50
+    sig = core.decide_entry(dict(ctx))
+    assert sig is not None
+    assert sig["dir"] == -1
 
 
 def test_entry_quantile_threshold():
@@ -2131,6 +2336,15 @@ def test_signal_decision_replay_vs_live_match():
     assert d["summary"]["n_matched"] == d["summary"]["n_replay"]
     assert d["summary"]["n_matched"] == d["summary"]["n_live"]
 
+    from qqq_btc.common.signal_collect import first_entry_diff
+
+    off = pd.DataFrame([{"session_bar": 17, "leg": "CALL", "edge": 0.14, "ts": "a"}])
+    st_ok = pd.DataFrame([{"session_bar": 17, "leg": "CALL", "edge": 0.15, "ts": "b"}])
+    st_miss = pd.DataFrame([{"session_bar": 39, "leg": "CALL", "edge": 0.16, "ts": "b"}])
+    assert first_entry_diff(off, st_ok, time_tolerance_bars=0)["summary"]["n_matched"] == 1
+    assert first_entry_diff(off, st_miss, time_tolerance_bars=0)["summary"]["n_matched"] == 0
+    assert first_entry_diff(off, st_miss, time_tolerance_bars=30)["summary"]["n_matched"] == 1
+
     # event replay 仍返回 events
     result = run_strict_replay(df.iloc[:80], fm, qcfg.REPLAY, qcfg.EXIT_RAILS)
     assert isinstance(result.events, list)
@@ -2192,6 +2406,75 @@ def test_fill_audit_writer(tmp_path, monkeypatch):
     ex = audit_exit_reasons(log)
     assert ex["n_close"] == 1
     assert "QQQ_BTC_STEP_PROTECT" in ex["live_distribution"]
+
+
+def test_exit_lifecycle_reason_normalize_and_first_exit():
+    from qqq_btc.common.exit_lifecycle import (
+        diff_exit_lifecycle,
+        first_exit_diff,
+        normalize_exit_reason,
+    )
+
+    assert normalize_exit_reason("QQQ_BTC_STEP_PROTECT|NO_QUOTE") == "STEP_PROTECT"
+    assert normalize_exit_reason("STEP_PROTECT") == "STEP_PROTECT"
+    assert normalize_exit_reason(None) == ""
+
+    off = pd.DataFrame(
+        [
+            {
+                "session_bar": 42,
+                "leg": "CALL",
+                "reason": "QQQ_BTC_STEP_PROTECT",
+                "reason_family": "STEP_PROTECT",
+                "net_return": 0.01,
+            }
+        ]
+    )
+    live = pd.DataFrame(
+        [
+            {
+                "session_bar": 43,
+                "leg": "CALL",
+                "reason": "STEP_PROTECT",
+                "reason_family": "STEP_PROTECT",
+                "net_return": 0.011,
+            }
+        ]
+    )
+    fe = first_exit_diff(off, live, time_tolerance_bars=1)
+    assert fe["summary"]["pass"] is True
+    assert fe["summary"]["bar_delta"] == 1.0
+    el = diff_exit_lifecycle(off, live, time_tolerance_bars=1)
+    assert el["summary"]["pass"] is True
+    assert el["summary"]["n_matched"] == 1
+    # both empty → pass
+    empty = first_exit_diff(pd.DataFrame(), pd.DataFrame())
+    assert empty["summary"]["pass"] is True
+    # mismatch reason → fail
+    bad = live.copy()
+    bad["reason_family"] = "TIME_STOP"
+    assert first_exit_diff(off, bad, time_tolerance_bars=1)["summary"]["pass"] is False
+
+
+def test_load_fill_audit_exits_parses_leg_and_session_bar(tmp_path):
+    from qqq_btc.common.exit_lifecycle import load_fill_audit_exits
+
+    # 2026-06-02 10:00 ET ≈ 1748872800? use explicit NY session ts
+    # 2026-06-02 09:45 ET = session_bar 15
+    ts_close = pd.Timestamp("2026-06-02 10:12:00", tz="America/New_York").timestamp()
+    path = tmp_path / "fill_audit_20260602.csv"
+    path.write_text(
+        "ts,symbol,action,side,qty,fill_px,bid,ask,spread_pct,fill_spread_frac,"
+        "model_frac,delta_frac,reason,exit_reason,mode,leg,session_bar,net_return\n"
+        f"{ts_close},QQQ,CLOSE,SELL,1,2.0,1.98,2.02,0.02,0.5,0.775,-0.275,,"
+        "QQQ_BTC_STEP_PROTECT,REALTIME_DRY,CALL,42,0.01\n",
+        encoding="utf-8",
+    )
+    out = load_fill_audit_exits(path, "2026-06-02")
+    assert len(out) == 1
+    assert int(out.iloc[0]["session_bar"]) == 42
+    assert out.iloc[0]["leg"] == "CALL"
+    assert out.iloc[0]["reason_family"] == "STEP_PROTECT"
 
 
 def test_se_feature_bridge_injects_time_features():

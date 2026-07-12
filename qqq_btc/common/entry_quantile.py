@@ -43,6 +43,8 @@ def call_edge_buffer_blocked(
     spot_day_ret: Optional[float],
     vix_reversal_count_30m: Optional[float],
     spot_range_30m: Optional[float],
+    day_range_pos: Optional[float] = None,
+    bb_width: Optional[float] = None,
 ) -> bool:
     if replay_cfg.call_trend_r2_min is not None:
         if (
@@ -86,6 +88,24 @@ def call_edge_buffer_blocked(
             and vix_reversal_count_30m is not None
             and np.isfinite(vix_reversal_count_30m)
             and vix_reversal_count_30m >= float(t_vix)
+        ):
+            return True
+    spent_drp = replay_cfg.call_spent_day_range_pos_min
+    spent_bb = replay_cfg.call_spent_bb_width_max
+    if spent_drp is not None and spent_bb is not None:
+        spent_min_bar = replay_cfg.call_spent_min_session_bar
+        in_spent_window = (
+            spent_min_bar is None
+            or (session_bar is not None and session_bar >= int(spent_min_bar))
+        )
+        if (
+            in_spent_window
+            and day_range_pos is not None
+            and np.isfinite(day_range_pos)
+            and bb_width is not None
+            and np.isfinite(bb_width)
+            and float(day_range_pos) >= float(spent_drp)
+            and float(bb_width) <= float(spent_bb)
         ):
             return True
     return regime_buffer_blocked(replay_cfg, vix_reversal_count_30m=vix_reversal_count_30m)
@@ -134,6 +154,8 @@ def maybe_append_edge_buffers(
     vix_reversal_count_30m: Optional[float] = None,
     spot_range_30m: Optional[float] = None,
     trend_ret_30m: Optional[float] = None,
+    day_range_pos: Optional[float] = None,
+    bb_width: Optional[float] = None,
 ) -> None:
     """在入场窗内、未被门控拦截的 bar 追加 edge 观测(与 replay_session CLOSE 一致)。"""
     if edge_buf is None or not replay_cfg.session_allows_entry(session_bar):
@@ -153,6 +175,8 @@ def maybe_append_edge_buffers(
             spot_day_ret=spot_day_ret,
             vix_reversal_count_30m=vix_reversal_count_30m,
             spot_range_30m=spot_range_30m,
+            day_range_pos=day_range_pos,
+            bb_width=bb_width,
         )
     ):
         edge_buf.append(float(main_edge))

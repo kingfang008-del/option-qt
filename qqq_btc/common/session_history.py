@@ -14,7 +14,12 @@ import pandas as pd
 from .time_features import SESSION_TZ
 
 SEQ_LEN = 30
-DEFAULT_CARRYOVER_BARS = SEQ_LEN - 1  # 29; + 当日首 bar = 30
+DEFAULT_CARRYOVER_BARS = SEQ_LEN - 1  # 29; + 当日首 bar = 30(模型 seq 口径)
+# 特征计算 carryover:整个前一 RTH session。
+# 离线 quote_features_raw 的 trend/ADX 等长记忆特征是跨日连续计算的,
+# strict replay 直接消费这些列;live enrich 若只带 29 根会在每日前 ~119 根 bar
+# 产生 trend_fit_r2_120m / adx_smooth_10 偏差(实测 390 根后 max err ≤ 1e-9)。
+FEATURE_CARRYOVER_BARS = 390
 
 
 def _to_ny_date(ts: pd.Series) -> pd.Series:

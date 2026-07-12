@@ -71,6 +71,8 @@ def choose_entry(
     vix_reversal_count_30m: Optional[float] = None,
     spot_day_ret: Optional[float] = None,
     spot_range_30m: Optional[float] = None,
+    day_range_pos: Optional[float] = None,
+    bb_width: Optional[float] = None,
 ) -> Optional[EntryDecision]:
     """
     单 bar 入场决策。spread 门控在调用方二次校验(各腿 spread 不同)。
@@ -169,6 +171,25 @@ def choose_entry(
             and vix_reversal_count_30m is not None
             and np.isfinite(vix_reversal_count_30m)
             and vix_reversal_count_30m >= float(t_vix)
+        ):
+            call_blocked = True
+    # TREND_SPENT:日振幅高位 + bb 压缩 + (可选)午后时点 → 禁 CALL
+    spent_drp = replay_cfg.call_spent_day_range_pos_min
+    spent_bb = replay_cfg.call_spent_bb_width_max
+    if spent_drp is not None and spent_bb is not None:
+        spent_min_bar = replay_cfg.call_spent_min_session_bar
+        in_spent_window = (
+            spent_min_bar is None
+            or (session_bar is not None and session_bar >= int(spent_min_bar))
+        )
+        if (
+            in_spent_window
+            and day_range_pos is not None
+            and np.isfinite(day_range_pos)
+            and bb_width is not None
+            and np.isfinite(bb_width)
+            and float(day_range_pos) >= float(spent_drp)
+            and float(bb_width) <= float(spent_bb)
         ):
             call_blocked = True
 

@@ -389,8 +389,19 @@ class OrchestratorAccounting:
         )
 
         # 👇 [🔥 核心路由：获取安全的时间戳]
+        # REALTIME_DRY / REDIS_STREAM_SIM 必须用策略时钟 curr_ts。
+        # 若用 wall clock，speed=inf 下亏损冷却会挡住当天剩余全部行情。
         is_simulated = self.orch.mode == 'backtest'
-        safe_now_ts = curr_ts if is_simulated else time.time()
+        use_strategy_clock = is_simulated
+        if not use_strategy_clock:
+            try:
+                from config import IS_REALTIME_DRY as _is_rt_dry
+            except Exception:
+                _is_rt_dry = False
+            use_strategy_clock = bool(_is_rt_dry) or (
+                str(os.environ.get("REDIS_STREAM_SIM", "")).strip().lower() in ("1", "true", "yes")
+            )
+        safe_now_ts = curr_ts if use_strategy_clock else time.time()
         
         # 冷却与熔断逻辑
         if roi < 0 or "STOP" in reason or "FLIP" in reason:

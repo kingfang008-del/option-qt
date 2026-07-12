@@ -14,19 +14,47 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 def build_opt_data_from_quotes(quotes: Mapping[str, float], *, leg: str = "CALL") -> dict:
     """从 bar-close quotes 构造 OMS _build_strategy_ctx 所需的 opt_data。"""
+    call_bid = float(quotes.get("exec_call_bid", 0.0) or 0.0)
+    call_ask = float(quotes.get("exec_call_ask", 0.0) or 0.0)
+    put_bid = float(quotes.get("exec_put_bid", 0.0) or 0.0)
+    put_ask = float(quotes.get("exec_put_ask", 0.0) or 0.0)
+    call_mid = float(
+        quotes.get(
+            "exec_call_mid",
+            (call_bid + call_ask) / 2.0 if call_bid > 0 and call_ask >= call_bid else 0.0,
+        )
+        or 0.0
+    )
+    put_mid = float(
+        quotes.get(
+            "exec_put_mid",
+            (put_bid + put_ask) / 2.0 if put_bid > 0 and put_ask >= put_bid else 0.0,
+        )
+        or 0.0
+    )
     leg_u = leg.upper()
     if leg_u == "PUT":
-        bid = float(quotes.get("exec_put_bid", 0.0) or 0.0)
-        ask = float(quotes.get("exec_put_ask", 0.0) or 0.0)
-        mid = float(quotes.get("exec_put_mid", (bid + ask) / 2.0 if bid and ask else 0.0) or 0.0)
+        bid, ask, mid = put_bid, put_ask, put_mid
     else:
-        bid = float(quotes.get("exec_call_bid", 0.0) or 0.0)
-        ask = float(quotes.get("exec_call_ask", 0.0) or 0.0)
-        mid = float(quotes.get("exec_call_mid", (bid + ask) / 2.0 if bid and ask else 0.0) or 0.0)
+        bid, ask, mid = call_bid, call_ask, call_mid
     spread_pct = float(
         quotes.get(
             f"exec_{leg_u.lower()}_spread_pct",
             ((ask - bid) / mid if mid > 0 and ask >= bid else 0.0),
+        )
+        or 0.0
+    )
+    call_spread = float(
+        quotes.get(
+            "exec_call_spread_pct",
+            ((call_ask - call_bid) / call_mid if call_mid > 0 and call_ask >= call_bid else 0.0),
+        )
+        or 0.0
+    )
+    put_spread = float(
+        quotes.get(
+            "exec_put_spread_pct",
+            ((put_ask - put_bid) / put_mid if put_mid > 0 and put_ask >= put_bid else 0.0),
         )
         or 0.0
     )
@@ -36,10 +64,14 @@ def build_opt_data_from_quotes(quotes: Mapping[str, float], *, leg: str = "CALL"
         "bid": bid,
         "ask": ask,
         "price": mid,
-        "call_bid": float(quotes.get("exec_call_bid", bid) or bid),
-        "call_ask": float(quotes.get("exec_call_ask", ask) or ask),
-        "put_bid": float(quotes.get("exec_put_bid", 0.0) or 0.0),
-        "put_ask": float(quotes.get("exec_put_ask", 0.0) or 0.0),
+        "call_bid": call_bid,
+        "call_ask": call_ask,
+        "call_price": call_mid,
+        "call_spread_pct": call_spread,
+        "put_bid": put_bid,
+        "put_ask": put_ask,
+        "put_price": put_mid,
+        "put_spread_pct": put_spread,
         "spread_pct": spread_pct,
     }
 

@@ -39,6 +39,9 @@ _HEADER = (
     "reason",
     "exit_reason",
     "mode",
+    "leg",
+    "session_bar",
+    "net_return",
 )
 
 
@@ -83,6 +86,9 @@ def record_fill_audit(
     reason: str = "",
     exit_reason: str = "",
     mode: str = "",
+    leg: str = "",
+    session_bar: Any = "",
+    net_return: Any = "",
 ) -> Optional[Dict[str, Any]]:
     """audit_fill + 写 CSV;返回行 dict 便于单测。"""
     if not fill_audit_enabled():
@@ -109,6 +115,9 @@ def record_fill_audit(
         "reason": reason,
         "exit_reason": exit_reason,
         "mode": mode,
+        "leg": str(leg or ""),
+        "session_bar": session_bar if session_bar != "" else "",
+        "net_return": net_return if net_return != "" else "",
     }
     append_fill_audit_row(row)
     logger.info(
@@ -156,6 +165,14 @@ def apply_fill_audit_patch() -> None:
         execution_meta = kwargs.get("execution_meta") or {}
         if isinstance(execution_meta, dict):
             meta.update({k: v for k, v in execution_meta.items() if v not in (None, "")})
+        leg = str(sig.get("leg") or meta.get("leg") or "")
+        if not leg:
+            # reason 形如 QQQ_BTC_ENTRY|CALL|E:0.15
+            for part in str(sig.get("reason", "") or "").split("|"):
+                p = part.strip().upper()
+                if p in ("CALL", "PUT", "STRADDLE"):
+                    leg = p
+                    break
         record_fill_audit(
             symbol=sym,
             side="BUY",
@@ -167,6 +184,8 @@ def apply_fill_audit_patch() -> None:
             ts=float(entry_ts),
             reason=str(sig.get("reason", "") or ""),
             mode=str(kwargs.get("mode_override") or getattr(self.orch, "mode", "") or ""),
+            leg=leg,
+            session_bar=getattr(st, "qqq_btc_entry_bar", ""),
         )
 
     def _wrapped_exit(
@@ -182,6 +201,26 @@ def apply_fill_audit_patch() -> None:
         if filled_qty <= 0:
             return
         meta = execution_meta if isinstance(execution_meta, dict) else {}
+        leg = "PUT" if pos_dir < 0 else "CALL"
+        nr = ""
+        sb = ""
+        try:
+            from qqq_btc.common.time_features import session_minute
+            from qqq_btc.live.session_governor import net_return_from_prices
+            import pandas as pd
+            from pytz import timezone as tz
+
+            ny = tz("America/New_York")
+            ts_s = pd.Series([pd.Timestamp.fromtimestamp(float(curr_ts), tz=ny)])
+            sb = int(session_minute(ts_s).iloc[0])
+            comm = 0.0
+            try:
+                comm = float(qcfg.FILL_MODEL.commission_return_drag(entry_px))
+            except Exception:
+                pass
+            nr = float(net_return_from_prices(entry_px, float(fill_price), commission_drag=comm))
+        except Exception:
+            pass
         record_fill_audit(
             symbol=sym,
             side="SELL",
@@ -194,6 +233,9 @@ def apply_fill_audit_patch() -> None:
             reason="",
             exit_reason=str(reason or ""),
             mode=str(getattr(self.orch, "mode", "") or ""),
+            leg=leg,
+            session_bar=sb,
+            net_return=nr,
         )
         try:
             from qqq_btc.live.session_governor import get_session_governor, net_return_from_prices
@@ -203,10 +245,9 @@ def apply_fill_audit_patch() -> None:
                 comm = float(qcfg.FILL_MODEL.commission_return_drag(entry_px))
             except Exception:
                 pass
-            nr = net_return_from_prices(entry_px, float(fill_price), commission_drag=comm)
-            leg = "PUT" if pos_dir < 0 else "CALL"
+            nr2 = net_return_from_prices(entry_px, float(fill_price), commission_drag=comm)
             streak_until = get_session_governor().record_trade_close(
-                sym, net_ret=nr, curr_ts=float(curr_ts), leg=leg,
+                sym, net_ret=nr2, curr_ts=float(curr_ts), leg=leg,
             )
             if streak_until > 0 and hasattr(st, "cooldown_until"):
                 st.cooldown_until = max(float(getattr(st, "cooldown_until", 0.0) or 0.0), streak_until)

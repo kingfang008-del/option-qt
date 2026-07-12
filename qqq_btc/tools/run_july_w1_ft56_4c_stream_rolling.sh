@@ -45,7 +45,7 @@ POS_FRAC="${POS_FRAC:-0.25}"
 
 
 
-DAYS=(2026-07-01 2026-07-02 2026-07-06 2026-07-07 2026-07-08 2026-07-09)
+DAYS=(2026-07-01 2026-07-02 2026-07-06 2026-07-07 2026-07-08 2026-07-09 2026-07-10)
 mkdir -p "$OUT_DIR"
 LOG="$OUT_DIR/run.log"
 : > "$LOG"
@@ -126,7 +126,7 @@ out = Path(os.environ["OUT_DIR"])
 ckpt = os.environ["CKPT"]
 opt_root = os.environ["OPT_ROOT"]
 pos = float(os.environ.get("POS_FRAC", "0.25"))
-days = ["2026-07-01", "2026-07-02", "2026-07-06", "2026-07-07", "2026-07-08", "2026-07-09"]
+days = ["2026-07-01", "2026-07-02", "2026-07-06", "2026-07-07", "2026-07-08", "2026-07-09", "2026-07-10"]
 day_set = set(pd.Timestamp(d).date() for d in days)
 
 frames = []

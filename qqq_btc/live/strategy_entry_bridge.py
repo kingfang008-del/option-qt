@@ -30,13 +30,52 @@ def _session_bar_from_ctx(ctx: dict) -> int:
         return 0
 
 
-def _spread_pct_from_ctx(ctx: dict) -> float:
-    bid = float(ctx.get("bid", 0.0) or 0.0)
-    ask = float(ctx.get("ask", 0.0) or 0.0)
-    mid = float(ctx.get("curr_price", 0.0) or 0.0)
+def _spread_pct(bid: float, ask: float, mid: float = 0.0) -> float:
+    bid = float(bid or 0.0)
+    ask = float(ask or 0.0)
+    mid = float(mid or 0.0)
+    if mid <= 0.01 and bid > 0 and ask >= bid:
+        mid = 0.5 * (bid + ask)
     if mid > 0.01 and ask >= bid > 0:
         return (ask - bid) / mid
     return 0.0
+
+
+def _spread_pct_from_ctx(ctx: dict) -> float:
+    """兼容旧路径:ctx.bid/ask 可能是 alpha 符号选腿后的盘口(空仓时常为 CALL)。"""
+    return _spread_pct(
+        float(ctx.get("bid", 0.0) or 0.0),
+        float(ctx.get("ask", 0.0) or 0.0),
+        float(ctx.get("curr_price", 0.0) or 0.0),
+    )
+
+
+def _leg_spreads_from_ctx(ctx: dict) -> tuple[float, Optional[float], Optional[float]]:
+    """
+    与 replay_session._choose_entry 对齐:
+      spread_pct = CALL 盘口; put_spread_pct = PUT 盘口。
+    空仓时 OMS 常按 alpha>0 把 ctx.bid/ask 填成 CALL,若只传这一路,
+    PUT 会用过紧的 CALL spread 过门(July7 第二笔主因)。
+    """
+    call_bid = _f_ctx(ctx, "call_bid")
+    call_ask = _f_ctx(ctx, "call_ask")
+    put_bid = _f_ctx(ctx, "put_bid")
+    put_ask = _f_ctx(ctx, "put_ask")
+
+    call_sp = _f_ctx(ctx, "call_spread_pct")
+    if call_sp is None and call_bid is not None and call_ask is not None:
+        call_sp = _spread_pct(call_bid, call_ask)
+    if call_sp is None:
+        call_sp = _spread_pct_from_ctx(ctx)
+
+    put_sp = _f_ctx(ctx, "put_spread_pct")
+    if put_sp is None and put_bid is not None and put_ask is not None:
+        put_sp = _spread_pct(put_bid, put_ask)
+
+    straddle_sp = None
+    if put_sp is not None:
+        straddle_sp = max(float(call_sp), float(put_sp))
+    return float(call_sp), put_sp, straddle_sp
 
 
 def _f_ctx(ctx: dict, key: str) -> Optional[float]:
@@ -63,6 +102,9 @@ def _edge_q10_from_ctx(ctx: dict) -> Optional[float]:
 
 def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
     """用 choose_entry 替换 V0 simple/legacy 入场路径；前置/流动性仍走 StrategyCoreV0。"""
+    import os
+    from datetime import date as _date
+
     self._last_reject_reason = None
     self._last_gate_trace = []
 
@@ -80,10 +122,26 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
     session_bar = _session_bar_from_ctx(ctx)
     sym = str(ctx.get("symbol", "QQQ") or "QQQ")
     curr_ts = float(ctx.get("curr_ts", 0.0) or 0.0)
+
+    # 连续流预热日禁止新开仓:QQQ_BTC_TRADE_FROM_DATE=YYYYMMDD|YYYY-MM-DD
+    trade_from = os.environ.get("QQQ_BTC_TRADE_FROM_DATE", "").strip()
+    if trade_from and curr_ts > 0:
+        try:
+            if len(trade_from) == 8 and trade_from.isdigit():
+                cutoff = _date(int(trade_from[:4]), int(trade_from[4:6]), int(trade_from[6:8]))
+            else:
+                cutoff = pd.Timestamp(trade_from).date()
+            day = pd.Timestamp(curr_ts, unit="s", tz="UTC").tz_convert("America/New_York").date()
+            if day < cutoff:
+                self._trace("E9.qqq_btc_trade_from", "block", f"day={day} < TRADE_FROM={cutoff}")
+                self._last_reject_reason = f"before_trade_from_date:{cutoff}"
+                return None
+        except Exception:
+            pass
     edge = float(ctx.get("net_edge_raw", ctx.get("alpha_z", 0.0)) or 0.0)
     call_edge = float(ctx.get("call_edge", edge) or edge)
     put_edge = float(ctx.get("put_edge", 0.0) or 0.0)
-    spread_pct = _spread_pct_from_ctx(ctx)
+    spread_pct, put_spread_pct, straddle_spread_pct = _leg_spreads_from_ctx(ctx)
     edge_q10 = _edge_q10_from_ctx(ctx)
 
     dual_mode = not bool(replay_cfg.long_only)
@@ -99,6 +157,8 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
     trend_r2_30m = _f_ctx(ctx, "trend_fit_r2_30m")
     vix_rev = _f_ctx(ctx, "vix_reversal_count_30m")
     spot_range_30m = _f_ctx(ctx, "spot_range_30m")
+    day_range_pos = _f_ctx(ctx, "day_range_pos")
+    bb_width = _f_ctx(ctx, "bb_width")
 
     gov = get_session_governor(replay_cfg)
     if curr_ts > 0:
@@ -146,6 +206,8 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         vix_reversal_count_30m=vix_rev,
         spot_range_30m=spot_range_30m,
         trend_ret_30m=trend_ret_30m,
+        day_range_pos=day_range_pos,
+        bb_width=bb_width,
     )
     dyn_th, put_dyn_th = gov.dynamic_thresholds(sym)
     straddles_today = gov.straddles_today_for(sym)
@@ -158,6 +220,8 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         put_edge=put_edge,
         edge_q10=edge_q10,
         spread_pct=spread_pct,
+        put_spread_pct=put_spread_pct,
+        straddle_spread_pct=straddle_spread_pct,
         dual_mode=dual_mode,
         has_put=has_put,
         straddle_enabled=dual_mode,
@@ -174,6 +238,8 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         vix_reversal_count_30m=vix_rev,
         spot_day_ret=spot_day_ret,
         spot_range_30m=spot_range_30m,
+        day_range_pos=day_range_pos,
+        bb_width=bb_width,
     )
 
     if decision is None:
@@ -186,10 +252,13 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         q10_note = ""
         if edge_q10 is not None and edge > 0:
             q10_note = f", q10={edge_q10:.4f}"
+        put_sp_note = ""
+        if put_spread_pct is not None:
+            put_sp_note = f", put_sp={put_spread_pct:.4f}"
         self._trace(
             "E9.qqq_btc_entry",
             "block",
-            f"edge={edge:.4f} th={th:.4f}{dyn_note} spread={spread_pct:.4f}{q10_note}",
+            f"edge={edge:.4f} th={th:.4f}{dyn_note} spread={spread_pct:.4f}{put_sp_note}{q10_note}",
         )
         self._last_reject_reason = "qqq_btc_entry"
         record_entry_signal_audit(
@@ -224,14 +293,33 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         "reason": f"QQQ_BTC_ENTRY|{decision.leg}|E:{decision.edge:.3f}(Th:{decision.threshold:.3f})",
     }
 
+    # 流动性/审计盘口切到选定腿,避免 PUT 仍用 CALL bid/ask
+    liq_ctx = ctx
+    if decision.leg == "PUT":
+        pb, pa = _f_ctx(ctx, "put_bid"), _f_ctx(ctx, "put_ask")
+        if pb is not None and pa is not None and pb > 0 and pa >= pb:
+            liq_ctx = dict(ctx)
+            liq_ctx["bid"] = pb
+            liq_ctx["ask"] = pa
+            liq_ctx["curr_price"] = 0.5 * (pb + pa)
+            if put_spread_pct is not None:
+                liq_ctx["put_spread_pct"] = put_spread_pct
+    elif decision.leg == "CALL":
+        cb, ca = _f_ctx(ctx, "call_bid"), _f_ctx(ctx, "call_ask")
+        if cb is not None and ca is not None and cb > 0 and ca >= cb:
+            liq_ctx = dict(ctx)
+            liq_ctx["bid"] = cb
+            liq_ctx["ask"] = ca
+            liq_ctx["curr_price"] = 0.5 * (cb + ca)
+
     if getattr(self, "_cfg_enabled", None) and self._cfg_enabled("ENTRY_LIQUIDITY_GUARD_ENABLED", True):
         if not self._check_entry_liquidity_guard(
-            ctx,
+            liq_ctx,
             spread_threshold_override=replay_cfg.max_spread_pct,
         ):
             self._last_reject_reason = "liquidity_guard"
             record_entry_signal_audit(
-                ctx=ctx,
+                ctx=liq_ctx,
                 decision=decision,
                 block_reason="liquidity_guard",
                 session_bar=session_bar,
@@ -241,7 +329,7 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
             )
             return None
     record_entry_signal_audit(
-        ctx=ctx,
+        ctx=liq_ctx,
         decision=decision,
         session_bar=session_bar,
         dyn_threshold=dyn_th,

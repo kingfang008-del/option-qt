@@ -121,10 +121,11 @@ class RollingWindowNormalizer:
         self.window = window
         self.use_tanh = use_tanh
         self.feature_names = feature_names
-        
+        self.frozen = False
+
         self.raw_buffer = deque(maxlen=window)
         self.count = 0
-        
+
         n = len(feature_names)
         self.last_mean = np.zeros(n, dtype=np.float32)
         self.last_std = np.ones(n, dtype=np.float32)
@@ -132,7 +133,7 @@ class RollingWindowNormalizer:
         # 语义上仍属于低频台阶式更新；如需更快或更慢刷新，可通过
         # 环境变量 FCS_NORMALIZER_STATS_UPDATE_INTERVAL 覆盖。
         self.stats_update_interval = max(1, int(os.environ.get("FCS_NORMALIZER_STATS_UPDATE_INTERVAL", "5")))
-        
+
         # 排除归一化的特征名单
         self.bounded_features = {
             'session', 'day_of_week', 'hour', 'is_holiday', 'rsi_divergence',
@@ -141,7 +142,7 @@ class RollingWindowNormalizer:
             'symbol', 'open', 'high', 'low', 'close', 'volume',
             'fast_vol', 'spy_roc_5min', 'qqq_roc_5min'
         }
-        
+
         self.categorical_mask = np.zeros(n, dtype=bool)
         for i, name in enumerate(feature_names):
             cfg = config_dicts.get(name, {})
@@ -150,7 +151,7 @@ class RollingWindowNormalizer:
             if cfg.get('type') == 'categorical': should_normalize = False
             if cfg.get('calc') == 'raw': should_normalize = False
             if name.startswith('label_'): should_normalize = False
-            
+
             if not should_normalize:
                 self.categorical_mask[i] = True
 
@@ -175,17 +176,22 @@ class RollingWindowNormalizer:
         if not np.isfinite(x_raw_1d).all():
             x_raw_1d = np.nan_to_num(x_raw_1d, nan=0.0, posinf=0.0, neginf=0.0)
 
+        if self.fat_tail_mask.any():
+            target_vals = x_raw_1d[self.fat_tail_mask]
+            x_raw_1d = x_raw_1d.copy()
+            x_raw_1d[self.fat_tail_mask] = np.sign(target_vals) * np.log1p(np.abs(target_vals))
+
         self._enforce_categorical_identity_stats()
         # 直接使用现有统计量
         x_norm = (x_raw_1d - self.last_mean) / (self.last_std + 1e-6)
         x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=10.0, neginf=-10.0)
-        
+
         if self.use_tanh:
             real_mask = ~self.categorical_mask
             x_norm[real_mask] = np.tanh(x_norm[real_mask] / 3.0)
         else:
             x_norm = np.clip(x_norm, -10.0, 10.0)
-            
+
         return x_norm
 
     def get_state(self):
@@ -193,7 +199,8 @@ class RollingWindowNormalizer:
             'buffer': list(self.raw_buffer),
             'mean': self.last_mean,
             'std': self.last_std,
-            'count': self.count
+            'count': self.count,
+            'frozen': self.frozen,
         }
 
     def set_state(self, state):
@@ -202,7 +209,50 @@ class RollingWindowNormalizer:
         self.last_mean = state.get('mean', self.last_mean)
         self.last_std = state.get('std', self.last_std)
         self.count = state.get('count', 0)
+        self.frozen = bool(state.get('frozen', self.frozen))
         self._enforce_categorical_identity_stats()
+
+    def load_frozen_stats(self, mean: np.ndarray, std: np.ndarray, *, count: int = 10_000) -> None:
+        """加载离线 rolling_norm 导出的 mean/std,后续 process_frame 不再更新统计量。"""
+        self.last_mean = np.asarray(mean, dtype=np.float32).copy()
+        self.last_std = np.asarray(std, dtype=np.float32).copy()
+        self.last_std[self.last_std < 1e-6] = 1.0
+        self.count = int(count)
+        self.frozen = True
+        self._enforce_categorical_identity_stats()
+
+    def seed_rolling_buffer(self, rows: np.ndarray, *, apply_fat_tail: bool = True) -> int:
+        """用离线 raw 特征预填 rolling buffer,不冻结 — 后续 process_frame 继续更新统计。
+
+        对齐 offline apply_rolling_norm 的「上月 buffer → 本月」语义。
+        """
+        arr = np.asarray(rows, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] != len(self.feature_names):
+            raise ValueError(
+                f"seed_rolling_buffer expect (T,{len(self.feature_names)}), got {arr.shape}"
+            )
+        self.frozen = False
+        self.raw_buffer.clear()
+        n_seed = 0
+        for row in arr[-self.window :]:
+            x = row.copy()
+            if not np.isfinite(x).all():
+                x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            if apply_fat_tail and self.fat_tail_mask.any():
+                tv = x[self.fat_tail_mask]
+                x[self.fat_tail_mask] = np.sign(tv) * np.log1p(np.abs(tv))
+            self.raw_buffer.append(x)
+            n_seed += 1
+        self.count = max(self.count, n_seed)
+        if n_seed >= 2:
+            raw_block = np.vstack(list(self.raw_buffer))
+            self.last_mean = np.mean(raw_block, axis=0).astype(np.float32)
+            self.last_std = np.std(raw_block, axis=0).astype(np.float32)
+            self.last_std[self.last_std < 1e-6] = 1.0
+            self.last_mean[self.categorical_mask] = 0.0
+            self.last_std[self.categorical_mask] = 1.0
+        self._enforce_categorical_identity_stats()
+        return n_seed
 
     def process_frame(self, x_raw_1d: np.ndarray) -> np.ndarray:
         if not np.isfinite(x_raw_1d).all():
@@ -212,34 +262,38 @@ class RollingWindowNormalizer:
         # 公式: sign(x) * log(1 + abs(x))
         if self.fat_tail_mask.any():
             target_vals = x_raw_1d[self.fat_tail_mask]
+            x_raw_1d = x_raw_1d.copy()
             x_raw_1d[self.fat_tail_mask] = np.sign(target_vals) * np.log1p(np.abs(target_vals))
 
+        # frozen 只冻结 mean/std; raw_buffer 必须持续追加,否则 get_sequence 全零。
         self.raw_buffer.append(x_raw_1d)
-        self.count += 1
-        
-        # 每个 committed minute 都刷新统计量；如需压低回放成本，可通过
-        # FCS_NORMALIZER_STATS_UPDATE_INTERVAL 显式调大，但实时默认必须为 1。
-        if self.count < 100 or self.count % self.stats_update_interval == 0:
-            if len(self.raw_buffer) >= 2:
-                raw_block = np.vstack(list(self.raw_buffer))
-                self.last_mean = np.mean(raw_block, axis=0).astype(np.float32)
-                self.last_std = np.std(raw_block, axis=0).astype(np.float32)
-                
-                self.last_std[self.last_std < 1e-6] = 1.0
-                self.last_mean[self.categorical_mask] = 0.0
-                self.last_std[self.categorical_mask] = 1.0
+
+        if not self.frozen:
+            self.count += 1
+
+            # 每个 committed minute 都刷新统计量；如需压低回放成本，可通过
+            # FCS_NORMALIZER_STATS_UPDATE_INTERVAL 显式调大，但实时默认必须为 1。
+            if self.count < 100 or self.count % self.stats_update_interval == 0:
+                if len(self.raw_buffer) >= 2:
+                    raw_block = np.vstack(list(self.raw_buffer))
+                    self.last_mean = np.mean(raw_block, axis=0).astype(np.float32)
+                    self.last_std = np.std(raw_block, axis=0).astype(np.float32)
+
+                    self.last_std[self.last_std < 1e-6] = 1.0
+                    self.last_mean[self.categorical_mask] = 0.0
+                    self.last_std[self.categorical_mask] = 1.0
 
         self._enforce_categorical_identity_stats()
         # [对齐离线训练]：Z-Score (epsilon=1e-6) + Tanh(/3) 压缩
         x_norm = (x_raw_1d - self.last_mean) / (self.last_std + 1e-6)
         x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=10.0, neginf=-10.0)
-        
+
         if self.use_tanh:
             real_mask = ~self.categorical_mask
             x_norm[real_mask] = np.tanh(x_norm[real_mask] / 3.0)
         else:
             x_norm = np.clip(x_norm, -10.0, 10.0)
-            
+
         return x_norm
 
     def get_sequence(self, seq_len: int) -> np.ndarray:
@@ -275,15 +329,36 @@ class OptionMinuteAggregator:
     将秒级期权 quote 流归约为“分钟唯一快照”。
     当前采用与分钟基准库最接近的语义：
     - 价格/盘口/size：取该分钟最后一个有效 quote
-    - volume：统一强制定义为 bid_size + ask_size（与训练口径一致）
+    - volume：优先保留已注入的分钟成交量(quote_options_*_iv / locked_feature 训练口径);
+      仅当 volume 缺失或为 0 时,才回退 bid_size + ask_size
+
+    重要：ingest 会先写入新分钟 tick，再由 commit_grace 延迟 finalize 上一分钟。
+    因此切换 minute_dt 时必须把上一分钟快照暂存到 closed，否则 finalize 拿不到
+    正确快照并回退到 option_snapshot（下一分钟），造成 volume/盘口 off-by-one。
     """
     def __init__(self, rows: int = 6, cols: int = 12):
         self.rows = rows
         self.cols = cols
         self.state = {}
+        # symbol -> {minute_dt: state}；支持 commit_grace 延迟与跳分钟。
+        self.closed = {}
 
     def reset(self):
         self.state = {}
+        self.closed = {}
+
+    @staticmethod
+    def _apply_volume_policy(arr: np.ndarray) -> np.ndarray:
+        """col6=volume。
+
+        - NaN → 回退 bid_size+ask_size（IBKR/缺列）
+        - 显式 0 → 保留（对齐 locked_feature：该分钟无真实 quote 则 volume=0，禁止用 ffill size 冒充）
+        """
+        out = np.asarray(arr, dtype=np.float32).copy()
+        size_sum = np.maximum(out[:, 10], 0.0) + np.maximum(out[:, 11], 0.0)
+        missing = ~np.isfinite(out[:, 6])
+        out[missing, 6] = size_sum[missing]
+        return out
 
     def update(self, symbol: str, minute_dt, snapshot_arr: np.ndarray, contracts, update_ts: float = None):
         if snapshot_arr is None:
@@ -296,10 +371,17 @@ class OptionMinuteAggregator:
         if arr.shape[1] < self.cols:
             arr = np.hstack([arr, np.zeros((arr.shape[0], self.cols - arr.shape[1]), dtype=np.float32)])
         arr = arr[:self.rows, :self.cols].copy()
+        arr = self._apply_volume_policy(arr)
 
-        # 统一分钟语义：volume 永远强制使用最后有效盘口 size 之和。
-        size_sum = np.maximum(arr[:, 10], 0.0) + np.maximum(arr[:, 11], 0.0)
-        arr[:, 6] = size_sum
+        prev = self.state.get(symbol)
+        if (
+            prev is not None
+            and prev.get("minute_dt") is not None
+            and minute_dt is not None
+            and prev.get("minute_dt") != minute_dt
+        ):
+            bucket = self.closed.setdefault(symbol, {})
+            bucket[prev["minute_dt"]] = prev
 
         self.state[symbol] = {
             'minute_dt': minute_dt,
@@ -310,14 +392,15 @@ class OptionMinuteAggregator:
 
     def finalize(self, symbol: str, minute_dt):
         st = self.state.get(symbol)
-        if not st:
-            return None, [], None
-        if st.get('minute_dt') != minute_dt:
-            return None, [], None
-        snap = np.asarray(st.get('snapshot'), dtype=np.float32).copy()
-        size_sum = np.maximum(snap[:, 10], 0.0) + np.maximum(snap[:, 11], 0.0)
-        snap[:, 6] = size_sum
-        return snap, list(st.get('contracts', [])), st.get('update_ts')
+        if st and st.get('minute_dt') == minute_dt:
+            snap = self._apply_volume_policy(st.get('snapshot'))
+            return snap, list(st.get('contracts', [])), st.get('update_ts')
+        closed_map = self.closed.get(symbol) or {}
+        closed = closed_map.pop(minute_dt, None)
+        if closed is not None:
+            snap = self._apply_volume_policy(closed.get('snapshot'))
+            return snap, list(closed.get('contracts', [])), closed.get('update_ts')
+        return None, [], None
 
 class FeatureComputeService:
     def __init__(self, redis_cfg, symbols, config_paths):
@@ -421,6 +504,7 @@ class FeatureComputeService:
                 use_tanh=True
             ) for s in symbols
         }
+        self._load_frozen_normalizer_stats()
 
         # 先初始化处理器，避免 reset_internal_memory() -> _load_service_state()
         # 期间访问 support_handler / warmup_handler 时出现属性缺失。
@@ -432,19 +516,213 @@ class FeatureComputeService:
         self.HISTORY_LEN = 500
         # 🚀 [核心重构] 调用显式重置，确保初始化与重置逻辑合一
         self.reset_internal_memory()
+        # state restore 可能覆盖 mean/std; 再强制一次冻结 / rolling seed 加载
+        self._load_frozen_normalizer_stats()
+        self._load_rolling_norm_seed()
+
+    def _load_rolling_norm_seed(self) -> None:
+        """FCS_ROLLING_NORM_SEED_PATH: 离线 quote_features_raw parquet,预填 rolling buffer(不冻结)。
+
+        可选 FCS_ROLLING_NORM_SEED_BEFORE=YYYYMMDD — 只取严格早于该日的行(对齐 trade_from)。
+        若已加载 frozen,则跳过。
+        """
+        path_raw = os.environ.get("FCS_ROLLING_NORM_SEED_PATH", "").strip()
+        if not path_raw:
+            return
+        if any(getattr(n, "frozen", False) for n in self.normalizers.values()):
+            logger.info("⏭️ [FCS-Norm] rolling seed skipped (frozen normalizer active)")
+            return
+        path = Path(path_raw).expanduser()
+        if not path.exists():
+            logger.warning("⚠️ [FCS-Norm] FCS_ROLLING_NORM_SEED_PATH not found: %s", path)
+            return
+        try:
+            import pandas as pd
+
+            df = pd.read_parquet(path)
+            if "timestamp" in df.columns:
+                df = df.sort_values("timestamp")
+                before = os.environ.get("FCS_ROLLING_NORM_SEED_BEFORE", "").strip()
+                if before:
+                    if len(before) == 8 and before.isdigit():
+                        cutoff = pd.Timestamp(
+                            f"{before[:4]}-{before[4:6]}-{before[6:8]}",
+                            tz="America/New_York",
+                        )
+                    else:
+                        cutoff = pd.Timestamp(before, tz="America/New_York")
+                    ts = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("America/New_York")
+                    df = df.loc[ts < cutoff].copy()
+            cols = []
+            mat = np.zeros((len(df), len(self.all_feat_names)), dtype=np.float32)
+            for i, name in enumerate(self.all_feat_names):
+                if name in df.columns:
+                    mat[:, i] = pd.to_numeric(df[name], errors="coerce").fillna(0.0).to_numpy(
+                        dtype=np.float32
+                    )
+                    cols.append(name)
+            if len(df) == 0:
+                logger.warning("⚠️ [FCS-Norm] rolling seed empty after filters: %s", path)
+                return
+            seed_symbol = os.environ.get("FCS_ROLLING_NORM_SEED_SYMBOL", "QQQ").strip() or "QQQ"
+            seeded = []
+            for sym, norm in self.normalizers.items():
+                if seed_symbol and sym != seed_symbol:
+                    continue
+                n = norm.seed_rolling_buffer(mat)
+                seeded.append(f"{sym}:{n}")
+            logger.info(
+                "✅ [FCS-Norm] Rolling seed from %s rows=%d matched_cols=%d/%d seeded=%s frozen=False",
+                path,
+                len(df),
+                len(cols),
+                len(self.all_feat_names),
+                seeded or "none",
+            )
+        except Exception as exc:
+            logger.error("⚠️ [FCS-Norm] Failed rolling seed from %s: %s", path, exc)
+
+    def _load_frozen_normalizer_stats(self) -> None:
+        """FCS_FROZEN_NORM_PATH: 加载离线 rolling_norm 导出的 mean/std,冻结在线统计量。"""
+        path_raw = os.environ.get("FCS_FROZEN_NORM_PATH", "").strip()
+        if not path_raw:
+            return
+        path = Path(path_raw).expanduser()
+        if not path.exists():
+            logger.warning("⚠️ [FCS-Norm] FCS_FROZEN_NORM_PATH not found: %s", path)
+            return
+        try:
+            blob = np.load(path, allow_pickle=True)
+            saved_names = [str(x) for x in blob["feature_names"].tolist()]
+            mean = np.asarray(blob["mean"], dtype=np.float32)
+            std = np.asarray(blob["std"], dtype=np.float32)
+            count = int(blob["count"]) if "count" in blob.files else 10_000
+            seed_buffer = None
+            if "buffer" in getattr(blob, "files", []):
+                raw_buf = np.asarray(blob["buffer"], dtype=np.float32)
+                if raw_buf.ndim == 2 and raw_buf.shape[0] > 0:
+                    seed_buffer = raw_buf
+            if saved_names != list(self.all_feat_names):
+                name_to_idx = {n: i for i, n in enumerate(saved_names)}
+                aligned_mean = np.zeros(len(self.all_feat_names), dtype=np.float32)
+                aligned_std = np.ones(len(self.all_feat_names), dtype=np.float32)
+                for i, name in enumerate(self.all_feat_names):
+                    j = name_to_idx.get(name)
+                    if j is not None:
+                        aligned_mean[i] = mean[j]
+                        aligned_std[i] = std[j]
+                if seed_buffer is not None:
+                    aligned_buf = np.zeros(
+                        (seed_buffer.shape[0], len(self.all_feat_names)), dtype=np.float32
+                    )
+                    for i, name in enumerate(self.all_feat_names):
+                        j = name_to_idx.get(name)
+                        if j is not None:
+                            aligned_buf[:, i] = seed_buffer[:, j]
+                    seed_buffer = aligned_buf
+                mean, std = aligned_mean, aligned_std
+                logger.warning(
+                    "⚠️ [FCS-Norm] feature name reorder applied (%d saved → %d live)",
+                    len(saved_names),
+                    len(self.all_feat_names),
+                )
+            seed_symbol = str(blob["symbol"]) if "symbol" in getattr(blob, "files", []) else ""
+            seeded = []
+            for sym, norm in self.normalizers.items():
+                norm.load_frozen_stats(mean, std, count=count)
+                if seed_buffer is not None and (not seed_symbol or sym == seed_symbol):
+                    norm.raw_buffer.clear()
+                    for row in seed_buffer[-norm.window :]:
+                        norm.raw_buffer.append(row.copy())
+                    seeded.append(sym)
+            logger.info(
+                "✅ [FCS-Norm] Frozen normalizer loaded from %s (count=%d, frozen=True, "
+                "buffer_seeded=%s rows=%d)",
+                path,
+                count,
+                seeded or "none",
+                0 if seed_buffer is None else int(seed_buffer.shape[0]),
+            )
+        except Exception as exc:
+            logger.error("⚠️ [FCS-Norm] Failed to load frozen stats from %s: %s", path, exc)
+
+    def _load_symbol_map_file(self) -> dict:
+        """
+        qqq_btc LMDB/infer 用 CONFIG/symbol_map.json(QQQ→stock_id=1)。
+        stocks_us 常缺 QQQ 行 → enumerate 落到 stock_id=0,embedding 错位,
+        对拍 2026-06-02 sb=17: id=0→BLOCK put, id=1→ENTER CALL(与离线一致)。
+        """
+        candidates = []
+        env_path = os.environ.get("FCS_SYMBOL_MAP", "").strip() or os.environ.get(
+            "QQQ_BTC_SYMBOL_MAP", ""
+        ).strip()
+        if env_path:
+            candidates.append(Path(env_path).expanduser())
+        # New_Pro/baseline_qqq/DAO → repo root
+        repo = Path(__file__).resolve().parents[3]
+        candidates.append(repo / "qqq_btc" / "CONFIG" / "symbol_map.json")
+        out = {}
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                blob = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning("⚠️ [FCS-Meta] bad symbol_map %s: %s", path, exc)
+                continue
+            for sym, meta in blob.items():
+                if sym == "comment" or not isinstance(meta, dict):
+                    continue
+                if "stock_id" not in meta:
+                    continue
+                out[str(sym)] = {
+                    "stock_id": int(meta["stock_id"]),
+                    "sector_id": int(meta.get("sector_id", 0)),
+                }
+            if out:
+                logger.info(
+                    "✅ [FCS-Meta] symbol_map %s → %d symbols (e.g. QQQ=%s)",
+                    path,
+                    len(out),
+                    out.get("QQQ"),
+                )
+                return out
+        return out
 
     def _load_symbol_meta_from_pg(self) -> None:
         """
-        Align FCS static ids with S0/LMDB training samples.
+        Align FCS static ids with training samples.
 
-        S0 stores metadata from stocks_us.id / stocks_us.sector_id.  The TFT model
-        consumes those ids through static embeddings, so replay/live inference must
-        not use the transient TARGET_SYMBOLS array index as stock_id.
+        Priority:
+          1) qqq_btc CONFIG/symbol_map.json (LMDB / run_inference 同源)
+          2) stocks_us.id / sector_id (多标的 S0 路径)
+          3) TARGET_SYMBOLS enumerate 兜底
         """
+        if not self.symbols:
+            return
+
+        file_map = self._load_symbol_map_file()
+        if file_map:
+            n = 0
+            for sym in self.symbols:
+                meta = file_map.get(sym)
+                if not meta:
+                    continue
+                self.stock_id_map[sym] = int(meta["stock_id"])
+                self.sector_id_map[sym] = int(meta["sector_id"])
+                n += 1
+            if n:
+                logger.info("✅ [FCS-Meta] Applied symbol_map to %d/%d symbols", n, len(self.symbols))
+
         try:
-            if not self.symbols:
-                return
-            conn = self.pg_conn if self.pg_conn and not self.pg_conn.closed else psycopg2.connect(PG_DB_URL)
+            from config import PG_DB_URL as _PG_URL
+        except Exception:
+            _PG_URL = os.environ.get(
+                "PG_DB_URL",
+                "dbname=quant_trade user=postgres password=postgres host=localhost port=5432",
+            )
+        try:
+            conn = self.pg_conn if self.pg_conn and not self.pg_conn.closed else psycopg2.connect(_PG_URL)
             placeholders = ",".join(["%s"] * len(self.symbols))
             with conn.cursor() as cur:
                 cur.execute(
@@ -455,19 +733,30 @@ class FeatureComputeService:
             if conn is not self.pg_conn:
                 conn.close()
             if not rows:
-                logger.warning("⚠️ [FCS-Meta] stocks_us returned no rows; fallback to TARGET_SYMBOLS index ids.")
+                if not file_map:
+                    logger.warning(
+                        "⚠️ [FCS-Meta] stocks_us empty and no symbol_map; "
+                        "using TARGET_SYMBOLS index ids."
+                    )
                 return
-            db_stock_ids = {str(sym): int(stock_id or 0) for sym, stock_id, _ in rows}
-            db_sector_ids = {str(sym): int(sector_id or 0) for sym, _, sector_id in rows}
-            missing = [s for s in self.symbols if s not in db_stock_ids]
-            self.stock_id_map.update(db_stock_ids)
-            self.sector_id_map.update(db_sector_ids)
-            logger.info(
-                f"✅ [FCS-Meta] Loaded DB stock/sector ids for {len(db_stock_ids)}/{len(self.symbols)} symbols; "
-                f"missing={missing[:5]}"
-            )
+            # 仅补 symbol_map 未覆盖的标的,避免冲掉 qqq_btc 训练 id
+            db_stock_ids = {}
+            db_sector_ids = {}
+            for sym, stock_id, sector_id in rows:
+                sym = str(sym)
+                if sym in file_map:
+                    continue
+                db_stock_ids[sym] = int(stock_id or 0)
+                db_sector_ids[sym] = int(sector_id or 0)
+            if db_stock_ids:
+                self.stock_id_map.update(db_stock_ids)
+                self.sector_id_map.update(db_sector_ids)
+                logger.info(
+                    "✅ [FCS-Meta] Loaded DB ids for %d symbols not in symbol_map",
+                    len(db_stock_ids),
+                )
         except Exception as e:
-            logger.warning(f"⚠️ [FCS-Meta] Failed to load stocks_us ids; fallback to index ids: {e}")
+            logger.warning(f"⚠️ [FCS-Meta] Failed to load stocks_us ids; fallback to index/map ids: {e}")
 
     def reset_internal_memory(self):
         """🚀 [状态消磁] 物理抹除所有内部缓冲区，并由于由于初始化 SDS 4.0 状态机机机机"""
@@ -1023,6 +1312,126 @@ class FeatureComputeService:
         )
         return [(ftype, names, res_sym.get(ftype)) for ftype, names in blocks if res_sym.get(ftype) is not None]
 
+    def _lookup_option_feat_5m_hold(
+        self,
+        sym: str,
+        fname: str,
+        alpha_label_ts: float,
+        hist_map: dict,
+    ) -> float | None:
+        """对齐离线 merge_1m_5m: 5min 期权结构特征取 <=floor_5m(ts) 的最近值并保持。"""
+        hist = hist_map.get(sym)
+        if hist is None or hist.empty or fname not in hist.columns:
+            return None
+        ts = pd.Timestamp(alpha_label_ts, unit="s", tz=NY_TZ)
+        floored = ts.floor("5min")
+        series = pd.to_numeric(hist[fname], errors="coerce")
+        if floored in series.index:
+            val = series.loc[floored]
+            if np.isscalar(val) and np.isfinite(val):
+                return float(val)
+            if isinstance(val, pd.Series):
+                val = val.dropna()
+                if not val.empty and np.isfinite(val.iloc[-1]):
+                    return float(val.iloc[-1])
+        sub = series.loc[:floored].dropna()
+        if sub.empty:
+            return None
+        return float(sub.iloc[-1])
+
+    def _inject_option_feats_to_history(
+        self,
+        sym: str,
+        *,
+        snap: np.ndarray | None,
+        price: float,
+        row_ts: pd.Timestamp,
+        hist_map: dict,
+    ) -> dict[str, float]:
+        """用当前分钟期权快照写 1m 期权特征到 history(含 struc_*),供 5m hold 取边界值。"""
+        if snap is None or not np.isfinite(price) or price <= 0:
+            return {}
+        # 注意：离线 options_locked_feature 用 ceil 结束标签，首根 09:31 已有完整期权特征。
+        # 实盘 start-label 的 09:30 棒 = 离线 09:31，不得清零，否则 Step-1 Pearson 被首根拖垮。
+        try:
+            feats = self.engine._calc_opt_feats_from_snap(
+                torch.tensor(np.asarray(snap, dtype=np.float32), dtype=torch.float32),
+                torch.tensor(float(price), dtype=torch.float32),
+            )
+            vals = {k: float(v.item() if hasattr(v, "item") else v) for k, v in feats.items()}
+        except Exception as exc:
+            logger.warning("[FCS] option feat inject failed %s: %s", sym, exc)
+            return {}
+        hist = hist_map.get(sym)
+        if hist is None:
+            return vals
+        for k, v in vals.items():
+            if np.isfinite(v):
+                hist.loc[row_ts, k] = v
+                if sym in self.history_1min and self.history_1min[sym] is not hist:
+                    self.history_1min[sym].loc[row_ts, k] = v
+        return vals
+
+    def _is_session_open_minute(self, ts_like) -> bool:
+        """RTH 09:30 首分钟(start-label)。"""
+        try:
+            ts = pd.Timestamp(ts_like)
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert(NY_TZ)
+            return int(ts.hour * 60 + ts.minute) == 570
+        except Exception:
+            return False
+
+    def _copy_enrich_derived_to_raw_vec(
+        self,
+        *,
+        sym: str,
+        hist_map: dict,
+        row_ts: pd.Timestamp,
+        raw_vec: np.ndarray,
+    ) -> None:
+        hist_en = hist_map.get(sym)
+        if hist_en is None or hist_en.empty:
+            return
+        try:
+            from qqq_btc.live.se_feature_bridge import DERIVED_NAMES
+        except Exception:
+            return
+        try:
+            hist_ts = hist_en.index
+            if getattr(hist_ts, "tz", None) is not None and row_ts.tz is not None:
+                row_ts_use = row_ts.tz_convert(hist_ts.tz)
+            else:
+                row_ts_use = row_ts
+            loc = hist_ts.get_indexer([row_ts_use], method="ffill")[0]
+        except Exception:
+            loc = -1
+            row_ts_use = row_ts
+        for fname in DERIVED_NAMES:
+            idx = self.feat_name_to_idx.get(fname)
+            if idx is None or fname not in hist_en.columns:
+                continue
+            try:
+                if loc >= 0:
+                    hv = hist_en.iloc[loc][fname]
+                elif row_ts_use in hist_en.index:
+                    hv = hist_en.loc[row_ts_use, fname]
+                else:
+                    continue
+                if isinstance(hv, pd.Series):
+                    hv = hv.iloc[-1]
+                hv = float(hv)
+            except Exception:
+                continue
+            if np.isfinite(hv):
+                raw_vec[idx] = hv
+                if getattr(self, "_enrich_raw_log_count", 0) < 3 and abs(hv) > 1e-8:
+                    logger.info(
+                        "[FCS-Enrich→raw] %s %s=%s @%s",
+                        sym, fname, hv, row_ts_use,
+                    )
+                    self._enrich_raw_log_count = getattr(self, "_enrich_raw_log_count", 0) + 1
+
     def _fill_raw_vec_from_result(
         self,
         *,
@@ -1036,10 +1445,52 @@ class FeatureComputeService:
         将最新特征块写入 raw_vec；函数式输入输出，避免调用侧堆叠条件。
         """
         target_history_map = self.committed_history_1min if is_new_minute else self.history_1min
+        row_ts = pd.Timestamp(alpha_label_ts, unit="s", tz=NY_TZ)
+        if is_new_minute:
+            # 09:30 start-label = 离线 ceil 09:31，同样注入期权特征
+            snap = None
+            if hasattr(self, "committed_option_snapshot"):
+                snap = self.committed_option_snapshot.get(sym)
+            if snap is None:
+                snap = res_sym.get("updated_buckets")
+            if snap is None:
+                snap = self.option_snapshot.get(sym)
+            try:
+                price = float(target_history_map[sym].loc[row_ts, "close"])
+            except Exception:
+                price = float(self.latest_prices.get(sym, 0.0) or 0.0)
+            self._inject_option_feats_to_history(
+                sym, snap=snap, price=price, row_ts=row_ts, hist_map=target_history_map
+            )
+            # enrich time/trend/open30 → raw_vec
+            self._copy_enrich_derived_to_raw_vec(
+                sym=sym, hist_map=target_history_map, row_ts=row_ts, raw_vec=raw_vec
+            )
+
         for ftype, names, tensor_blk in self._iter_feature_sources(res_sym):
             latest = tensor_blk[0, :, -1].cpu().numpy()
+            try:
+                from qqq_btc.live.se_feature_bridge import DERIVED_NAMES as _DERIVED
+            except Exception:
+                _DERIVED = frozenset()
             for i, fname in enumerate(names):
+                # time/trend/open30 以 enrich 为准,禁止引擎零值覆盖
+                if fname in _DERIVED:
+                    continue
                 val = float(latest[i]) if i < len(latest) else np.nan
+                res = getattr(self, "feat_resolutions", {}).get(fname, "1min")
+                # 5min 期权结构特征：用 1m history 在 5m 边界的值(对齐 merge_asof)，
+                # 避免 5m 路径用「最新 1m snap expand」污染整段。
+                if (
+                    is_new_minute
+                    and res == "5min"
+                    and fname.startswith("options_")
+                ):
+                    held = self._lookup_option_feat_5m_hold(
+                        sym, fname, alpha_label_ts, target_history_map
+                    )
+                    if held is not None:
+                        val = held
                 if (not np.isfinite(val)) and ftype == 'slow_1m':
                     hist_df = target_history_map.get(sym)
                     if hist_df is not None and fname in hist_df.columns:
@@ -1049,10 +1500,13 @@ class FeatureComputeService:
                 if np.isfinite(val):
                     raw_vec[self.feat_name_to_idx[fname]] = val
                     if is_new_minute:
-                        ts_logi = pd.Timestamp(alpha_label_ts, unit='s', tz=NY_TZ)
-                        target_history_map[sym].loc[ts_logi, fname] = val
-                        self.history_1min[sym].loc[ts_logi, fname] = val
-
+                        # 5min 期权特征: history 保留 1m inject 原值，raw_vec 用 hold 值入模
+                        if not (res == "5min" and fname.startswith("options_")):
+                            target_history_map[sym].loc[row_ts, fname] = val
+                            self.history_1min[sym].loc[row_ts, fname] = val
+                        else:
+                            # 入模用 hold；debug/norm 看 raw_vec。history 边界值已由 inject 写入。
+                            pass
     def _finalize_1min_bar(self, sym, dt, cleanup=True):
         return self.persistence_handler.finalize_1min_bar(sym, dt, cleanup=cleanup)
 
@@ -1064,17 +1518,11 @@ class FeatureComputeService:
             
     def _calc_and_inject_option_features(self, sym):
         if self.history_1min[sym].empty: return
-        # [🔥 修复] 从 10 列中切片前 8 列供 PyTorch 引擎计算，防止 Tensor Mismatch
-        snap = self.option_snapshot[sym][:, :8]
+        # 需保留 bid/ask/size(>=12列) 才能算 spread_pct / imbalance
+        snap = np.asarray(self.option_snapshot[sym], dtype=np.float32)
         price = self.latest_prices[sym]
-         
-        
-        # 简单过滤开盘不稳定期 (09:30-09:31)
-        current_time = self.history_1min[sym].index[-1]
-        minutes_from_midnight = current_time.hour * 60 + current_time.minute
-        if 570 <= minutes_from_midnight < 571: # 09:30
-             return
 
+        # 09:30 start-label 对应离线 ceil 首根 09:31，需正常注入（勿清零）
         feats = self.engine._calc_opt_feats_from_snap(
             torch.tensor(snap, dtype=torch.float32), 
             torch.tensor(price, dtype=torch.float32)
@@ -1169,6 +1617,10 @@ class FeatureComputeService:
             snap_df = snap_df.replace([np.inf, -np.inf], np.nan).dropna(subset=cols)
             snap_df = snap_df[snap_df['close'] > 0.0]
             snap_df = snap_df[snap_df['options_vw_iv'] >= min_iv]
+            # 只保留当日 RTH，避免 Deep Warmup 上日 IV 污染开盘 pct_change(5)
+            if isinstance(snap_df.index, pd.DatetimeIndex) and len(snap_df) > 0:
+                last_day = snap_df.index[-1].date()
+                snap_df = snap_df[snap_df.index.date == last_day]
             if len(snap_df) > dq.maxlen:
                 snap_df = snap_df.iloc[-dq.maxlen:]
 
@@ -1204,15 +1656,18 @@ class FeatureComputeService:
             
         mom_iv, acc_gamma, div_iv = 0.0, 0.0, 0.0
         
-        # 提取 5 分钟前状态进行对比计算 (如果不足 5 分钟，取最老的一帧)
-        if len(self.deriv_history[sym]) > 1:
-            lookback_idx = max(0, len(self.deriv_history[sym]) - 6)
-            prev = self.deriv_history[sym][lookback_idx]
+        # 对齐离线 pct_change(5).fillna(0)：不足 6 个物理分钟一律为 0，禁止用更短 lookback
+        if len(self.deriv_history[sym]) >= 6:
+            prev = self.deriv_history[sym][-6]
             eps = 1e-6
-            
-            mom_iv = (curr_iv - prev['iv']) / (prev['iv'] if abs(prev['iv']) > eps else 1.0)
-            acc_gamma = (curr_gamma - prev['gamma']) / (prev['gamma'] if abs(prev['gamma']) > eps else 1.0)
-            price_ret = (curr_price - prev['price']) / (prev['price'] if prev['price'] > eps else 1.0)
+
+            mom_iv = (curr_iv - prev["iv"]) / (prev["iv"] if abs(prev["iv"]) > eps else 1.0)
+            acc_gamma = (curr_gamma - prev["gamma"]) / (
+                prev["gamma"] if abs(prev["gamma"]) > eps else 1.0
+            )
+            price_ret = (curr_price - prev["price"]) / (
+                prev["price"] if prev["price"] > eps else 1.0
+            )
             div_iv = mom_iv - price_ret
             
         idx_mom = self.feat_name_to_idx.get('options_iv_momentum')
@@ -1449,12 +1904,46 @@ class FeatureComputeService:
 
         return batch_raw, valid_mask, results_map
 
+    def _maybe_reseed_rolling_on_trade_from(self, date_str: str) -> None:
+        """跨入交易日起时,用离线 June raw 重灌 rolling buffer,对齐 offline「上月 buffer→本月」。
+
+        6 月流式仍用于特征引擎预热;进入 TRADE_FROM 日时把 normalizer 重置为离线 raw 尾窗。
+        """
+        if getattr(self, "_rolling_reseed_done", False):
+            return
+        if any(getattr(n, "frozen", False) for n in self.normalizers.values()):
+            return
+        before = os.environ.get("FCS_ROLLING_NORM_SEED_BEFORE", "").strip()
+        if not before:
+            before = os.environ.get("QQQ_BTC_TRADE_FROM_DATE", "").strip()
+        if not before:
+            return
+        before_n = before.replace("-", "")
+        if len(before_n) != 8 or not before_n.isdigit():
+            return
+        if date_str < before_n:
+            return
+        # 触发一次重载(seed_before 过滤保证只用 before 之前的行)
+        self._rolling_reseed_done = True
+        logger.info(
+            "🔁 [FCS-Norm] trade_from=%s reached (date=%s) → reseed rolling from offline raw",
+            before_n,
+            date_str,
+        )
+        self._load_rolling_norm_seed()
+        # 导数队列不得跨日/跨 trade_from 偷看上月 history（对齐离线月文件冷启动 pct_change）
+        for sym in self.symbols:
+            self.deriv_history[sym] = deque(maxlen=10)
+        logger.info("🔁 [FCS-Norm] cleared option deriv_history on trade_from")
+
     def _apply_normalization_sequence(self, batch_raw, valid_mask, data_ts, is_new_minute):
         """[V8 Helper] 归一化层：执行 Z-Score，并通过 normalizer.get_sequence(30) 生成输入序列"""
         dt_ny = datetime.fromtimestamp(data_ts, NY_TZ)
         date_str = dt_ny.strftime('%Y%m%d')
         if not hasattr(self, 'created_debug_dates'): self.created_debug_dates = set()
         if date_str not in self.created_debug_dates: self._ensure_debug_tables(date_str); self.created_debug_dates.add(date_str)
+        if is_new_minute:
+            self._maybe_reseed_rolling_on_trade_from(date_str)
         
         batch_norm = []
         is_rth = bool(self.market_profile.is_rth_minute(dt_ny))
@@ -1606,6 +2095,19 @@ class FeatureComputeService:
             fname: valid_norm_seq[:, :, self.feat_name_to_idx[fname]] 
             for fname in self.slow_feat_names
         }
+        # 5min 特征:与 LMDB / row_to_tensors 一致,对 [B,30] 做 6×repeat5 stair-step。
+        # raw_buffer 仍按分钟 asof/hold 写入;入模前重排,避免块内逐分钟微漂 + 锚点错位。
+        try:
+            from qqq_btc.common.inference_tensors import apply_5m_stair_step
+            for fname in self.slow_feat_names:
+                if getattr(self, "feat_resolutions", {}).get(fname, "1min") != "5min":
+                    continue
+                arr = np.asarray(features_dict[fname], dtype=np.float32)
+                features_dict[fname] = apply_5m_stair_step(arr)
+        except Exception as exc:
+            if getattr(self, "_stair5_log_count", 0) < 3:
+                logger.warning("[FCS] 5min stair-step skipped: %s", exc)
+                self._stair5_log_count = getattr(self, "_stair5_log_count", 0) + 1
 
         # 🚀 [架构升维：事前合并期权字典 (Pre-Join)]
         live_options = {}
@@ -2091,7 +2593,13 @@ class FeatureComputeService:
                 await asyncio.sleep(1)
 
     def _sync_history_from_redis(self, symbol, limit=500):
-        """🚀 [Redis 唯一标准] 从 Redis 物理回读历史序列，确保内存状态与系统账本绝对对齐"""
+        """🚀 [Redis 唯一标准] 从 Redis 物理回读历史序列，确保内存状态与系统账本绝对对齐
+
+        跨日/隔夜 gap 触发 full sync 时，Redis 往往只有「今日」bar，而 Deep Warmup
+        已从 PG 灌入上日 history。若直接整表替换，会把预热 K 线抹掉 → 开盘后
+        master_index 只剩 1–2 根、ADX/BB 冷启动、5m 广播尺寸错位。
+        因此：Redis 回读结果与现有 committed history 做合并（同 ts 以 Redis 为准）。
+        """
         try:
             key = f"BAR:1M:{symbol}"
             raw_data = self.r.hgetall(key)
@@ -2112,6 +2620,20 @@ class FeatureComputeService:
             data_list = data_list[-limit:]
             df = pd.DataFrame(data_list)
             df.set_index('timestamp', inplace=True)
+            prev = self.committed_history_1min.get(symbol)
+            if not (isinstance(prev, pd.DataFrame) and not prev.empty):
+                prev = self.history_1min.get(symbol)
+            if isinstance(prev, pd.DataFrame) and not prev.empty:
+                cols = [c for c in ('open', 'high', 'low', 'close', 'volume', 'vwap') if c in df.columns or c in prev.columns]
+                left = prev[[c for c in cols if c in prev.columns]].copy()
+                right = df[[c for c in cols if c in df.columns]].copy()
+                merged = pd.concat([left, right], axis=0)
+                merged = merged[~merged.index.duplicated(keep='last')].sort_index()
+                df = merged.iloc[-limit:]
+                logger.info(
+                    "🔗 [Redis Back-Read] merge %s redis=%d prev=%d → combined=%d",
+                    symbol, len(right), len(left), len(df),
+                )
             self.history_1min[symbol] = df
             self.committed_history_1min[symbol] = df.copy()
         except Exception as e:

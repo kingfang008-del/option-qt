@@ -104,6 +104,9 @@ class FCSWarmupHandler:
                 if raw_bars_1m:
                     df_hist_1m = pd.DataFrame(raw_bars_1m).drop_duplicates(subset=['ts']).set_index('ts').sort_index()
                     svc.history_1min[sym] = df_hist_1m.iloc[-svc.HISTORY_LEN:]
+                    # Deep Warmup 必须同时填 committed，否则首根 bar 因
+                    # committed 为空走 Redis full-sync，把预热 K 线整表抹掉。
+                    svc.committed_history_1min[sym] = svc.history_1min[sym].copy()
 
                 rows_5m = sym_to_rows_5m.get(sym, [])
                 raw_bars_5m = []
@@ -118,6 +121,7 @@ class FCSWarmupHandler:
                 if raw_bars_5m:
                     df_hist_5m = pd.DataFrame(raw_bars_5m).drop_duplicates(subset=['ts']).set_index('ts').sort_index()
                     svc.history_5min[sym] = df_hist_5m.iloc[-500:]
+                    svc.committed_history_5min[sym] = svc.history_5min[sym].copy()
 
                 opt_snap = sym_to_opt_row.get(sym)
                 if opt_snap:

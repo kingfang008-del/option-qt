@@ -70,6 +70,7 @@ def run_inference_df(
     batch_size: int = 256,
     use_carryover: bool = True,
     carryover_bars: int = DEFAULT_CARRYOVER_BARS,
+    frozen_norm: Path | str | None = None,
 ) -> pd.DataFrame:
     import torch
 
@@ -79,20 +80,42 @@ def run_inference_df(
         if use_carryover
         else raw
     )
-    work = work.copy().sort_values("timestamp").reset_index(drop=True)
+    # 禁止在 carryover 后再按 timestamp 排序:augment 会插入与前日尾部
+    # 同戳的 `_carryover` 行,stable sort 会把它们与真实行交错,破坏滚动窗
+    # 序列 → trend_fit_r2_120m 等被重算成错误值(对拍 2026-06-02 sb=17:
+    # feat/stream=0.726, 错序重算=0.784)。
     if "time_session_sin" not in work.columns:
         work = add_time_features(work)
     price_col = next((c for c in ("close", "price", "vwap") if c in work.columns), None)
-    if price_col and (
-        "trend_fit_ret_30m" not in work.columns or "spot_range_30m" not in work.columns
-    ):
+    # 仅在缺核心 trend 列时重算。v4 特征表不含 spot_range_30m,旧条件
+    # `or spot_range missing` 会在已有正确 trend_fit_* 时整表覆盖重算。
+    if price_col and "trend_fit_ret_30m" not in work.columns:
         work = add_trend_features(work, price_col=price_col)
+    elif price_col and "spot_range_30m" not in work.columns:
+        # 决策闸门可能需要 range,但不覆盖已有 trend_fit_*。
+        px = pd.to_numeric(work[price_col], errors="coerce")
+        high_col = "high" if "high" in work.columns else price_col
+        low_col = "low" if "low" in work.columns else price_col
+        hi_s = pd.to_numeric(work[high_col], errors="coerce").rolling(30).max()
+        lo_s = pd.to_numeric(work[low_col], errors="coerce").rolling(30).min()
+        work["spot_range_30m"] = ((hi_s - lo_s) / px.replace(0, np.nan)).fillna(0.0).clip(lower=0.0)
+        if "trend_strength_30m" not in work.columns and "trend_fit_ret_30m" in work.columns:
+            work["trend_strength_30m"] = (
+                np.abs(work["trend_fit_ret_30m"]) * work["trend_fit_r2_30m"]
+            ).astype(np.float64)
     if price_col and "open30_ret" not in work.columns:
         work = add_open30_features(work, price_col=price_col)
     if "vix_proxy_close" in work.columns and "vix_reversal_count_30m" not in work.columns:
         work = add_vix_regime_features(work)
     if price_col and "spot_day_ret" not in work.columns:
         work = add_spot_day_ret(work, price_col=price_col)
+
+    if frozen_norm:
+        from qqq_btc.common.frozen_norm import apply_frozen_norm_df
+
+        feat_names = [f["name"] for f in config.get("features", []) if f.get("name")]
+        work = apply_frozen_norm_df(work, frozen_norm, feature_names=feat_names)
+        logger.info("applied frozen norm from %s (%d feature cols)", frozen_norm, len(feat_names))
 
     stock_map, option_map, n_stock, n_opt = build_feature_maps(config)
     if not work.empty:
@@ -200,6 +223,11 @@ def main() -> None:
         help="禁用前日 tail 拼入(默认开启,与 live carryover 一致)",
     )
     parser.add_argument("--carryover-bars", type=int, default=DEFAULT_CARRYOVER_BARS)
+    parser.add_argument(
+        "--frozen-norm",
+        default=None,
+        help="日冻结 normalizer .npz;输入须为 quote_features_raw,与 FCS FROZEN_NORM_PATH 同文件",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -224,6 +252,7 @@ def main() -> None:
         batch_size=args.batch_size,
         use_carryover=not args.no_carryover,
         carryover_bars=args.carryover_bars,
+        frozen_norm=Path(args.frozen_norm).expanduser() if args.frozen_norm else None,
     )
     Path(args.output).expanduser().parent.mkdir(parents=True, exist_ok=True)
     out.to_parquet(args.output, index=False)

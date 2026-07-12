@@ -214,6 +214,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None, help="默认 42 或环境变量 QQQ_BTC_SEED")
     parser.add_argument("--call-bucket", type=int, default=qcfg.TRADE_BUCKET_ID)
     parser.add_argument("--put-bucket", type=int, default=0)
+    parser.add_argument(
+        "--frozen-norm",
+        default=None,
+        help="日冻结 normalizer .npz;feature-root 须为 quote_features_raw,与 FCS 同文件",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -255,6 +260,7 @@ def main() -> None:
             sector_id=int(sym["sector_id"]),
             device=device,
             use_carryover=True,
+            frozen_norm=Path(args.frozen_norm).expanduser() if args.frozen_norm else None,
         )
         # 回放成交一律从 databento 1m 重新 attach(5min 容差),不用特征内嵌 exec_*
         pred = drop_embedded_exec_columns(pred)
@@ -295,6 +301,8 @@ def main() -> None:
     summary["session_entry_end_bar"] = qcfg.REPLAY.session_entry_end_bar
     summary["call_bucket"] = int(args.call_bucket)
     summary["put_bucket"] = int(args.put_bucket)
+    if args.frozen_norm:
+        summary["frozen_norm"] = str(Path(args.frozen_norm).expanduser())
 
     summary_path = out_dir / "replay_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:

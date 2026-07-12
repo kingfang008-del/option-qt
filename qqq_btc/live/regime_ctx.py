@@ -20,6 +20,8 @@ REGIME_CTX_KEYS = (
     "open30_max_ret",
     "open30_peak_dd",
     "vix_level",
+    "day_range_pos",
+    "bb_width",
 )
 
 

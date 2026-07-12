@@ -1448,7 +1448,10 @@ class OrchestratorExecution:
                             simulated_fill_price = float(limit_price * (1 + slippage_entry_pct))
                         st.entry_price = simulated_fill_price
                         
-                        log_ts = curr_ts if (self.orch.mode == 'backtest' or SYNC_EXECUTION) else time.time()
+                        # 始终用策略时钟 curr_ts(回放/实盘帧时间),勿用 wall clock。
+                        # 否则 REDIS_STREAM_SIM 下 entry_ts 错位 → held_mins/GhostB 保护期失真。
+                        log_ts = float(curr_ts)
+                        st.entry_ts = log_ts
                         timing_fields = self._build_timing_fields(alpha_label_ts, alpha_available_ts, start_time, log_ts)
                         self.orch.accounting._process_open_accounting(
                             sym,
@@ -1576,17 +1579,32 @@ class OrchestratorExecution:
                 original_position = sig.get('original_position', st.position)
                 
                 if not runtime_trading_enabled:
-                    # SELL 平仓始终吃买盘深度；bid_size 缺失时回退 ask_size。
-                    available_size = sig.get('bid_size', sig.get('ask_size', 100))
-                    actual_fill_qty = min(exit_qty, int(available_size))
-                    if actual_fill_qty <= 0: return 
-                    
-                    slippage_exit_pct = self._effective_slippage_pct('exit')
+                    # REALTIME_DRY / mock / Redis 流式对拍：无限流动性，对齐 offline 全仓离场。
+                    # 否则 bid_size 会把 HARD_STOP 拆成多笔，残余仓位挡住后续开仓。
+                    use_full_exit = (
+                        IS_REALTIME_DRY
+                        or str(os.environ.get("OMS_MOCK_IBKR", "")).strip().lower()
+                        in ("1", "true", "yes")
+                        or str(os.environ.get("REDIS_STREAM_SIM", "")).strip().lower()
+                        in ("1", "true", "yes")
+                        or str(os.environ.get("QQQ_BTC_FULL_EXIT", "")).strip().lower()
+                        in ("1", "true", "yes")
+                    )
+                    if use_full_exit:
+                        actual_fill_qty = int(exit_qty)
+                    else:
+                        # 真·无交易权限纸面路径：SELL 平仓吃买盘深度；bid_size 缺失回退 ask_size。
+                        available_size = sig.get("bid_size", sig.get("ask_size", 100))
+                        actual_fill_qty = min(exit_qty, int(available_size))
+                    if actual_fill_qty <= 0:
+                        return
+
+                    slippage_exit_pct = self._effective_slippage_pct("exit")
                     simulated_exit_price = max(round(raw_price * (1 - slippage_exit_pct), 2), 0.01)
                     self.orch.accounting._process_exit_accounting(
                         sym, st, actual_fill_qty, simulated_exit_price, stock_price, curr_ts, reason, 0.0, 1.0,
                         original_position=original_position,
-                        execution_meta={'bid': bid, 'ask': ask},
+                        execution_meta={"bid": bid, "ask": ask},
                     )
                 else:
                     order_key = self._make_pending_order_key(sym, "CLOSE", getattr(st, 'contract_id', ''), curr_ts)
@@ -1803,10 +1821,13 @@ class OrchestratorExecution:
                 st.max_roi = 0.0
                 st.contract_id = _meta2.get('contract_id', '') or ''
                 
-                fill_ts = time.time()
+                # 用策略/回放时钟 curr_ts,勿用 wall clock — 否则 REDIS_STREAM_SIM 下
+                # held_mins 恒为负/0,exit_rails 永久孵化,STEP_PROTECT 永不触发。
+                fill_ts = float(curr_ts)
                 self.orch.accounting._process_open_accounting(
                     sym, st, total_qty_filled, st.entry_price, stock_price, fill_ts, sig,
-                    duration=fill_ts - iceberg_start_time, ratio=(total_qty_filled / target_total_qty),
+                    duration=max(0.0, fill_ts - float(iceberg_start_time or fill_ts)),
+                    ratio=(total_qty_filled / target_total_qty),
                     mode_override='REALTIME', note_suffix=f"|GHOST_A_{chunks}",
                     execution_meta=sig.get('meta', {}),
                 )
@@ -2082,7 +2103,10 @@ class OrchestratorExecution:
                     )
                 alpha_label_ts = sig.get('meta', {}).get('alpha_label_ts', 0.0)
                 alpha_available_ts = sig.get('meta', {}).get('alpha_available_ts', 0.0)
-                fill_ts = time.time()
+                # 优先 alpha/sim 时钟;live 无 meta 时退回 wall clock
+                fill_ts = float(alpha_available_ts or getattr(st, 'entry_ts', 0.0) or time.time())
+                if not getattr(st, 'entry_ts', 0.0):
+                    st.entry_ts = fill_ts
                 timing_fields = self._build_timing_fields(alpha_label_ts, alpha_available_ts, start_time, fill_ts)
                 self.orch.accounting._process_open_accounting(
                     sym,
@@ -2092,7 +2116,7 @@ class OrchestratorExecution:
                     stock_price,
                     fill_ts,
                     sig,
-                    duration=fill_ts - start_time,
+                    duration=max(0.0, fill_ts - float(start_time or fill_ts)),
                     ratio=ratio,
                     timing_fields=timing_fields,
                     mode_override='REALTIME',
