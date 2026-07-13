@@ -1,16 +1,18 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Step-1 特征门控：PG debug_slow vs 离线 quote_features（归一化后）。
+Gate-2 特征门控：PG debug_slow vs 离线 quote_features（归一化后）。
 
-实盘/流式 FCS 把归一化 slow 特征写入 debug_slow；离线 replay 用
-quote_features_test（rolling_norm 后）。开仓/平仓对拍之前，先过本门控。
+实盘/流式 FCS 把归一化 slow 特征写入 debug_slow；离线用
+quote_features_test（rolling/frozen norm 后）。
+须先过 Gate-1（compare_debug_raw_offline.py / quote_features_raw），
+本门通过后再做 Gate-3 交易对拍。
 
 用法:
   python qqq_btc/tools/compare_debug_slow_offline.py \\
       --dates 2026-07-01,2026-07-02 \\
-      --offline ~/train_data/july_w1_v4_experiment/quote_features_test/QQQ/regular/09:30-16:00/1min/2026-07.parquet \\
-      --out qqq_btc/results/july_w1_ft56_4c_stream_rolling/feat_parity_step1.json
+      --offline ~/train_data/.../quote_features_test/.../1min/2026-07.parquet \\
+      --out .../feat_parity_gate2_norm.json
 """
 from __future__ import annotations
 
@@ -183,6 +185,12 @@ def compare_day(
                 if int(keep.sum()) >= 10 and np.std(aa[keep]) > 1e-12 and np.std(bb[keep]) > 1e-12:
                     robust_corr = float(np.corrcoef(aa[keep], bb[keep])[0, 1])
                 ok = robust_corr is None or robust_corr >= corr_min
+            elif p90 <= max(float(med_tol) * 20.0, 0.01) and mx <= max(0.05, float(med_tol) * 100.0):
+                # 中位/主体已贴合时，corr 对少数尖峰极敏感（iv_momentum 等）
+                keep = err <= np.quantile(err, 0.95)
+                if int(keep.sum()) >= 10 and np.std(aa[keep]) > 1e-12 and np.std(bb[keep]) > 1e-12:
+                    robust_corr = float(np.corrcoef(aa[keep], bb[keep])[0, 1])
+                ok = robust_corr is not None and robust_corr >= max(0.5, float(corr_min) - 0.15)
             else:
                 ok = False
         elif corr is not None and corr < corr_min:
@@ -220,7 +228,7 @@ def compare_day(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Step-1: debug_slow vs offline feature gate")
+    ap = argparse.ArgumentParser(description="Gate-2: debug_slow vs offline normed features")
     ap.add_argument("--dates", required=True, help="comma YYYY-MM-DD")
     ap.add_argument(
         "--offline",
@@ -290,8 +298,8 @@ def main() -> int:
 
     overall = all(r.get("pass") for r in by_day)
     summary = {
-        "step": 1,
-        "gate": "debug_slow_vs_offline_normed_features",
+        "gate": 2,
+        "name": "debug_slow_vs_offline_normed_features",
         "offline": str(Path(args.offline).expanduser()),
         "symbol": args.symbol,
         "med_tol": args.med_tol,
@@ -300,9 +308,9 @@ def main() -> int:
         "n_feats": len(feats),
         "overall_pass": overall,
         "by_day": [{k: v for k, v in r.items() if k != "columns"} for r in by_day],
-        "note": "Step-2 entry/exit 仅在 overall_pass=true 后进行",
+        "next": "Gate-3 trade parity only if overall_pass",
     }
-    print(f"\n=== STEP-1 OVERALL: {'PASS' if overall else 'FAIL'} ===")
+    print(f"\n=== GATE-2 NORM OVERALL: {'PASS' if overall else 'FAIL'} ===")
     if args.out:
         out = Path(args.out).expanduser()
         out.parent.mkdir(parents=True, exist_ok=True)

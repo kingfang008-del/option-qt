@@ -4,7 +4,8 @@
 不修改旧路径任何文件;复用旧代码中已验证正确的逻辑,重写有结构缺陷的部分。
 
 > **分阶段里程碑与 MAG7 模型集群设计** → [CLUSTER_ROADMAP.md](./CLUSTER_ROADMAP.md)  
-> **G3 shadow 逐日核对** → [PARITY_CHECKLIST.md](./PARITY_CHECKLIST.md) · **端到端时序** → [§2.6](#26-端到端时序bar-close--fill)
+> **G3 shadow 逐日核对** → [PARITY_CHECKLIST.md](./PARITY_CHECKLIST.md) · **端到端时序** → [§2.6](#26-端到端时序bar-close--fill)  
+> **1DTE ladder 升级路线（特征日锁 + 选腿增益，搁置真 0DTE）** → [docs/1dte_ladder_upgrade_architecture.md](./docs/1dte_ladder_upgrade_architecture.md)
 
 ## 1. 设计原则(来自架构审查的结论)
 

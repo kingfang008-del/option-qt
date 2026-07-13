@@ -118,7 +118,11 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
             self._last_reject_reason = "pre_conditions"
         return None
 
-    replay_cfg = qcfg.REPLAY
+    # Live 默认 REPLAY(含 entry_delay);QQQ_BTC_USE_LIVE_REPLAY=1 时用 immediate。
+    # 阈值 override 与 fill 侧共用 resolve_replay_cfg，避免 governor 双实例。
+    from qqq_btc.live.session_governor import resolve_replay_cfg
+
+    replay_cfg = resolve_replay_cfg()
     session_bar = _session_bar_from_ctx(ctx)
     sym = str(ctx.get("symbol", "QQQ") or "QQQ")
     curr_ts = float(ctx.get("curr_ts", 0.0) or 0.0)

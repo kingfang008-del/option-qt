@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from qqq_btc.common.time_features import add_time_features
+from qqq_btc.common.time_features import TIME_FEATURE_NAMES, add_time_features
 from qqq_btc.common.regime_features import add_vix_regime_features
 from qqq_btc.common.trend_features import add_trend_features, add_open30_features, add_spot_day_ret
 
@@ -20,7 +20,15 @@ def enrich_fcs_bars(df: pd.DataFrame, price_col: str = "close") -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy().sort_values("timestamp").reset_index(drop=True)
-    out = add_time_features(out)
+    # FCS history 索引多为 bar 起点；离线 quote_features 用 end-label。
+    # 时间特征按 end-label(=start+1min) 计算，避免 Gate-1 固定偏 1/390。
+    ts = pd.to_datetime(out["timestamp"])
+    tmp = out.copy()
+    tmp["timestamp"] = ts + pd.Timedelta(minutes=1)
+    tmp = add_time_features(tmp)
+    for col in TIME_FEATURE_NAMES:
+        if col in tmp.columns:
+            out[col] = tmp[col]
     if price_col not in out.columns:
         for c in ("price", "vwap"):
             if c in out.columns:

@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import re
+import os
 try:
     from py_vollib_vectorized import vectorized_implied_volatility, get_all_greeks
     HAS_VOLLIB = True
@@ -143,17 +144,25 @@ def calculate_bucket_greeks(buckets: np.ndarray, S: float, T: float, r: float = 
         
         if strike < 0.01: continue
 
-        # 强约束：Greeks 计算只允许使用 bid/ask，不允许使用成交价（IDX_PRICE）。
-        if buckets.shape[1] <= IDX_ASK:
-            continue
-        bid = float(buckets[i, IDX_BID])
-        ask = float(buckets[i, IDX_ASK])
-        if not (bid > 0.0 and ask >= bid):
-            # 无有效盘口则跳过该合约，保持 Greeks/IV 为 0
+        # IV 定价输入:
+        #   FCS_IV_PRICE_MODE=mid   (默认) 盘口 mid，偏实盘
+        #   FCS_IV_PRICE_MODE=close 优先用 snap 第0列(pitcher 写入的 mid/close/last)，对齐离线 option_cac 的 close
+        bid = float(buckets[i, IDX_BID]) if buckets.shape[1] > IDX_BID else 0.0
+        ask = float(buckets[i, IDX_ASK]) if buckets.shape[1] > IDX_ASK else 0.0
+        trade_px = float(buckets[i, IDX_PRICE]) if buckets.shape[1] > IDX_PRICE else 0.0
+        iv_mode = os.environ.get("FCS_IV_PRICE_MODE", "mid").strip().lower()
+        price = 0.0
+        if iv_mode in {"close", "trade", "price", "last"} and trade_px > 1e-6:
+            price = trade_px
+        elif bid > 0.0 and ask >= bid:
+            price = 0.5 * (bid + ask)
+        elif trade_px > 1e-6:
+            price = trade_px
+        else:
+            # 无有效价格则跳过该合约，保持 Greeks/IV 为 0
             buckets[i, IDX_PRICE] = 0.0
             continue
-        price = 0.5 * (bid + ask)
-        # 下游仍有对第0列的读取，统一回写为 mid，避免携带成交价语义
+        # 下游仍有对第0列的读取，统一回写为本次 IV 所用价格
         buckets[i, IDX_PRICE] = price
         
         iv = 0.0

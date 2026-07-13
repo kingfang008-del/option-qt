@@ -1,0 +1,23 @@
+{
+  "profile": "qqq_old_style_true_0dte",
+  "description": "旧锁约算法（全天原始 delta）+ 真正 trading 0DTE only；无 0DTE 则跳过当天，禁止退到 1/2。",
+
+  "front_allowed_dte": [0],
+  "front_prefer_dte": 0,
+  "front_min_dte": 0,
+  "front_max_dte": 0,
+  "allow_front_dte_fallback": false,
+  "use_next_buckets": false,
+
+  "delta_tolerance": 0.15,
+  "atm_center": 0.50,
+  "otm_center": 0.25,
+
+  "label_trade_bucket_id": 2,
+  "symbols": ["QQQ"],
+
+  "paths": {
+    "raw_iv_dir": "~/train_data/nq_options_day_iv",
+    "locked_targets_output": "~/train_data/locked_targets_map_old_style_true_0dte.parquet"
+  }
+}

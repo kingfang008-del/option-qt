@@ -106,9 +106,20 @@ def calculate_locked_features(df: pd.DataFrame) -> pd.DataFrame:
     # ---------------------------------------------------------
     # A. 核心基准特征 (Baseline Metrics)
     # ---------------------------------------------------------
-    # 1. 真实基准 IV (Baseline IV): 绝对不混合 Call 和 Put！
-    # 业界标准：只取平值期权 (ATM) 的均值，因为 ATM 流动性最好，Skew 扭曲最小。
-    df_wide['options_vw_iv'] = (iv[put_atm] + iv[call_atm]) / 2.0 
+    # 1. 真实基准 IV (Baseline IV): ATM put/call 均值。
+    # 单腿 BSM 失败会留下 IV≈0；与 0 取平均会把 IV 腰斩。
+    # 仅对有效腿(>0.01)取平均；单腿有效则用该腿（对齐 FCS realtime_feature_engine）。
+    def _atm_iv_mean(put_iv, call_iv):
+        put_ok = put_iv > 0.01
+        call_ok = call_iv > 0.01
+        both = put_ok & call_ok
+        return np.where(
+            both,
+            (put_iv + call_iv) / 2.0,
+            np.where(put_ok, put_iv, np.where(call_ok, call_iv, 0.0)),
+        )
+
+    df_wide['options_vw_iv'] = _atm_iv_mean(iv[put_atm], iv[call_atm]) 
     
     # 2. 净 Delta 敞口 (Net Delta Exposure) - 按成交量加权是合理的！
     # 因为 Put 的 Delta 是负数，Call 是正数，按成交量加总正好代表了市场资金的“净做多/做空方向”
@@ -159,7 +170,10 @@ def calculate_locked_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # 期限结构: 次月 ATM vs 近月 ATM (Contango / Backwardation)
     front_atm = df_wide['options_vw_iv']
-    next_atm = (iv[4] + iv[5]) / 2.0 if not is_ladder8 else 0.0
+    if not is_ladder8:
+        next_atm = _atm_iv_mean(iv[4], iv[5])
+    else:
+        next_atm = 0.0
     df_wide['options_struc_atm_iv'] = front_atm
     df_wide['options_struc_term'] = np.where((next_atm > 0.01) & (front_atm > 0.01), next_atm - front_atm, 0.0) if not is_ladder8 else 0.0
 

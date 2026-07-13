@@ -75,9 +75,40 @@ def load_minute_option_ref(
     分钟 IV parquet → {(minute_unix_ts, bucket_id): {iv, delta, ..., volume}}。
     raw_1s 期权无 volume 列时由发球机 / FCS 注入 col 6。
 
-    优先 monthly_iv 月度文件：它是训练特征 (bucketed_v7 → quote_features_raw)
-    的真实输入；daily 文件可能被 databento 重建覆盖，分钟覆盖率与 volume 不同。
+    优先级:
+      1) 显式 greek_root 下的 day_iv（诚实对拍传入 openwin day_iv）
+      2) 显式 greek_root 旁的 monthly_iv（同实验树）
+      3) 默认 monthly_iv（训练金标）
+      4) 默认 / 显式 greek_root day_iv 回退
     """
+    # 1) 显式 greek_root 的日文件优先，避免被全局 monthly 盖掉
+    if greek_root is not None:
+        path = resolve_greek_day_path(sym, date_iso, greek_root)
+        if path is not None:
+            df = pd.read_parquet(path)
+            if not df.empty and "bucket_id" in df.columns:
+                return _build_minute_ref(df)
+        # 同实验树 monthly：greek_root 常为 .../quote_options_day_iv → 旁路 monthly
+        sibling_monthly = Path(greek_root).expanduser().resolve().parent / "quote_options_monthly_iv"
+        if sibling_monthly.exists():
+            old = os.environ.get("FCS_MINUTE_OPTION_MONTHLY_IV_ROOT")
+            try:
+                os.environ["FCS_MINUTE_OPTION_MONTHLY_IV_ROOT"] = str(sibling_monthly)
+                path_m = resolve_greek_monthly_path(sym, date_iso)
+            finally:
+                if old is None:
+                    os.environ.pop("FCS_MINUTE_OPTION_MONTHLY_IV_ROOT", None)
+                else:
+                    os.environ["FCS_MINUTE_OPTION_MONTHLY_IV_ROOT"] = old
+            if path_m is not None:
+                df = pd.read_parquet(path_m)
+                if not df.empty and "bucket_id" in df.columns:
+                    ts_day = _align_timestamp_series(df)
+                    df = df[ts_day.dt.strftime("%Y-%m-%d") == date_iso]
+                    if not df.empty:
+                        return _build_minute_ref(df)
+
+    # 2) 默认 monthly（开卷 / 训练对齐）
     path = resolve_greek_monthly_path(sym, date_iso)
     if path is not None:
         df = pd.read_parquet(path)
@@ -86,6 +117,8 @@ def load_minute_option_ref(
             df = df[ts_day.dt.strftime("%Y-%m-%d") == date_iso]
             if not df.empty:
                 return _build_minute_ref(df)
+
+    # 3) day_iv 回退
     path = resolve_greek_day_path(sym, date_iso, greek_root)
     if path is None:
         return {}

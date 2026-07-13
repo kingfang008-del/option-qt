@@ -1,0 +1,32 @@
+{
+  "profile": "stock_non0dte_old_lock",
+  "description": "MAG7 NVDA/TSLA 非0DTE 锁约：trading DTE∈{1,2}，prefer=1。QQQ 0DTE 不稳定，个股 TFT 训练禁用当日到期。配合 step1_build_target_map_old.py，不改旧代码。",
+
+  "front_allowed_dte": [1, 2],
+  "front_prefer_dte": 1,
+  "front_min_dte": 1,
+  "front_max_dte": 2,
+  "allow_front_dte_fallback": false,
+  "exclude_0dte": true,
+  "use_next_buckets": false,
+  "dte_basis": "trading",
+  "model_family": "tft_dual_stream_v4",
+
+  "delta_tolerance": 0.15,
+  "atm_center": 0.50,
+  "otm_center": 0.25,
+
+  "label_trade_bucket_id": 2,
+  "label_dte_min": 1,
+  "label_dte_max": 2,
+
+  "research_start": "2026-02-02",
+  "symbols": ["NVDA", "TSLA"],
+
+  "paths": {
+    "raw_iv_dir": "~/train_data/nq_options_day_iv",
+    "day_iv_dir": "~/train_data/builds/stock_non0dte/quote_options_day_iv",
+    "locked_targets_output": "~/train_data/locked_targets_map_stock_non0dte_old_lock.parquet",
+    "sniper_option_dir": "/mnt/s990/data/raw_1s/options"
+  }
+}

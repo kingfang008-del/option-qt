@@ -64,10 +64,15 @@ def bootstrap_qqq_btc_live(*, patch_oms: bool = True) -> bool:
     os.environ.setdefault("FAST_GATE_ENABLED", "0")
     # 冷却与 replay cooldown_bars=10 对齐(分钟 bar)
     os.environ.setdefault("COOLDOWN_MINUTES", "10")
-    # put_gate 与训练同用冻结归一化 vix(若存在)
+    # put_gate / regime：实盘默认因果自算，禁止默读 July 金标文件
+    os.environ.setdefault("QQQ_BTC_PUT_GATE_MODE", "vixy_z")
+    os.environ.setdefault("QQQ_BTC_REGIME_GOLD_1M", "0")
+    # 与 deploy 同款冻结归一化（对拍开卷脚本须显式 export FCS_FROZEN_NORM_PATH=""）
     default_frozen = repo / "qqq_btc" / "CONFIG" / "frozen_norm_qqq_daily.npz"
     if default_frozen.exists():
-        os.environ.setdefault("FCS_FROZEN_NORM_PATH", str(default_frozen))
+        cur_frozen = os.environ.get("FCS_FROZEN_NORM_PATH", "").strip()
+        if not cur_frozen:
+            os.environ["FCS_FROZEN_NORM_PATH"] = str(default_frozen)
     default_sym_map = repo / "qqq_btc" / "CONFIG" / "symbol_map.json"
     if default_sym_map.exists():
         # FCS stock_id/sector_id 与 LMDB/infer 同源(QQQ→1),避免 enumerate→0 导致 edge 翻转

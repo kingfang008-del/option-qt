@@ -1,10 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-QQQ 0DTE 路径的全部运行参数 —— 标签、回放、实盘共用一份配置对象。
+QQQ **1DTE 族**（standard_old_v2 / 生产主路径）运行参数。
 
-上一代的参数散落在 config.py / strategy_config0.py / slow_feature.json /
-环境变量四处且互相矛盾;本路径收敛为一个模块,fill 假设只在这里出现一次。
+历史上 docstring 写过「0DTE」,但锁约与特征实际是 trading≈1DTE;
+EXIT_RAILS / REPLAY 也按 1DTE 权利金路径标定(hard=-0.28, vol_ref=0.048)。
+
+真正 trading 0DTE 请用 ``qqq_btc.qqq.config_true_0dte``,不要与本模块共用规则。
+
+标签、回放、实盘(1DTE 族)共用本文件;fill 假设只在这里出现一次。
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ from qqq_btc.common.labels import LabelHorizon
 from qqq_btc.common.replay_types import ReplayConfig
 
 SYMBOL = "QQQ"
+PROFILE = "1dte_family"  # 与 config_true_0dte.PROFILE 区分;勿混用 EXIT_RAILS/REPLAY
 
 # ---------------------------------------------------------------------------
 # 成交模型:全路径唯一的 fill 假设(标签 = 回放 = 实盘审计基准)

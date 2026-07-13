@@ -431,7 +431,8 @@ class OptionIVCalculator:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         #from config import TARGET_SYMBOLS
-        TARGET_SYMBOLS= ['QQQ']
+        TARGET_SYMBOLS =   ['QQQ','NVDA', 'TSLA', 'AMD', 'INTC', 'MSFT', 'AMZN', 'GOOG', 'META', 'AAPL' ]
+
          
         placeholders = ','.join(['?'] * len(TARGET_SYMBOLS))
         query = f"SELECT symbol FROM stocks_us WHERE symbol IN ({placeholders})"

@@ -246,6 +246,7 @@ def apply_fill_audit_patch() -> None:
             except Exception:
                 pass
             nr2 = net_return_from_prices(entry_px, float(fill_price), commission_drag=comm)
+            # 与 entry 共用同一 singleton governor（含 LIVE_REPLAY env）
             streak_until = get_session_governor().record_trade_close(
                 sym, net_ret=nr2, curr_ts=float(curr_ts), leg=leg,
             )

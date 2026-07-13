@@ -850,6 +850,12 @@ class FeatureComputeService:
         self.feature_parity_ts = int(_safe_float_env("FCS_FEATURE_PARITY_TS", 1767366000.0))
         parity_out_default = f"{self.feature_parity_symbol.lower()}_fcs_parity_{self.feature_parity_ts}.npz"
         self.feature_parity_output = os.environ.get("FCS_FEATURE_PARITY_OUTPUT", parity_out_default).strip() or parity_out_default
+        # Gate1 对拍：落盘归一化前 raw slow 特征到 debug_raw_*（与 debug_slow 的 normed 分离）
+        self.debug_raw_enabled = os.environ.get("FCS_DEBUG_RAW", "0").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if self.debug_raw_enabled:
+            logger.info("🧪 FCS_DEBUG_RAW=1 → will persist pre-norm features to debug_raw_*")
         # 与 S4 一致：SPY/QQQ 1s 收盘环形缓冲，用于 spy/qqq_roc_5min 特征异常时回算（见 replay_live_parity_utils）
         self._index_1s_close_ring: Dict[str, deque] = {k: deque(maxlen=400) for k in ("SPY", "QQQ")}
         self._index_1s_close_last_wall: Dict[str, Optional[float]] = {k: None for k in ("SPY", "QQQ")}
@@ -1111,8 +1117,11 @@ class FeatureComputeService:
     def _ensure_debug_tables(self, date_str):
         return self.support_handler.ensure_debug_tables(date_str)
      
-    def _write_debug_batch(self, ts, date_str, fast_data_list, slow_data_list, source_ts=None):
-        return self.support_handler.write_debug_batch(ts, date_str, fast_data_list, slow_data_list, source_ts=source_ts)
+    def _write_debug_batch(self, ts, date_str, fast_data_list, slow_data_list, source_ts=None, raw_data_list=None):
+        return self.support_handler.write_debug_batch(
+            ts, date_str, fast_data_list, slow_data_list,
+            source_ts=source_ts, raw_data_list=raw_data_list,
+        )
 
     def _build_slow_data_list_from_payload(self, compute_payload: Optional[dict]):
         if not compute_payload:
@@ -1143,6 +1152,36 @@ class FeatureComputeService:
                     vals.append(0.0)
             slow_data_list.append((sym, vals))
         return slow_data_list
+
+    def _build_raw_data_list_from_cache(self, compute_payload: Optional[dict]):
+        """Gate1：从 cached_batch_raw 抽出与 slow_feat_names 对齐的 pre-norm 向量。"""
+        if not getattr(self, "debug_raw_enabled", False) or not compute_payload:
+            return []
+        batch_raw = getattr(self, "cached_batch_raw", None)
+        if not batch_raw:
+            return []
+        batch_syms = compute_payload.get("symbols", []) or []
+        raw_data_list = []
+        for sym in batch_syms:
+            try:
+                b_idx = self.symbols.index(sym)
+            except ValueError:
+                continue
+            if b_idx >= len(batch_raw):
+                continue
+            raw_vec = batch_raw[b_idx]
+            vals = []
+            for fn in self.slow_feat_names:
+                idx = self.feat_name_to_idx.get(fn)
+                if idx is None or idx >= len(raw_vec):
+                    vals.append(0.0)
+                else:
+                    try:
+                        vals.append(float(raw_vec[idx]))
+                    except Exception:
+                        vals.append(0.0)
+            raw_data_list.append((sym, vals))
+        return raw_data_list
 
     # --- 持久化方法 ---
     def _save_service_state(self):
@@ -1781,7 +1820,9 @@ class FeatureComputeService:
                 logger.error(f"Engine Compute Error: {e}", exc_info=True); return None
 
             run_mode = _runtime_mode()
-            dry_mode = (run_mode == "REALTIME_DRY")
+            # BACKTEST 快路径与 REALTIME_DRY 一样：IV-Gate 失败仍填充 raw 特征。
+            # 否则单腿/清盘口分钟引擎已算对 IV，但 raw_vec 保持全 0 → Gate1 假崩。
+            dry_mode = run_mode in {"REALTIME_DRY", "BACKTEST"}
             batch_raw, valid_mask = [], []
             gate_audit = {}
             for sym in self.symbols:
@@ -1947,12 +1988,16 @@ class FeatureComputeService:
         
         batch_norm = []
         is_rth = bool(self.market_profile.is_rth_minute(dt_ny))
+        run_mode = _runtime_mode()
+        # BACKTEST/DRY 下 raw 已旁路填充；若仍因 valid=False 走 normalize_only，
+        # 不会 append raw_buffer → get_sequence 卡住上一分钟（Gate2 假崩）。
+        dry_mode = run_mode in {"REALTIME_DRY", "BACKTEST"}
         
         for b_idx, sym in enumerate(self.symbols):
             raw_vec = batch_raw[b_idx]
             is_valid = valid_mask[b_idx]
             norm = self.normalizers[sym]
-            if is_valid and is_rth and is_new_minute:
+            if is_rth and is_new_minute and (is_valid or dry_mode):
                 norm.process_frame(raw_vec)
             else:
                 norm.normalize_only(raw_vec)
@@ -1997,7 +2042,9 @@ class FeatureComputeService:
         history_1min_source = self.committed_history_1min if is_new_minute else self.history_1min
 
         run_mode = _runtime_mode()
-        dry_mode = (run_mode == "REALTIME_DRY")
+        # BACKTEST/turbo 与 REALTIME_DRY 一样：option gate 失败仍保留标的，
+        # 否则下午单腿/清盘口时 assemble 空 symbols → None，Gate1 漏采。
+        dry_mode = run_mode in {"REALTIME_DRY", "BACKTEST"}
         spy_merged_roc = None
         qqq_merged_roc = None
         for b_idx, sym in enumerate(self.symbols):
@@ -2362,7 +2409,11 @@ class FeatureComputeService:
         from config import NY_TZ
         today_str = datetime.now(NY_TZ).strftime('%Y%m%d')
         self._ensure_debug_tables(today_str)
-        logger.info(f"📁 提前初始化今日 Debug Postgres 数据库表: debug_fast_{today_str} and debug_slow_{today_str}")
+        logger.info(
+            f"📁 提前初始化今日 Debug Postgres 数据库表: "
+            f"debug_fast_{today_str}, debug_slow_{today_str}"
+            + (f", debug_raw_{today_str}" if getattr(self, "debug_raw_enabled", False) else "")
+        )
         # ==========================================================
          
         
@@ -2537,15 +2588,22 @@ class FeatureComputeService:
                                                 date_str = datetime.fromtimestamp(ts_val, NY_TZ).strftime('%Y%m%d')
                                                 
                                                 slow_data_list = self._build_slow_data_list_from_payload(compute_payload)
-                                                if slow_data_list:
-                                                    sample_sym, sample_vals = slow_data_list[0]
-                                                    logger.info(f"📊 [Persistence-Prep] ts={ts_val} | Symbols={len(slow_data_list)} | Sample={sample_sym} | First 3 Feats={sample_vals[:3]}")
+                                                raw_data_list = self._build_raw_data_list_from_cache(compute_payload)
+                                                if slow_data_list or raw_data_list:
+                                                    if slow_data_list:
+                                                        sample_sym, sample_vals = slow_data_list[0]
+                                                        logger.info(
+                                                            f"📊 [Persistence-Prep] ts={ts_val} | Symbols={len(slow_data_list)} "
+                                                            f"| Sample={sample_sym} | First 3 Feats(normed)={sample_vals[:3]} "
+                                                            f"| raw_rows={len(raw_data_list)}"
+                                                        )
                                                     self._write_debug_batch(
                                                         ts_val,
                                                         date_str,
                                                         fast_data_list=[],
                                                         slow_data_list=slow_data_list,
                                                         source_ts=float(compute_payload.get('log_ts', current_batch_ts) or current_batch_ts or ts_val),
+                                                        raw_data_list=raw_data_list,
                                                     )
                                                 else:
                                                     logger.warning(f"⚠️ [Persistence-Skip] slow_data_list is empty for ts={ts_val}")

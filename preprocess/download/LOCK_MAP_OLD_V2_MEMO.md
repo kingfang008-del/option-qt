@@ -219,3 +219,4 @@ python preprocess/download/step1_build_target_map.py \
 
 - 2026-07-12：初稿。确认 old_v2≈trading-1DTE；首版 UTC+0/1/2 退档复现 ~83% ticker；现网开盘窗锁约导致结构特征 corr~0.4、IC 腰斩；落地 `step1_build_target_map_old.py`。
 - 2026-07-12：补充「实盘锁约」——开盘锁合法；应对齐 trading 1DTE；生产模型需开盘锁重训或接受 gap。
+- 2026-07-13：真 0DTE 重训结论为先搁置；后续升级路线见 [`qqq_btc/docs/1dte_ladder_upgrade_architecture.md`](../../qqq_btc/docs/1dte_ladder_upgrade_architecture.md)（特征日锁 4 约 + ladder 下载 + value_score 选腿）。

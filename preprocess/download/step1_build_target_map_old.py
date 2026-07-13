@@ -89,16 +89,19 @@ def load_anchor_config(path: Path) -> dict:
 
 
 def select_front_dte(available_dtes: Sequence[int], cfg: dict) -> Optional[int]:
-    """main 首版: allowed 内 prefer，否则 fallback 到 >= min 的最小 dte。"""
+    """main 首版: allowed 内 prefer；默认可 fallback。true-0dte 设 allow_front_dte_fallback=false。"""
     allowed = set(cfg.get("front_allowed_dte") or [0, 1, 2])
     prefer = int(cfg.get("front_prefer_dte", 0))
     dte_min = int(cfg.get("front_min_dte", 0))
     dte_max = int(cfg.get("front_max_dte", 2))
+    allow_fallback = bool(cfg.get("allow_front_dte_fallback", True))
 
     candidates = sorted(
         {int(d) for d in available_dtes if dte_min <= int(d) <= dte_max and int(d) in allowed}
     )
     if not candidates:
+        if not allow_fallback:
+            return None
         fallbacks = sorted({int(d) for d in available_dtes if int(d) >= dte_min})
         if not fallbacks:
             return None

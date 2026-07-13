@@ -123,9 +123,11 @@ def _build_child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     env.setdefault("SKIP_DEEP_WARMUP", "1")
     env.setdefault("REDIS_STREAM_SIM", "1")
     env.setdefault("OMS_MOCK_IBKR", "1")
+    v4 = _REPO / "qqq_btc" / "CONFIG" / "slow_feature_qqq_v4.json"
     v2 = _REPO / "qqq_btc" / "CONFIG" / "slow_feature_qqq_v2.json"
-    if v2.exists():
-        env.setdefault("SLOW_FEATURE_CONFIG", str(v2))
+    default_slow = v4 if v4.exists() else v2
+    if default_slow.exists():
+        env.setdefault("SLOW_FEATURE_CONFIG", str(default_slow))
     env.setdefault("RECALC_GREEKS", "1")
     env.setdefault("FCS_STATE_BACKEND", "none")
     default_frozen = _REPO / "qqq_btc" / "CONFIG" / "frozen_norm_qqq_daily.npz"

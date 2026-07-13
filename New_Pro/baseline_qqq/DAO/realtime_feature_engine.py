@@ -125,6 +125,9 @@ class RealTimeFeatureEngine:
             'session', 'day_of_week', 'hour', 'is_holiday',
             'minute', 'is_expiry', 'is_fed_meeting', 'stock_id', 'timestamp', 'date', 'symbol'
         }
+        # 对齐离线 options_locked_feature：IV=0 视为缺失，按分钟 ffill(limit=30)
+        # {symbol: {bucket_id: (iv, ts_unix)}}
+        self._last_good_iv: dict[str, dict[int, tuple[float, float]]] = {}
         # 定义必须在 Pandas 原始分钟频率下预计算的特征
         self.PANDAS_FEATS = [
             'close_log_return', 'open_log_return', 'price_z_score','volume_ratio', 'vwap_diff',
@@ -223,7 +226,15 @@ class RealTimeFeatureEngine:
             ts_ny = pd.Timestamp(timestamp, unit='s', tz='UTC').tz_convert('America/New_York')
             # 使用 replace(tzinfo=None) 替代 tz_localize(None) 更加稳健
             ts_naive = ts_ny.replace(tzinfo=None)
-            ts_anchor = ts_naive.floor('1min')
+            # 与离线 options_locked_feature.ceil('1min') / option_cac 分钟 end-label 对齐：
+            # FCS alpha_label_ts=T0 表示 bar [T0,T0+60)，T 应锚在 T0+60。
+            # FCS_OPTION_T_LABEL=start|floor 可回退旧行为。
+            _t_label = os.environ.get("FCS_OPTION_T_LABEL", "end").strip().lower()
+            _floor = ts_naive.floor('1min')
+            if _t_label in {"start", "floor"}:
+                ts_anchor = _floor
+            else:
+                ts_anchor = _floor + pd.Timedelta(minutes=1)
             
             n_rows = min(len(out), len(contracts) if contracts is not None else 0)
             for i in range(n_rows):
@@ -256,6 +267,57 @@ class RealTimeFeatureEngine:
             # 仅在 Debug 模式打印详情，生产环境避免刷屏
             logger.error(f"⚠️ [{symbol}] supplement_greeks 异常: {e}")
 
+        return out
+
+    def apply_iv_state_ffill(
+        self,
+        symbol: str,
+        buckets: np.ndarray,
+        timestamp: float,
+        *,
+        limit_min: int = 30,
+    ) -> np.ndarray:
+        """对齐离线 locked_feature：IV==0 当缺失，向前填充最多 limit_min 分钟。
+
+        离线路径: `replace(0, nan).ffill(limit=30)` 后再算 ATM 均值。
+        诚实自算时 BSM 失败会写 IV=0；若直接进特征，会与离线 ffill 后的 IV 分叉。
+        """
+        if buckets is None:
+            return buckets
+        out = np.asarray(buckets, dtype=np.float32).copy()
+        if out.ndim != 2 or out.shape[1] <= 7:
+            return out
+        try:
+            ts = float(timestamp)
+        except Exception:
+            return out
+        # 跨日：清空该标的状态，避免上一日 IV 渗入
+        state = self._last_good_iv.setdefault(symbol, {})
+        if state:
+            # 任取一个 bucket 看日期；更稳：用 NY 日期
+            try:
+                cur_day = pd.Timestamp(ts, unit="s", tz="UTC").tz_convert("America/New_York").date()
+                sample_ts = next(iter(state.values()))[1]
+                prev_day = pd.Timestamp(sample_ts, unit="s", tz="UTC").tz_convert("America/New_York").date()
+                if cur_day != prev_day:
+                    state.clear()
+            except Exception:
+                pass
+
+        limit_sec = float(max(0, int(limit_min))) * 60.0
+        n = min(out.shape[0], 6)
+        for b in range(n):
+            iv = float(out[b, 7]) if np.isfinite(out[b, 7]) else 0.0
+            if iv > 0.01:
+                state[b] = (iv, ts)
+                continue
+            prev = state.get(b)
+            if prev is not None and (ts - float(prev[1])) <= limit_sec + 1e-6:
+                out[b, 7] = float(prev[0])
+            else:
+                out[b, 7] = 0.0
+                if prev is not None and (ts - float(prev[1])) > limit_sec:
+                    state.pop(b, None)
         return out
 
     # ==========================================================================
@@ -768,18 +830,23 @@ class RealTimeFeatureEngine:
                       #            raw_snap 里的 price/bid/ask 由上游 pipeline 更新，Delta/IV 等结构性特征
                       #            在下一分钟翻页时再统一重算。
                       if recalc_greeks and is_new_minute and option_contracts and s in option_contracts:
-                          # 与 5m 路径一致：已有有效 IV(发球机 minute_ref 注入)时不再 BSM 抹除重算，
-                          # 否则 options_flow_skew 等 IV 比值特征会系统性偏离离线 locked_feature。
+                          # greek-parity 注入有效 IV 时跳过 BSM，避免抹掉金标；
+                          # 诚实自算：每分钟强制重算（否则上游/缓存带入旧 IV 后 iv_missing=False 会锁死全日）。
                           force_recalc = os.environ.get("FCS_FORCE_RECALC_GREEKS", "0").strip().lower() in {
                               "1", "true", "yes", "on",
                           }
+                          greek_parity = os.environ.get("GREEK_PARITY_MODE", "0").strip().lower() in {
+                              "1", "true", "yes", "on",
+                          }
                           iv_missing = raw_snap.shape[1] > 7 and float(np.nanmax(np.abs(raw_snap[:4, 7]))) <= 0.01
-                          if force_recalc or iv_missing:
+                          if force_recalc or iv_missing or not greek_parity:
                               target_ts = current_ts if current_ts else last_ts.timestamp()
                               raw_snap = self.supplement_greeks(
                                   s, raw_snap, option_contracts[s],
                                   float(last_row['close']), target_ts
                               )
+                              # 对齐离线 IV 状态 ffill(limit=30)
+                              raw_snap = self.apply_iv_state_ffill(s, raw_snap, float(target_ts), limit_min=30)
 
                   if raw_snap.shape[0] < 6:
                       raw_snap = np.vstack([raw_snap, np.zeros((6-raw_snap.shape[0], raw_snap.shape[1]), dtype=raw_snap.dtype)])
@@ -836,17 +903,24 @@ class RealTimeFeatureEngine:
                     if raw_snap_5m is not None:
                         raw_snap_5m = np.asarray(raw_snap_5m, dtype=np.float32).copy()
                         iv_missing_5m = raw_snap_5m.shape[1] > 7 and np.nanmax(np.abs(raw_snap_5m[:, 7])) <= 0.01
-                        if recalc_greeks and is_new_minute and iv_missing_5m and option_contracts and s in option_contracts:
-                            df_5m = derived_history_5m.get(s)
-                            if df_5m is not None and not df_5m.empty:
-                                target_ts = current_ts if current_ts else last_ts.timestamp()
-                                raw_snap_5m = self.supplement_greeks(
-                                    s,
-                                    raw_snap_5m,
-                                    option_contracts[s],
-                                    float(df_5m.iloc[-1]['close']),
-                                    target_ts,
-                                )
+                        greek_parity = os.environ.get("GREEK_PARITY_MODE", "0").strip().lower() in {
+                            "1", "true", "yes", "on",
+                        }
+                        force_recalc = os.environ.get("FCS_FORCE_RECALC_GREEKS", "0").strip().lower() in {
+                            "1", "true", "yes", "on",
+                        }
+                        if recalc_greeks and is_new_minute and option_contracts and s in option_contracts:
+                            if force_recalc or iv_missing_5m or not greek_parity:
+                                df_5m = derived_history_5m.get(s)
+                                if df_5m is not None and not df_5m.empty:
+                                    target_ts = current_ts if current_ts else last_ts.timestamp()
+                                    raw_snap_5m = self.supplement_greeks(
+                                        s,
+                                        raw_snap_5m,
+                                        option_contracts[s],
+                                        float(df_5m.iloc[-1]['close']),
+                                        target_ts,
+                                    )
                         updated_buckets_5m[s] = raw_snap_5m
                         opts_bh_5m[i] = torch.tensor(raw_snap_5m, dtype=torch.float32, device=self.device)
 
@@ -1156,10 +1230,25 @@ class RealTimeFeatureEngine:
             return torch.where(use_equal, fill, weighted)
 
         # ==========================================================
-        # 对齐 options_locked_feature: vw_iv = (put_atm + call_atm) / 2，非量权
+        # 对齐 options_locked_feature: vw_iv = ATM put/call 均值
+        # 诚实自算时单腿 BSM 失败会留下 IV=0；与 0 取平均会把 IV 腰斩。
+        # 仅对有效腿(IV>0.01)取平均；单腿有效则用该腿。
+        # 注：离线会对 IV 状态 ffill(limit=30)，不以 volume 作为 ATM 有效腿门控。
         # ==========================================================
-        out['options_vw_iv'] = (iv_vec[:, 0] + iv_vec[:, 2]) / 2.0
-
+        put_atm_iv = iv_vec[:, 0]
+        call_atm_iv = iv_vec[:, 2]
+        put_ok = put_atm_iv > 0.01
+        call_ok = call_atm_iv > 0.01
+        both_ok = put_ok & call_ok
+        out['options_vw_iv'] = torch.where(
+            both_ok,
+            (put_atm_iv + call_atm_iv) / 2.0,
+            torch.where(
+                put_ok,
+                put_atm_iv,
+                torch.where(call_ok, call_atm_iv, torch.zeros_like(put_atm_iv)),
+            ),
+        )
         # ==========================================================
         # 净 Delta: 量权；断流 → 0。Gamma/Vega/Theta: 量权；断流 → ATM 均值
         # ==========================================================
@@ -1213,9 +1302,19 @@ class RealTimeFeatureEngine:
             torch.ones_like(iv_vec[:, 0]),
         )
 
-        front_atm = (iv_vec[:, 0] + iv_vec[:, 2]) / 2.0
+        front_atm = out['options_vw_iv']
         out['options_struc_atm_iv'] = front_atm
-        next_atm = (iv_vec[:, 4] + iv_vec[:, 5]) / 2.0
+        next_put_ok = iv_vec[:, 4] > 0.01
+        next_call_ok = iv_vec[:, 5] > 0.01
+        next_atm = torch.where(
+            next_put_ok & next_call_ok,
+            (iv_vec[:, 4] + iv_vec[:, 5]) / 2.0,
+            torch.where(
+                next_put_ok,
+                iv_vec[:, 4],
+                torch.where(next_call_ok, iv_vec[:, 5], torch.zeros_like(iv_vec[:, 4])),
+            ),
+        )
         term_val = next_atm - front_atm
         out['options_struc_term'] = torch.where(
             (next_atm > 0.01) & (front_atm > 0.01), term_val, torch.zeros_like(term_val)

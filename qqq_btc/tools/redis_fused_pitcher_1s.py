@@ -778,6 +778,7 @@ def _build_option_snapshots_1s(
     df_day: pd.DataFrame,
     *,
     minute_greeks: dict[tuple[int, int], dict[str, float]] | None = None,
+    greek_parity: bool = False,
 ) -> dict[float, dict]:
     if df_day.empty or "bucket_id" not in df_day.columns:
         return {}
@@ -818,13 +819,15 @@ def _build_option_snapshots_1s(
 
     parts = []
     for b_id, group in df.groupby("bucket_id"):
-        # 先 last 再 ffill：盘口状态可延续；volume 另按 real_minute_buckets 门控
+        # 先 last 再 ffill：盘口/IV 状态可延续，但必须与离线 locked_feature
+        # `ffill(limit=30)`（分钟）对齐——超过 30 分钟无真实 quote 则断档为 NaN→0，
+        # 避免下午无 put ATM 时仍用数小时前盘口喂 FCS BSM。
         resampled = (
             group.set_index("timestamp")[existing_cols]
             .resample("1s")
             .last()
             .reindex(all_seconds)
-            .ffill()
+            .ffill(limit=30 * 60)
         )
         resampled["bucket_id"] = int(b_id)
         parts.append(resampled.reset_index().rename(columns={"index": "timestamp"}))
@@ -850,6 +853,19 @@ def _build_option_snapshots_1s(
             ask = float(getattr(row, "ask", price))
             bid_size = float(getattr(row, "bid_size", 0.0) or 0.0)
             ask_size = float(getattr(row, "ask_size", 0.0) or 0.0)
+            # NaN after ffill expiry → treat as absent leg
+            if not np.isfinite(price):
+                price = 0.0
+            if not np.isfinite(bid):
+                bid = 0.0
+            if not np.isfinite(ask):
+                ask = 0.0
+            if not np.isfinite(strike):
+                strike = 0.0
+            if not np.isfinite(bid_size):
+                bid_size = 0.0
+            if not np.isfinite(ask_size):
+                ask_size = 0.0
             # Greeks/IV：day_iv / offline feature 用 ceil 结束标签。
             # FCS alpha_label_ts=T 对应股票 bar [T,T+60) ≡ offline stamp T+60；
             # 秒级落在 [T,T+60) 时必须注入 day_iv[T+60]，若用 floor=T 会拿到上一根
@@ -863,37 +879,56 @@ def _build_option_snapshots_1s(
                     or minute_greeks.get((minute_start, b_id))
                     or {}
                 )
-                # 离线对拍：bid/ask/mid 冻结为 day_iv 分钟收盘
-                d_bid = float(greek.get("bid", 0.0) or 0.0)
-                d_ask = float(greek.get("ask", 0.0) or 0.0)
-                d_mid = float(greek.get("mid", 0.0) or greek.get("close", 0.0) or 0.0)
-                if d_bid > 1e-6 and d_ask > 1e-6:
-                    bid, ask = d_bid, d_ask
-                    price = d_mid if d_mid > 1e-6 else 0.5 * (d_bid + d_ask)
-                    bs = float(greek.get("bid_size", 0.0) or 0.0)
-                    asz = float(greek.get("ask_size", 0.0) or 0.0)
-                    if bs > 0.0:
-                        bid_size = bs
-                    if asz > 0.0:
-                        ask_size = asz
+                # 仅 greek_parity 开卷：冻结 bid/ask/mid 为 day_iv 分钟收盘
+                if greek_parity:
+                    d_bid = float(greek.get("bid", 0.0) or 0.0)
+                    d_ask = float(greek.get("ask", 0.0) or 0.0)
+                    d_mid = float(greek.get("mid", 0.0) or greek.get("close", 0.0) or 0.0)
+                    if d_bid > 1e-6 and d_ask > 1e-6:
+                        bid, ask = d_bid, d_ask
+                        price = d_mid if d_mid > 1e-6 else 0.5 * (d_bid + d_ask)
+                        bs = float(greek.get("bid_size", 0.0) or 0.0)
+                        asz = float(greek.get("ask_size", 0.0) or 0.0)
+                        if bs > 0.0:
+                            bid_size = bs
+                        if asz > 0.0:
+                            ask_size = asz
             # 离线 locked_feature：volume 不跨分钟 ffill；无真实 quote 的分钟 volume=0
+            # cbbo raw_1s 常无 trade volume → 优先用 day_iv/options_1m 分钟 volume（非开卷 Greeks）
             if (minute_start, b_id) in real_minute_buckets:
                 tick_vol = float(getattr(row, "volume", 0.0) or 0.0)
+                if not np.isfinite(tick_vol):
+                    tick_vol = 0.0
                 if tick_vol <= 0.0:
                     tick_vol = float(greek.get("volume", 0.0) or 0.0) if greek else 0.0
                 if tick_vol <= 0.0:
                     tick_vol = max(bid_size, 0.0) + max(ask_size, 0.0)
             else:
                 tick_vol = 0.0
+                # 诚实模式：无真实 quote 分钟清零盘口；IV 连续性改由 FCS
+                # apply_iv_state_ffill(limit=30) 对齐离线 locked_feature，避免用过期
+                # 盘口重新 BSM 出与离线 ffill-IV 不同的值。
+                if not greek_parity:
+                    price = bid = ask = 0.0
+                    bid_size = ask_size = 0.0
+            if greek_parity:
+                g_delta = float(greek.get("delta", 0.0))
+                g_gamma = float(greek.get("gamma", 0.0))
+                g_vega = float(greek.get("vega", 0.0))
+                g_theta = float(greek.get("theta", 0.0))
+                g_iv = float(greek.get("iv", 0.0))
+            else:
+                # 诚实模式：盘口自算；Greeks/IV 留给 FCS RECALC_GREEKS
+                g_delta = g_gamma = g_vega = g_theta = g_iv = 0.0
             buckets[b_id] = [
                 price,
-                float(greek.get("delta", 0.0)),
-                float(greek.get("gamma", 0.0)),
-                float(greek.get("vega", 0.0)),
-                float(greek.get("theta", 0.0)),
+                g_delta,
+                g_gamma,
+                g_vega,
+                g_theta,
                 strike,
                 tick_vol,
-                float(greek.get("iv", 0.0)),
+                g_iv,
                 bid,
                 ask,
                 bid_size,
@@ -1014,7 +1049,8 @@ class RawParquetPitcher1s(FusedPitcher1s):
             opt_path = self.option_root / sym / f"{sym}_{date_iso}.parquet"
             if opt_path.exists():
                 df_opt = pd.read_parquet(opt_path)
-                # raw_1s 无 volume → 始终尝试分钟 IV parquet 注入 volume/Greeks
+                # raw_1s 无 volume → 始终尝试分钟 IV parquet 注入 volume
+                # greek_parity=False 时只取 volume，不冻盘口、不写预计算 Greeks
                 minute_greeks = _load_minute_greeks_lookup(
                     sym,
                     date_iso,
@@ -1024,6 +1060,7 @@ class RawParquetPitcher1s(FusedPitcher1s):
                     sym,
                     df_opt,
                     minute_greeks=minute_greeks,
+                    greek_parity=self.greek_parity,
                 )
                 for ts_val, per_sym in snaps.items():
                     payload = per_sym.get(sym)

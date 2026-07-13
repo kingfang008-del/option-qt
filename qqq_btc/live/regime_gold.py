@@ -97,11 +97,15 @@ class RegimeGold1m:
 
 
 def load_regime_gold_1m() -> Optional[RegimeGold1m]:
-    """QQQ_BTC_REGIME_GOLD_1M=0 关闭;默认 quote_features_test 1min。"""
+    """仅当显式设置 QQQ_BTC_REGIME_GOLD_1M=<path> 时加载。
+
+    空 / 未设置 / 0|off → 关闭（实盘默认必须自算 open30/trend，禁止开卷）。
+    开卷诊断脚本须自己 export 金标路径。
+    """
     raw = os.environ.get("QQQ_BTC_REGIME_GOLD_1M", "").strip()
-    if raw.lower() in ("0", "false", "no", "off", "none"):
+    if not raw or raw.lower() in ("0", "false", "no", "off", "none"):
         return None
-    path = raw if raw else str(_DEFAULT_1M)
+    path = raw
     gold = RegimeGold1m()
     n = gold.load(path)
     if n <= 0:

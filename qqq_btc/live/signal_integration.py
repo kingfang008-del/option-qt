@@ -17,7 +17,7 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 
-from qqq_btc.common.vix_level import PutGateFeature5m, VixyCloseBuffer
+from qqq_btc.common.vix_level import PutGateFeature5m, Vixy5mGateBuffer, VixyCloseBuffer
 from qqq_btc.live.regime_ctx import REGIME_CTX_KEYS, extract_regime_ctx
 from qqq_btc.live.regime_gold import load_regime_gold_1m
 from qqq_btc.model.backbone import DualStreamAlphaNet, resolve_embedding_caps
@@ -26,24 +26,52 @@ from qqq_btc.qqq import config as qcfg
 logger = logging.getLogger("qqq_btc.live.signal_integration")
 
 _VIXY_FALLBACK = Path.home() / "train_data/spnq_train/VIXY"
+_VIXY_1M_RESAMPLED = (
+    Path.home() / "train_data/spnq_train_resampled/VIXY/regular/09:30-16:00/1min"
+)
 _PUT_GATE_5M_DEFAULT = (
     Path.home()
     / "train_data/july_w1_v4_databento/quote_features_test/QQQ/regular/09:30-16:00/5min"
 )
+# 与向量化 raw5 put_gate 同序列（已修复的诚实 raw 5min）
+_PUT_GATE_RAW5_DEFAULT = (
+    Path.home()
+    / "train_data/july_w1_v4_honest_openwin/quote_features_raw/QQQ/regular/09:30-16:00/5min"
+)
 
 
 def _put_gate_mode() -> str:
-    """feature5m | vixy_z | off。默认 feature5m(对齐 +37.7% offline put_gate)。"""
-    raw = os.environ.get("QQQ_BTC_PUT_GATE_MODE", "feature5m").strip().lower()
+    """vixy_5m | vixy_z | feature5m | off。
+
+    vixy_5m 默认 asof 诚实 raw 5min（与向量化 put_gate 同口径）。
+    QQQ_BTC_VIXY_5M_SOURCE=buffer → 真因果 1m→5m buffer（无桶内前视）。
+    feature5m：显式金标路径；vixy_z：1min frozen z。
+    """
+    raw = os.environ.get("QQQ_BTC_PUT_GATE_MODE", "vixy_5m").strip().lower()
     if raw in ("0", "false", "no", "off", "none"):
         return "off"
-    if raw in ("vixy", "vixy_z", "z", "1min"):
+    if raw in ("feature5m", "offline5m", "gold5m"):
+        return "feature5m"
+    if raw in ("vixy_5m", "vixy5m", "5m_raw", "vixy_5min"):
+        return "vixy_5m"
+    if raw in ("vixy", "vixy_z", "z", "1min", "5m"):
+        # 历史别名 5m 曾指向 feature5m；现仅 vixy_z。开卷请用 feature5m。
+        if raw == "5m":
+            return "feature5m"
         return "vixy_z"
-    return "feature5m"
+    return "vixy_5m"
 
 
-def _load_put_gate_feature_5m() -> Optional[PutGateFeature5m]:
-    path = os.environ.get("QQQ_BTC_PUT_GATE_5M_FEATURE", "").strip()
+def _vixy_5m_source() -> str:
+    """asof（默认，对齐向量化）| buffer（真因果）。"""
+    raw = os.environ.get("QQQ_BTC_VIXY_5M_SOURCE", "asof").strip().lower()
+    if raw in ("buffer", "live", "causal", "stream"):
+        return "buffer"
+    return "asof"
+
+
+def _load_put_gate_feature_5m(path: Optional[str] = None) -> Optional[PutGateFeature5m]:
+    path = (path or os.environ.get("QQQ_BTC_PUT_GATE_5M_FEATURE", "")).strip()
     if not path:
         path = str(_PUT_GATE_5M_DEFAULT)
     gate = PutGateFeature5m()
@@ -59,24 +87,37 @@ def _load_put_gate_feature_5m() -> Optional[PutGateFeature5m]:
     return gate
 
 
-def _seed_vixy_buffer(buf: VixyCloseBuffer, *, lookback_days: int = 3) -> int:
-    """从本地 VIXY 1m parquet 预热缓冲,避免开盘 put_gate 冷启动。
+def _load_raw5_asof_gate() -> Optional[PutGateFeature5m]:
+    """加载与向量化相同的 raw 5min vix_level asof 源。"""
+    path = os.environ.get("QQQ_BTC_PUT_GATE_RAW5", "").strip()
+    if not path:
+        path = str(_PUT_GATE_RAW5_DEFAULT)
+    gate = _load_put_gate_feature_5m(path)
+    if gate is not None:
+        return gate
+    # fallback: VIXY 5min 月文件（含 vix_level）
+    alt = Path.home() / "train_data/spnq_train_resampled/VIXY/regular/09:30-16:00/5min"
+    return _load_put_gate_feature_5m(str(alt))
 
-    Redis 对拍默认也可因果预热:只取严格早于 QQQ_BTC_VIXY_SEED_BEFORE(或今天)
-    的交易日,避免灌入「未来」VIXY。设 QQQ_BTC_VIXY_SEED=0 可关闭。
-    """
+
+def _load_vixy_seed_frame(*, lookback_days: int = 3):
+    """返回预热用 VIXY 1m DataFrame(timestamp UTC, close)，无数据则 None。"""
     import pandas as pd
 
     if os.environ.get("QQQ_BTC_VIXY_SEED", "1").strip().lower() in ("0", "false", "no", "off"):
-        return 0
+        return None
 
-    root = Path(os.environ.get("QQQ_BTC_VIXY_1M_ROOT", str(_VIXY_FALLBACK))).expanduser()
+    root = Path(
+        os.environ.get(
+            "QQQ_BTC_VIXY_1M_ROOT",
+            str(_VIXY_1M_RESAMPLED if _VIXY_1M_RESAMPLED.exists() else _VIXY_FALLBACK),
+        )
+    ).expanduser()
     if not root.exists():
-        return 0
+        return None
     files = sorted(root.glob("*.parquet"))
     if not files:
-        return 0
-    # 取最近 lookback_days 个有数据的月份文件末尾若干交易日
+        return None
     frames = []
     for fp in files[-2:]:
         try:
@@ -86,7 +127,7 @@ def _seed_vixy_buffer(buf: VixyCloseBuffer, *, lookback_days: int = 3) -> int:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         frames.append(df)
     if not frames:
-        return 0
+        return None
     all_df = pd.concat(frames, ignore_index=True).sort_values("timestamp")
     all_df["day"] = all_df["timestamp"].dt.tz_convert("America/New_York").dt.date
     days = sorted(all_df["day"].unique())
@@ -105,12 +146,41 @@ def _seed_vixy_buffer(buf: VixyCloseBuffer, *, lookback_days: int = 3) -> int:
             pass
 
     if not days:
-        return 0
+        return None
     use_days = days[-max(1, int(lookback_days)) :]
-    part = all_df[all_df["day"].isin(use_days)]
+    return all_df[all_df["day"].isin(use_days)]
+
+
+def _seed_vixy_buffer(buf: VixyCloseBuffer, *, lookback_days: int = 3) -> int:
+    """从本地 VIXY 1m parquet 预热缓冲,避免开盘 put_gate 冷启动。"""
+    import pandas as pd
+
+    part = _load_vixy_seed_frame(lookback_days=lookback_days)
+    if part is None or part.empty:
+        return 0
     closes = pd.to_numeric(part["close"], errors="coerce").dropna().tolist()
     before = len(buf)
     buf.extend(closes)
+    return len(buf) - before
+
+
+def _seed_vixy_5m_buffer(buf: Vixy5mGateBuffer, *, lookback_days: int = 5) -> int:
+    """预热 5min put_gate：灌入带时间戳的 1m close（内部再聚合成 5min）。"""
+    import pandas as pd
+
+    part = _load_vixy_seed_frame(lookback_days=lookback_days)
+    if part is None or part.empty:
+        return 0
+    before = len(buf)
+    ts = part["timestamp"]
+    if hasattr(ts.dt, "tz") and ts.dt.tz is not None:
+        ts_unix = ts.view("int64") / 1e9
+    else:
+        ts_unix = pd.to_datetime(ts, utc=True).view("int64") / 1e9
+    closes = pd.to_numeric(part["close"], errors="coerce")
+    for t, c in zip(ts_unix.to_numpy(), closes.to_numpy()):
+        if np.isfinite(t) and np.isfinite(c) and float(c) > 0:
+            buf.append(float(t), float(c))
     return len(buf) - before
 
 
@@ -165,15 +235,42 @@ def create_qqq_btc_signal_engine(
             self._qqq_btc_regime_by_sym: Dict[str, dict] = {}
             self._qqq_btc_q10_by_sym: Dict[str, float] = {}
             self._qqq_btc_put_gate_mode = _put_gate_mode()
+            self._qqq_btc_vixy_5m_source = _vixy_5m_source()
             self._qqq_btc_vixy_buf = VixyCloseBuffer()
+            self._qqq_btc_vixy_5m_buf = Vixy5mGateBuffer()
             self._qqq_btc_put_gate_5m: Optional[PutGateFeature5m] = None
             self._qqq_btc_regime_gold = load_regime_gold_1m()
             if self._qqq_btc_put_gate_mode == "feature5m":
                 self._qqq_btc_put_gate_5m = _load_put_gate_feature_5m()
                 if self._qqq_btc_put_gate_5m is None:
-                    logger.warning("put_gate feature5m unavailable → fallback vixy_z")
-                    self._qqq_btc_put_gate_mode = "vixy_z"
-            if self._qqq_btc_put_gate_mode == "vixy_z":
+                    logger.warning("put_gate feature5m unavailable → fallback vixy_5m")
+                    self._qqq_btc_put_gate_mode = "vixy_5m"
+            if self._qqq_btc_put_gate_mode == "vixy_5m":
+                if self._qqq_btc_vixy_5m_source == "asof":
+                    self._qqq_btc_put_gate_5m = _load_raw5_asof_gate()
+                    if self._qqq_btc_put_gate_5m is None:
+                        logger.warning(
+                            "vixy_5m asof raw5 missing → fallback causal buffer"
+                        )
+                        self._qqq_btc_vixy_5m_source = "buffer"
+                    else:
+                        logger.info(
+                            "vixy_5m source=asof rows=%d (vectorized raw5 put_gate)",
+                            len(self._qqq_btc_put_gate_5m),
+                        )
+                if self._qqq_btc_vixy_5m_source == "buffer":
+                    n_seed = _seed_vixy_5m_buffer(
+                        self._qqq_btc_vixy_5m_buf, lookback_days=5
+                    )
+                    if n_seed:
+                        logger.info(
+                            "VIXY 5m put_gate buffer seeded +%d 1m bars "
+                            "(len=%d, raw5_z=%.3f)",
+                            n_seed,
+                            len(self._qqq_btc_vixy_5m_buf),
+                            self._qqq_btc_vixy_5m_buf.raw_level(),
+                        )
+            elif self._qqq_btc_put_gate_mode == "vixy_z":
                 n_seed = _seed_vixy_buffer(self._qqq_btc_vixy_buf, lookback_days=3)
                 if n_seed:
                     logger.info(
@@ -183,8 +280,9 @@ def create_qqq_btc_signal_engine(
                         self._qqq_btc_vixy_buf.raw_level(),
                     )
             logger.info(
-                "put_gate mode=%s regime_gold=%s",
+                "put_gate mode=%s source=%s regime_gold=%s",
                 self._qqq_btc_put_gate_mode,
+                getattr(self, "_qqq_btc_vixy_5m_source", "-"),
                 "on" if self._qqq_btc_regime_gold is not None else "off",
             )
 
@@ -268,8 +366,7 @@ def create_qqq_btc_signal_engine(
                 "put_edge": put_edges,
             }
 
-        def _update_vixy_gate_buffer(self, batch, symbols, prices) -> Optional[float]:
-            """从 batch 中的 VIXY 收盘价累积缓冲,返回 put_gate 用 vix_level。"""
+        def _vixy_px_from_batch(self, batch, symbols, prices) -> Optional[float]:
             if not symbols:
                 return None
             for i, sym in enumerate(symbols):
@@ -289,16 +386,56 @@ def create_qqq_btc_signal_engine(
                         except Exception:
                             px = 0.0
                 if px > 0:
-                    self._qqq_btc_vixy_buf.append(px)
+                    return px
+            return None
+
+        def _batch_label_ts(self, batch, ny_now) -> Optional[float]:
+            ts = ny_now
+            if ts is None:
+                try:
+                    ts = batch.get("alpha_label_ts") or batch.get("label_ts") or batch.get("ts")
+                except Exception:
+                    ts = None
+            if ts is None:
+                return None
+            try:
+                import pandas as pd
+
+                t = pd.Timestamp(ts)
+                if t.tzinfo is None:
+                    t = t.tz_localize("America/New_York")
+                return float(t.tz_convert("UTC").timestamp())
+            except Exception:
+                try:
+                    return float(ts)
+                except Exception:
+                    return None
+
+        def _update_vixy_gate_buffer(self, batch, symbols, prices) -> Optional[float]:
+            """从 batch 中的 VIXY 收盘价累积缓冲,返回 put_gate 用 vix_level。"""
+            px = self._vixy_px_from_batch(batch, symbols, prices)
+            if px is not None and px > 0:
+                self._qqq_btc_vixy_buf.append(px)
             if len(self._qqq_btc_vixy_buf) < 20:
                 return None
             return self._qqq_btc_vixy_buf.gate_level()
 
+        def _update_vixy_5m_gate_buffer(self, batch, symbols, prices, ny_now) -> Optional[float]:
+            """因果 5min raw put_gate（与离线 quote_features_raw 5min vix 同口径）。"""
+            px = self._vixy_px_from_batch(batch, symbols, prices)
+            ts = self._batch_label_ts(batch, ny_now)
+            if px is not None and px > 0 and ts is not None:
+                self._qqq_btc_vixy_5m_buf.append(ts, px)
+            if len(self._qqq_btc_vixy_5m_buf) < 20:
+                return None
+            return self._qqq_btc_vixy_5m_buf.gate_level()
+
         def _resolve_put_gate(self, batch, symbols, prices, ny_now) -> Optional[float]:
-            mode = getattr(self, "_qqq_btc_put_gate_mode", "feature5m")
+            mode = getattr(self, "_qqq_btc_put_gate_mode", "vixy_5m")
             if mode == "off":
                 return None
-            if mode == "feature5m":
+
+            def _asof_from_file() -> Optional[float]:
                 gate5 = getattr(self, "_qqq_btc_put_gate_5m", None)
                 if gate5 is None:
                     return None
@@ -309,6 +446,14 @@ def create_qqq_btc_signal_engine(
                     except Exception:
                         ts = None
                 return gate5.gate_at(ts)
+
+            if mode == "feature5m":
+                return _asof_from_file()
+            if mode == "vixy_5m":
+                src = getattr(self, "_qqq_btc_vixy_5m_source", "asof")
+                if src == "asof":
+                    return _asof_from_file()
+                return self._update_vixy_5m_gate_buffer(batch, symbols, prices, ny_now)
             return self._update_vixy_gate_buffer(batch, symbols, prices)
 
         async def _run_model_inference(self, batch, symbols, prices, ny_now):
@@ -326,7 +471,7 @@ def create_qqq_btc_signal_engine(
                 symbols,
                 history_store=self._qqq_btc_feature_history,
             )
-            # 覆盖 put_gate:默认用离线 5min vix_level asof(对齐 +37.7% replay)
+            # 覆盖 put_gate:默认 vixy_z；开卷 feature5m 仅诊断脚本显式开启
             if gate_vix is not None:
                 for sym in symbols:
                     if str(sym).upper() == "VIXY":

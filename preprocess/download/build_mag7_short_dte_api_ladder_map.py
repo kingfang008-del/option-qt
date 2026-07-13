@@ -4,7 +4,11 @@
 Unlike QQQ daily-0DTE maps, this selects — for each trade_date — the expiry whose
 trading DTE equals the requested bucket, then locks near-ATM puts/calls.
 
-Default research window starts 2026-02-01 (MAG7 Mon/Wed expiries ~Feb 2026).
+Default research window starts 2026-02-02 (MAG7 Mon/Wed expiries from Feb 2026).
+
+Output rows include trading DTE buckets; weekday columns are added by
+``stock_options.tools.report_mag7_short_dte_weekday_coverage`` (or can be derived
+from ``date_str`` / ``expiration``).
 """
 from __future__ import annotations
 

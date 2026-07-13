@@ -201,13 +201,56 @@ class LiveSessionGovernor:
         return {sym: st.straddles_today for sym, st in self._sym.items()}
 
 
+def resolve_replay_cfg(replay_cfg: Optional[ReplayConfig] = None) -> ReplayConfig:
+    """与 strategy_entry_bridge 同一套 cfg：LIVE_REPLAY env + 阈值 override。
+
+    必须跨 entry / fill 共用同一 governor；禁止用 id(cfg) 做 key
+    （USE_LIVE_REPLAY=1 时 entry 拿 LIVE、fill 默认 REPLAY → 双实例，
+    max_trades / daily_loss 形同虚设，本周曾出现单日 7 笔）。
+    """
+    import os
+    from dataclasses import replace as _dc_replace
+
+    if replay_cfg is not None:
+        cfg = replay_cfg
+    else:
+        use_live = os.environ.get("QQQ_BTC_USE_LIVE_REPLAY", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        cfg = qcfg.LIVE_REPLAY if use_live else qcfg.REPLAY
+    _ov: dict = {}
+    for env_k, attr, cast in (
+        ("QQQ_BTC_PUT_GATE_MIN", "put_gate_min", float),
+        ("QQQ_BTC_PUT_EARLY_VIX_MIN", "put_early_vix_min", float),
+        ("QQQ_BTC_EDGE_Q10_FLOOR", "edge_q10_floor", float),
+    ):
+        raw = os.environ.get(env_k, "").strip()
+        if not raw:
+            continue
+        if raw.lower() in ("none", "null", "off"):
+            _ov[attr] = None
+        else:
+            try:
+                _ov[attr] = cast(raw)
+            except ValueError:
+                pass
+    if _ov:
+        cfg = _dc_replace(cfg, **_ov)
+    return cfg
+
+
 def get_session_governor(replay_cfg: Optional[ReplayConfig] = None) -> LiveSessionGovernor:
-    cfg = replay_cfg or qcfg.REPLAY
-    key = id(cfg)
-    gov = _GOVERNORS.get(str(key))
+    """OMS 进程内唯一 governor；cfg 可热更新，状态不因 cfg 对象身份而分裂。"""
+    cfg = resolve_replay_cfg(replay_cfg)
+    key = "qqq_btc_default"
+    gov = _GOVERNORS.get(key)
     if gov is None:
         gov = LiveSessionGovernor(cfg)
-        _GOVERNORS[str(key)] = gov
+        _GOVERNORS[key] = gov
+    else:
+        gov.replay_cfg = cfg
     return gov
 
 

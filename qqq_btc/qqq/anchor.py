@@ -223,6 +223,7 @@ def get_daily_locked_contracts(df: pd.DataFrame, cfg: dict) -> Optional[pd.DataF
                 if fallbacks:
                     selected_next_dte = min(fallbacks)
 
+        used_tickers: set[str] = set()
         for b_id, is_front, is_call, target_delta in targets:
             target_dte = selected_front_dte if is_front else selected_next_dte
             type_str = "Call" if is_call else "Put"
@@ -230,6 +231,10 @@ def get_daily_locked_contracts(df: pd.DataFrame, cfg: dict) -> Optional[pd.DataF
                 daily_group["contract_type"].astype(str).str.upper().str.startswith(type_str[0])
             )
             subset = daily_group[mask].copy()
+            if not subset.empty and used_tickers:
+                subset = subset[
+                    ~subset["contract_symbol"].astype(str).isin(used_tickers)
+                ].copy()
             best_ticker = None
             best_dist = float("inf")
             if not subset.empty:
@@ -241,11 +246,29 @@ def get_daily_locked_contracts(df: pd.DataFrame, cfg: dict) -> Optional[pd.DataF
             # CALL 链在开盘窗常缺 ATM 行权价(跳空日尤甚,如只剩深虚值 720+):
             # 用同到期 PUT 链(通常密得多)按 put-call parity 反推目标行权价,
             # 合成 CALL 合约代码。call_delta = 1 + put_delta(同行权价)。
-            if is_call and best_dist >= delta_tol:
+            # 合成代码必须当日真实存在；否则回退到开盘窗内已有 CALL（即使超 tol）。
+            if is_call and (best_ticker is None or best_dist >= delta_tol):
                 put_mask = (daily_group["dte"] == target_dte) & (
                     daily_group["contract_type"].astype(str).str.upper().str.startswith("P")
                 )
                 puts = daily_group[put_mask].copy()
+                day_call_syms = {
+                    str(x)
+                    for x in work.loc[
+                        (work["date_str"] == date_val)
+                        & (work["dte"] == target_dte)
+                        & (
+                            work["contract_type"]
+                            .astype(str)
+                            .str.upper()
+                            .str.startswith("C")
+                        ),
+                        "contract_symbol",
+                    ]
+                    .dropna()
+                    .astype(str)
+                    .unique()
+                } - used_tickers
                 if not puts.empty:
                     puts = _recompute_open_deltas(puts, target_dte, is_call=False)
                     # abs_delta 为 |put_delta|;目标 |put_delta| = 1 - call_delta
@@ -255,11 +278,48 @@ def get_daily_locked_contracts(df: pd.DataFrame, cfg: dict) -> Optional[pd.DataF
                         synth = re.sub(
                             r"P(\d{8})$", r"C\1", str(cand["contract_symbol"])
                         )
-                        if synth != cand["contract_symbol"]:
+                        if synth != cand["contract_symbol"] and synth in day_call_syms:
                             best_ticker = synth
+                            best_dist = float(cand["delta_dist"])
+                        elif not subset.empty:
+                            # 合成合约不存在 → 保留窗内真实 CALL 最近 δ
+                            top = subset.sort_values("delta_dist").iloc[0]
+                            best_ticker = top["contract_symbol"]
+                            best_dist = float(top["delta_dist"])
+                        elif day_call_syms:
+                            # 窗内无 CALL 行但全日有：用 PUT 行权价就近匹配真实 CALL
+                            strike_col = (
+                                "strike" if "strike" in cand.index else "strike_price"
+                            )
+                            target_k = float(cand[strike_col])
+                            call_day = work.loc[
+                                (work["date_str"] == date_val)
+                                & (work["dte"] == target_dte)
+                                & (
+                                    work["contract_type"]
+                                    .astype(str)
+                                    .str.upper()
+                                    .str.startswith("C")
+                                )
+                            ].copy()
+                            call_day = call_day[
+                                ~call_day["contract_symbol"].astype(str).isin(used_tickers)
+                            ]
+                            sc = "strike" if "strike" in call_day.columns else "strike_price"
+                            if not call_day.empty:
+                                call_day = call_day.sort_values("timestamp").groupby(
+                                    "contract_symbol", as_index=False
+                                ).last()
+                                call_day["k_dist"] = (
+                                    pd.to_numeric(call_day[sc], errors="coerce") - target_k
+                                ).abs()
+                                best_ticker = call_day.sort_values("k_dist").iloc[0][
+                                    "contract_symbol"
+                                ]
 
             if best_ticker is None:
                 continue
+            used_tickers.add(str(best_ticker))
 
             locked_map.append(
                 {

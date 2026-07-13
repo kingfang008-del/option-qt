@@ -27,11 +27,22 @@ _REPO = Path(__file__).resolve().parent.parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
+import importlib
+
 from qqq_btc.tools.run_inference import load_model, run_inference_df
 from qqq_btc.common.replay_harness import run_strict_replay
 from qqq_btc.qqq import config as qcfg
 
 logger = logging.getLogger("qqq_btc.eval_test")
+
+
+def _load_strategy_config(module_path: str | None):
+    """加载策略规则模块;默认 1DTE 族 ``qqq_btc.qqq.config``。"""
+    if not module_path:
+        return qcfg
+    mod = importlib.import_module(module_path)
+    logger.info("strategy-config=%s profile=%s", module_path, getattr(mod, "PROFILE", "?"))
+    return mod
 
 
 def _feat_names_by_res(config: dict) -> tuple[list[str], list[str]]:
@@ -212,12 +223,22 @@ def main() -> None:
     parser.add_argument("--output-dir", default="/tmp/qqq_btc_test_eval")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=None, help="默认 42 或环境变量 QQQ_BTC_SEED")
-    parser.add_argument("--call-bucket", type=int, default=qcfg.TRADE_BUCKET_ID)
+    parser.add_argument("--call-bucket", type=int, default=None)
     parser.add_argument("--put-bucket", type=int, default=0)
+    parser.add_argument(
+        "--strategy-config",
+        default=None,
+        help="策略规则模块,如 qqq_btc.qqq.config_true_0dte;默认 qqq_btc.qqq.config(1DTE族)",
+    )
     parser.add_argument(
         "--frozen-norm",
         default=None,
         help="日冻结 normalizer .npz;feature-root 须为 quote_features_raw,与 FCS 同文件",
+    )
+    parser.add_argument(
+        "--infer-parquet",
+        default=None,
+        help="若已有 test_infer.parquet,跳过推理直接 replay(省时间)",
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -225,6 +246,10 @@ def main() -> None:
     import torch
 
     from qqq_btc.common.seed_utils import resolve_seed, set_global_seed
+
+    scfg = _load_strategy_config(args.strategy_config)
+    if args.call_bucket is None:
+        args.call_bucket = int(scfg.TRADE_BUCKET_ID)
 
     seed = set_global_seed(resolve_seed(args.seed), deterministic=True)
     logger.info("global seed=%s", seed)
@@ -237,70 +262,83 @@ def main() -> None:
     with open(args.symbol_map, "r", encoding="utf-8") as f:
         sym = json.load(f)[args.symbol]
 
-    root = Path(args.feature_root).expanduser() / args.symbol / "regular" / "09:30-16:00"
-    files_1m = sorted((root / "1min").glob("*.parquet"))
-    if not files_1m:
-        raise SystemExit(f"no 1min files under {root / '1min'}")
-
-    _, feats_5m = _feat_names_by_res(config)
-    model = load_model(Path(args.checkpoint), config, device)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    all_parts = []
-    for f1 in files_1m:
-        f5 = root / "5min" / f1.name
-        logger.info("infer %s", f1.name)
-        df = merge_1m_5m(f1, f5, feats_5m)
-        pred = run_inference_df(
-            df,
-            model,
-            config,
-            stock_id=int(sym["stock_id"]),
-            sector_id=int(sym["sector_id"]),
-            device=device,
-            use_carryover=True,
-            frozen_norm=Path(args.frozen_norm).expanduser() if args.frozen_norm else None,
-        )
-        # 回放成交一律从 databento 1m 重新 attach(5min 容差),不用特征内嵌 exec_*
-        pred = drop_embedded_exec_columns(pred)
-        pred = attach_exec_quotes(
-            pred,
-            Path(args.option_1m_root),
-            args.symbol,
-            call_bucket=args.call_bucket,
-            put_bucket=args.put_bucket,
-        )
-        all_parts.append(pred)
+    if args.infer_parquet:
+        full = pd.read_parquet(Path(args.infer_parquet).expanduser())
+        logger.info("reuse infer parquet %s rows=%d", args.infer_parquet, len(full))
+    else:
+        root = Path(args.feature_root).expanduser() / args.symbol / "regular" / "09:30-16:00"
+        files_1m = sorted((root / "1min").glob("*.parquet"))
+        if not files_1m:
+            raise SystemExit(f"no 1min files under {root / '1min'}")
 
-    full = pd.concat(all_parts, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
-    infer_path = out_dir / "test_infer.parquet"
-    full.to_parquet(infer_path, index=False)
-    logger.info("written %s rows -> %s", len(full), infer_path)
+        _, feats_5m = _feat_names_by_res(config)
+        model = load_model(Path(args.checkpoint), config, device)
+
+        all_parts = []
+        for f1 in files_1m:
+            f5 = root / "5min" / f1.name
+            logger.info("infer %s", f1.name)
+            df = merge_1m_5m(f1, f5, feats_5m)
+            pred = run_inference_df(
+                df,
+                model,
+                config,
+                stock_id=int(sym["stock_id"]),
+                sector_id=int(sym["sector_id"]),
+                device=device,
+                use_carryover=True,
+                frozen_norm=Path(args.frozen_norm).expanduser() if args.frozen_norm else None,
+            )
+            # 回放成交一律从 databento 1m 重新 attach(5min 容差),不用特征内嵌 exec_*
+            pred = drop_embedded_exec_columns(pred)
+            pred = attach_exec_quotes(
+                pred,
+                Path(args.option_1m_root),
+                args.symbol,
+                call_bucket=args.call_bucket,
+                put_bucket=args.put_bucket,
+            )
+            all_parts.append(pred)
+
+        full = pd.concat(all_parts, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+        infer_path = out_dir / "test_infer.parquet"
+        full.to_parquet(infer_path, index=False)
+        logger.info("written %s rows -> %s", len(full), infer_path)
 
     metrics = label_metrics(full)
     logger.info("test label metrics: %s", metrics)
 
     result = run_strict_replay(
         full,
-        qcfg.FILL_MODEL,
-        qcfg.REPLAY,
-        qcfg.EXIT_RAILS,
+        scfg.FILL_MODEL,
+        scfg.REPLAY,
+        scfg.EXIT_RAILS,
         edge_col="net_edge",
-        edge_q10_col=qcfg.EDGE_Q10_COL,
-        call_edge_col=qcfg.CALL_EDGE_COL,
-        put_edge_col=qcfg.PUT_EDGE_COL,
-        put_gate_col=qcfg.PUT_GATE_COL,
+        edge_q10_col=scfg.EDGE_Q10_COL,
+        call_edge_col=scfg.CALL_EDGE_COL,
+        put_edge_col=scfg.PUT_EDGE_COL,
+        put_gate_col=scfg.PUT_GATE_COL,
     )
-    summary = result.summary(position_frac=qcfg.REPLAY.position_frac)
+    summary = result.summary(position_frac=scfg.REPLAY.position_frac)
     summary["label_metrics"] = metrics
     summary["n_rows"] = int(len(full))
     summary["checkpoint"] = str(args.checkpoint)
     summary["seed"] = int(seed)
-    summary["session_entry_start_bar"] = qcfg.REPLAY.session_entry_start_bar
-    summary["session_entry_end_bar"] = qcfg.REPLAY.session_entry_end_bar
+    summary["strategy_config"] = args.strategy_config or "qqq_btc.qqq.config"
+    summary["profile"] = getattr(scfg, "PROFILE", "1dte_family")
+    summary["session_entry_start_bar"] = scfg.REPLAY.session_entry_start_bar
+    summary["session_entry_end_bar"] = scfg.REPLAY.session_entry_end_bar
     summary["call_bucket"] = int(args.call_bucket)
     summary["put_bucket"] = int(args.put_bucket)
+    summary["exit_rails"] = {
+        "hard_stop_roi": scfg.EXIT_RAILS.hard_stop_roi,
+        "max_hold_bars": scfg.EXIT_RAILS.max_hold_bars,
+        "vol_scale_ref": scfg.EXIT_RAILS.vol_scale_ref,
+        "time_stop_bars": scfg.EXIT_RAILS.time_stop_bars,
+    }
     if args.frozen_norm:
         summary["frozen_norm"] = str(Path(args.frozen_norm).expanduser())
 

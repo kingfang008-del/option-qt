@@ -216,7 +216,24 @@ class FCSSupportHandler:
             part_slow = f"debug_slow_{date_str}"
             c.execute(f"CREATE TABLE IF NOT EXISTS {part_slow} PARTITION OF debug_slow FOR VALUES FROM ({start_ts}) TO ({end_ts});")
 
-            for part_name, feat_names in [(part_fast, svc.fast_feat_names), (part_slow, svc.slow_feat_names)]:
+            # Gate1：归一化前 raw（与 debug_slow 同列名，便于 compare）
+            write_raw = bool(getattr(svc, "debug_raw_enabled", False))
+            part_raw = f"debug_raw_{date_str}"
+            if write_raw:
+                c.execute("""CREATE TABLE IF NOT EXISTS debug_raw (ts DOUBLE PRECISION, symbol TEXT, created_at TEXT, write_wall_ts DOUBLE PRECISION, write_wall_at TEXT, source_ts DOUBLE PRECISION, PRIMARY KEY (ts, symbol)) PARTITION BY RANGE (ts);""")
+                existing_cols_raw = get_existing_cols("debug_raw")
+                for fixed_col, fixed_type in [("write_wall_ts", "DOUBLE PRECISION"), ("write_wall_at", "TEXT"), ("source_ts", "DOUBLE PRECISION")]:
+                    if fixed_col not in existing_cols_raw:
+                        c.execute(f'ALTER TABLE debug_raw ADD COLUMN "{fixed_col}" {fixed_type}')
+                for name in svc.slow_feat_names:
+                    if name not in existing_cols_raw:
+                        c.execute(f'ALTER TABLE debug_raw ADD COLUMN "{name}" DOUBLE PRECISION')
+                c.execute(f"CREATE TABLE IF NOT EXISTS {part_raw} PARTITION OF debug_raw FOR VALUES FROM ({start_ts}) TO ({end_ts});")
+
+            parts_to_sync = [(part_fast, svc.fast_feat_names), (part_slow, svc.slow_feat_names)]
+            if write_raw:
+                parts_to_sync.append((part_raw, svc.slow_feat_names))
+            for part_name, feat_names in parts_to_sync:
                 existing_partition_cols = get_existing_cols(part_name)
                 for fixed_col, fixed_type in [("write_wall_ts", "DOUBLE PRECISION"), ("write_wall_at", "TEXT"), ("source_ts", "DOUBLE PRECISION")]:
                     if fixed_col not in existing_partition_cols:
@@ -232,15 +249,17 @@ class FCSSupportHandler:
                             logger.info(f"➕ [Schema Sync] Added column '{name}' to partition {part_name}")
                         except Exception as ae:
                             logger.warning(f"Failed to add column {name} to {part_name}: {ae}")
-            logger.info(f"✅ Debug 表分区化确认完成: debug_fast_{date_str}, debug_slow_{date_str}")
+            raw_note = f", {part_raw}" if write_raw else ""
+            logger.info(f"✅ Debug 表分区化确认完成: debug_fast_{date_str}, debug_slow_{date_str}{raw_note}")
         except Exception as e:
             logger.error(f"❌ Debug Postgres 分区化建表失败: {e}")
         finally:
             if conn:
                 conn.close()
 
-    def write_debug_batch(self, ts, date_str, fast_data_list, slow_data_list, source_ts=None):
-        if not fast_data_list and not slow_data_list:
+    def write_debug_batch(self, ts, date_str, fast_data_list, slow_data_list, source_ts=None, raw_data_list=None):
+        raw_data_list = raw_data_list or []
+        if not fast_data_list and not slow_data_list and not raw_data_list:
             return
         import psycopg2
         svc = self.service
@@ -316,6 +335,26 @@ class FCSSupportHandler:
                         rows_slow
                     )
                     logger.info(f"✅ [Debug-Write] Success for {table_name}")
+
+            if raw_data_list and getattr(svc, "debug_raw_enabled", False):
+                table_name = f"debug_raw_{date_str}"
+                fixed_cols = ["ts", "symbol", "created_at", "write_wall_ts", "write_wall_at", "source_ts"]
+                cols_str = ", ".join(fixed_cols + [f'"{name}"' for name in svc.slow_feat_names])
+                placeholders = ",".join(["%s"] * (len(fixed_cols) + len(svc.slow_feat_names)))
+                rows_raw = []
+                for sym, vals in raw_data_list:
+                    clean_vals = [None if not np.isfinite(v) else float(v) for v in vals]
+                    rows_raw.append([ts, sym, created_at, wall_ts, write_wall_at, source_ts] + clean_vals)
+                if rows_raw:
+                    logger.info(f"📁 [Debug-Write-Raw] Writing {len(rows_raw)} symbols to {table_name} at ts={ts}")
+                    update_cols = ["created_at", "write_wall_ts", "write_wall_at", "source_ts"] + [f'"{name}"' for name in svc.slow_feat_names]
+                    update_sql = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_cols])
+                    c.executemany(
+                        f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders}) "
+                        f"ON CONFLICT (ts, symbol) DO UPDATE SET {update_sql}",
+                        rows_raw
+                    )
+                    logger.info(f"✅ [Debug-Write-Raw] Success for {table_name}")
             c.close()
         except Exception as e:
             if "does not exist" in str(e):
@@ -656,7 +695,17 @@ class FCSSupportHandler:
         merged = np.zeros((out_rows, out_cols), dtype=np.float32)
         merged[:raw_arr.shape[0], :raw_arr.shape[1]] = raw_arr
         rows = min(out_rows, enriched_arr.shape[0])
-        # Greeks/IV: 仅当 raw 缺失时用 enriched 补洞。
+        # 死腿判定：无有效盘口且 volume=0 → 禁止用上一分钟 enriched 回填 IV/Greeks
+        # （诚实模式下 pitcher 对无真实 quote 分钟会清零盘口；若仍回填会导致 IV 粘住）。
+        raw_alive = np.zeros(rows, dtype=bool)
+        if out_cols > 9:
+            bid0 = merged[:rows, 8]
+            ask0 = merged[:rows, 9]
+            raw_alive |= np.isfinite(bid0) & np.isfinite(ask0) & (bid0 > 0.0) & (ask0 >= bid0)
+        if out_cols > 6:
+            vol0 = merged[:rows, 6]
+            raw_alive |= np.isfinite(vol0) & (vol0 > 0.0)
+        # Greeks/IV: 仅当 raw 缺失且该腿仍存活时用 enriched 补洞。
         # 旧逻辑 `where(isfinite(enriched), enriched, raw)` 会让上一分钟的
         # latest_opt_buckets 永久覆盖发球机新注入的 minute IV/Greeks，
         # 造成 options_vw_iv 全日冻结，而 volume(col6) 仍在更新。
@@ -669,7 +718,8 @@ class FCSSupportHandler:
                 raw_ok = np.isfinite(dst) & (dst > 0.01)
             else:
                 raw_ok = np.isfinite(dst) & (np.abs(dst) > 1e-8)
-            merged[:rows, col] = np.where(raw_ok, dst, np.where(np.isfinite(src), src, dst))
+            filled = np.where(raw_ok, dst, np.where(raw_alive & np.isfinite(src), src, 0.0))
+            merged[:rows, col] = filled
         # 强约束：价格列统一由 bid/ask 重建为 mid，避免沿用成交价。
         if out_cols > 9:
             bid = merged[:rows, 8]

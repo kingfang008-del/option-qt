@@ -41,11 +41,17 @@ class FCSPersistenceHandler:
         svc.frozen_option_snapshot_5m[sym] = current_snap_5m.copy() if current_snap_5m is not None else np.zeros((6, 12), dtype=np.float32)
         # 发球机已注入有效 minute IV 时，直接用本分钟 agg 快照，避免 stale
         # latest_opt_buckets 在 merge 时盖住新 IV（见 merge_option_snapshot_with_greeks）。
+        # 诚实强制重算：即使 snap IV 全 0，也用本分钟盘口快照，禁止跨分钟带回旧 Greeks。
         snap_has_iv = False
         if isinstance(current_snap, np.ndarray) and current_snap.ndim == 2 and current_snap.shape[1] > 7:
             snap_has_iv = bool(np.nanmax(np.abs(current_snap[:4, 7])) > 0.01)
-        if snap_has_iv:
-            svc.frozen_latest_opt_buckets[sym] = current_snap.copy()
+        force_recalc = os.environ.get("FCS_FORCE_RECALC_GREEKS", "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if snap_has_iv or force_recalc:
+            svc.frozen_latest_opt_buckets[sym] = (
+                current_snap.copy() if current_snap is not None else np.zeros((6, 12), dtype=np.float32)
+            )
         elif isinstance(prev_enriched, np.ndarray) and prev_enriched.size > 0:
             svc.frozen_latest_opt_buckets[sym] = prev_enriched.copy()
         elif isinstance(prev_enriched, list) and len(prev_enriched) > 0:

@@ -100,6 +100,80 @@ class VixyCloseBuffer:
         return apply_frozen_norm_scalar(self.raw_level(), "vix_level")
 
 
+# 离线 generate_vix_level_global(5min): adj_intraday = 60/5 = 12, min_periods = max(2, 12/3)=4
+VIX_5M_WIN = 12
+VIX_5M_MIN_PERIODS = 4
+
+
+class Vixy5mGateBuffer:
+    """真·因果 5min put_gate（仅用已收盘 5min 桶）。
+
+    从 1min VIXY close 聚合成 5min last-close,再 rolling z(win=12)。
+    **丢掉未收盘的最后一根 5min 桶**，否则会把 1–4 分钟的局部 close 当成完整 bar，
+    z 会严重偏离离线序列（July W1 曾因此在开盘误放 PUT）。
+
+    注意：离线 merge_asof(raw 5min) 在桶内带最多 ~5min 前视（left 标签 + 桶末 close）。
+    对拍向量化请用 PutGateFeature5m / vixy_5m+asof，不要用本 buffer 硬追 +64%。
+    **不做 frozen_norm**：阈值 0.25 / early 0.6 标定在 raw 5min 标尺上。
+    """
+
+    def __init__(self, maxlen_1m: int = 8000) -> None:
+        self._ts: Deque[float] = deque(maxlen=int(maxlen_1m))
+        self._closes: Deque[float] = deque(maxlen=int(maxlen_1m))
+
+    def __len__(self) -> int:
+        return len(self._closes)
+
+    def extend_pairs(self, pairs: Sequence[tuple[float, float]]) -> None:
+        for ts, close in pairs:
+            self.append(ts, close)
+
+    def append(self, ts: float, close: float) -> None:
+        try:
+            t = float(ts)
+            c = float(close)
+        except (TypeError, ValueError):
+            return
+        if not (np.isfinite(t) and np.isfinite(c) and c > 0):
+            return
+        self._ts.append(t)
+        self._closes.append(c)
+
+    def _closes_5m_frame(self):
+        if not self._closes:
+            return None
+        import pandas as pd
+
+        idx = pd.to_datetime(np.asarray(self._ts, dtype=np.float64), unit="s", utc=True)
+        idx = idx.tz_convert("America/New_York")
+        s = pd.Series(np.asarray(self._closes, dtype=np.float64), index=idx)
+        s = s[~s.index.duplicated(keep="last")].sort_index()
+        out = s.resample("5min", label="left", closed="left").last().dropna()
+        if out.empty:
+            return out
+        # 丢弃未收盘桶：最新 1m 若落在某 5m 桶内且未到桶末，该桶 close 尚未可知
+        last_1m = idx.max()
+        last_bucket = out.index[-1]
+        if last_1m < last_bucket + pd.Timedelta(minutes=5):
+            out = out.iloc[:-1]
+        return out
+
+    def _closes_5m(self) -> np.ndarray:
+        out = self._closes_5m_frame()
+        if out is None or len(out) == 0:
+            return np.asarray([], dtype=np.float64)
+        return out.to_numpy(dtype=np.float64)
+
+    def raw_level(self) -> float:
+        return causal_vix_level(
+            self._closes_5m(), win=VIX_5M_WIN, min_periods=VIX_5M_MIN_PERIODS
+        )
+
+    def gate_level(self) -> float:
+        """put_gate:始终返回 raw 5min z,不套 frozen_norm。"""
+        return float(self.raw_level())
+
+
 class PutGateFeature5m:
     """put_gate = 离线 5min 特征树 vix_level 的 backward-asof。
 

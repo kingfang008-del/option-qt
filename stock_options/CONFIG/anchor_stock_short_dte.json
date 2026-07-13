@@ -1,0 +1,50 @@
+{
+  "profile": "stock_short_dte",
+  "description": "MAG7 short-DTE (trading dte∈{0,1,2}) for V4 dual-stream TFT. Shared TFT + weekday/DTE features; thresholds calibrated per (symbol, dte, weekday). Research window from 2026-02-02 (Mon/Wed expiries).",
+
+  "front_allowed_dte": [0, 1, 2],
+  "front_prefer_dte": 0,
+  "front_min_dte": 0,
+  "front_max_dte": 2,
+  "exclude_0dte": false,
+  "weekly_expiry_only": false,
+  "use_next_buckets": false,
+  "dte_basis": "trading",
+  "model_family": "tft_dual_stream_v4",
+
+  "min_volume": 0,
+  "atm_center": 0.50,
+  "otm_center": 0.25,
+  "delta_tolerance": 0.15,
+
+  "label_trade_bucket_id": 2,
+  "label_dte_min": 0,
+  "label_dte_max": 2,
+
+  "train_weekdays": [0, 1, 2, 3, 4],
+  "deploy_weekdays": [0, 1, 2, 3, 4],
+  "research_start": "2026-02-02",
+  "mon_wed_expected_from": "2026-02-01",
+  "expiry_weekdays_primary": [0, 2, 4],
+  "model_shape": "shared_tft_plus_weekday_dte_features",
+  "calibration_axes": ["symbol", "selected_dte", "trade_weekday", "expiry_weekday"],
+  "split": {
+    "train_end": "2026-04-30",
+    "val_end": "2026-05-31",
+    "test_end": "2026-06-30"
+  },
+
+  "symbols": ["NVDA", "TSLA"],
+
+  "paths": {
+    "locked_targets_output": "~/train_data/locked_targets_map_stock_short_dte_old_lock.parquet",
+    "locked_targets_old_lock": "~/train_data/locked_targets_map_stock_short_dte_old_lock.parquet",
+    "locked_targets_api_ladder": "~/train_data/locked_targets_map_mag7_short_dte_api_ladder.parquet",
+    "locked_targets_weekday": "~/train_data/locked_targets_map_mag7_short_dte_weekday.parquet",
+    "micro_root": "/mnt/s990/data/microstructure/mag7_short_dte_api_ladder",
+    "stock_1s_root": "/mnt/s990/data/raw_1s/stocks",
+    "day_iv_dir": "~/train_data/quote_options_day_iv_stock_short_dte",
+    "feature_config": "stock_options/CONFIG/slow_feature_stock_short_dte.json",
+    "expiry_inventory": "stock_options/results/mag7_short_dte_expiry_inventory"
+  }
+}
