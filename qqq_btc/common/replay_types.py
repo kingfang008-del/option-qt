@@ -43,6 +43,9 @@ class ReplayConfig:
     entry_quantile: Optional[float] = None
     entry_quantile_window: int = 1500   # ~5 个交易日的入场窗 bar
     entry_quantile_min_obs: int = 300   # 观测不足时退回静态阈值
+    # True: PUT 腿也用 put_edge 分位抬高门槛。False:仅 CALL 用分位(PUT 仍用静态阈值)。
+    # Jul W1 对拍:put_dyn 会把 13:10 大 PUT(edge~0.044)挡在 q80~0.06 外,丢掉 +38% 路径关键腿。
+    apply_put_entry_quantile: bool = True
     # --- PUT 腿行情开关(None=不门控) ---
     # PUT 只在恐慌/高波动 regime 有正期望:三时期审计显示 vix_level(归一化)
     # 最高四分位贡献了 PUT 几乎全部利润,低 VIX 时 PUT 持续放血且挤占 CALL
@@ -109,6 +112,10 @@ class ReplayConfig:
     # W1 金标网格: vix≥0.6 + open30_max>0 @ sb<30 可去掉 July1 -28.8% 且保留 July7 +69%。
     put_early_session_bar: Optional[int] = None
     put_early_vix_min: Optional[float] = None
+    # 早盘中段 vix 禁 PUT: lo <= vix < hi 且无 morning_fade 时拒(July1≈0.84 假恐慌)。
+    # 与抬高 put_early_vix_min 不同:不挡高 vix 早盘(Jul8≈1.06),也不挡低 vix+fade(Jul7)。
+    put_early_vix_ban_lo: Optional[float] = None
+    put_early_vix_ban_hi: Optional[float] = None
     put_early_open30_max_min: Optional[float] = None
     put_early_range30_min: Optional[float] = None
     # --- CALL TREND_SPENT 禁开(None=关闭) ---

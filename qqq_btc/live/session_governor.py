@@ -22,6 +22,17 @@ from qqq_btc.qqq import config as qcfg
 
 _NY = timezone("America/New_York")
 _GOVERNORS: Dict[str, "LiveSessionGovernor"] = {}
+_ATEXIT_REGISTERED = False
+
+
+def _register_persist_atexit() -> None:
+    global _ATEXIT_REGISTERED
+    if _ATEXIT_REGISTERED:
+        return
+    import atexit
+
+    atexit.register(persist_session_governor)
+    _ATEXIT_REGISTERED = True
 
 
 @dataclass
@@ -129,13 +140,70 @@ class LiveSessionGovernor:
             day_range_pos=day_range_pos,
             bb_width=bb_width,
         )
+        # 周期性落盘：日终 atexit 常被下一交易日 pkill -9 吃掉
+        path = _governor_state_path()
+        if path and st.edge_buf is not None and len(st.edge_buf) > 0 and len(st.edge_buf) % 60 == 0:
+            try:
+                self.save_quantile_state(path)
+            except Exception:
+                pass
 
     def dynamic_thresholds(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
         st = self._state(symbol)
+        put_th = quantile_threshold(st.put_edge_buf, self.replay_cfg)
+        if not bool(getattr(self.replay_cfg, "apply_put_entry_quantile", True)):
+            put_th = None
         return (
             quantile_threshold(st.edge_buf, self.replay_cfg),
-            quantile_threshold(st.put_edge_buf, self.replay_cfg),
+            put_th,
         )
+
+    def save_quantile_state(self, path: str) -> None:
+        """持久化各标的 edge/put_edge 分位缓冲（跨日流式对齐 offline 连续周）。"""
+        import pickle
+        from pathlib import Path
+
+        payload = {}
+        for sym, st in self._sym.items():
+            payload[sym] = {
+                "edge_buf": list(st.edge_buf) if st.edge_buf is not None else None,
+                "put_edge_buf": list(st.put_edge_buf) if st.put_edge_buf is not None else None,
+            }
+        p = Path(path).expanduser()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(pickle.dumps(payload, protocol=4))
+
+    def load_quantile_state(self, path: str) -> int:
+        """恢复分位缓冲；返回主标的 edge_buf 长度。"""
+        import pickle
+        from pathlib import Path
+
+        p = Path(path).expanduser()
+        if not p.is_file():
+            return 0
+        try:
+            payload = pickle.loads(p.read_bytes())
+        except Exception:
+            return 0
+        if not isinstance(payload, dict):
+            return 0
+        n_main = 0
+        win = int(self.replay_cfg.entry_quantile_window)
+        for sym, blob in payload.items():
+            if not isinstance(blob, dict):
+                continue
+            st = self._state(str(sym))
+            eb = blob.get("edge_buf")
+            pb = blob.get("put_edge_buf")
+            if eb is not None and st.edge_buf is not None:
+                st.edge_buf = deque((float(x) for x in eb if np.isfinite(float(x))), maxlen=win)
+            if pb is not None and st.put_edge_buf is not None:
+                st.put_edge_buf = deque(
+                    (float(x) for x in pb if np.isfinite(float(x))), maxlen=win
+                )
+            if str(sym).upper() == "QQQ" and st.edge_buf is not None:
+                n_main = len(st.edge_buf)
+        return n_main
 
     def blocked_for_entry(
         self,
@@ -224,7 +292,17 @@ def resolve_replay_cfg(replay_cfg: Optional[ReplayConfig] = None) -> ReplayConfi
     for env_k, attr, cast in (
         ("QQQ_BTC_PUT_GATE_MIN", "put_gate_min", float),
         ("QQQ_BTC_PUT_EARLY_VIX_MIN", "put_early_vix_min", float),
+        ("QQQ_BTC_PUT_EARLY_SESSION_BAR", "put_early_session_bar", int),
+        ("QQQ_BTC_PUT_EARLY_VIX_BAN_LO", "put_early_vix_ban_lo", float),
+        ("QQQ_BTC_PUT_EARLY_VIX_BAN_HI", "put_early_vix_ban_hi", float),
+        ("QQQ_BTC_PUT_EARLY_OPEN30_MAX_MIN", "put_early_open30_max_min", float),
         ("QQQ_BTC_EDGE_Q10_FLOOR", "edge_q10_floor", float),
+        ("QQQ_BTC_ENTRY_QUANTILE", "entry_quantile", float),
+        ("QQQ_BTC_ENTRY_QUANTILE_MIN_OBS", "entry_quantile_min_obs", int),
+        ("QQQ_BTC_ENTRY_QUANTILE_WINDOW", "entry_quantile_window", int),
+        ("QQQ_BTC_MORNING_FADE_MIN_RET", "morning_fade_min_ret", float),
+        ("QQQ_BTC_MORNING_FADE_MAX_PEAK_DD", "morning_fade_max_peak_dd", float),
+        ("QQQ_BTC_MORNING_FADE_SESSION_END_BAR", "morning_fade_session_end_bar", int),
     ):
         raw = os.environ.get(env_k, "").strip()
         if not raw:
@@ -236,22 +314,84 @@ def resolve_replay_cfg(replay_cfg: Optional[ReplayConfig] = None) -> ReplayConfi
                 _ov[attr] = cast(raw)
             except ValueError:
                 pass
+    # CALL-only 分位:QQQ_BTC_APPLY_PUT_ENTRY_QUANTILE=0/false/off
+    raw_put_q = os.environ.get("QQQ_BTC_APPLY_PUT_ENTRY_QUANTILE", "").strip().lower()
+    if raw_put_q in ("0", "false", "no", "off"):
+        _ov["apply_put_entry_quantile"] = False
+    elif raw_put_q in ("1", "true", "yes", "on"):
+        _ov["apply_put_entry_quantile"] = True
     if _ov:
         cfg = _dc_replace(cfg, **_ov)
     return cfg
 
 
+def _governor_state_path() -> Optional[str]:
+    import os
+
+    p = os.environ.get("QQQ_BTC_GOVERNOR_STATE", "").strip()
+    return p or None
+
+
 def get_session_governor(replay_cfg: Optional[ReplayConfig] = None) -> LiveSessionGovernor:
-    """OMS 进程内唯一 governor；cfg 可热更新，状态不因 cfg 对象身份而分裂。"""
+    """进程内唯一 governor；cfg 可热更新，状态不因 cfg 对象身份而分裂。
+
+    若设 QQQ_BTC_GOVERNOR_STATE=path.pkl，则跨日复用 edge 分位缓冲
+   （单日流式重启时否则永远凑不满 min_obs=300，dyn_threshold 恒为 None）。
+    """
     cfg = resolve_replay_cfg(replay_cfg)
     key = "qqq_btc_default"
     gov = _GOVERNORS.get(key)
     if gov is None:
         gov = LiveSessionGovernor(cfg)
+        state_path = _governor_state_path()
+        if state_path:
+            n = gov.load_quantile_state(state_path)
+            if n:
+                import logging
+
+                logging.getLogger("qqq_btc.live.session_governor").info(
+                    "governor quantile state loaded from %s (edge_buf=%d)",
+                    state_path,
+                    n,
+                )
+            _register_persist_atexit()
         _GOVERNORS[key] = gov
     else:
         gov.replay_cfg = cfg
     return gov
+
+
+def persist_session_governor() -> None:
+    """日终把分位缓冲落盘（诚实多日脚本在每天进程退出前调用）。"""
+    from pathlib import Path
+
+    gov = _GOVERNORS.get("qqq_btc_default")
+    path = _governor_state_path()
+    if gov is None or not path:
+        return
+    # 避免 OMS 空缓冲 atexit 覆盖 Signal 已写入的状态
+    n = 0
+    for st in gov._sym.values():
+        if st.edge_buf is not None:
+            n = max(n, len(st.edge_buf))
+    if n <= 0:
+        return
+    try:
+        prev = Path(path).expanduser()
+        if prev.is_file():
+            import pickle
+
+            old = pickle.loads(prev.read_bytes())
+            old_n = 0
+            if isinstance(old, dict):
+                for blob in old.values():
+                    if isinstance(blob, dict) and blob.get("edge_buf") is not None:
+                        old_n = max(old_n, len(blob["edge_buf"]))
+            if n < old_n:
+                return
+    except Exception:
+        pass
+    gov.save_quantile_state(path)
 
 
 def net_return_from_prices(entry_px: float, exit_px: float, *, commission_drag: float = 0.0) -> float:

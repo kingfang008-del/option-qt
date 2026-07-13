@@ -24,6 +24,18 @@ REGIME_CTX_KEYS = (
     "bb_width",
 )
 
+# 需要 ≥30 根 close 才能因果算满的门控键。SE 本地 history 若不足
+# (开盘后未预热前日 bar),enrich 会 nan→0,盖住 FCS features_dict 真值。
+_ROLLING_30_REGIME_KEYS = frozenset(
+    (
+        "trend_fit_ret_30m",
+        "trend_fit_r2_30m",
+        "spot_range_30m",
+        "vix_reversal_count_30m",
+    )
+)
+_MIN_BARS_FOR_ROLLING_30 = 30
+
 
 def _last_seq_val(arr: Any, sym_idx: int) -> Optional[float]:
     if arr is None:
@@ -63,20 +75,30 @@ def extract_regime_ctx(
         vals: Dict[str, float] = {}
         hist = history_store.get(sym)
         frame = hist.to_frame() if hist is not None and hasattr(hist, "to_frame") else None
+        hist_len = 0 if frame is None or frame.empty else len(frame)
+        rolling30_ok = hist_len >= _MIN_BARS_FOR_ROLLING_30
         if frame is not None and not frame.empty:
             enriched = enrich_fcs_bars(frame, price_col="close")
             last = enriched.iloc[-1]
             for key in REGIME_CTX_KEYS:
-                if key in last.index:
-                    try:
-                        v = float(last[key])
-                    except (TypeError, ValueError):
-                        continue
-                    if np.isfinite(v):
-                        vals[key] = v
-            sr5 = _spot_ret_5bar_from_frame(enriched)
-            if sr5 is not None:
-                vals["spot_ret_5bar"] = sr5
+                # 短历史 rolling-30 的 0 是假值,留给 features_dict 回填
+                if key in _ROLLING_30_REGIME_KEYS and not rolling30_ok:
+                    continue
+                if key not in last.index:
+                    continue
+                try:
+                    v = float(last[key])
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(v):
+                    vals[key] = v
+            if rolling30_ok:
+                sr5 = _spot_ret_5bar_from_frame(enriched)
+                if sr5 is not None:
+                    vals["spot_ret_5bar"] = sr5
+            else:
+                # 5bar 收益也需要足够历史;不足时同样走 fd
+                pass
 
         for key in REGIME_CTX_KEYS:
             if key in vals:

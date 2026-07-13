@@ -22,6 +22,7 @@ from .exit_rails import (
     ExitRailsConfig,
     PositionState,
     check_exit,
+    check_forced_time_exit,
     check_tick_stops,
     scale_rails,
     vol_scale_from_returns,
@@ -191,6 +192,8 @@ class OpenPosition:
     # 入场时按当日波动缩放后的护栏(vol_scale_ref 未启用时为 None → 用全局配置)
     rails: Optional[ExitRailsConfig] = None
     vol_scale: float = 1.0
+    # 强制时间退出遇到空盘口时，用最近一个因果分钟 mid 估值；至少为入场成交价。
+    last_valid_mtm: float = 0.0
 
 
 class ReplaySession:
@@ -544,6 +547,8 @@ class ReplaySession:
         straddle_sp = max(quotes.call_spread_pct, put_sp or 0.0) if quotes.has_put() else None
         dyn_th = self._quantile_threshold(self._edge_buf)
         put_dyn_th = self._quantile_threshold(self._put_edge_buf)
+        if not bool(getattr(self.replay_cfg, "apply_put_entry_quantile", True)):
+            put_dyn_th = None
         return choose_entry(
             self.replay_cfg,
             session_bar=session_bar,
@@ -590,7 +595,16 @@ class ReplaySession:
         assert self.position is not None
         mtm = quotes.mid(self.position.leg)
         if not (np.isfinite(mtm) and mtm > 0):
-            return None
+            reason = check_forced_time_exit(
+                self.position.rails or self.rails_cfg,
+                entry_bar=self.position.entry_bar,
+                current_bar=bar_index,
+                session_bar_index=session_bar,
+            )
+            if reason is None:
+                return None
+            return self._close_position(bar_index, ts, quotes, reason, disaster=False)
+        self.position.last_valid_mtm = float(mtm)
         reason = check_exit(
             self.position.rails or self.rails_cfg,
             self.position.state,
@@ -622,6 +636,7 @@ class ReplaySession:
             commission_mult=comm_mult,
             rails=rails,
             vol_scale=vol_scale,
+            last_valid_mtm=float(fill_px),
         )
         ev = ReplayEvent(
             kind="ENTER",
@@ -646,10 +661,18 @@ class ReplaySession:
     ) -> ReplayEvent:
         assert self.position is not None
         pos = self.position
-        exit_px = quotes.exit_fill(pos.leg, self.fill_model)
+        try:
+            exit_px = quotes.exit_fill(pos.leg, self.fill_model)
+        except (TypeError, ValueError):
+            exit_px = float("nan")
         mtm = quotes.mid(pos.leg)
         if not (np.isfinite(exit_px) and exit_px > 0):
-            exit_px = mtm if np.isfinite(mtm) and mtm > 0 else pos.entry_price
+            if np.isfinite(mtm) and mtm > 0:
+                exit_px = mtm
+            elif np.isfinite(pos.last_valid_mtm) and pos.last_valid_mtm > 0:
+                exit_px = pos.last_valid_mtm
+            else:
+                exit_px = pos.entry_price
             reason = f"{reason}|NO_QUOTE"
 
         net_ret = float(exit_px) / pos.entry_price - 1.0

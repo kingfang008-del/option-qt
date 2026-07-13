@@ -328,11 +328,13 @@ def main() -> int:
         extra_env["FCS_ROLLING_NORM_SEED_BEFORE"] = args.trade_from_date or args.date
         extra_env.setdefault("FCS_ROLLING_NORM_SEED_SYMBOL", "QQQ")
 
-    # put_gate 因果 VIXY 预热:只灌入严格早于流起点的 1m close
+    # put_gate / trend 因果预热:只灌入严格早于流起点的 1m close
     vixy_before = args.warmup_from_date or args.date
     extra_env["QQQ_BTC_VIXY_SEED_BEFORE"] = vixy_before
+    extra_env["QQQ_BTC_SPOT_SEED_BEFORE"] = vixy_before
     child_env = _build_child_env(extra_env)
     os.environ["QQQ_BTC_VIXY_SEED_BEFORE"] = vixy_before
+    os.environ["QQQ_BTC_SPOT_SEED_BEFORE"] = vixy_before
     if args.trade_from_date:
         os.environ["QQQ_BTC_TRADE_FROM_DATE"] = args.trade_from_date
     if getattr(args, "rolling_norm_seed", None):

@@ -322,6 +322,9 @@ def run_event_replay(
 
         close_q = close_quotes if has_minute_ticks else minute_quotes
 
+        # 注意:持仓 bar 传空 signal → 这些 bar 的 edge 不进分位缓冲。
+        # 副作用:出场早晚会通过缓冲改写之后几天的动态阈值(路径依赖,与 live 侧
+        # entry bridge 仅在空仓时 record_edges 的语义一致,暂保留)。
         if session.position is not None:
             session.on_minute_bar(
                 bar_index, ts, session_bar, close_q, SessionSignal(),

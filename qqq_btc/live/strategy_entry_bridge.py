@@ -167,6 +167,26 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
     gov = get_session_governor(replay_cfg)
     if curr_ts > 0:
         gov.maybe_reset_day(sym, curr_ts)
+
+    # 与 offline replay_session CLOSE 一致:入场窗内每分钟都追加 edge 观测,
+    # 即使持仓/冷却也不能跳过,否则分位缓冲远小于离线、dyn_th 长期为空,
+    # Jul6 早盘 CALL 会在静态 thr=0.03 放行并挤掉午后大 PUT。
+    if replay_cfg.session_allows_entry(session_bar):
+        gov.record_edges(
+            sym,
+            session_bar=session_bar,
+            call_edge=call_edge,
+            put_edge=put_edge,
+            dual_mode=dual_mode,
+            trend_r2_30m=trend_r2_30m,
+            spot_day_ret=spot_day_ret,
+            vix_reversal_count_30m=vix_rev,
+            spot_range_30m=spot_range_30m,
+            trend_ret_30m=trend_ret_30m,
+            day_range_pos=day_range_pos,
+            bb_width=bb_width,
+        )
+
     blocked, block_reason = gov.blocked_for_entry(
         sym,
         curr_ts=curr_ts if curr_ts > 0 else 0.0,
@@ -199,20 +219,6 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         return None
     self._trace("E9.qqq_btc_session", "pass", f"session_bar={session_bar}")
 
-    gov.record_edges(
-        sym,
-        session_bar=session_bar,
-        call_edge=call_edge,
-        put_edge=put_edge,
-        dual_mode=dual_mode,
-        trend_r2_30m=trend_r2_30m,
-        spot_day_ret=spot_day_ret,
-        vix_reversal_count_30m=vix_rev,
-        spot_range_30m=spot_range_30m,
-        trend_ret_30m=trend_ret_30m,
-        day_range_pos=day_range_pos,
-        bb_width=bb_width,
-    )
     dyn_th, put_dyn_th = gov.dynamic_thresholds(sym)
     straddles_today = gov.straddles_today_for(sym)
 

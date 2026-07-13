@@ -183,6 +183,50 @@ def test_exit_rails_eod():
     assert check_exit(cfg, pos, 2.0, current_bar=381, session_bar_index=381) == "EOD_CLOSE"
 
 
+def test_replay_max_hold_forces_exit_without_current_quote():
+    """MAX_HOLD 是时间硬上限，不能因当前分钟盘口缺失而继续持仓。"""
+    from qqq_btc.common.replay_session import OpenPosition, ReplaySession, SessionQuotes
+
+    rails = ExitRailsConfig(
+        hard_stop_roi=-0.50,
+        soft_stop_roi=-0.40,
+        early_stop_bars=None,
+        max_hold_bars=5,
+        trailing_trigger_roi=9.0,
+        flash_trigger_roi=9.0,
+        ladder=((9.0, -9.0),),
+        eod_close_bar_index=None,
+    )
+    fill = OptionSpreadFillModel(
+        entry_frac=0.775,
+        exit_frac=0.775,
+        commission_per_contract=0.65,
+    )
+    session = ReplaySession(ReplayConfig(), rails, fill)
+    state = PositionState(entry_price=2.0, entry_bar=10)
+    session.position = OpenPosition(
+        leg="CALL",
+        entry_price=2.0,
+        entry_bar=10,
+        entry_ts=pd.Timestamp("2026-07-01 10:00", tz="America/New_York"),
+        signal_edge=0.10,
+        state=state,
+        rails=rails,
+        last_valid_mtm=1.80,
+    )
+    no_quote = SessionQuotes(call_bid=float("nan"), call_ask=float("nan"))
+    ev = session._try_minute_exit(
+        15,
+        pd.Timestamp("2026-07-01 10:05", tz="America/New_York"),
+        35,
+        no_quote,
+    )
+    assert ev is not None
+    assert ev.reason == "MAX_HOLD|NO_QUOTE"
+    assert ev.price == 1.80
+    assert session.result.trades[0].bars_held == 5
+
+
 # ---------------------------------------------------------------------------
 # strict replay 与标签的一致性(核心不变量)
 # ---------------------------------------------------------------------------
@@ -1229,6 +1273,43 @@ def test_choose_entry_early_put_vix_gate():
     assert d4 is not None and d4.leg == "PUT"
 
 
+def test_choose_entry_early_put_mid_vix_ban():
+    """中段 vix 禁令:挡 July1≈0.84,放行高 vix / 低 vix+fade。"""
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02,
+        long_only=False,
+        max_spread_pct=0.06,
+        put_gate_min=0.25,
+        put_early_session_bar=30,
+        put_early_vix_min=0.6,
+        put_early_vix_ban_lo=0.8,
+        put_early_vix_ban_hi=1.0,
+        morning_fade_min_ret=0.004,
+        morning_fade_max_peak_dd=-0.003,
+        morning_fade_session_end_bar=60,
+    )
+    common = dict(
+        dual_mode=True,
+        call_edge=0.01, put_edge=0.05,
+        spread_pct=0.02, put_spread_pct=0.02, has_put=True,
+        trend_ret_30m=-0.001,
+    )
+    # July1 型中段 vix → 拒
+    d = choose_entry(rc, session_bar=16, put_gate=0.84, **common)
+    assert d is None or d.leg != "PUT"
+    # July8 型高 vix → 允许
+    d2 = choose_entry(rc, session_bar=15, put_gate=1.06, **common)
+    assert d2 is not None and d2.leg == "PUT"
+    # 中段但 fade → 允许
+    d3 = choose_entry(
+        rc, session_bar=16, put_gate=0.84, **common,
+        open30_max_ret=0.005, open30_peak_dd=-0.004,
+    )
+    assert d3 is not None and d3.leg == "PUT"
+
+
 def test_choose_entry_early_put_open30_range_blocks():
     from qqq_btc.common.entry_decision import choose_entry
 
@@ -1901,6 +1982,31 @@ def test_strategy_exit_bridge_hard_stop():
     assert "HARD_STOP" in sig["reason"]
 
 
+def test_strategy_exit_bridge_max_hold_without_current_quote():
+    from datetime import datetime
+
+    from pytz import timezone
+
+    from qqq_btc.common.exit_rails import ExitRailsConfig
+    from qqq_btc.live.strategy_exit_bridge import check_exit_via_rails
+
+    rails = ExitRailsConfig(max_hold_bars=55, eod_close_bar_index=None)
+    ctx = {
+        "holding": {
+            "entry_price": 2.0,
+            "dir": 1,
+            "max_roi": 0.10,
+            "entry_bar": 30,
+        },
+        "curr_price": 0.0,
+        "held_mins": 55.0,
+        "time": datetime(2026, 7, 1, 10, 55, tzinfo=timezone("America/New_York")),
+    }
+    sig = check_exit_via_rails(ctx, rails)
+    assert sig is not None
+    assert sig["reason"] == "QQQ_BTC_MAX_HOLD|NO_QUOTE"
+
+
 def test_strategy_entry_bridge_call_with_q10(monkeypatch):
     import sys
     from datetime import datetime
@@ -2007,6 +2113,7 @@ def test_regime_ctx_extract_and_merge():
     assert "QQQ" in out
     assert out["QQQ"].get("spot_day_ret") is not None
     assert abs(out["QQQ"].get("vix_level", 0) - 0.35) < 1e-5
+    assert out["QQQ"].get("trend_fit_r2_30m", 0) > 0.5
 
     ctx = {"symbol": "QQQ"}
     item = {"spot_day_ret": 0.01, "trend_fit_r2_30m": 0.2, "vix_reversal_count_30m": 3.0}
@@ -2014,6 +2121,58 @@ def test_regime_ctx_extract_and_merge():
     assert ctx["spot_day_ret"] == 0.01
     assert ctx["trend_fit_r2_30m"] == 0.2
     assert ctx["vix_reversal_count_30m"] == 3.0
+
+
+def test_extract_regime_ctx_short_history_falls_back_to_features_dict():
+    """开盘不足 30 根时,本地 enrich 的 trend=0 不得盖住 FCS features_dict。"""
+    import numpy as np
+    from qqq_btc.live.regime_ctx import extract_regime_ctx
+    from qqq_btc.live.se_feature_bridge import _SymbolBarHistory
+
+    hist = _SymbolBarHistory()
+    base_ts = 1_700_000_000.0
+    for i in range(15):
+        hist.append(base_ts + i * 60, 400.0 + 0.01 * i)
+
+    batch = {
+        "features_dict": {
+            "trend_fit_r2_30m": np.full((1, 30), 0.196, dtype=np.float32),
+            "trend_fit_ret_30m": np.full((1, 30), 0.002, dtype=np.float32),
+        }
+    }
+    out = extract_regime_ctx(batch, ["QQQ"], history_store={"QQQ": hist})
+    assert abs(out["QQQ"]["trend_fit_r2_30m"] - 0.196) < 1e-5
+    assert abs(out["QQQ"]["trend_fit_ret_30m"] - 0.002) < 1e-5
+
+
+def test_symbol_bar_history_dedupes_same_ts():
+    from qqq_btc.live.se_feature_bridge import _SymbolBarHistory
+
+    h = _SymbolBarHistory()
+    h.append(1000.0, 400.0)
+    h.append(1000.0, 401.0)  # same ts → update
+    h.append(999.0, 399.0)   # older → ignore
+    h.append(1060.0, 402.0)
+    assert len(h) == 2
+    assert list(h._close) == [401.0, 402.0]
+
+
+def test_seed_qqq_feature_history_enables_early_trend():
+    import os
+    from qqq_btc.live import signal_integration as si
+    from qqq_btc.live.fcs_adapter import enrich_fcs_bars
+
+    os.environ["QQQ_BTC_SPOT_SEED_BEFORE"] = "20260702"
+    store: dict = {}
+    n = si._seed_qqq_feature_history(store, max_bars=390)
+    assert n >= 30
+    hist = store["QQQ"]
+    base = list(hist._ts)[-1] + 60
+    for i in range(19):
+        hist.append(base + i * 60, 736.0 + 0.05 * i)
+    enriched = enrich_fcs_bars(hist.to_frame())
+    r2 = float(enriched.iloc[-1]["trend_fit_r2_30m"])
+    assert r2 > 0.05, f"expected non-zero early r2 after seed, got {r2}"
 
 
 def test_strategy_entry_bridge_put_dual(monkeypatch):

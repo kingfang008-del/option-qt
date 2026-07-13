@@ -4,7 +4,7 @@
 QQQ **1DTE 族**（standard_old_v2 / 生产主路径）运行参数。
 
 历史上 docstring 写过「0DTE」,但锁约与特征实际是 trading≈1DTE;
-EXIT_RAILS / REPLAY 也按 1DTE 权利金路径标定(hard=-0.28, vol_ref=0.048)。
+EXIT_RAILS / REPLAY 也按 1DTE 权利金路径标定(hard=-0.25, vol_ref=0.048)。
 
 真正 trading 0DTE 请用 ``qqq_btc.qqq.config_true_0dte``,不要与本模块共用规则。
 
@@ -81,9 +81,9 @@ REPLAY = ReplayConfig(
     max_straddles_per_day=2,
     # 09:45 起可新开仓;open30 形态在 bar29(10:00)冻结,早盘 fade 门控用滚动值
     session_entry_start_bar=15,
-    # 14:30 后禁新开仓:尾盘 theta 衰减最快且 Q2 该时段胜率仅 17%(6笔 -0.46 ROI);
-    # 双时期验证收紧到 300 后 Q2 4.17x→4.52x / H2 94.7x→124.3x,MDD 同步下降
-    session_entry_end_bar=300,
+    # 13:30 后禁新开仓:FT56 Jul W1 honest 优化段 +26.9%→+49.0%,
+    # 7/9–10 时间外仍 +2.3%;同时减少尾盘 theta 暴露。
+    session_entry_end_bar=240,
     # frozen_norm + 1m5m 栈下 CALL 偏好 bar 的 q10 中位约 -26%(rolling/eval 约 -21%)。
     # 原 floor=-0.20 在 rolling 上放行 ~38% call_pref;frozen 上仅 ~3%,CALL 被系统性关掉。
     # 按 2026-06 frozen_1m5m 重标定到 -0.25,使 call_pref 通过率回到 ~38%。
@@ -95,6 +95,9 @@ REPLAY = ReplayConfig(
     entry_quantile=0.80,
     entry_quantile_window=1500,
     entry_quantile_min_obs=300,
+    # CALL-only 分位:put_dyn 会系统性挡掉 edge 落在静态阈值之上、q80 之下的大 PUT
+    # (Jul6 13:10 +38% 路径)。诚实流式/1m-gate 对拍默认关 PUT 分位。
+    apply_put_entry_quantile=False,
     # PUT 腿行情开关:入场 bar 归一化 vix_level >= 0.25 才允许开 PUT。
     # 三时期 PUT 审计:vix_level 最高四分位贡献几乎全部 PUT 利润,低 VIX 时
     # PUT 持续放血(2026Q1 无门控 PUT 腿 -31%,门控后 +95%)。0.2/0.25/0.3
@@ -169,14 +172,17 @@ MODEL_MODULE = "qqq_btc.model.backbone"
 # 退出轨道(bar = 1 分钟) —— val 上 calibrate_rails(max_hold=45, hold=30) 重标
 # 见 /tmp/rails_h30_suggestion.json;孵化期只跑 hard,利润保护延后
 EXIT_RAILS = ExitRailsConfig(
-    hard_stop_roi=-0.28,         # 赢单 MAE q01 中位
-    soft_stop_roi=-0.20,         # 赢单 MAE q05 中位
-    profit_protect_min_bars=15,  # 前 15 bar 孵化:仅 hard,无 soft/ladder/trailing
+    # Jul W1 离线: -0.28→-0.25 收窄开盘毒 PUT 单笔冲击,周 acct@25% 38.3%→40.5%
+    hard_stop_roi=-0.25,
+    soft_stop_roi=-0.20,         # 赢单 MAE q05 中位;孵化期内也生效(见 exit_rails.check_exit)
+    profit_protect_min_bars=15,  # 前 15 bar 孵化:推迟 ladder/trailing/flash,不推迟 soft/hard
     early_stop_bars=15,
     early_stop_roi=-0.12,
     time_stop_bars=30,
     time_stop_min_roi=0.03,
-    max_hold_bars=45,            # ≥ LABEL_HORIZON.hold_bars(30)
+    # 55 是无条件硬上限而非最低持有期；soft/early/time/trailing/step 均可提前退出。
+    # FT56 Jul W1 honest:优化段 +49.0%,7/9–10 时间外 +2.3%(f=0.25)。
+    max_hold_bars=55,
     trailing_trigger_roi=0.57,   # 大波段才 trailing
     trailing_keep_ratio=0.65,
     ladder=(

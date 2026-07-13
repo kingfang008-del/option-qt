@@ -57,7 +57,21 @@ def _feat_names_by_res(config: dict) -> tuple[list[str], list[str]]:
     return f1, f5
 
 
-def merge_1m_5m(path_1m: Path, path_5m: Path, feats_5m: list[str]) -> pd.DataFrame:
+def merge_1m_5m(
+    path_1m: Path,
+    path_5m: Path,
+    feats_5m: list[str],
+    *,
+    causal_5m: bool = False,
+    bar_minutes: int = 5,
+) -> pd.DataFrame:
+    """合并 1min 主表与 5min 特征。
+
+    causal_5m=False(历史默认):merge_asof(backward) 直接用 5min 左标签时间戳。
+      若 5min close 含桶末价格,则在桶内 1–4 分钟会读到未收盘才确定的值(前视)。
+    causal_5m=True:把 5min 可用时刻平移到桶结束(timestamp + bar_minutes),
+      只有桶走完后才 asof 得到该 bar —— 与实盘 buffer/等收盘一致。
+    """
     df1 = pd.read_parquet(path_1m)
     df1["timestamp"] = pd.to_datetime(df1["timestamp"])
     if not path_5m.exists():
@@ -87,6 +101,15 @@ def merge_1m_5m(path_1m: Path, path_5m: Path, feats_5m: list[str]) -> pd.DataFra
         and str(base["timestamp"].dt.tz) != str(right["timestamp"].dt.tz)
     ):
         right["timestamp"] = right["timestamp"].dt.tz_convert(base["timestamp"].dt.tz)
+
+    if causal_5m:
+        right = right.copy()
+        right["timestamp"] = right["timestamp"] + pd.Timedelta(minutes=int(bar_minutes))
+        logger.info(
+            "causal_5m: delay 5min features by %dmin before asof (%s)",
+            int(bar_minutes),
+            path_5m.name,
+        )
 
     out = pd.merge_asof(base, right, on="timestamp", direction="backward")
     return out.sort_values("timestamp").reset_index(drop=True)
@@ -240,6 +263,22 @@ def main() -> None:
         default=None,
         help="若已有 test_infer.parquet,跳过推理直接 replay(省时间)",
     )
+    parser.add_argument(
+        "--causal-5m",
+        action="store_true",
+        help="5min 特征仅在桶结束后可用(去掉桶内前视);默认关闭以复现旧口径",
+    )
+    parser.add_argument(
+        "--live-replay",
+        action="store_true",
+        help="用 LIVE_REPLAY(entry_delay=0) 而非 REPLAY",
+    )
+    parser.add_argument(
+        "--put-gate-raw5",
+        default=None,
+        help="用 raw 5min vix_level asof/因果覆盖 put_gate(阈值在 raw 标尺);"
+        "目录或文件。与 --causal-5m 同时时按因果可用时刻 asof",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -280,8 +319,8 @@ def main() -> None:
         all_parts = []
         for f1 in files_1m:
             f5 = root / "5min" / f1.name
-            logger.info("infer %s", f1.name)
-            df = merge_1m_5m(f1, f5, feats_5m)
+            logger.info("infer %s causal_5m=%s", f1.name, args.causal_5m)
+            df = merge_1m_5m(f1, f5, feats_5m, causal_5m=bool(args.causal_5m))
             pred = run_inference_df(
                 df,
                 model,
@@ -308,25 +347,66 @@ def main() -> None:
         full.to_parquet(infer_path, index=False)
         logger.info("written %s rows -> %s", len(full), infer_path)
 
+    # 可选:put_gate 用 raw 5min(阈值标定在 raw 标尺;frozen vix 会压死 early_vix)
+    put_gate_col = scfg.PUT_GATE_COL
+    if args.put_gate_raw5:
+        raw_path = Path(args.put_gate_raw5).expanduser()
+        if raw_path.is_dir():
+            fps = sorted(raw_path.glob("*.parquet"))
+        else:
+            fps = [raw_path]
+        raw_frames = []
+        for fp in fps:
+            d = pd.read_parquet(fp, columns=["timestamp", "vix_level"])
+            d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True)
+            raw_frames.append(d)
+        raw5 = pd.concat(raw_frames, ignore_index=True).sort_values("timestamp")
+        raw5 = raw5.drop_duplicates("timestamp", keep="last")
+        if args.causal_5m:
+            raw5 = raw5.copy()
+            raw5["timestamp"] = raw5["timestamp"] + pd.Timedelta(minutes=5)
+        full = full.copy()
+        full["timestamp"] = pd.to_datetime(full["timestamp"], utc=True)
+        m = pd.merge_asof(
+            full[["timestamp"]].reset_index(drop=True),
+            raw5.rename(columns={"vix_level": "_put_gate_raw5"}),
+            on="timestamp",
+            direction="backward",
+        )
+        full["put_gate_raw5"] = m["_put_gate_raw5"].to_numpy()
+        put_gate_col = "put_gate_raw5"
+        logger.info(
+            "put_gate overridden with raw5 (%s) causal=%s ge0.6=%.3f",
+            raw_path,
+            args.causal_5m,
+            float((full["put_gate_raw5"] >= 0.6).mean()),
+        )
+
     metrics = label_metrics(full)
     logger.info("test label metrics: %s", metrics)
 
+    replay_cfg = scfg.LIVE_REPLAY if args.live_replay else scfg.REPLAY
     result = run_strict_replay(
         full,
         scfg.FILL_MODEL,
-        scfg.REPLAY,
+        replay_cfg,
         scfg.EXIT_RAILS,
         edge_col="net_edge",
         edge_q10_col=scfg.EDGE_Q10_COL,
         call_edge_col=scfg.CALL_EDGE_COL,
         put_edge_col=scfg.PUT_EDGE_COL,
-        put_gate_col=scfg.PUT_GATE_COL,
+        put_gate_col=put_gate_col,
     )
-    summary = result.summary(position_frac=scfg.REPLAY.position_frac)
+    summary = result.summary(position_frac=replay_cfg.position_frac)
     summary["label_metrics"] = metrics
     summary["n_rows"] = int(len(full))
     summary["checkpoint"] = str(args.checkpoint)
     summary["seed"] = int(seed)
+    summary["causal_5m"] = bool(args.causal_5m)
+    summary["live_replay"] = bool(args.live_replay)
+    summary["put_gate_col"] = put_gate_col
+    if args.put_gate_raw5:
+        summary["put_gate_raw5"] = str(Path(args.put_gate_raw5).expanduser())
     summary["strategy_config"] = args.strategy_config or "qqq_btc.qqq.config"
     summary["profile"] = getattr(scfg, "PROFILE", "1dte_family")
     summary["session_entry_start_bar"] = scfg.REPLAY.session_entry_start_bar

@@ -187,6 +187,25 @@ def ladder_floor(cfg: ExitRailsConfig, max_roi: float) -> float:
     return ladder_floor_from(cfg.ladder, max_roi)
 
 
+def check_forced_time_exit(
+    cfg: ExitRailsConfig,
+    *,
+    entry_bar: int,
+    current_bar: int,
+    session_bar_index: Optional[int] = None,
+) -> Optional[str]:
+    """无需 MTM 的强制时间退出；报价缺失时仍必须执行。"""
+    if (
+        cfg.eod_close_bar_index is not None
+        and session_bar_index is not None
+        and session_bar_index >= cfg.eod_close_bar_index
+    ):
+        return "EOD_CLOSE"
+    if current_bar - entry_bar >= cfg.max_hold_bars:
+        return "MAX_HOLD"
+    return None
+
+
 def check_exit(
     cfg: ExitRailsConfig,
     pos: PositionState,
@@ -209,13 +228,23 @@ def check_exit(
     ):
         return "EOD_CLOSE"
 
-    # 硬止损始终生效;孵化期内不做 soft / 利润保护(tick disaster 另轨)
+    # 硬止损始终生效。
+    # 软止损也始终生效:孵化期若只留 hard,会拖到 -25%~-28% 才走
+    # (Jul1 09:46 PUT: held=6 已 -22% 本该 soft,却拖到 held=13 才 HARD)。
+    # 利润保护(阶梯/trailing/flash)仍仅孵化结束后启用,避免刚开仓小反弹被 STEP 剪掉。
     if roi <= cfg.hard_stop_roi:
         return "HARD_STOP"
-    if not incubating and roi <= cfg.soft_stop_roi:
+    if roi <= cfg.soft_stop_roi:
         return "SOFT_STOP"
 
     if incubating:
+        # 孵化期内仍允许 early_stop(持有足够 bar 且持续亏),与 soft 同属止损侧
+        if (
+            cfg.early_stop_bars is not None
+            and held >= int(cfg.early_stop_bars)
+            and roi <= cfg.early_stop_roi
+        ):
+            return "EARLY_STOP"
         return None
 
     if (

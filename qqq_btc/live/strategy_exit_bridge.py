@@ -12,7 +12,12 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
-from qqq_btc.common.exit_rails import ExitRailsConfig, PositionState, check_exit
+from qqq_btc.common.exit_rails import (
+    ExitRailsConfig,
+    PositionState,
+    check_exit,
+    check_forced_time_exit,
+)
 from qqq_btc.common.time_features import session_minute
 from qqq_btc.qqq import config as qcfg
 
@@ -43,11 +48,6 @@ def check_exit_via_rails(
     if pos.get("qqq_btc_exit_rails") is not None:
         rails = pos["qqq_btc_exit_rails"]
 
-    entry_price = float(pos.get("entry_price", 0.0) or 0.0)
-    curr_price = float(ctx.get("curr_price", 0.0) or 0.0)
-    if entry_price <= 0 or curr_price <= 0:
-        return None
-
     held_mins = float(ctx.get("held_mins", 0.0) or 0.0)
     entry_bar = int(pos.get("entry_bar", 0) or 0)
     session_bar = _session_bar_from_ctx(ctx)
@@ -56,6 +56,24 @@ def check_exit_via_rails(
         current_bar = int(session_bar)
     else:
         current_bar = entry_bar + max(0, int(round(held_mins)))
+
+    # MAX_HOLD / EOD 不依赖 MTM；盘口短暂缺失也必须向 OMS 发出强平指令。
+    forced_reason = check_forced_time_exit(
+        rails,
+        entry_bar=entry_bar,
+        current_bar=current_bar,
+        session_bar_index=session_bar if session_bar > 0 else None,
+    )
+    entry_price = float(pos.get("entry_price", 0.0) or 0.0)
+    curr_price = float(ctx.get("curr_price", 0.0) or 0.0)
+    if entry_price <= 0 or curr_price <= 0:
+        if forced_reason:
+            return {
+                "action": "SELL",
+                "reason": f"QQQ_BTC_{forced_reason}|NO_QUOTE",
+                "dir": pos.get("dir", 1),
+            }
+        return None
 
     ps = PositionState(entry_price=entry_price, entry_bar=entry_bar)
     ps.max_roi = float(pos.get("max_roi", 0.0) or 0.0)

@@ -8,7 +8,8 @@
 #
 # 与 restart_ft56_july_w1_stream_parity.sh（开卷诊断）的区别：
 #   - 无 greek-parity / 无 day_iv 注入（FCS RECALC_GREEKS 自算）
-#   - put_gate = vixy_5m（因果 5min raw z），禁止 feature5m 金标
+#   - put_gate = vixy_z（因果 1min raw z），禁止 feature5m 金标
+#   - 模型特征仍为 5min vix_level（Step1 只改门控；Step2 再微调 1min 模型）
 #   - regime gold = off
 #   - 归一化 = deploy 同款 frozen_norm_qqq_daily.npz + PG Deep Warmup
 #
@@ -17,6 +18,7 @@
 #   DAYS="2026-07-01" bash qqq_btc/tools/restart_ft56_july_w1_honest_live_parity.sh
 #   SKIP_GATES=1 bash ...          # 只跑流式+diagnostic 汇总，不跑门控
 #   FORCE_GATE3=1 bash ...         # Gate 失败仍输出交易汇总（标为 ungated）
+#   QQQ_BTC_PUT_GATE_MODE=vixy_5m bash ...   # 回退 5min 门控
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO"
@@ -30,16 +32,15 @@ export QQQ_BTC_LIVE=1
 export QQQ_BTC_FILL_AUDIT=1
 export FCS_NORMALIZER_STATS_UPDATE_INTERVAL="${FCS_NORMALIZER_STATS_UPDATE_INTERVAL:-1}"
 unset FCS_TA_MONTH_ISOLATED || true
-export QQQ_BTC_PUT_GATE_MODE=vixy_5m
-# asof=与向量化 raw5 put_gate 同序列；buffer=真因果（无桶内前视，目标不是 +64%）
-export QQQ_BTC_VIXY_5M_SOURCE="${QQQ_BTC_VIXY_5M_SOURCE:-asof}"
+export QQQ_BTC_PUT_GATE_MODE="${QQQ_BTC_PUT_GATE_MODE:-vixy_z}"
+# 若改回 vixy_5m：buffer=真因果；asof=仅复现旧离线/+64%（有前视）
+export QQQ_BTC_VIXY_5M_SOURCE="${QQQ_BTC_VIXY_5M_SOURCE:-buffer}"
 export QQQ_BTC_PUT_GATE_RAW5="${QQQ_BTC_PUT_GATE_RAW5:-$HOME/train_data/july_w1_v4_honest_openwin/quote_features_raw/QQQ/regular/09:30-16:00/5min}"
 export QQQ_BTC_REGIME_GOLD_1M=0
 unset QQQ_BTC_PUT_GATE_5M_FEATURE || true
-# 与离线 raw 5min put_gate / early_vix=0.6 同标尺；勿沿用 vixy_z 重标定阈值
-unset QQQ_BTC_PUT_GATE_MIN || true
-unset QQQ_BTC_PUT_EARLY_VIX_MIN || true
-unset QQQ_BTC_EDGE_Q10_FLOOR || true
+# put_gate 阈值可用环境覆盖（勿 unset）
+# 例: QQQ_BTC_EDGE_Q10_FLOOR=-0.2 bash ...
+# QQQ_BTC_PUT_GATE_MIN / PUT_EARLY_VIX_MIN / EDGE_Q10_FLOOR
 export QQQ_BTC_USE_LIVE_REPLAY="${QQQ_BTC_USE_LIVE_REPLAY:-1}"
 export EXECUTION_DELAY_BARS=0
 export OMS_SIGNAL_DELAY_BARS=0
@@ -71,6 +72,14 @@ if [[ -n "${OFFLINE_CLEAN:-}" && "${OFFLINE_NORM}" == "$HONEST_FEAT_ROOT/quote_f
   OFFLINE_NORM="$OFFLINE_CLEAN"
 fi
 OUT_DIR="${HONEST_OUT_DIR:-$REPO/qqq_btc/results/july_w1_ft56_honest_live_parity}"
+# 跨日复用 entry_quantile 缓冲（单日进程重启否则永远 < min_obs=300，dyn_th 恒空）
+export QQQ_BTC_GOVERNOR_STATE="${QQQ_BTC_GOVERNOR_STATE:-$OUT_DIR/governor_quantile.pkl}"
+# 单日入场窗约 285 bar；与离线 LIVE_REPLAY 默认 min_obs=300 对齐，
+# 使跨日 governor 缓冲在 Jul6 前能点亮 dyn_th（拦早盘 CALL、让出午后 PUT）。
+# 仍可用 env 覆盖。
+export QQQ_BTC_ENTRY_QUANTILE_MIN_OBS="${QQQ_BTC_ENTRY_QUANTILE_MIN_OBS:-300}"
+# CALL-only 分位：put_dyn 会挡掉 Jul6 13:10 大 PUT（逼近离线 +38% 的关键腿）
+export QQQ_BTC_APPLY_PUT_ENTRY_QUANTILE="${QQQ_BTC_APPLY_PUT_ENTRY_QUANTILE:-0}"
 export SLOW_FEATURE_CONFIG="${SLOW_FEATURE_CONFIG:-$REPO/qqq_btc/CONFIG/slow_feature_qqq_v4.json}"
 if [[ "$(basename "$SLOW_FEATURE_CONFIG")" == *v2* ]]; then
   export SLOW_FEATURE_CONFIG="$REPO/qqq_btc/CONFIG/slow_feature_qqq_v4.json"
@@ -103,7 +112,7 @@ cat > "$OUT_DIR/manifest.json" <<EOF
     "FCS_TA_MONTH_ISOLATED"
   ],
   "norm": "$FROZEN_NORM",
-  "put_gate": "${QQQ_BTC_PUT_GATE_MODE:-vixy_5m}",
+  "put_gate": "${QQQ_BTC_PUT_GATE_MODE:-vixy_z}",
   "regime_gold": "off",
   "checkpoint": "$CKPT",
   "option_root": "$OPT_ROOT",
@@ -163,6 +172,7 @@ for d in "${DAY_ARR[@]}"; do
     "$HOME/quant_project/shadow/se_alpha_${d}.csv"
   export QQQ_BTC_FILL_AUDIT_PATH="$audit"
   export QQQ_BTC_VIXY_SEED_BEFORE="$ymd"
+  export QQQ_BTC_SPOT_SEED_BEFORE="$ymd"
 
   "$PY" -u "$REPO/qqq_btc/tools/run_qqq_btc_redis_sim.py" \
     --date "$ymd" \
@@ -359,7 +369,7 @@ summary = {
     "frozen_norm": frozen,
     "warmup": "PG Deep Warmup",
     "greek_parity": False,
-    "put_gate": os.environ.get("QQQ_BTC_PUT_GATE_MODE", "vixy_5m"),
+    "put_gate": os.environ.get("QQQ_BTC_PUT_GATE_MODE", "vixy_z"),
     "regime_gold": False,
     "days": days,
     "trades": len(trades),

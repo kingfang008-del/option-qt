@@ -121,6 +121,21 @@ def choose_entry(
         )
         put_gate_ok = bool(early_vix_ok or fade_ok)
 
+    # 中段 vix 禁令(可叠加 early_vix_min):假恐慌带无 fade → 拒 PUT
+    ban_hi = replay_cfg.put_early_vix_ban_hi
+    if in_early and ban_hi is not None and not fade_ok:
+        ban_lo = (
+            float(replay_cfg.put_early_vix_ban_lo)
+            if replay_cfg.put_early_vix_ban_lo is not None
+            else 0.0
+        )
+        if (
+            put_gate is not None
+            and np.isfinite(put_gate)
+            and ban_lo <= float(put_gate) < float(ban_hi)
+        ):
+            put_gate_ok = False
+
     call_blocked = False
     if replay_cfg.block_call_on_rapid_drop and replay_cfg.rapid_drop_ret is not None:
         if (

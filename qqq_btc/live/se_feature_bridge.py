@@ -15,24 +15,52 @@ import pandas as pd
 
 from qqq_btc.common.time_features import TIME_FEATURE_NAMES
 from qqq_btc.common.trend_features import OPEN30_FEATURE_NAMES, TREND_FEATURE_NAMES
+from qqq_btc.common.session_history import FEATURE_CARRYOVER_BARS
 from qqq_btc.live.fcs_adapter import enrich_fcs_bars
 
 SEQ_LEN = 30
 DERIVED_NAMES = frozenset(TIME_FEATURE_NAMES + TREND_FEATURE_NAMES + OPEN30_FEATURE_NAMES)
+# 覆盖 trend_fit_120m 所需前日 RTH + 当日全日
+_HISTORY_MAXLEN = int(FEATURE_CARRYOVER_BARS) + 400
 
 
 class _SymbolBarHistory:
     __slots__ = ("_ts", "_close")
 
-    def __init__(self, maxlen: int = 200) -> None:
+    def __init__(self, maxlen: int = _HISTORY_MAXLEN) -> None:
         self._ts: deque = deque(maxlen=maxlen)
         self._close: deque = deque(maxlen=maxlen)
+
+    def __len__(self) -> int:
+        return len(self._ts)
 
     def append(self, ts: float, close: float) -> None:
         if close <= 0 or not np.isfinite(close):
             return
-        self._ts.append(float(ts))
-        self._close.append(float(close))
+        t = float(ts)
+        c = float(close)
+        if self._ts:
+            last = self._ts[-1]
+            # 同分钟重复推理只更新 close，避免把 1s 帧灌成假 1m bar
+            if abs(t - last) < 1e-6:
+                self._close[-1] = c
+                return
+            if t < last:
+                return
+        self._ts.append(t)
+        self._close.append(c)
+
+    def extend_seed(self, timestamps: list, closes: list) -> int:
+        """预热前日 close(严格因果);返回新增条数。"""
+        before = len(self._ts)
+        for t, c in zip(timestamps, closes):
+            try:
+                tf = float(t)
+                cf = float(c)
+            except (TypeError, ValueError):
+                continue
+            self.append(tf, cf)
+        return len(self._ts) - before
 
     def to_frame(self) -> pd.DataFrame:
         if not self._ts:

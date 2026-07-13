@@ -64,9 +64,11 @@ def bootstrap_qqq_btc_live(*, patch_oms: bool = True) -> bool:
     os.environ.setdefault("FAST_GATE_ENABLED", "0")
     # 冷却与 replay cooldown_bars=10 对齐(分钟 bar)
     os.environ.setdefault("COOLDOWN_MINUTES", "10")
-    # put_gate / regime：实盘默认因果自算，禁止默读 July 金标文件
+    # put_gate / regime：实盘默认因果 1min raw z；5min 仅诊断/复现旧 asof
     os.environ.setdefault("QQQ_BTC_PUT_GATE_MODE", "vixy_z")
+    os.environ.setdefault("QQQ_BTC_VIXY_5M_SOURCE", "buffer")
     os.environ.setdefault("QQQ_BTC_REGIME_GOLD_1M", "0")
+    os.environ.setdefault("QQQ_BTC_USE_LIVE_REPLAY", "1")
     # 与 deploy 同款冻结归一化（对拍开卷脚本须显式 export FCS_FROZEN_NORM_PATH=""）
     default_frozen = repo / "qqq_btc" / "CONFIG" / "frozen_norm_qqq_daily.npz"
     if default_frozen.exists():

@@ -96,8 +96,20 @@ class VixyCloseBuffer:
         return causal_vix_level(self._closes)
 
     def gate_level(self) -> float:
-        """put_gate 用:raw z-score,若配置了 frozen_norm 则再变换到训练口径。"""
-        return apply_frozen_norm_scalar(self.raw_level(), "vix_level")
+        """put_gate 用：默认 raw 1min z（与 LIVE 阈值 0.25/0.6 同标尺）。
+
+        模型特征仍可走 frozen_norm；门控不要混用，否则 early=0.6 在压缩后几乎永不触发。
+        显式需要旧行为时设 QQQ_BTC_PUT_GATE_FROZEN=1。
+        """
+        raw = self.raw_level()
+        if os.environ.get("QQQ_BTC_PUT_GATE_FROZEN", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return apply_frozen_norm_scalar(raw, "vix_level")
+        return float(raw)
 
 
 # 离线 generate_vix_level_global(5min): adj_intraday = 60/5 = 12, min_periods = max(2, 12/3)=4
