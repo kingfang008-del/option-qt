@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from qqq_btc.common.entry_decision import choose_entry
-from qqq_btc.common.time_features import session_minute
+from qqq_btc.live.live_clock import live_session_bar
 from qqq_btc.live.session_governor import get_session_governor
 from qqq_btc.live.signal_audit_writer import record_entry_signal_audit
 from qqq_btc.qqq import config as qcfg
@@ -25,7 +25,7 @@ def _session_bar_from_ctx(ctx: dict) -> int:
     if t is None:
         return 0
     try:
-        return int(session_minute(pd.Series([pd.Timestamp(t)])).iloc[0])
+        return live_session_bar(t)
     except Exception:
         return 0
 
@@ -168,9 +168,8 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
     if curr_ts > 0:
         gov.maybe_reset_day(sym, curr_ts)
 
-    # 与 offline replay_session CLOSE 一致:入场窗内每分钟都追加 edge 观测,
-    # 即使持仓/冷却也不能跳过,否则分位缓冲远小于离线、dyn_th 长期为空,
-    # Jul6 早盘 CALL 会在静态 thr=0.03 放行并挤掉午后大 PUT。
+    # 与 offline replay_session CLOSE 一致；TICK_FAST_HARD 风险锁定期间
+    # governor 会跳过 edge，防止提前平仓改写后续动态阈值路径。
     if replay_cfg.session_allows_entry(session_bar):
         gov.record_edges(
             sym,
@@ -185,6 +184,7 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
             trend_ret_30m=trend_ret_30m,
             day_range_pos=day_range_pos,
             bb_width=bb_width,
+            curr_ts=curr_ts,
         )
 
     blocked, block_reason = gov.blocked_for_entry(
@@ -274,6 +274,22 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         record_entry_signal_audit(
             ctx=ctx,
             block_reason="qqq_btc_entry",
+            session_bar=session_bar,
+            dyn_threshold=dyn_th,
+            put_dyn_threshold=put_dyn_th,
+            mode=getattr(self, "mode", ""),
+        )
+        return None
+
+    if curr_ts > 0 and gov.leg_blocked_for_entry(
+        sym, leg=decision.leg, curr_ts=curr_ts
+    ):
+        block_reason = f"tick_stop_leg_lock:{decision.leg}"
+        self._trace("E9.qqq_btc_governor", "block", block_reason)
+        self._last_reject_reason = block_reason
+        record_entry_signal_audit(
+            ctx=ctx,
+            block_reason=block_reason,
             session_bar=session_bar,
             dyn_threshold=dyn_th,
             put_dyn_threshold=put_dyn_th,

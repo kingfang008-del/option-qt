@@ -953,6 +953,60 @@ def test_tick_fast_hard_between_hard_and_disaster():
     assert pos.max_roi == 0.0  # 不污染分钟棘轮
 
 
+def test_tick_fast_hard_applies_reentry_lockout_and_freezes_quantile():
+    from qqq_btc.common.replay_session import (
+        OpenPosition,
+        ReplaySession,
+        SessionQuotes,
+        SessionSignal,
+    )
+
+    replay_cfg = ReplayConfig(
+        cooldown_bars=10,
+        tick_stop_cooldown_bars=30,
+        tick_stop_lock_leg_for_day=True,
+        entry_quantile=0.80,
+        entry_quantile_min_obs=1,
+        max_spread_pct=1.0,
+    )
+    rails = ExitRailsConfig(
+        tick_fast_hard_roi=-0.18,
+        disaster_stop_roi=-0.35,
+        tick_profit_trigger_roi=None,
+        tick_profit_ladder=(),
+    )
+    session = ReplaySession(replay_cfg, rails, OptionSpreadFillModel())
+    session.position = OpenPosition(
+        leg="CALL",
+        entry_price=2.0,
+        entry_bar=0,
+        entry_ts=pd.Timestamp("2026-07-01 09:30", tz="America/New_York"),
+        signal_edge=0.05,
+        state=PositionState(entry_price=2.0, entry_bar=0),
+        rails=rails,
+        last_valid_mtm=2.0,
+    )
+    events = session.on_tick(
+        5,
+        pd.Timestamp("2026-07-01 09:35:05", tz="America/New_York"),
+        SessionQuotes(call_bid=1.60, call_ask=1.64),
+        smoothed_mtm=1.62,
+    )
+    assert events and events[0].reason == "TICK_FAST_HARD"
+    assert session.tick_stop_cooldown_until == 35
+    assert session.tick_stopped_legs == {"CALL"}
+
+    session.on_minute_bar(
+        6,
+        pd.Timestamp("2026-07-01 09:36", tz="America/New_York"),
+        6,
+        SessionQuotes(call_bid=2.0, call_ask=2.02),
+        SessionSignal(edge=0.10),
+    )
+    assert list(session._edge_buf or []) == []
+    assert session.position is None
+
+
 def test_tick_profit_trail_independent_of_minute_max_roi():
     """冲高回落:tick_peak 独立,不写入 max_roi。"""
     from qqq_btc.common.exit_rails import check_tick_stops
@@ -1890,7 +1944,7 @@ def test_event_replay_disaster_stop_on_tick():
     tick_df = pd.DataFrame(ticks)
 
     rails = ExitRailsConfig(
-        hard_stop_roi=-0.12, disaster_stop_roi=-0.25, max_hold_bars=99,
+        hard_stop_roi=-0.12, disaster_stop_roi=-0.25, disaster_smooth_n=1, max_hold_bars=99,
         eod_close_bar_index=None,
     )
     cfg = ReplayConfig(entry_threshold=0.015, entry_delay_bars=1, cooldown_bars=99, max_spread_pct=1.0)
@@ -1940,6 +1994,42 @@ def test_oms_integration_entry_limit_uses_fill_model():
     px = entry_limit_price_qqq_btc(sig, base_price=2.0, attempt_no=0)
     # 0.775 fill on [1.98, 2.02] → 2.011, capped below ask-0.01
     assert 1.98 <= px < 2.02
+
+
+def test_oms_tick_stop_reads_position_leg_quote():
+    from qqq_btc.live.oms_integration import _quote_option_mid
+
+    quote = {
+        "call_bid": 8.0,
+        "call_ask": 8.2,
+        "put_bid": 3.65,
+        "put_ask": 3.69,
+    }
+    assert abs(_quote_option_mid(quote, 1) - 8.1) < 1e-12
+    assert abs(_quote_option_mid(quote, -1) - 3.67) < 1e-12
+
+
+def test_oms_stale_guard_allows_qqq_btc_forced_time_exits():
+    from qqq_btc.live.oms_integration import allow_qqq_btc_forced_exits_on_stale_quotes
+
+    class _Engine:
+        STALE_GUARD_RISK_EXIT_TOKENS = ("TIME_STOP",)
+
+    tokens = allow_qqq_btc_forced_exits_on_stale_quotes(_Engine)
+    assert "QQQ_BTC_MAX_HOLD" in tokens
+    assert "QQQ_BTC_EOD_CLOSE" in tokens
+    # 重复 bootstrap 不得不断追加相同 token。
+    assert allow_qqq_btc_forced_exits_on_stale_quotes(_Engine) == tokens
+
+
+def test_live_clock_converts_fcs_start_label_to_end_label(monkeypatch):
+    from qqq_btc.live.live_clock import live_session_bar
+
+    ts = pd.Timestamp("2026-07-02 09:48:00", tz="America/New_York").timestamp()
+    monkeypatch.delenv("QQQ_BTC_LIVE_LABEL_SHIFT_SEC", raising=False)
+    assert live_session_bar(ts) == 19
+    monkeypatch.setenv("QQQ_BTC_LIVE_LABEL_SHIFT_SEC", "0")
+    assert live_session_bar(ts) == 18
 
 
 def test_bootstrap_tick_exits_mode():
@@ -2329,6 +2419,52 @@ def test_live_session_governor_frequency():
     gov2.record_trade_close("QQQ", net_ret=0.01, curr_ts=ts, leg="CALL")
     blocked, reason = gov2.blocked_for_entry("QQQ", curr_ts=ts + 60)
     assert blocked and reason == "max_trades_per_day"
+
+
+def test_live_session_governor_tick_stop_lockout_freezes_edges():
+    from qqq_btc.common.replay_types import ReplayConfig
+    from qqq_btc.live.session_governor import LiveSessionGovernor
+
+    cfg = ReplayConfig(
+        cooldown_bars=10,
+        tick_stop_cooldown_bars=30,
+        tick_stop_lock_leg_for_day=True,
+        entry_quantile=0.80,
+        entry_quantile_min_obs=1,
+    )
+    gov = LiveSessionGovernor(cfg)
+    ts = 1_700_000_000.0
+    gov.record_edges(
+        "QQQ",
+        session_bar=10,
+        call_edge=0.05,
+        put_edge=0.04,
+        dual_mode=True,
+        curr_ts=ts,
+    )
+    before = len(gov._state("QQQ").edge_buf or [])
+    cool_until = gov.record_trade_close(
+        "QQQ",
+        net_ret=-0.19,
+        curr_ts=ts,
+        leg="CALL",
+        reason="QQQ_BTC_TICK_FAST_HARD",
+    )
+    assert cool_until == ts + 30 * 60
+    blocked, reason = gov.blocked_for_entry("QQQ", curr_ts=ts + 60)
+    assert blocked and reason == "tick_stop_cooldown"
+    assert gov.leg_blocked_for_entry("QQQ", leg="CALL", curr_ts=ts + 31 * 60)
+    assert not gov.leg_blocked_for_entry("QQQ", leg="PUT", curr_ts=ts + 31 * 60)
+
+    gov.record_edges(
+        "QQQ",
+        session_bar=11,
+        call_edge=0.10,
+        put_edge=0.09,
+        dual_mode=True,
+        curr_ts=ts + 60,
+    )
+    assert len(gov._state("QQQ").edge_buf or []) == before
 
 
 def test_live_entry_quantile_raises_threshold():

@@ -228,6 +228,8 @@ class ReplaySession:
         self.pending_leg = default_leg
         self.cooldown_until = -1
         self.streak_cooldown_until = -1
+        self.tick_stop_cooldown_until = -1
+        self.tick_stopped_legs: set[str] = set()
 
         self.cur_day = None
         self.trades_today = 0
@@ -274,7 +276,11 @@ class ReplaySession:
             mid = quotes.mid(self.default_leg)
             if np.isfinite(mid) and mid > 0:
                 self._day_mids.append(float(mid))
-            if self._edge_buf is not None and self.replay_cfg.session_allows_entry(session_bar):
+            if (
+                self._edge_buf is not None
+                and self.replay_cfg.session_allows_entry(session_bar)
+                and bar_index > self.tick_stop_cooldown_until
+            ):
                 # dual 模式 CALL 腿比较的是 call_edge,分位缓冲须跟踪同一分数
                 main_edge = (
                     signal.call_edge
@@ -443,6 +449,8 @@ class ReplaySession:
         decision = self._choose_entry(session_bar, quotes, signal)
         if decision is None:
             return []
+        if decision.leg in self.tick_stopped_legs:
+            return []
         sp = quotes.spread_pct(decision.leg)
         if not (np.isfinite(sp) and sp <= self.replay_cfg.max_spread_pct):
             return []
@@ -512,6 +520,8 @@ class ReplaySession:
         self.day_halted = False
         self.pending_entry_bar = None
         self.loss_streak = 0
+        self.tick_stop_cooldown_until = -1
+        self.tick_stopped_legs.clear()
         self._day_mids = []
 
     def _entry_rails(self) -> tuple:
@@ -525,7 +535,11 @@ class ReplaySession:
 
     def _blocked_for_entry(self, bar_index: int) -> bool:
         rc = self.replay_cfg
-        if bar_index <= self.cooldown_until or bar_index <= self.streak_cooldown_until:
+        if (
+            bar_index <= self.cooldown_until
+            or bar_index <= self.streak_cooldown_until
+            or bar_index <= self.tick_stop_cooldown_until
+        ):
             return True
         if self.day_halted:
             return True
@@ -701,6 +715,15 @@ class ReplaySession:
         closed_leg = pos.leg
         self.position = None
         self.cooldown_until = bar_index + self.replay_cfg.cooldown_bars
+        if reason.startswith("TICK_FAST_HARD"):
+            tick_bars = self.replay_cfg.tick_stop_cooldown_bars
+            if tick_bars is not None:
+                self.tick_stop_cooldown_until = bar_index + int(tick_bars)
+                self.cooldown_until = max(
+                    self.cooldown_until, self.tick_stop_cooldown_until
+                )
+            if self.replay_cfg.tick_stop_lock_leg_for_day:
+                self.tick_stopped_legs.add(closed_leg)
 
         self.trades_today += 1
         if closed_leg == "STRADDLE":

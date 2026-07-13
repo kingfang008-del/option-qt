@@ -44,6 +44,8 @@ class _SymbolDayState:
     day_halted: bool = False
     loss_streak: int = 0
     streak_cooldown_until_ts: float = 0.0
+    tick_stop_cooldown_until_ts: float = 0.0
+    tick_stopped_legs: set[str] = field(default_factory=set)
     edge_buf: Optional[Deque[float]] = field(default=None)
     put_edge_buf: Optional[Deque[float]] = field(default=None)
     day_mids: List[float] = field(default_factory=list)
@@ -83,6 +85,8 @@ class LiveSessionGovernor:
             st.day_halted = False
             st.loss_streak = 0
             st.streak_cooldown_until_ts = 0.0
+            st.tick_stop_cooldown_until_ts = 0.0
+            st.tick_stopped_legs.clear()
             st.day_mids = []
 
     def record_minute_mid(self, symbol: str, mid: float, ts: float) -> None:
@@ -122,8 +126,11 @@ class LiveSessionGovernor:
         trend_ret_30m: Optional[float] = None,
         day_range_pos: Optional[float] = None,
         bb_width: Optional[float] = None,
+        curr_ts: float = 0.0,
     ) -> None:
         st = self._state(symbol)
+        if curr_ts > 0 and curr_ts < st.tick_stop_cooldown_until_ts:
+            return
         maybe_append_edge_buffers(
             self.replay_cfg,
             session_bar=session_bar,
@@ -219,11 +226,19 @@ class LiveSessionGovernor:
             return True, "cooldown"
         if float(curr_ts) < float(st.streak_cooldown_until_ts or 0.0):
             return True, "loss_streak_cooldown"
+        if float(curr_ts) < float(st.tick_stop_cooldown_until_ts or 0.0):
+            return True, "tick_stop_cooldown"
         if st.day_halted:
             return True, "daily_loss_stop"
         if rc.max_trades_per_day is not None and st.trades_today >= int(rc.max_trades_per_day):
             return True, "max_trades_per_day"
         return False, ""
+
+    def leg_blocked_for_entry(
+        self, symbol: str, *, leg: str, curr_ts: float
+    ) -> bool:
+        self.maybe_reset_day(symbol, curr_ts)
+        return str(leg).upper() in self._state(symbol).tick_stopped_legs
 
     def record_trade_close(
         self,
@@ -232,6 +247,7 @@ class LiveSessionGovernor:
         net_ret: float,
         curr_ts: float,
         leg: str = "CALL",
+        reason: str = "",
     ) -> float:
         """平仓后更新日内统计;返回冷却截止时间(含 cooldown_bars + 连亏冷却)。"""
         self.maybe_reset_day(symbol, curr_ts)
@@ -247,6 +263,14 @@ class LiveSessionGovernor:
         bars = int(getattr(rc, "cooldown_bars", 0) or 0)
         if bars > 0 and curr_ts > 0:
             cool_until = float(curr_ts) + bars * 60.0
+        if str(reason or "").upper().startswith(("TICK_FAST_HARD", "QQQ_BTC_TICK_FAST_HARD")):
+            tick_bars = getattr(rc, "tick_stop_cooldown_bars", None)
+            if tick_bars is not None and curr_ts > 0:
+                tick_until = float(curr_ts) + int(tick_bars) * 60.0
+                st.tick_stop_cooldown_until_ts = tick_until
+                cool_until = max(cool_until, tick_until)
+            if bool(getattr(rc, "tick_stop_lock_leg_for_day", False)):
+                st.tick_stopped_legs.add(str(leg).upper())
         if nr < 0:
             st.loss_streak += 1
             if rc.loss_streak_n is not None and st.loss_streak >= int(rc.loss_streak_n):

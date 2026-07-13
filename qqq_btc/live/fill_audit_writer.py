@@ -146,16 +146,19 @@ def apply_fill_audit_patch() -> None:
         _orig_open(self, sym, st, filled_qty, fill_price, stock_price, entry_ts, sig, *args, **kwargs)
         if filled_qty <= 0:
             return
+        # 强制时间退出与 replay 一致：即使之后盘口中断，也至少有入场成交价可兜底。
+        st.qqq_btc_last_valid_mtm = float(fill_price)
+        st.qqq_btc_last_valid_bid = float(
+            getattr(st, "entry_fill_bid", 0.0) or 0.0
+        )
+        st.qqq_btc_last_valid_ask = float(
+            getattr(st, "entry_fill_ask", 0.0) or 0.0
+        )
         try:
-            import pandas as pd
-            from pytz import timezone as tz
-
-            from qqq_btc.common.time_features import session_minute
+            from qqq_btc.live.live_clock import live_session_bar
             from qqq_btc.live.session_governor import get_session_governor
 
-            ny = tz("America/New_York")
-            ts = pd.Series([pd.Timestamp.fromtimestamp(float(entry_ts), tz=ny)])
-            st.qqq_btc_entry_bar = int(session_minute(ts).iloc[0])
+            st.qqq_btc_entry_bar = live_session_bar(float(entry_ts))
             rails, vol_scale = get_session_governor().scaled_exit_rails(sym)
             st.qqq_btc_exit_rails = rails
             st.qqq_btc_vol_scale = float(vol_scale)
@@ -198,21 +201,17 @@ def apply_fill_audit_patch() -> None:
             self, sym, st, filled_qty, fill_price, stock_price, curr_ts, reason, duration, ratio,
             original_position=original_position, execution_meta=execution_meta,
         )
-        if filled_qty <= 0:
+        if abs(float(filled_qty or 0.0)) <= 0:
             return
         meta = execution_meta if isinstance(execution_meta, dict) else {}
         leg = "PUT" if pos_dir < 0 else "CALL"
         nr = ""
         sb = ""
         try:
-            from qqq_btc.common.time_features import session_minute
+            from qqq_btc.live.live_clock import live_session_bar
             from qqq_btc.live.session_governor import net_return_from_prices
-            import pandas as pd
-            from pytz import timezone as tz
 
-            ny = tz("America/New_York")
-            ts_s = pd.Series([pd.Timestamp.fromtimestamp(float(curr_ts), tz=ny)])
-            sb = int(session_minute(ts_s).iloc[0])
+            sb = live_session_bar(float(curr_ts))
             comm = 0.0
             try:
                 comm = float(qcfg.FILL_MODEL.commission_return_drag(entry_px))
@@ -227,7 +226,7 @@ def apply_fill_audit_patch() -> None:
             fill_px=float(fill_price),
             bid=float(meta.get("bid", 0) or 0),
             ask=float(meta.get("ask", 0) or 0),
-            qty=float(filled_qty),
+            qty=abs(float(filled_qty)),
             action="CLOSE",
             ts=float(curr_ts),
             reason="",
@@ -248,7 +247,11 @@ def apply_fill_audit_patch() -> None:
             nr2 = net_return_from_prices(entry_px, float(fill_price), commission_drag=comm)
             # 与 entry 共用同一 singleton governor（含 LIVE_REPLAY env）
             streak_until = get_session_governor().record_trade_close(
-                sym, net_ret=nr2, curr_ts=float(curr_ts), leg=leg,
+                sym,
+                net_ret=nr2,
+                curr_ts=float(curr_ts),
+                leg=leg,
+                reason=str(reason or ""),
             )
             if streak_until > 0 and hasattr(st, "cooldown_until"):
                 st.cooldown_until = max(float(getattr(st, "cooldown_until", 0.0) or 0.0), streak_until)

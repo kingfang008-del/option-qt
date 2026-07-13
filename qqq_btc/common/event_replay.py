@@ -50,6 +50,9 @@ class EventReplayConfig:
     signal_timing: SignalTiming = SignalTiming.MINUTE_CLOSE
     tick_disaster_stop: bool = True
     tick_smooth_n: int = 3
+    # L1/infer replay 的分钟入场和普通 rails 仍使用 minute_df 官方盘口；
+    # tick_df 只叠加秒级风险轨。S4 minute-open 编排不受此开关影响。
+    use_tick_quotes_for_minute_close: bool = False
 
 
 def _normalize_ts(series: pd.Series) -> pd.Series:
@@ -138,7 +141,8 @@ def _tick_mtm_smooth(buf: List[float], mtm: float, n: int) -> float:
     buf.append(mtm)
     if len(buf) > n:
         buf.pop(0)
-    return float(np.mean(buf)) if buf else float("nan")
+    # 必须积满窗口才判定；否则所谓 5 秒确认会在第 1 秒退化成单点止损。
+    return float(np.mean(buf)) if len(buf) >= n else float("nan")
 
 
 def _run_disaster_ticks(
@@ -320,7 +324,11 @@ def run_event_replay(
         ):
             entry_quotes = open_quotes
 
-        close_q = close_quotes if has_minute_ticks else minute_quotes
+        close_q = (
+            close_quotes
+            if has_minute_ticks and event_cfg.use_tick_quotes_for_minute_close
+            else minute_quotes
+        )
 
         # 注意:持仓 bar 传空 signal → 这些 bar 的 edge 不进分位缓冲。
         # 副作用:出场早晚会通过缓冲改写之后几天的动态阈值(路径依赖,与 live 侧

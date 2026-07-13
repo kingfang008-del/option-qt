@@ -42,6 +42,8 @@ unset QQQ_BTC_PUT_GATE_5M_FEATURE || true
 # 例: QQQ_BTC_EDGE_Q10_FLOOR=-0.2 bash ...
 # QQQ_BTC_PUT_GATE_MIN / PUT_EARLY_VIX_MIN / EDGE_Q10_FLOOR
 export QQQ_BTC_USE_LIVE_REPLAY="${QQQ_BTC_USE_LIVE_REPLAY:-1}"
+# FCS alpha_label_ts 是分钟起点；交易/audit 使用结束标签与离线 timestamp 对齐。
+export QQQ_BTC_LIVE_LABEL_SHIFT_SEC="${QQQ_BTC_LIVE_LABEL_SHIFT_SEC:-60}"
 export EXECUTION_DELAY_BARS=0
 export OMS_SIGNAL_DELAY_BARS=0
 export BACKTEST_OPT_FILL_SPREAD_FRAC="${BACKTEST_OPT_FILL_SPREAD_FRAC:-0.775}"
@@ -122,7 +124,8 @@ cat > "$OUT_DIR/manifest.json" <<EOF
   "fcs_debug_raw": true,
   "fcs_ta_month_isolated": true,
   "fcs_option_t_label": "${FCS_OPTION_T_LABEL:-end}",
-  "fcs_iv_price_mode": "${FCS_IV_PRICE_MODE:-close}"
+  "fcs_iv_price_mode": "${FCS_IV_PRICE_MODE:-close}",
+  "live_label_shift_sec": ${QQQ_BTC_LIVE_LABEL_SHIFT_SEC}
 }
 EOF
 

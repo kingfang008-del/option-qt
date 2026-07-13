@@ -60,6 +60,10 @@ REPLAY = ReplayConfig(
     entry_delay_bars=1,        # 与标签的 60s 延迟一致
     max_spread_pct=0.06,       # 0DTE ATM 常态点差 1-3%,>6% 视为执行环境恶化
     cooldown_bars=10,
+    # 秒级快速止损后冻结策略 30 分钟；冻结期不重入、也不喂动态分位缓冲。
+    tick_stop_cooldown_bars=30,
+    # 快速止损后当日禁开同一腿，避免失效方向反复试错；反向腿仍允许。
+    tick_stop_lock_leg_for_day=True,
     # 双腿开启(2026-07 验证):PUT 腿受 vix_level 行情门控(见 put_gate_min),
     # 三时期回放 CALL单腿 vs 门控双腿:2025H2 +681%→+3138% /
     # 2026Q1 +10%→+100% / 2026Q2 +10%→+102%;fill 压力(0.90)下仍全正。
@@ -194,19 +198,16 @@ EXIT_RAILS = ExitRailsConfig(
     flash_exit_roi=0.08,
     eod_close_bar_index=380,   # 09:30 起第 380 分钟 = 15:50 强平
     # tick 级:分钟轨放宽后,闪崩保护仍紧(不污染分钟 max_roi)
-    tick_fast_hard_roi=-0.20,
-    tick_fast_hard_smooth_n=3,
+    # 秒级 MTM 连续平滑跌破 -18% 时快速退出；Jul W1 tick replay 风控/收益折中优于 -15%。
+    tick_fast_hard_roi=-0.18,
+    tick_fast_hard_smooth_n=5,
     disaster_stop_roi=-0.35,
     disaster_smooth_n=3,
-    tick_profit_trigger_roi=0.25,
+    # 正常浮盈继续交给分钟 trailing/ladder；+25% tick trail 会截断 1DTE 凸性右尾。
+    tick_profit_trigger_roi=None,
     tick_profit_keep_ratio=0.50,
     tick_profit_smooth_n=3,
-    tick_profit_ladder=(
-        (0.25, 0.12),
-        (0.40, 0.22),
-        (0.60, 0.35),
-        (1.00, 0.55),
-    ),
+    tick_profit_ladder=(),
     # 波动自适应:利润保护阈值按「当日近 60 bar 权利金分钟波动 / 历史参考」缩放。
     # 0.048 = 2025-07~2026-03 日度分钟收益 std 的中位数(189 个交易日)。
     # 动机:2026-06 尾部 |30min ROI| p99 从 2.0 拉到 10.4,静态阈值把右尾剪掉、

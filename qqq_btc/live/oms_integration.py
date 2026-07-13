@@ -31,6 +31,15 @@ _ORIG_SELECT_ENTRY = None
 _ORIG_CACHE_EXEC = None
 
 
+def allow_qqq_btc_forced_exits_on_stale_quotes(ExecutionEngineV8) -> tuple[str, ...]:
+    """MAX_HOLD/EOD 是时钟约束，不能被执行盘口 stale guard 静默拦截。"""
+    current = tuple(getattr(ExecutionEngineV8, "STALE_GUARD_RISK_EXIT_TOKENS", ()) or ())
+    required = ("QQQ_BTC_MAX_HOLD", "QQQ_BTC_EOD_CLOSE")
+    merged = current + tuple(token for token in required if token not in current)
+    ExecutionEngineV8.STALE_GUARD_RISK_EXIT_TOKENS = merged
+    return merged
+
+
 def select_entry_candidates_qqq_btc(
     entry_candidates: List[Dict[str, Any]],
     allowed_entries: int,
@@ -126,12 +135,25 @@ def _position_entry_price(st: Any) -> Optional[float]:
     return None
 
 
-def _quote_option_mid(quote: dict) -> Optional[float]:
-    bid = float(quote.get("opt_bid", quote.get("bid", 0.0)) or 0.0)
-    ask = float(quote.get("opt_ask", quote.get("ask", 0.0)) or 0.0)
+def _quote_option_mid(quote: dict, side: int = 0) -> Optional[float]:
+    """从 execution quote 取当前持仓腿；缓存使用 call_*/put_*，不是通用 bid/ask。"""
+    prefix = "put" if int(side or 0) < 0 else "call"
+    bid = float(
+        quote.get(f"{prefix}_bid", quote.get("opt_bid", quote.get("bid", 0.0)))
+        or 0.0
+    )
+    ask = float(
+        quote.get(f"{prefix}_ask", quote.get("opt_ask", quote.get("ask", 0.0)))
+        or 0.0
+    )
     if bid > 0 and ask >= bid:
         return (bid + ask) / 2.0
-    px = float(quote.get("opt_price", quote.get("price", 0.0)) or 0.0)
+    px = float(
+        quote.get(
+            f"{prefix}_price", quote.get("opt_price", quote.get("price", 0.0))
+        )
+        or 0.0
+    )
     return px if px > 0 else None
 
 
@@ -151,25 +173,70 @@ async def evaluate_disaster_tick_exits(engine, curr_ts: float, rails: ExitRailsC
             # 平仓后清掉独立 tick_peak,避免下一笔继承
             if hasattr(st, "qqq_btc_tick_peak_roi"):
                 st.qqq_btc_tick_peak_roi = 0.0
+            st.qqq_btc_tick_disaster_buf = []
+            st.qqq_btc_tick_risk_buf = []
+            st.qqq_btc_tick_position_key = None
+            st.qqq_btc_tick_exit_pending = False
+            continue
+        if bool(getattr(st, "qqq_btc_tick_exit_pending", False)):
             continue
         quote = engine._second_quote_for_symbol(sym)
         if not quote:
             continue
+        side = int(getattr(st, "position", 1) or 1)
         entry_px = _position_entry_price(st)
-        mid = _quote_option_mid(quote)
+        mid = _quote_option_mid(quote, side)
         if entry_px is None or mid is None:
             continue
+        position_key = (float(entry_px), side)
+        if getattr(st, "qqq_btc_tick_position_key", None) != position_key:
+            st.qqq_btc_tick_disaster_buf = []
+            st.qqq_btc_tick_risk_buf = []
+            st.qqq_btc_tick_position_key = position_key
         peak = float(getattr(st, "qqq_btc_tick_peak_roi", 0.0) or 0.0)
         pos = PositionState(entry_price=entry_px, entry_bar=0, tick_peak_roi=peak)
-        rails = getattr(st, "qqq_btc_exit_rails", None) or rails
-        reason = check_tick_stops(rails, pos, mid)
+        position_rails = getattr(st, "qqq_btc_exit_rails", None) or rails
+
+        def _smooth(attr: str, n: int) -> Optional[float]:
+            buf = list(getattr(st, attr, []) or [])
+            buf.append(float(mid))
+            buf = buf[-max(1, int(n)) :]
+            setattr(st, attr, buf)
+            return sum(buf) / len(buf) if len(buf) >= max(1, int(n)) else None
+
+        disaster_mid = _smooth(
+            "qqq_btc_tick_disaster_buf",
+            int(position_rails.disaster_smooth_n or 3),
+        )
+        reason = (
+            check_tick_stops(
+                position_rails, pos, disaster_mid, disaster_only=True
+            )
+            if disaster_mid is not None
+            else None
+        )
+        risk_mid = disaster_mid
+        if reason is None:
+            risk_mid = _smooth(
+                "qqq_btc_tick_risk_buf",
+                int(position_rails.tick_fast_hard_smooth_n or 5),
+            )
+            if risk_mid is not None:
+                reason = check_tick_stops(position_rails, pos, risk_mid)
         st.qqq_btc_tick_peak_roi = pos.tick_peak_roi
         if not reason:
             continue
         st.qqq_btc_tick_peak_roi = 0.0
-        side = int(getattr(st, "position", 1) or 1)
-        bid = float(quote.get("opt_bid", quote.get("bid", 0.0)) or 0.0)
-        ask = float(quote.get("opt_ask", quote.get("ask", 0.0)) or 0.0)
+        st.qqq_btc_tick_exit_pending = True
+        prefix = "put" if side < 0 else "call"
+        bid = float(
+            quote.get(f"{prefix}_bid", quote.get("opt_bid", quote.get("bid", 0.0)))
+            or 0.0
+        )
+        ask = float(
+            quote.get(f"{prefix}_ask", quote.get("opt_ask", quote.get("ask", 0.0)))
+            or 0.0
+        )
         exit_sig = {
             "action": "SELL",
             "dir": side,
@@ -179,7 +246,13 @@ async def evaluate_disaster_tick_exits(engine, curr_ts: float, rails: ExitRailsC
             "market_price": mid,
             "bid": bid,
             "ask": ask,
-            "meta": {"source": "qqq_btc_tick_stop", "roi": mid / entry_px - 1.0},
+            "meta": {
+                "source": "qqq_btc_tick_stop",
+                "roi": mid / entry_px - 1.0,
+                "smoothed_roi": (
+                    risk_mid / entry_px - 1.0 if risk_mid is not None else None
+                ),
+            },
         }
         logger.warning(
             "⚡ [qqq_btc tick_stop] %s | %s | roi=%.1f%%",
@@ -346,13 +419,15 @@ def apply_oms_patches(*, tick_exits_mode: str = "disaster_only") -> None:
         orch = self.orch
         orig_gfm = orch._get_fair_market_price
 
-        # 尽量用 fresh 1s bid/ask 覆写信号盘口
+        # 优先 fresh 1s；强制时间退出遇到断档时复用最后有效持仓腿盘口。
         try:
+            qb = qa = 0.0
+            source = ""
+            st = orch.states.get(sym)
             freshness = getattr(orch, "_execution_quote_freshness", None)
             if freshness is not None:
                 is_fresh, _lag, _wall, quote = freshness(sym, curr_ts)
                 if is_fresh and quote:
-                    st = orch.states.get(sym)
                     pos = int(getattr(st, "position", 0) or 0) if st is not None else 0
                     opt_type = "put" if pos < 0 else "call"
                     leg = str((sig.get("meta") or {}).get("leg", "") or "").upper()
@@ -362,15 +437,20 @@ def apply_oms_patches(*, tick_exits_mode: str = "disaster_only") -> None:
                         opt_type = "call"
                     qb = float(quote.get(f"{opt_type}_bid", 0.0) or 0.0)
                     qa = float(quote.get(f"{opt_type}_ask", 0.0) or 0.0)
-                    if qb > 0.0 and qa >= qb:
-                        sig = dict(sig)
-                        sig["bid"] = qb
-                        sig["ask"] = qa
-                        meta = dict(sig.get("meta") or {})
-                        meta["bid"] = qb
-                        meta["ask"] = qa
-                        meta["realtime_dry_exit_fill_source"] = "fill_model_0.775"
-                        sig["meta"] = meta
+                    source = "fresh_1s"
+            if (qb <= 0.0 or qa < qb) and st is not None:
+                qb = float(getattr(st, "qqq_btc_last_valid_bid", 0.0) or 0.0)
+                qa = float(getattr(st, "qqq_btc_last_valid_ask", 0.0) or 0.0)
+                source = "last_valid_quote"
+            if qb > 0.0 and qa >= qb:
+                sig = dict(sig)
+                sig["bid"] = qb
+                sig["ask"] = qa
+                meta = dict(sig.get("meta") or {})
+                meta["bid"] = qb
+                meta["ask"] = qa
+                meta["realtime_dry_exit_fill_source"] = source
+                sig["meta"] = meta
         except Exception:
             pass
 
@@ -441,6 +521,13 @@ def apply_oms_patches(*, tick_exits_mode: str = "disaster_only") -> None:
         import execution_engine_v8 as eex
         from qqq_btc.live.regime_ctx import merge_regime_into_ctx
 
+        stale_exit_tokens = allow_qqq_btc_forced_exits_on_stale_quotes(
+            eex.ExecutionEngineV8
+        )
+        logger.info(
+            "patched OMS stale quote guard → allow forced qqq_btc exits %s",
+            [x for x in stale_exit_tokens if x.startswith("QQQ_BTC_")],
+        )
         _orig_build_ctx = eex.ExecutionEngineV8._build_strategy_ctx
 
         def _patched_build_ctx(self, item, opt_data, frame, ny_now, curr_ts, spy_roc, qqq_roc):
@@ -474,6 +561,31 @@ def apply_oms_patches(*, tick_exits_mode: str = "disaster_only") -> None:
             holding = ctx.get("holding")
             st = self.states.get(sym) if sym else None
             if holding and st is not None and int(getattr(st, "position", 0) or 0) != 0:
+                if ctx_curr_price > 0.01:
+                    st.qqq_btc_last_valid_mtm = float(ctx_curr_price)
+                    if ctx_bid > 0.0:
+                        st.qqq_btc_last_valid_bid = float(ctx_bid)
+                    if ctx_ask >= ctx_bid > 0.0:
+                        st.qqq_btc_last_valid_ask = float(ctx_ask)
+                else:
+                    fallback = float(
+                        getattr(st, "qqq_btc_last_valid_mtm", 0.0)
+                        or getattr(st, "entry_price", 0.0)
+                        or 0.0
+                    )
+                    if fallback > 0.01:
+                        ctx_curr_price = fallback
+                        market_opt_price = fallback
+                        ctx["curr_price"] = fallback
+                        st.last_opt_price = fallback
+                        cached_bid = float(
+                            getattr(st, "qqq_btc_last_valid_bid", 0.0) or 0.0
+                        )
+                        cached_ask = float(
+                            getattr(st, "qqq_btc_last_valid_ask", 0.0) or 0.0
+                        )
+                        if cached_bid > 0.0 and cached_ask >= cached_bid:
+                            ctx_bid, ctx_ask = cached_bid, cached_ask
                 if getattr(st, "qqq_btc_exit_rails", None) is not None:
                     holding["qqq_btc_exit_rails"] = st.qqq_btc_exit_rails
                 if getattr(st, "qqq_btc_entry_bar", None) is not None:

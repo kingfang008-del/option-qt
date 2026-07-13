@@ -10,15 +10,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-import pandas as pd
-
 from qqq_btc.common.exit_rails import (
     ExitRailsConfig,
     PositionState,
     check_exit,
     check_forced_time_exit,
 )
-from qqq_btc.common.time_features import session_minute
+from qqq_btc.live.live_clock import live_session_bar
 from qqq_btc.qqq import config as qcfg
 
 
@@ -27,7 +25,7 @@ def _session_bar_from_ctx(ctx: dict) -> int:
     if t is None:
         return 0
     try:
-        return int(session_minute(pd.Series([pd.Timestamp(t)])).iloc[0])
+        return live_session_bar(t)
     except Exception:
         return 0
 

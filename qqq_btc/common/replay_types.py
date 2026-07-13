@@ -16,6 +16,11 @@ class ReplayConfig:
     entry_delay_bars: int = 1
     max_spread_pct: float = 0.06
     cooldown_bars: int = 5
+    # TICK_FAST_HARD 属于异常风险退出；可使用更长的独立冷却，避免刚止损便在
+    # 同一失效信号上重新开仓。None=沿用普通 cooldown_bars。
+    tick_stop_cooldown_bars: Optional[int] = None
+    # 快速止损代表该腿当日交易逻辑失效；锁同腿至收盘，反向腿仍可交易。
+    tick_stop_lock_leg_for_day: bool = False
     long_only: bool = True
     entry_threshold_schedule: Optional[tuple] = None
     max_trades_per_day: Optional[int] = None
