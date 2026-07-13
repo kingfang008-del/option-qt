@@ -64,6 +64,13 @@ REPLAY = ReplayConfig(
     tick_stop_cooldown_bars=30,
     # 快速止损后当日禁开同一腿，避免失效方向反复试错；反向腿仍允许。
     tick_stop_lock_leg_for_day=True,
+    # 大亏锁同腿 / 结构否决延长:Jul W1 网格显示默认伤周收益,先关;仅保留 open30。
+    loss_lock_leg_for_day=False,
+    loss_lock_leg_min_loss=None,
+    loss_reentry_edge_mult=None,
+    put_structure_veto_end_bar=None,
+    # bounce-cut SPOT_THESIS 后锁同腿 45 分钟:挡 Jul1 11:01 再入,仍放行 Jul6 13:10。
+    thesis_lock_leg_bars=45,
     # 双腿开启(2026-07 验证):PUT 腿受 vix_level 行情门控(见 put_gate_min),
     # 三时期回放 CALL单腿 vs 门控双腿:2025H2 +681%→+3138% /
     # 2026Q1 +10%→+100% / 2026Q2 +10%→+102%;fill 压力(0.90)下仍全正。
@@ -148,6 +155,13 @@ REPLAY = ReplayConfig(
     call_spent_day_range_pos_min=0.85,
     call_spent_bb_width_max=0.0,
     call_spent_min_session_bar=210,
+    # 早盘 PUT 要求 open30 曾翻红(>0):挡 Jul1 阴跌无结构 09:46 PUT(-22.6%),保留 Jul7。
+    put_early_open30_max_min=0.0,
+    # 方向头一致性门控默认关:当前 best_side/spot_dir 头近常数(NONE≈0.42,up≈0.47),
+    # 开启会系统性误杀赢家(Jul7 +89% 等)。代码保留可选。
+    block_when_side_none=False,
+    require_leg_side_agree=False,
+    require_leg_spot_agree=False,
     # 半 Kelly(~0.45 的一半):单笔权利金 ROI ±30% 时禁止全仓复利
     position_frac=0.25,
 )
@@ -179,6 +193,26 @@ EXIT_RAILS = ExitRailsConfig(
     # Jul W1 离线: -0.28→-0.25 收窄开盘毒 PUT 单笔冲击,周 acct@25% 38.3%→40.5%
     hard_stop_roi=-0.25,
     soft_stop_roi=-0.20,         # 赢单 MAE q05 中位;孵化期内也生效(见 exit_rails.check_exit)
+    # 孵化期紧 soft 默认关: -0.12/-0.15 会剪掉先回撤再爆发的赢家(Jul2 +65%),
+    # 且同日提前止损后容易再开第二笔亏单。代码保留 incubate_soft_stop_roi 可选。
+    incubate_soft_stop_roi=None,
+    # 全局 SPOT_THESIS 默认关(全量开启会误杀 Jul2 路径)。
+    # 减亏改走 bounce_cut:仅当 PUT 入场已见反弹 onset 时仓位级开启。
+    spot_thesis_against_entry=None,
+    spot_thesis_confirm_bars=2,
+    spot_thesis_min_hold_bars=3,
+    spot_thesis_mom_window=3,
+    spot_thesis_require_mom=True,
+    # open30 挡不住时进来减亏:vwap 1m jump≥10bp + 现货先跌后翻红 → 仓位级 thesis(5bp/1bar)。
+    # Jul W1:10:47 -18%→~-10%;Jul2/Jul7 不触发。
+    bounce_cut_enabled=True,
+    bounce_vwap_jump_min=0.001,
+    bounce_spot_prior_bars=5,
+    bounce_spot_thesis_against_entry=0.0005,
+    bounce_spot_thesis_confirm_bars=1,
+    bounce_spot_thesis_min_hold_bars=2,
+    bounce_spot_thesis_require_mom=True,
+    bounce_incubate_soft_stop_roi=None,
     profit_protect_min_bars=15,  # 前 15 bar 孵化:推迟 ladder/trailing/flash,不推迟 soft/hard
     early_stop_bars=15,
     early_stop_roi=-0.12,

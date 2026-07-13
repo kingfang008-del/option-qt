@@ -46,9 +46,16 @@ class _SymbolDayState:
     streak_cooldown_until_ts: float = 0.0
     tick_stop_cooldown_until_ts: float = 0.0
     tick_stopped_legs: set[str] = field(default_factory=set)
+    loss_legs_today: set[str] = field(default_factory=set)
+    # SPOT_THESIS 短期同腿锁:leg -> unix ts 截止(含)
+    leg_lock_until_ts: Dict[str, float] = field(default_factory=dict)
+    put_structure_veto_until: Optional[int] = None
     edge_buf: Optional[Deque[float]] = field(default=None)
     put_edge_buf: Optional[Deque[float]] = field(default=None)
+    last_edge_session_bar: Optional[int] = None
     day_mids: List[float] = field(default_factory=list)
+    spot_closes: List[float] = field(default_factory=list)
+    vwap_lrs: List[float] = field(default_factory=list)
 
 
 def _day_key_from_ts(ts: float) -> str:
@@ -87,7 +94,13 @@ class LiveSessionGovernor:
             st.streak_cooldown_until_ts = 0.0
             st.tick_stop_cooldown_until_ts = 0.0
             st.tick_stopped_legs.clear()
+            st.loss_legs_today.clear()
+            st.leg_lock_until_ts.clear()
+            st.put_structure_veto_until = None
+            st.last_edge_session_bar = None
             st.day_mids = []
+            st.spot_closes = []
+            st.vwap_lrs = []
 
     def record_minute_mid(self, symbol: str, mid: float, ts: float) -> None:
         """记录分钟期权 mid(波动自适应 exit_rails 用,与 replay _day_mids 一致)。"""
@@ -96,20 +109,57 @@ class LiveSessionGovernor:
         self.maybe_reset_day(symbol, ts)
         self._state(symbol).day_mids.append(float(mid))
 
+    def record_bounce_inputs(
+        self,
+        symbol: str,
+        *,
+        spot_close: Optional[float] = None,
+        vwap_log_return: Optional[float] = None,
+        ts: float = 0.0,
+    ) -> None:
+        """记录现货/vwap(bounce-cut 与 replay _spot_closes/_vwap_lrs 对齐)。"""
+        if ts > 0:
+            self.maybe_reset_day(symbol, ts)
+        st = self._state(symbol)
+        if spot_close is not None and np.isfinite(spot_close) and float(spot_close) > 0:
+            st.spot_closes.append(float(spot_close))
+        if vwap_log_return is not None and np.isfinite(vwap_log_return):
+            st.vwap_lrs.append(float(vwap_log_return))
+
     def scaled_exit_rails(
         self,
         symbol: str,
         base_rails: Optional[ExitRailsConfig] = None,
+        *,
+        leg: Optional[str] = None,
     ) -> Tuple[ExitRailsConfig, float]:
-        """入场时按当日已实现 minute return std 缩放护栏(replay _entry_rails 口径)。"""
+        """入场时按当日已实现 minute return std 缩放护栏(replay _entry_rails 口径)。
+
+        传入 leg=PUT 时叠加 bounce-cut 仓位级证伪。
+        """
+        from qqq_btc.common.exit_rails import maybe_bounce_cut_rails
+
         base = base_rails or qcfg.EXIT_RAILS
         if base.vol_scale_ref is None:
-            return base, 1.0
-        st = self._state(symbol)
-        mids = np.asarray(st.day_mids, dtype=float)
-        rets = (mids[1:] / mids[:-1] - 1.0).tolist() if mids.size >= 2 else []
-        scale = vol_scale_from_returns(base, rets)
-        return scale_rails(base, scale), scale
+            rails, scale = base, 1.0
+        else:
+            st = self._state(symbol)
+            mids = np.asarray(st.day_mids, dtype=float)
+            rets = (mids[1:] / mids[:-1] - 1.0).tolist() if mids.size >= 2 else []
+            scale = vol_scale_from_returns(base, rets)
+            rails = scale_rails(base, scale)
+        if leg is not None:
+            st = self._state(symbol)
+            vwap_jump = None
+            if len(st.vwap_lrs) >= 2:
+                vwap_jump = float(st.vwap_lrs[-1]) - float(st.vwap_lrs[-2])
+            rails = maybe_bounce_cut_rails(
+                rails,
+                leg=str(leg),
+                vwap_jump=vwap_jump,
+                spot_closes=st.spot_closes,
+            )
+        return rails, scale
 
     def record_edges(
         self,
@@ -131,6 +181,15 @@ class LiveSessionGovernor:
         st = self._state(symbol)
         if curr_ts > 0 and curr_ts < st.tick_stop_cooldown_until_ts:
             return
+        # 同一分钟 OMS build_ctx + decide_entry 可能各走一次；仅 live(curr_ts>0) 去重。
+        if (
+            curr_ts > 0
+            and session_bar is not None
+            and st.last_edge_session_bar == int(session_bar)
+        ):
+            return
+        before = len(st.edge_buf) if st.edge_buf is not None else 0
+        before_put = len(st.put_edge_buf) if st.put_edge_buf is not None else 0
         maybe_append_edge_buffers(
             self.replay_cfg,
             session_bar=session_bar,
@@ -147,9 +206,18 @@ class LiveSessionGovernor:
             day_range_pos=day_range_pos,
             bb_width=bb_width,
         )
-        # 周期性落盘：日终 atexit 常被下一交易日 pkill -9 吃掉
+        after = len(st.edge_buf) if st.edge_buf is not None else 0
+        after_put = len(st.put_edge_buf) if st.put_edge_buf is not None else 0
+        if curr_ts > 0 and session_bar is not None and (
+            after > before
+            or after_put > before_put
+            or self.replay_cfg.session_allows_entry(session_bar)
+        ):
+            st.last_edge_session_bar = int(session_bar)
+        # 每次更新后落盘：单日有效 edge 可能少于 60，且日终进程可能被强制终止。
+        # 文件仅包含有界 deque（默认最多 1500 项），分钟级写入开销可忽略。
         path = _governor_state_path()
-        if path and st.edge_buf is not None and len(st.edge_buf) > 0 and len(st.edge_buf) % 60 == 0:
+        if path and st.edge_buf is not None and len(st.edge_buf) > 0:
             try:
                 self.save_quantile_state(path)
             except Exception:
@@ -222,11 +290,13 @@ class LiveSessionGovernor:
         self.maybe_reset_day(symbol, curr_ts)
         st = self._state(symbol)
         rc = self.replay_cfg
-        if float(curr_ts) < float(cooldown_until or 0.0):
+        # ReplaySession 用 bar_index <= cooldown_until；时间戳边界也必须封锁，
+        # 否则恰好第 N 分钟会比离线早一根重新入场。
+        if float(curr_ts) <= float(cooldown_until or 0.0):
             return True, "cooldown"
-        if float(curr_ts) < float(st.streak_cooldown_until_ts or 0.0):
+        if float(curr_ts) <= float(st.streak_cooldown_until_ts or 0.0):
             return True, "loss_streak_cooldown"
-        if float(curr_ts) < float(st.tick_stop_cooldown_until_ts or 0.0):
+        if float(curr_ts) <= float(st.tick_stop_cooldown_until_ts or 0.0):
             return True, "tick_stop_cooldown"
         if st.day_halted:
             return True, "daily_loss_stop"
@@ -238,7 +308,14 @@ class LiveSessionGovernor:
         self, symbol: str, *, leg: str, curr_ts: float
     ) -> bool:
         self.maybe_reset_day(symbol, curr_ts)
-        return str(leg).upper() in self._state(symbol).tick_stopped_legs
+        st = self._state(symbol)
+        leg_u = str(leg).upper()
+        if leg_u in st.tick_stopped_legs:
+            return True
+        until = st.leg_lock_until_ts.get(leg_u)
+        if until is not None and float(curr_ts) <= float(until):
+            return True
+        return False
 
     def record_trade_close(
         self,
@@ -263,7 +340,8 @@ class LiveSessionGovernor:
         bars = int(getattr(rc, "cooldown_bars", 0) or 0)
         if bars > 0 and curr_ts > 0:
             cool_until = float(curr_ts) + bars * 60.0
-        if str(reason or "").upper().startswith(("TICK_FAST_HARD", "QQQ_BTC_TICK_FAST_HARD")):
+        reason_u = str(reason or "").upper()
+        if reason_u.startswith(("TICK_FAST_HARD", "QQQ_BTC_TICK_FAST_HARD")):
             tick_bars = getattr(rc, "tick_stop_cooldown_bars", None)
             if tick_bars is not None and curr_ts > 0:
                 tick_until = float(curr_ts) + int(tick_bars) * 60.0
@@ -271,8 +349,21 @@ class LiveSessionGovernor:
                 cool_until = max(cool_until, tick_until)
             if bool(getattr(rc, "tick_stop_lock_leg_for_day", False)):
                 st.tick_stopped_legs.add(str(leg).upper())
+        if reason_u.startswith(("SPOT_THESIS", "QQQ_BTC_SPOT_THESIS")):
+            lock_bars = getattr(rc, "thesis_lock_leg_bars", None)
+            if lock_bars is not None and int(lock_bars) > 0 and curr_ts > 0:
+                until = float(curr_ts) + int(lock_bars) * 60.0
+                leg_u = str(leg).upper()
+                prev = st.leg_lock_until_ts.get(leg_u)
+                st.leg_lock_until_ts[leg_u] = until if prev is None else max(float(prev), until)
+                cool_until = max(cool_until, until)
         if nr < 0:
             st.loss_streak += 1
+            st.loss_legs_today.add(str(leg).upper())
+            if bool(getattr(rc, "loss_lock_leg_for_day", False)):
+                min_loss = getattr(rc, "loss_lock_leg_min_loss", None)
+                if min_loss is None or float(nr) <= float(min_loss):
+                    st.tick_stopped_legs.add(str(leg).upper())
             if rc.loss_streak_n is not None and st.loss_streak >= int(rc.loss_streak_n):
                 streak_bars = int(rc.loss_streak_cooldown_bars)
                 streak_until = float(curr_ts) + streak_bars * 60.0
@@ -284,6 +375,51 @@ class LiveSessionGovernor:
         if rc.daily_loss_stop is not None and st.day_pnl <= float(rc.daily_loss_stop):
             st.day_halted = True
         return cool_until
+    def note_put_structure_veto(
+        self,
+        symbol: str,
+        *,
+        session_bar: Optional[int],
+        put_edge: Optional[float],
+        open30_max_ret: Optional[float],
+    ) -> None:
+        """与 ReplaySession._maybe_trip_put_structure_veto 同口径。"""
+        rc = self.replay_cfg
+        end = getattr(rc, "put_structure_veto_end_bar", None)
+        if end is None or session_bar is None:
+            return
+        early_bar = rc.put_early_session_bar
+        open30_min = rc.put_early_open30_max_min
+        if early_bar is None or open30_min is None:
+            return
+        if session_bar >= int(early_bar):
+            return
+        th = rc.threshold_at(session_bar)
+        if put_edge is None or not np.isfinite(put_edge) or float(put_edge) < float(th):
+            return
+        if (
+            open30_max_ret is not None
+            and np.isfinite(open30_max_ret)
+            and float(open30_max_ret) > float(open30_min)
+        ):
+            return
+        st = self._state(symbol)
+        cur = st.put_structure_veto_until
+        st.put_structure_veto_until = int(end) if cur is None else max(int(cur), int(end))
+
+    def entry_threshold_mults(self, symbol: str) -> tuple:
+        mult = getattr(self.replay_cfg, "loss_reentry_edge_mult", None)
+        c_mult = p_mult = 1.0
+        if mult is not None and float(mult) > 1.0:
+            st = self._state(symbol)
+            if "CALL" in st.loss_legs_today:
+                c_mult = float(mult)
+            if "PUT" in st.loss_legs_today:
+                p_mult = float(mult)
+        return c_mult, p_mult
+
+    def put_structure_veto_until_bar(self, symbol: str) -> Optional[int]:
+        return self._state(symbol).put_structure_veto_until
 
     def straddles_today_for(self, symbol: str) -> int:
         return self._state(symbol).straddles_today

@@ -23,7 +23,9 @@ from .exit_rails import (
     PositionState,
     check_exit,
     check_forced_time_exit,
+    check_spot_thesis_invalidate,
     check_tick_stops,
+    maybe_bounce_cut_rails,
     scale_rails,
     vol_scale_from_returns,
 )
@@ -165,6 +167,17 @@ class SessionSignal:
     # 当日振幅位置 / BB 宽度;CALL TREND_SPENT 门控输入
     day_range_pos: Optional[float] = None
     bb_width: Optional[float] = None
+    # 方向头概率;block_when_side_none / require_leg_*_agree 门控输入
+    best_side_put_prob: Optional[float] = None
+    best_side_none_prob: Optional[float] = None
+    best_side_call_prob: Optional[float] = None
+    spot_down_prob: Optional[float] = None
+    spot_flat_prob: Optional[float] = None
+    spot_up_prob: Optional[float] = None
+    # 现货收盘价;SPOT_THESIS 证伪用
+    spot_close: Optional[float] = None
+    # vwap_log_return;bounce-cut 用 1m jump(与上一根差分在 session 内算)
+    vwap_log_return: Optional[float] = None
 
 
 @dataclass
@@ -194,6 +207,8 @@ class OpenPosition:
     vol_scale: float = 1.0
     # 强制时间退出遇到空盘口时，用最近一个因果分钟 mid 估值；至少为入场成交价。
     last_valid_mtm: float = 0.0
+    # 入场时现货价;SPOT_THESIS 相对入场证伪
+    entry_spot: Optional[float] = None
 
 
 class ReplaySession:
@@ -230,6 +245,12 @@ class ReplaySession:
         self.streak_cooldown_until = -1
         self.tick_stop_cooldown_until = -1
         self.tick_stopped_legs: set[str] = set()
+        # 当日已亏损的腿(loss_reentry_edge_mult 用)
+        self.loss_legs_today: set[str] = set()
+        # SPOT_THESIS 后短期同腿锁:leg -> 禁开至该 bar_index(含)
+        self.leg_lock_until: Dict[str, int] = {}
+        # 早盘 open30 结构否决延长至该 session_bar(含)
+        self.put_structure_veto_until: Optional[int] = None
 
         self.cur_day = None
         self.trades_today = 0
@@ -240,6 +261,10 @@ class ReplaySession:
         self.events: List[ReplayEvent] = []
         # 当日交易腿分钟 mid 序列(波动自适应护栏用,分钟收盘更新)
         self._day_mids: List[float] = []
+        # 当日现货收盘序列(SPOT_THESIS 证伪)
+        self._spot_closes: List[float] = []
+        # 当日 vwap_log_return(bounce-cut 1m jump)
+        self._vwap_lrs: List[float] = []
         # 入场窗 bar 的 edge 滚动缓冲(跨日,滚动分位阈值用;call/put 分数尺度不同,分开维护)
         _q_on = getattr(replay_cfg, "entry_quantile", None) is not None
         self._edge_buf: Optional[deque] = (
@@ -276,6 +301,13 @@ class ReplaySession:
             mid = quotes.mid(self.default_leg)
             if np.isfinite(mid) and mid > 0:
                 self._day_mids.append(float(mid))
+            if signal.spot_close is not None and np.isfinite(signal.spot_close) and float(signal.spot_close) > 0:
+                self._spot_closes.append(float(signal.spot_close))
+            if (
+                signal.vwap_log_return is not None
+                and np.isfinite(signal.vwap_log_return)
+            ):
+                self._vwap_lrs.append(float(signal.vwap_log_return))
             if (
                 self._edge_buf is not None
                 and self.replay_cfg.session_allows_entry(session_bar)
@@ -451,6 +483,9 @@ class ReplaySession:
             return []
         if decision.leg in self.tick_stopped_legs:
             return []
+        lock_until = self.leg_lock_until.get(str(decision.leg).upper())
+        if lock_until is not None and bar_index <= int(lock_until):
+            return []
         sp = quotes.spread_pct(decision.leg)
         if not (np.isfinite(sp) and sp <= self.replay_cfg.max_spread_pct):
             return []
@@ -522,16 +557,48 @@ class ReplaySession:
         self.loss_streak = 0
         self.tick_stop_cooldown_until = -1
         self.tick_stopped_legs.clear()
+        self.loss_legs_today.clear()
+        self.leg_lock_until.clear()
+        self.put_structure_veto_until = None
         self._day_mids = []
+        self._spot_closes = []
+        self._vwap_lrs: List[float] = []
 
-    def _entry_rails(self) -> tuple:
-        """入场时刻的 (缩放护栏, scale)。未启用波动自适应时原样返回。"""
+    def _entry_rails(
+        self,
+        *,
+        leg: Optional[str] = None,
+        signal: Optional[SessionSignal] = None,
+    ) -> tuple:
+        """入场时刻的 (缩放护栏, scale)。未启用波动自适应时原样返回。
+
+        PUT + bounce onset 时再挂仓位级 SPOT_THESIS(open30 挡不住的减亏层)。
+        """
         if self.rails_cfg.vol_scale_ref is None:
-            return self.rails_cfg, 1.0
-        mids = np.asarray(self._day_mids, dtype=float)
-        rets = (mids[1:] / mids[:-1] - 1.0).tolist() if mids.size >= 2 else []
-        scale = vol_scale_from_returns(self.rails_cfg, rets)
-        return scale_rails(self.rails_cfg, scale), scale
+            rails, scale = self.rails_cfg, 1.0
+        else:
+            mids = np.asarray(self._day_mids, dtype=float)
+            rets = (mids[1:] / mids[:-1] - 1.0).tolist() if mids.size >= 2 else []
+            scale = vol_scale_from_returns(self.rails_cfg, rets)
+            rails = scale_rails(self.rails_cfg, scale)
+        if leg is not None:
+            vwap_jump = None
+            if len(self._vwap_lrs) >= 2:
+                vwap_jump = float(self._vwap_lrs[-1]) - float(self._vwap_lrs[-2])
+            elif (
+                signal is not None
+                and signal.vwap_log_return is not None
+                and len(self._vwap_lrs) == 1
+            ):
+                # 仅一根时无法算 jump → 不触发 bounce-cut
+                vwap_jump = None
+            rails = maybe_bounce_cut_rails(
+                rails,
+                leg=str(leg),
+                vwap_jump=vwap_jump,
+                spot_closes=self._spot_closes,
+            )
+        return rails, scale
 
     def _blocked_for_entry(self, bar_index: int) -> bool:
         rc = self.replay_cfg
@@ -563,6 +630,19 @@ class ReplaySession:
         put_dyn_th = self._quantile_threshold(self._put_edge_buf)
         if not bool(getattr(self.replay_cfg, "apply_put_entry_quantile", True)):
             put_dyn_th = None
+
+        # 早盘 open30 结构失败且 PUT edge 过静态阈 → 延长否决窗
+        self._maybe_trip_put_structure_veto(session_bar, signal)
+
+        mult = getattr(self.replay_cfg, "loss_reentry_edge_mult", None)
+        c_mult = 1.0
+        p_mult = 1.0
+        if mult is not None and float(mult) > 1.0:
+            if "CALL" in self.loss_legs_today:
+                c_mult = float(mult)
+            if "PUT" in self.loss_legs_today:
+                p_mult = float(mult)
+
         return choose_entry(
             self.replay_cfg,
             session_bar=session_bar,
@@ -592,6 +672,42 @@ class ReplaySession:
             spot_range_30m=signal.spot_range_30m,
             day_range_pos=signal.day_range_pos,
             bb_width=signal.bb_width,
+            best_side_put_prob=signal.best_side_put_prob,
+            best_side_none_prob=signal.best_side_none_prob,
+            best_side_call_prob=signal.best_side_call_prob,
+            spot_down_prob=signal.spot_down_prob,
+            spot_flat_prob=signal.spot_flat_prob,
+            spot_up_prob=signal.spot_up_prob,
+            call_threshold_mult=c_mult,
+            put_threshold_mult=p_mult,
+            put_structure_veto_until_bar=self.put_structure_veto_until,
+        )
+
+    def _maybe_trip_put_structure_veto(
+        self, session_bar: Optional[int], signal: SessionSignal
+    ) -> None:
+        """早盘 PUT 因 open30 未翻红被挡时,把否决延长到 put_structure_veto_end_bar。"""
+        rc = self.replay_cfg
+        end = getattr(rc, "put_structure_veto_end_bar", None)
+        if end is None or session_bar is None:
+            return
+        early_bar = rc.put_early_session_bar
+        open30_min = rc.put_early_open30_max_min
+        if early_bar is None or open30_min is None:
+            return
+        if session_bar >= int(early_bar):
+            return
+        th = rc.threshold_at(session_bar)
+        pe = signal.put_edge
+        if pe is None or not np.isfinite(pe) or float(pe) < float(th):
+            return
+        omax = signal.open30_max_ret
+        if omax is not None and np.isfinite(omax) and float(omax) > float(open30_min):
+            return
+        # 结构失败(缺失或 <= min)
+        cur = self.put_structure_veto_until
+        self.put_structure_veto_until = (
+            int(end) if cur is None else max(int(cur), int(end))
         )
 
     def _quantile_threshold(self, buf: Optional[deque]) -> Optional[float]:
@@ -607,10 +723,22 @@ class ReplaySession:
         quotes: SessionQuotes,
     ) -> Optional[ReplayEvent]:
         assert self.position is not None
+        rails = self.position.rails or self.rails_cfg
+        held = bar_index - self.position.entry_bar
+        if self.position.entry_spot is not None:
+            thesis = check_spot_thesis_invalidate(
+                rails,
+                leg=self.position.leg,
+                spot_closes=self._spot_closes,
+                entry_spot=float(self.position.entry_spot),
+                held=held,
+            )
+            if thesis is not None:
+                return self._close_position(bar_index, ts, quotes, thesis, disaster=False)
         mtm = quotes.mid(self.position.leg)
         if not (np.isfinite(mtm) and mtm > 0):
             reason = check_forced_time_exit(
-                self.position.rails or self.rails_cfg,
+                rails,
                 entry_bar=self.position.entry_bar,
                 current_bar=bar_index,
                 session_bar_index=session_bar,
@@ -620,7 +748,7 @@ class ReplaySession:
             return self._close_position(bar_index, ts, quotes, reason, disaster=False)
         self.position.last_valid_mtm = float(mtm)
         reason = check_exit(
-            self.position.rails or self.rails_cfg,
+            rails,
             self.position.state,
             float(mtm),
             bar_index,
@@ -639,7 +767,14 @@ class ReplaySession:
         if not (np.isfinite(fill_px) and fill_px > 0 and gate_ok):
             return None
         comm_mult = 2.0 if leg == "STRADDLE" else 1.0
-        rails, vol_scale = self._entry_rails()
+        rails, vol_scale = self._entry_rails(leg=leg)
+        entry_spot = self._spot_closes[-1] if self._spot_closes else None
+        bounce_on = (
+            rails.spot_thesis_against_entry is not None
+            and self.rails_cfg.spot_thesis_against_entry is None
+            and bool(getattr(self.rails_cfg, "bounce_cut_enabled", False))
+            and str(leg).upper() == "PUT"
+        )
         self.position = OpenPosition(
             leg=leg,
             entry_price=float(fill_px),
@@ -651,6 +786,7 @@ class ReplaySession:
             rails=rails,
             vol_scale=vol_scale,
             last_valid_mtm=float(fill_px),
+            entry_spot=float(entry_spot) if entry_spot is not None else None,
         )
         ev = ReplayEvent(
             kind="ENTER",
@@ -659,7 +795,7 @@ class ReplaySession:
             leg=leg,
             price=float(fill_px),
             edge=self.pending_edge,
-            extra={"vol_scale": vol_scale},
+            extra={"vol_scale": vol_scale, "bounce_cut": bounce_on},
         )
         self.events.append(ev)
         return ev
@@ -725,12 +861,27 @@ class ReplaySession:
             if self.replay_cfg.tick_stop_lock_leg_for_day:
                 self.tick_stopped_legs.add(closed_leg)
 
+        # bounce-cut / SPOT_THESIS:短期禁同腿再开(不锁全日,保留午后机会)
+        reason_u = str(reason).upper()
+        if reason_u.startswith("SPOT_THESIS"):
+            lock_bars = getattr(self.replay_cfg, "thesis_lock_leg_bars", None)
+            if lock_bars is not None and int(lock_bars) > 0:
+                until = bar_index + int(lock_bars)
+                leg_u = str(closed_leg).upper()
+                prev = self.leg_lock_until.get(leg_u)
+                self.leg_lock_until[leg_u] = until if prev is None else max(int(prev), until)
+
         self.trades_today += 1
         if closed_leg == "STRADDLE":
             self.straddles_today += 1
         self.day_pnl += net_ret
         if net_ret < 0:
             self.loss_streak += 1
+            self.loss_legs_today.add(closed_leg)
+            if bool(getattr(self.replay_cfg, "loss_lock_leg_for_day", False)):
+                min_loss = getattr(self.replay_cfg, "loss_lock_leg_min_loss", None)
+                if min_loss is None or float(net_ret) <= float(min_loss):
+                    self.tick_stopped_legs.add(closed_leg)
             rc = self.replay_cfg
             if rc.loss_streak_n is not None and self.loss_streak >= rc.loss_streak_n:
                 self.streak_cooldown_until = bar_index + rc.loss_streak_cooldown_bars

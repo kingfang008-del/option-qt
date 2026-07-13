@@ -73,6 +73,15 @@ def choose_entry(
     spot_range_30m: Optional[float] = None,
     day_range_pos: Optional[float] = None,
     bb_width: Optional[float] = None,
+    best_side_put_prob: Optional[float] = None,
+    best_side_none_prob: Optional[float] = None,
+    best_side_call_prob: Optional[float] = None,
+    spot_down_prob: Optional[float] = None,
+    spot_flat_prob: Optional[float] = None,
+    spot_up_prob: Optional[float] = None,
+    call_threshold_mult: float = 1.0,
+    put_threshold_mult: float = 1.0,
+    put_structure_veto_until_bar: Optional[int] = None,
 ) -> Optional[EntryDecision]:
     """
     单 bar 入场决策。spread 门控在调用方二次校验(各腿 spread 不同)。
@@ -92,6 +101,14 @@ def choose_entry(
             and vix_reversal_count_30m > float(replay_cfg.regime_vix_reversal_max)
         ):
             return None
+
+    # Jul1 型: best_side 显式偏好 NONE 时整 bar 弃权(字段缺失不拦)
+    if bool(getattr(replay_cfg, "block_when_side_none", False)):
+        probs = (best_side_put_prob, best_side_none_prob, best_side_call_prob)
+        if all(p is not None and np.isfinite(p) for p in probs):
+            p_put, p_none, p_call = (float(p) for p in probs)
+            if p_none > p_put and p_none > p_call:
+                return None
 
     put_gate_ok = True
     fade_ok = False
@@ -231,10 +248,11 @@ def choose_entry(
         ):
             put_blocked = True
     if in_early and replay_cfg.put_early_open30_max_min is not None:
+        # 语义:要求 open30_max_ret > min。min=0 即必须曾翻红(挡 Jul1 阴跌开盘)。
         if (
             open30_max_ret is None
             or not np.isfinite(open30_max_ret)
-            or float(open30_max_ret) < float(replay_cfg.put_early_open30_max_min)
+            or float(open30_max_ret) <= float(replay_cfg.put_early_open30_max_min)
         ):
             put_blocked = True
     if in_early and replay_cfg.put_early_range30_min is not None:
@@ -244,6 +262,37 @@ def choose_entry(
             or float(spot_range_30m) < float(replay_cfg.put_early_range30_min)
         ):
             put_blocked = True
+    # 结构否决延长:早盘 open30 失败后禁 PUT 至指定 bar
+    if (
+        put_structure_veto_until_bar is not None
+        and session_bar is not None
+        and session_bar <= int(put_structure_veto_until_bar)
+    ):
+        put_blocked = True
+
+    # 方向头一致性:与 edge 选腿打架时禁对应腿(字段缺失不拦)
+    if bool(getattr(replay_cfg, "require_leg_side_agree", False)):
+        if (
+            best_side_put_prob is not None
+            and best_side_call_prob is not None
+            and np.isfinite(best_side_put_prob)
+            and np.isfinite(best_side_call_prob)
+        ):
+            if float(best_side_put_prob) <= float(best_side_call_prob):
+                put_blocked = True
+            if float(best_side_call_prob) <= float(best_side_put_prob):
+                call_blocked = True
+    if bool(getattr(replay_cfg, "require_leg_spot_agree", False)):
+        if (
+            spot_down_prob is not None
+            and spot_up_prob is not None
+            and np.isfinite(spot_down_prob)
+            and np.isfinite(spot_up_prob)
+        ):
+            if float(spot_down_prob) <= float(spot_up_prob):
+                put_blocked = True
+            if float(spot_up_prob) <= float(spot_down_prob):
+                call_blocked = True
 
     th_static = replay_cfg.threshold_at(session_bar)
     th = th_static
@@ -252,6 +301,12 @@ def choose_entry(
     th_put = th_static
     if put_dynamic_threshold is not None and np.isfinite(put_dynamic_threshold):
         th_put = max(th_put, float(put_dynamic_threshold))
+    c_mult = float(call_threshold_mult) if call_threshold_mult and call_threshold_mult > 0 else 1.0
+    p_mult = float(put_threshold_mult) if put_threshold_mult and put_threshold_mult > 0 else 1.0
+    if c_mult != 1.0:
+        th = th * c_mult
+    if p_mult != 1.0:
+        th_put = th_put * p_mult
 
     if not np.isfinite(spread_pct) or spread_pct > replay_cfg.max_spread_pct:
         return None

@@ -21,6 +21,21 @@ class ReplayConfig:
     tick_stop_cooldown_bars: Optional[int] = None
     # 快速止损代表该腿当日交易逻辑失效；锁同腿至收盘，反向腿仍可交易。
     tick_stop_lock_leg_for_day: bool = False
+    # 任意亏损平仓后锁同腿至收盘(与 tick 锁共用 stopped_legs)。偏严,会误杀
+    # 「早亏午赚」路径(Jul6 10:58 亏后 13:10 +38%)。
+    loss_lock_leg_for_day: bool = False
+    # 仅当单笔净亏损 <= 该阈值时才锁同腿(更负=更严)。None=任意亏损都锁。
+    # -0.15:锁 Jul1 10:47(-18%),不锁 Jul6 早盘(-13%)以便接到午后大 PUT。
+    loss_lock_leg_min_loss: Optional[float] = None
+    # 同腿亏损后再开:该腿入场阈值 × mult(>1=更紧)。None/1=不抬高。
+    loss_reentry_edge_mult: Optional[float] = None
+    # 早盘 PUT 因 open30 结构失败被挡后,禁 PUT 直到该 session_bar(含)。
+    # 防「挡掉 09:46 阴跌 PUT 后 10:47 同向再开」。None=不延长否决。
+    # Jul W1:拉到 sb120 会误杀 Jul2/Jul7 早盘大 PUT,默认关。
+    put_structure_veto_end_bar: Optional[int] = None
+    # SPOT_THESIS(bounce-cut) 出场后短期禁同腿再开。防 Jul1 10:47 减亏后 11:01 再开更差 PUT。
+    # 用 bar 数而非锁全日,以保留 Jul6 午后大 PUT。None/0=关闭。
+    thesis_lock_leg_bars: Optional[int] = None
     long_only: bool = True
     entry_threshold_schedule: Optional[tuple] = None
     max_trades_per_day: Optional[int] = None
@@ -131,6 +146,13 @@ class ReplayConfig:
     call_spent_day_range_pos_min: Optional[float] = None
     call_spent_bb_width_max: Optional[float] = None
     call_spent_min_session_bar: Optional[int] = None
+    # --- 方向头一致性门控(Jul1 09:46 PUT 型;字段缺失时不拦截) ---
+    # best_side_none_prob 严格高于 call/put 时整 bar 弃权(模型显式偏好 NONE)。
+    block_when_side_none: bool = False
+    # PUT 要求 put_prob>call_prob; CALL 要求 call_prob>put_prob。
+    require_leg_side_agree: bool = False
+    # PUT 要求 spot_down>spot_up; CALL 要求 spot_up>spot_down。
+    require_leg_spot_agree: bool = False
 
     def threshold_at(self, session_bar: Optional[int]) -> float:
         if self.entry_threshold_schedule is None or session_bar is None:

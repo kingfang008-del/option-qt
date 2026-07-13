@@ -2023,13 +2023,95 @@ def test_oms_stale_guard_allows_qqq_btc_forced_time_exits():
 
 
 def test_live_clock_converts_fcs_start_label_to_end_label(monkeypatch):
-    from qqq_btc.live.live_clock import live_session_bar
+    from qqq_btc.live.live_clock import live_session_bar, live_end_label_ts
 
     ts = pd.Timestamp("2026-07-02 09:48:00", tz="America/New_York").timestamp()
     monkeypatch.delenv("QQQ_BTC_LIVE_LABEL_SHIFT_SEC", raising=False)
     assert live_session_bar(ts) == 19
+    end = live_end_label_ts(ts)
+    assert end.tz_convert("America/New_York").strftime("%H:%M") == "09:49"
     monkeypatch.setenv("QQQ_BTC_LIVE_LABEL_SHIFT_SEC", "0")
     assert live_session_bar(ts) == 18
+
+
+def test_live_start_minute_allows_fcs_0944_as_session_bar_15():
+    """START_MINUTE=45 不得挡掉 FCS 09:44 start-label（end-label=09:45=sb15）。"""
+    import sys
+    from datetime import datetime
+    from pathlib import Path
+
+    from pytz import timezone
+
+    from qqq_btc.common.replay_types import ReplayConfig
+    from qqq_btc.live.session_governor import get_session_governor, _GOVERNORS
+    import qqq_btc.qqq.config as qcfg
+
+    _GOVERNORS.clear()
+    cfg = ReplayConfig(
+        long_only=False,
+        entry_quantile=None,
+        entry_threshold_schedule=((0, 0.03),),
+        put_gate_min=None,
+        put_early_session_bar=None,
+        put_early_open30_max_min=None,
+        put_trend_max_ret=None,
+        call_trend_r2_min=None,
+        regime_vix_reversal_max=None,
+        session_entry_start_bar=15,
+        session_entry_end_bar=240,
+    )
+    baseline = Path(__file__).resolve().parents[2] / "New_Pro" / "baseline_qqq"
+    if str(baseline) not in sys.path:
+        sys.path.insert(0, str(baseline))
+    import baseline_paths  # noqa: E402,F401
+
+    from strategy.core_v0 import StrategyCoreV0
+    from strategy.config0 import StrategyConfig
+    from qqq_btc.live.strategy_entry_bridge import apply_strategy_entry_patch
+
+    old_replay = qcfg.REPLAY
+    qcfg.REPLAY = cfg
+    try:
+        apply_strategy_entry_patch(StrategyCoreV0)
+        scfg = StrategyConfig()
+        scfg.START_MINUTE = 45
+        core = StrategyCoreV0(scfg)
+        ny = timezone("America/New_York")
+        # FCS start-label for end-label 09:45 / sb15
+        ctx = {
+            "is_ready": True,
+            "is_banned": False,
+            "position": 0,
+            "cooldown_until": 0.0,
+            "curr_ts": pd.Timestamp("2026-07-08 09:44:00", tz="America/New_York").timestamp(),
+            "time": datetime(2026, 7, 8, 9, 44, tzinfo=ny),
+            "net_edge_raw": 0.05,
+            "call_edge": 0.02,
+            "put_edge": 0.05,
+            "alpha_z": 0.05,
+            "vol_z": 0.5,
+            "bid": 1.98,
+            "ask": 2.02,
+            "curr_price": 2.0,
+            "put_bid": 1.98,
+            "put_ask": 2.02,
+            "put_spread_pct": 0.02,
+            "options_vw_spread": 0.02,
+            "options_iv_momentum": 0.0,
+            "symbol": "QQQ",
+            "spy_roc": 0.001,
+            "qqq_roc": 0.001,
+            "spread_divergence": 0.0,
+            "vix_level": 1.4,
+            "trend_fit_ret_30m": -0.0001,
+            "open30_max_ret": 0.001,
+        }
+        get_session_governor(cfg)
+        sig = core.decide_entry(dict(ctx))
+        assert sig is not None, core.get_last_reject_reason()
+    finally:
+        qcfg.REPLAY = old_replay
+        _GOVERNORS.clear()
 
 
 def test_bootstrap_tick_exits_mode():
@@ -2421,6 +2503,82 @@ def test_live_session_governor_frequency():
     assert blocked and reason == "max_trades_per_day"
 
 
+def test_live_cooldown_still_feeds_entry_quantile_edges():
+    """V0 pre_conditions 冷却只挡开仓，不挡 edge 缓冲（对齐 offline CLOSE）。"""
+    import sys
+    from datetime import datetime
+    from pathlib import Path
+
+    from pytz import timezone
+
+    from qqq_btc.common.replay_types import ReplayConfig
+    from qqq_btc.live.session_governor import get_session_governor, _GOVERNORS
+    import qqq_btc.qqq.config as qcfg
+
+    _GOVERNORS.clear()
+    cfg = ReplayConfig(
+        long_only=False,
+        entry_quantile=0.80,
+        entry_quantile_window=100,
+        entry_quantile_min_obs=5,
+        entry_threshold_schedule=((0, 0.99),),  # 禁止实际入场
+        put_gate_min=None,
+        call_trend_r2_min=None,
+        regime_vix_reversal_max=None,
+        cooldown_bars=10,
+    )
+    baseline = Path(__file__).resolve().parents[2] / "New_Pro" / "baseline_qqq"
+    if str(baseline) not in sys.path:
+        sys.path.insert(0, str(baseline))
+    import baseline_paths  # noqa: E402,F401
+
+    from strategy.core_v0 import StrategyCoreV0
+    from strategy.config0 import StrategyConfig
+    from qqq_btc.live.strategy_entry_bridge import apply_strategy_entry_patch
+
+    old_replay = qcfg.REPLAY
+    qcfg.REPLAY = cfg
+    try:
+        apply_strategy_entry_patch(StrategyCoreV0)
+        core = StrategyCoreV0(StrategyConfig())
+        ny = timezone("America/New_York")
+        ts = 1_700_000_000.0
+        cool_until = ts + 10 * 60.0
+        ctx = {
+            "is_ready": True,
+            "is_banned": False,
+            "position": 0,
+            "cooldown_until": cool_until,
+            "curr_ts": ts + 60.0,  # 仍在冷却内
+            "time": datetime(2026, 6, 2, 10, 30, tzinfo=ny),
+            "net_edge_raw": 0.05,
+            "call_edge": 0.05,
+            "put_edge": 0.02,
+            "alpha_z": 0.05,
+            "vol_z": 0.5,
+            "bid": 1.98,
+            "ask": 2.02,
+            "curr_price": 2.0,
+            "options_vw_spread": 0.02,
+            "options_iv_momentum": 0.0,
+            "symbol": "QQQ",
+            "spy_roc": 0.001,
+            "qqq_roc": 0.001,
+            "spread_divergence": 0.0,
+        }
+        gov = get_session_governor(cfg)
+        before = len(gov._state("QQQ").edge_buf or [])
+        assert core.decide_entry(dict(ctx)) is None
+        after = len(gov._state("QQQ").edge_buf or [])
+        assert after == before + 1
+        # 同 bar 去重
+        assert core.decide_entry(dict(ctx)) is None
+        assert len(gov._state("QQQ").edge_buf or []) == after
+    finally:
+        qcfg.REPLAY = old_replay
+        _GOVERNORS.clear()
+
+
 def test_live_session_governor_tick_stop_lockout_freezes_edges():
     from qqq_btc.common.replay_types import ReplayConfig
     from qqq_btc.live.session_governor import LiveSessionGovernor
@@ -2453,6 +2611,10 @@ def test_live_session_governor_tick_stop_lockout_freezes_edges():
     assert cool_until == ts + 30 * 60
     blocked, reason = gov.blocked_for_entry("QQQ", curr_ts=ts + 60)
     assert blocked and reason == "tick_stop_cooldown"
+    blocked, reason = gov.blocked_for_entry("QQQ", curr_ts=cool_until)
+    assert blocked and reason == "tick_stop_cooldown"
+    blocked, _ = gov.blocked_for_entry("QQQ", curr_ts=cool_until + 1)
+    assert not blocked
     assert gov.leg_blocked_for_entry("QQQ", leg="CALL", curr_ts=ts + 31 * 60)
     assert not gov.leg_blocked_for_entry("QQQ", leg="PUT", curr_ts=ts + 31 * 60)
 
@@ -2465,6 +2627,19 @@ def test_live_session_governor_tick_stop_lockout_freezes_edges():
         curr_ts=ts + 60,
     )
     assert len(gov._state("QQQ").edge_buf or []) == before
+
+
+def test_live_vixy_put_gate_uses_previous_minute():
+    from qqq_btc.common.vix_level import VixyCloseBuffer
+    from qqq_btc.live.signal_integration import append_vixy_and_get_lagged_gate
+
+    buf = VixyCloseBuffer()
+    buf.extend([100.0 + i * 0.1 for i in range(25)])
+    expected = buf.gate_level()
+    got = append_vixy_and_get_lagged_gate(buf, 110.0)
+    assert got == expected
+    assert len(buf) == 26
+    assert buf.gate_level() != expected
 
 
 def test_live_entry_quantile_raises_threshold():

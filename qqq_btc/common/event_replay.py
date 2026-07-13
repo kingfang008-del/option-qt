@@ -134,6 +134,14 @@ def _signal_from_row(
         spot_range_30m=_f("spot_range_30m"),
         day_range_pos=_f("day_range_pos"),
         bb_width=_f("bb_width"),
+        best_side_put_prob=_f("best_side_put_prob"),
+        best_side_none_prob=_f("best_side_none_prob"),
+        best_side_call_prob=_f("best_side_call_prob"),
+        spot_down_prob=_f("spot_down_prob"),
+        spot_flat_prob=_f("spot_flat_prob"),
+        spot_up_prob=_f("spot_up_prob"),
+        spot_close=_f("close"),
+        vwap_log_return=_f("vwap_log_return"),
     )
 
 
@@ -302,7 +310,15 @@ def run_event_replay(
                 ts,
                 session_bar,
                 close_quotes,
-                SessionSignal(),
+                SessionSignal(
+                    spot_close=(
+                        float(row["close"])
+                        if "close" in row.index
+                        and row["close"] is not None
+                        and np.isfinite(row["close"])
+                        else None
+                    )
+                ),
                 day_key=day_key,
                 phase=BarPhase.CLOSE,
                 allow_signal=False,
@@ -330,12 +346,19 @@ def run_event_replay(
             else minute_quotes
         )
 
-        # 注意:持仓 bar 传空 signal → 这些 bar 的 edge 不进分位缓冲。
+        # 注意:持仓 bar 不传 edge 信号 → 这些 bar 的 edge 不进分位缓冲。
         # 副作用:出场早晚会通过缓冲改写之后几天的动态阈值(路径依赖,与 live 侧
         # entry bridge 仅在空仓时 record_edges 的语义一致,暂保留)。
+        # 但仍必须传入 spot_close,否则 SPOT_THESIS 无法在持仓期看到现货路径。
         if session.position is not None:
+            spot_v = row["close"] if "close" in row.index else None
+            try:
+                spot_f = float(spot_v) if spot_v is not None and np.isfinite(spot_v) else None
+            except (TypeError, ValueError):
+                spot_f = None
+            hold_sig = SessionSignal(spot_close=spot_f)
             session.on_minute_bar(
-                bar_index, ts, session_bar, close_q, SessionSignal(),
+                bar_index, ts, session_bar, close_q, hold_sig,
                 day_key=day_key, phase=BarPhase.CLOSE, allow_signal=False,
                 allow_entry=(event_cfg.fill_timing == FillTiming.MINUTE_CLOSE),
             )

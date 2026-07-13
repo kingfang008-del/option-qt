@@ -31,7 +31,7 @@ replay_harness 与实盘策略层共用本模块,保证回放退出分布 = 实�
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,9 @@ class ExitRailsConfig:
     soft_stop_roi: float = -0.08          # 软止损
     # 孵化期:持有未满 N bar 时只跑 hard_stop(不做 soft/利润保护),给 thesis 时间
     profit_protect_min_bars: Optional[int] = None
+    # 孵化期更紧软止损(None=仍用 soft_stop_roi)。用于防 Jul1 型 6 分钟闪崩拖到 -20%。
+    # 仅 held < profit_protect_min_bars 时生效;孵化结束后回退 soft_stop_roi。
+    incubate_soft_stop_roi: Optional[float] = None
     # 早期止损:持有 early_stop_bars 后 ROI 仍 <= early_stop_roi 则离场(None=关闭)
     early_stop_bars: Optional[int] = None
     early_stop_roi: float = -0.05
@@ -74,6 +77,29 @@ class ExitRailsConfig:
     tick_profit_smooth_n: int = 3
     # 可选:按 tick_peak 的阶梯 floor(与分钟 ladder 同语义,但只读 tick_peak)
     tick_profit_ladder: Tuple[Tuple[float, float], ...] = ()
+    # --- 现货路径证伪(Jul1 型:PUT 买在局部山顶) ---
+    # PUT:现货相对入场价连续 confirm 根 > thr,且短窗动量仍向上 → SPOT_THESIS。
+    # CALL 对称(现货相对入场连续下破)。None=关闭。
+    # 用「相对入场 + 连续确认」,避免趋势中的单根反弹毛刺误杀(Jul2 10:32 仅 1 根翻红)。
+    # 全局默认关;见 bounce_cut_* —— 仅当 PUT 入场已见反弹 onset 时仓位级开启。
+    spot_thesis_against_entry: Optional[float] = None
+    spot_thesis_confirm_bars: int = 2
+    spot_thesis_min_hold_bars: int = 1
+    spot_thesis_mom_window: int = 3
+    spot_thesis_require_mom: bool = True
+    # --- 反弹 onset 仓位减亏(入场 open30 挡不住时) ---
+    # PUT 入场若 vwap_log_return 1m jump≥阈值 且 1m 现货「先跌后翻红」,
+    # 则对该仓启用紧 SPOT_THESIS(默认 thr=5bp/confirm=1),把 10:47 型从 -18% 收到 ~-10%。
+    # 不满足 onset 的赢家(Jul2/Jul7)仍走全局护栏。False=完全关闭。
+    bounce_cut_enabled: bool = False
+    bounce_vwap_jump_min: float = 0.001  # 10bp
+    bounce_spot_prior_bars: int = 5      # 入场前 prior 窗(分钟)
+    bounce_spot_thesis_against_entry: float = 0.0005  # 5bp
+    bounce_spot_thesis_confirm_bars: int = 1
+    bounce_spot_thesis_min_hold_bars: int = 2
+    bounce_spot_thesis_require_mom: bool = True
+    # 可选:onset 仓额外孵化紧 soft;thesis 已够用时保持 None。
+    bounce_incubate_soft_stop_roi: Optional[float] = None
     # --- 波动自适应缩放(vol_scale_ref=None 关闭) ---
     # 动机:阈值是按常态波动校准的静态数;高波动月(2026-06 尾部 p99 从 2 拉到 10)
     # 会"涨一点就 STEP_PROTECT 出场、跌一段就 HARD_STOP",把右尾剪掉、左尾留下。
@@ -124,6 +150,7 @@ def scale_rails(cfg: ExitRailsConfig, scale: float) -> ExitRailsConfig:
         cfg,
         hard_stop_roi=cfg.hard_stop_roi * s,
         soft_stop_roi=cfg.soft_stop_roi * s,
+        incubate_soft_stop_roi=_opt(cfg.incubate_soft_stop_roi),
         early_stop_roi=cfg.early_stop_roi * s,
         tick_fast_hard_roi=_opt(cfg.tick_fast_hard_roi),
         disaster_stop_roi=_opt(cfg.disaster_stop_roi),
@@ -206,6 +233,120 @@ def check_forced_time_exit(
     return None
 
 
+def detect_put_bounce_onset(
+    cfg: ExitRailsConfig,
+    *,
+    vwap_jump: Optional[float],
+    spot_closes: Sequence[float],
+) -> bool:
+    """
+    PUT 入场反弹 onset(分钟口径,与 1s ret30 翻红在 Jul W1 对齐):
+
+      vwap_log_return 1m jump ≥ bounce_vwap_jump_min
+      且 现货 last1m > 0、入场前 prior 窗收益 < 0
+    """
+    if not bool(getattr(cfg, "bounce_cut_enabled", False)):
+        return False
+    jump_min = float(getattr(cfg, "bounce_vwap_jump_min", 0.001) or 0.001)
+    if vwap_jump is None or not (float(vwap_jump) >= jump_min):
+        return False
+    prior_n = max(1, int(getattr(cfg, "bounce_spot_prior_bars", 5) or 5))
+    # 需要: ... close[-1-prior], close[-2], close[-1] → 至少 prior+2 根
+    if len(spot_closes) < prior_n + 2:
+        return False
+    c_last = float(spot_closes[-1])
+    c_prev = float(spot_closes[-2])
+    c_prior = float(spot_closes[-2 - prior_n])
+    if not (c_last > 0 and c_prev > 0 and c_prior > 0):
+        return False
+    last_ret = c_last / c_prev - 1.0
+    prior_ret = c_prev / c_prior - 1.0
+    return bool(last_ret > 0.0 and prior_ret < 0.0)
+
+
+def apply_bounce_cut_rails(cfg: ExitRailsConfig) -> ExitRailsConfig:
+    """对已判定 bounce onset 的 PUT 仓,挂上仓位级证伪/可选紧 soft。"""
+    soft = getattr(cfg, "bounce_incubate_soft_stop_roi", None)
+    return replace(
+        cfg,
+        spot_thesis_against_entry=float(cfg.bounce_spot_thesis_against_entry),
+        spot_thesis_confirm_bars=int(cfg.bounce_spot_thesis_confirm_bars),
+        spot_thesis_min_hold_bars=int(cfg.bounce_spot_thesis_min_hold_bars),
+        spot_thesis_require_mom=bool(cfg.bounce_spot_thesis_require_mom),
+        incubate_soft_stop_roi=(
+            float(soft) if soft is not None else cfg.incubate_soft_stop_roi
+        ),
+    )
+
+
+def maybe_bounce_cut_rails(
+    cfg: ExitRailsConfig,
+    *,
+    leg: str,
+    vwap_jump: Optional[float],
+    spot_closes: Sequence[float],
+) -> ExitRailsConfig:
+    """PUT + bounce onset → 仓位级减亏护栏;否则原样返回。"""
+    if str(leg).upper() != "PUT":
+        return cfg
+    if not detect_put_bounce_onset(cfg, vwap_jump=vwap_jump, spot_closes=spot_closes):
+        return cfg
+    return apply_bounce_cut_rails(cfg)
+
+
+def check_spot_thesis_invalidate(
+    cfg: ExitRailsConfig,
+    *,
+    leg: str,
+    spot_closes: Sequence[float],
+    entry_spot: float,
+    held: int,
+) -> Optional[str]:
+    """
+    现货路径证伪:方向单的「相对入场价」被连续反向收复。
+
+    PUT:现货连续 confirm 根站上 entry*(1+thr),且短窗动量仍向上 → SPOT_THESIS。
+    CALL:对称下破。孵化期内也生效(这正是要砍 Jul1 型闪崩的窗口)。
+    """
+    thr = cfg.spot_thesis_against_entry
+    if thr is None or not (thr > 0):
+        return None
+    if entry_spot is None or not (entry_spot > 0):
+        return None
+    if held < int(cfg.spot_thesis_min_hold_bars or 0):
+        return None
+    n = max(1, int(cfg.spot_thesis_confirm_bars or 1))
+    if len(spot_closes) < n:
+        return None
+    recent = [float(x) for x in spot_closes[-n:]]
+    if not all(x > 0 for x in recent):
+        return None
+    leg_u = str(leg).upper()
+    if leg_u == "PUT":
+        if not all((x / entry_spot - 1.0) > float(thr) for x in recent):
+            return None
+        if cfg.spot_thesis_require_mom:
+            w = max(1, int(cfg.spot_thesis_mom_window or 3))
+            if len(spot_closes) <= w:
+                return None
+            mom = float(spot_closes[-1]) / float(spot_closes[-1 - w]) - 1.0
+            if not (mom > 0):
+                return None
+        return "SPOT_THESIS"
+    if leg_u == "CALL":
+        if not all((x / entry_spot - 1.0) < -float(thr) for x in recent):
+            return None
+        if cfg.spot_thesis_require_mom:
+            w = max(1, int(cfg.spot_thesis_mom_window or 3))
+            if len(spot_closes) <= w:
+                return None
+            mom = float(spot_closes[-1]) / float(spot_closes[-1 - w]) - 1.0
+            if not (mom < 0):
+                return None
+        return "SPOT_THESIS"
+    return None
+
+
 def check_exit(
     cfg: ExitRailsConfig,
     pos: PositionState,
@@ -232,9 +373,14 @@ def check_exit(
     # 软止损也始终生效:孵化期若只留 hard,会拖到 -25%~-28% 才走
     # (Jul1 09:46 PUT: held=6 已 -22% 本该 soft,却拖到 held=13 才 HARD)。
     # 利润保护(阶梯/trailing/flash)仍仅孵化结束后启用,避免刚开仓小反弹被 STEP 剪掉。
+    # 孵化期可用更紧 incubate_soft_stop_roi(如 -12%),避免 6 分钟才踩到 -20%。
+    soft_thr = float(cfg.soft_stop_roi)
+    if incubating and cfg.incubate_soft_stop_roi is not None:
+        soft_thr = float(cfg.incubate_soft_stop_roi)
+
     if roi <= cfg.hard_stop_roi:
         return "HARD_STOP"
-    if roi <= cfg.soft_stop_roi:
+    if roi <= soft_thr:
         return "SOFT_STOP"
 
     if incubating:

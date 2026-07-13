@@ -100,6 +100,61 @@ def _edge_q10_from_ctx(ctx: dict) -> Optional[float]:
     return v if np.isfinite(v) else None
 
 
+def record_session_edges_from_ctx(ctx: dict, replay_cfg: Any = None) -> None:
+    """空仓分钟喂入滚动分位缓冲。
+
+    与 offline replay_session CLOSE 一致：冷却 / V0 入场窗 / max_trades
+    只挡开仓，不挡 edge 观测。持仓分钟不喂。
+    """
+    if not ctx.get("is_ready", False):
+        return
+    if int(ctx.get("position", 0) or 0) != 0:
+        return
+
+    from qqq_btc.live.session_governor import resolve_replay_cfg
+
+    cfg = resolve_replay_cfg(replay_cfg)
+    session_bar = _session_bar_from_ctx(ctx)
+    if not cfg.session_allows_entry(session_bar):
+        return
+
+    sym = str(ctx.get("symbol", "QQQ") or "QQQ")
+    curr_ts = float(ctx.get("curr_ts", 0.0) or 0.0)
+    edge = float(ctx.get("net_edge_raw", ctx.get("alpha_z", 0.0)) or 0.0)
+    call_edge = float(ctx.get("call_edge", edge) or edge)
+    put_edge = float(ctx.get("put_edge", 0.0) or 0.0)
+    dual_mode = not bool(cfg.long_only)
+
+    spot_day_ret = _f_ctx(ctx, "spot_day_ret")
+    if spot_day_ret is None:
+        spot_day_ret = _f_ctx(ctx, "qqq_day_roc")
+    trend_ret_30m = _f_ctx(ctx, "trend_fit_ret_30m")
+    trend_r2_30m = _f_ctx(ctx, "trend_fit_r2_30m")
+    vix_rev = _f_ctx(ctx, "vix_reversal_count_30m")
+    spot_range_30m = _f_ctx(ctx, "spot_range_30m")
+    day_range_pos = _f_ctx(ctx, "day_range_pos")
+    bb_width = _f_ctx(ctx, "bb_width")
+
+    gov = get_session_governor(cfg)
+    if curr_ts > 0:
+        gov.maybe_reset_day(sym, curr_ts)
+    gov.record_edges(
+        sym,
+        session_bar=session_bar,
+        call_edge=call_edge,
+        put_edge=put_edge,
+        dual_mode=dual_mode,
+        trend_r2_30m=trend_r2_30m,
+        spot_day_ret=spot_day_ret,
+        vix_reversal_count_30m=vix_rev,
+        spot_range_30m=spot_range_30m,
+        trend_ret_30m=trend_ret_30m,
+        day_range_pos=day_range_pos,
+        bb_width=bb_width,
+        curr_ts=curr_ts,
+    )
+
+
 def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
     """用 choose_entry 替换 V0 simple/legacy 入场路径；前置/流动性仍走 StrategyCoreV0。"""
     import os
@@ -113,19 +168,34 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
 
         enrich_ctx_regime(ctx, self.cfg)
 
-    if not self._check_entry_pre_conditions(ctx):
-        if not self._last_reject_reason:
-            self._last_reject_reason = "pre_conditions"
-        return None
-
     # Live 默认 REPLAY(含 entry_delay);QQQ_BTC_USE_LIVE_REPLAY=1 时用 immediate。
     # 阈值 override 与 fill 侧共用 resolve_replay_cfg，避免 governor 双实例。
+    from qqq_btc.live.live_clock import live_end_label_ts
     from qqq_btc.live.session_governor import resolve_replay_cfg
 
     replay_cfg = resolve_replay_cfg()
     session_bar = _session_bar_from_ctx(ctx)
     sym = str(ctx.get("symbol", "QQQ") or "QQQ")
     curr_ts = float(ctx.get("curr_ts", 0.0) or 0.0)
+
+    # 必须在 V0 pre_conditions / cooldown 之前喂缓冲，否则冷却期空仓 bar
+    # 会被静默丢掉，周终 edge_buf 会系统性低于 offline（例如 296 vs 471）。
+    record_session_edges_from_ctx(ctx, replay_cfg)
+
+    # V0 START_MINUTE/NO_ENTRY 看 ctx["time"] 的时钟分钟；FCS 是 start-label。
+    # 若不先换成 end-label，09:44 标签会被 START_MINUTE=45 挡掉，整周缺 sb15，
+    # 导致 7/6 贵买、7/8 撞上 put_trend 晚进。
+    ctx_pre = dict(ctx)
+    if ctx_pre.get("time") is not None:
+        try:
+            ctx_pre["time"] = live_end_label_ts(ctx_pre["time"]).to_pydatetime()
+        except Exception:
+            pass
+
+    if not self._check_entry_pre_conditions(ctx_pre):
+        if not self._last_reject_reason:
+            self._last_reject_reason = "pre_conditions"
+        return None
 
     # 连续流预热日禁止新开仓:QQQ_BTC_TRADE_FROM_DATE=YYYYMMDD|YYYY-MM-DD
     trade_from = os.environ.get("QQQ_BTC_TRADE_FROM_DATE", "").strip()
@@ -167,25 +237,18 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
     gov = get_session_governor(replay_cfg)
     if curr_ts > 0:
         gov.maybe_reset_day(sym, curr_ts)
-
-    # 与 offline replay_session CLOSE 一致；TICK_FAST_HARD 风险锁定期间
-    # governor 会跳过 edge，防止提前平仓改写后续动态阈值路径。
-    if replay_cfg.session_allows_entry(session_bar):
-        gov.record_edges(
-            sym,
-            session_bar=session_bar,
-            call_edge=call_edge,
-            put_edge=put_edge,
-            dual_mode=dual_mode,
-            trend_r2_30m=trend_r2_30m,
-            spot_day_ret=spot_day_ret,
-            vix_reversal_count_30m=vix_rev,
-            spot_range_30m=spot_range_30m,
-            trend_ret_30m=trend_ret_30m,
-            day_range_pos=day_range_pos,
-            bb_width=bb_width,
-            curr_ts=curr_ts,
-        )
+    # bounce-cut 输入:与 replay 分钟 CLOSE 追加 spot/vwap 对齐
+    spot_px = _f_ctx(ctx, "spot_close")
+    if spot_px is None:
+        spot_px = _f_ctx(ctx, "stock_price")
+    if spot_px is None:
+        spot_px = _f_ctx(ctx, "close")
+    gov.record_bounce_inputs(
+        sym,
+        spot_close=spot_px,
+        vwap_log_return=_f_ctx(ctx, "vwap_log_return"),
+        ts=float(curr_ts) if curr_ts and curr_ts > 0 else 0.0,
+    )
 
     blocked, block_reason = gov.blocked_for_entry(
         sym,
@@ -221,6 +284,13 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
 
     dyn_th, put_dyn_th = gov.dynamic_thresholds(sym)
     straddles_today = gov.straddles_today_for(sym)
+    gov.note_put_structure_veto(
+        sym,
+        session_bar=session_bar,
+        put_edge=put_edge,
+        open30_max_ret=_f_ctx(ctx, "open30_max_ret"),
+    )
+    c_mult, p_mult = gov.entry_threshold_mults(sym)
 
     decision = choose_entry(
         replay_cfg,
@@ -250,6 +320,15 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         spot_range_30m=spot_range_30m,
         day_range_pos=day_range_pos,
         bb_width=bb_width,
+        best_side_put_prob=_f_ctx(ctx, "best_side_put_prob"),
+        best_side_none_prob=_f_ctx(ctx, "best_side_none_prob"),
+        best_side_call_prob=_f_ctx(ctx, "best_side_call_prob"),
+        spot_down_prob=_f_ctx(ctx, "spot_down_prob"),
+        spot_flat_prob=_f_ctx(ctx, "spot_flat_prob"),
+        spot_up_prob=_f_ctx(ctx, "spot_up_prob"),
+        call_threshold_mult=c_mult,
+        put_threshold_mult=p_mult,
+        put_structure_veto_until_bar=gov.put_structure_veto_until_bar(sym),
     )
 
     if decision is None:

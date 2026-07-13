@@ -207,6 +207,17 @@ class LiveSignalEngine:
             spot_range_30m=row.get("spot_range_30m"),
             day_range_pos=row.get("day_range_pos"),
             bb_width=row.get("bb_width"),
+            best_side_put_prob=preds.get("best_side_put_prob") or row.get("best_side_put_prob"),
+            best_side_none_prob=preds.get("best_side_none_prob") or row.get("best_side_none_prob"),
+            best_side_call_prob=preds.get("best_side_call_prob") or row.get("best_side_call_prob"),
+            spot_down_prob=preds.get("spot_down_prob") or row.get("spot_down_prob"),
+            spot_flat_prob=preds.get("spot_flat_prob") or row.get("spot_flat_prob"),
+            spot_up_prob=preds.get("spot_up_prob") or row.get("spot_up_prob"),
+            spot_close=(
+                float(row["close"])
+                if "close" in row.index and row.get("close") is not None and np.isfinite(row.get("close"))
+                else None
+            ),
         )
         evs = self.session.on_minute_bar(
             self.bar_index, ts, sess, sq, signal, day_key=day_key

@@ -15,6 +15,7 @@ from qqq_btc.common.exit_rails import (
     PositionState,
     check_exit,
     check_forced_time_exit,
+    check_spot_thesis_invalidate,
 )
 from qqq_btc.live.live_clock import live_session_bar
 from qqq_btc.qqq import config as qcfg
@@ -80,6 +81,35 @@ def check_exit_via_rails(
     if roi_now > ps.max_roi:
         ps.max_roi = roi_now
         pos["max_roi"] = ps.max_roi
+
+    # 现货路径证伪(与 offline ReplaySession 同口径)
+    spot_px = None
+    for k in ("spot_close", "stock_price", "qqq_close", "close"):
+        v = ctx.get(k)
+        if v is not None:
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if fv > 0:
+                spot_px = fv
+                break
+    if spot_px is not None:
+        buf = pos.setdefault("qqq_btc_spot_closes", [])
+        if not buf or abs(float(buf[-1]) - spot_px) > 1e-12:
+            buf.append(spot_px)
+        if pos.get("entry_spot") is None:
+            pos["entry_spot"] = float(spot_px)
+        held = max(0, int(current_bar) - int(entry_bar))
+        thesis = check_spot_thesis_invalidate(
+            rails,
+            leg=str(pos.get("leg") or pos.get("chosen_leg") or ("PUT" if int(pos.get("dir", 1) or 1) < 0 else "CALL")),
+            spot_closes=buf,
+            entry_spot=float(pos["entry_spot"]),
+            held=held,
+        )
+        if thesis:
+            return {"action": "SELL", "reason": f"QQQ_BTC_{thesis}", "dir": pos.get("dir", 1)}
 
     reason = check_exit(
         rails,

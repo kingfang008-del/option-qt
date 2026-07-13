@@ -158,8 +158,16 @@ def apply_fill_audit_patch() -> None:
             from qqq_btc.live.live_clock import live_session_bar
             from qqq_btc.live.session_governor import get_session_governor
 
+            meta0 = dict(sig.get("meta", {}) or {})
+            leg0 = str(sig.get("leg") or meta0.get("leg") or "")
+            if not leg0:
+                for part in str(sig.get("reason", "") or "").split("|"):
+                    p = part.strip().upper()
+                    if p in ("CALL", "PUT", "STRADDLE"):
+                        leg0 = p
+                        break
             st.qqq_btc_entry_bar = live_session_bar(float(entry_ts))
-            rails, vol_scale = get_session_governor().scaled_exit_rails(sym)
+            rails, vol_scale = get_session_governor().scaled_exit_rails(sym, leg=leg0 or None)
             st.qqq_btc_exit_rails = rails
             st.qqq_btc_vol_scale = float(vol_scale)
         except Exception as e:

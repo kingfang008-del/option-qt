@@ -45,6 +45,16 @@ _PUT_GATE_RAW5_DEFAULT = (
 )
 
 
+def append_vixy_and_get_lagged_gate(
+    buf: VixyCloseBuffer, px: Optional[float]
+) -> Optional[float]:
+    """返回追加当前 close 之前的 gate，匹配离线 put_gate(+1min) 因果语义。"""
+    previous = buf.gate_level() if len(buf) >= 20 else None
+    if px is not None and px > 0:
+        buf.append(px)
+    return previous
+
+
 def _put_gate_mode() -> str:
     """vixy_z | vixy_5m | feature5m | off。
 
@@ -448,6 +458,27 @@ def create_qqq_btc_signal_engine(
             self._qqq_btc_net_arr = net_arr
             self._qqq_btc_raw_arr = raw_arr
 
+            side_probs = {}
+            side_t = model_out.get("logits_best_side")
+            if side_t is not None:
+                import torch
+
+                p_side = torch.softmax(side_t, dim=-1).detach().cpu().numpy()
+                side_probs["best_side_put_prob"] = p_side[:, 0]
+                side_probs["best_side_none_prob"] = p_side[:, 1]
+                side_probs["best_side_call_prob"] = p_side[:, 2]
+            spot_probs = {}
+            spot_t = model_out.get("logits_spot_dir")
+            if spot_t is not None:
+                import torch
+
+                p_spot = torch.softmax(spot_t, dim=-1).detach().cpu().numpy()
+                spot_probs["spot_down_prob"] = p_spot[:, 0]
+                spot_probs["spot_flat_prob"] = p_spot[:, 1]
+                spot_probs["spot_up_prob"] = p_spot[:, 2]
+            self._qqq_btc_side_probs = side_probs
+            self._qqq_btc_spot_probs = spot_probs
+
             return {
                 "edge": edge,
                 "execution_cost": exec_cost,
@@ -501,13 +532,9 @@ def create_qqq_btc_signal_engine(
                     return None
 
         def _update_vixy_gate_buffer(self, batch, symbols, prices) -> Optional[float]:
-            """从 batch 中的 VIXY 收盘价累积缓冲,返回 put_gate 用 vix_level。"""
+            """追加当前 VIXY close，但门控读取上一分钟值（离线 +1min 语义）。"""
             px = self._vixy_px_from_batch(batch, symbols, prices)
-            if px is not None and px > 0:
-                self._qqq_btc_vixy_buf.append(px)
-            if len(self._qqq_btc_vixy_buf) < 20:
-                return None
-            return self._qqq_btc_vixy_buf.gate_level()
+            return append_vixy_and_get_lagged_gate(self._qqq_btc_vixy_buf, px)
 
         def _update_vixy_5m_gate_buffer(self, batch, symbols, prices, ny_now) -> Optional[float]:
             """因果 5min raw put_gate（与离线 quote_features_raw 5min vix 同口径）。"""
@@ -601,6 +628,8 @@ def create_qqq_btc_signal_engine(
             if alpha_items:
                 raw_arr = getattr(self, "_qqq_btc_raw_arr", None)
                 net_arr = getattr(self, "_qqq_btc_net_arr", None)
+                side_probs = getattr(self, "_qqq_btc_side_probs", {}) or {}
+                spot_probs = getattr(self, "_qqq_btc_spot_probs", {}) or {}
                 for item in alpha_items:
                     sym = item.get("symbol")
                     if not sym:
@@ -622,6 +651,9 @@ def create_qqq_btc_signal_engine(
                     if net_arr is not None and idx < len(net_arr):
                         item["net_edge"] = float(net_arr[idx])
                         item["alpha"] = float(max(item.get("call_edge", 0.0) or 0.0, item.get("put_edge", 0.0) or 0.0))
+                    for k, arr in {**side_probs, **spot_probs}.items():
+                        if arr is not None and idx < len(arr):
+                            item[k] = float(arr[idx])
             return await super()._publish_alpha_frame(*args, alpha_items=alpha_items, **kwargs)
 
     return QqqBtcSignalEngine
