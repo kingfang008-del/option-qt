@@ -151,6 +151,10 @@ class SessionSignal:
     edge_q10: Optional[float] = None
     # PUT 腿行情开关信号(如归一化 vix_level);None=缺失,门控开启时视为不通过
     put_gate: Optional[float] = None
+    # 日前 lookback 的因果 VIXY z；跨日 PUT quarantine 的低波 regime 条件。
+    regime_vix_z: Optional[float] = None
+    # 前一已完成 VX 日线的期限结构 VX2/VX1-1。
+    vx_curve_slope: Optional[float] = None
     open30_max_ret: Optional[float] = None
     open30_peak_dd: Optional[float] = None
     spot_ret_5bar: Optional[float] = None
@@ -247,6 +251,9 @@ class ReplaySession:
         self.tick_stopped_legs: set[str] = set()
         # 当日已亏损的腿(loss_reentry_edge_mult 用)
         self.loss_legs_today: set[str] = set()
+        # 跨日腿级隔离：按账户仓位复利累计当日各腿贡献；日切时决定下一日锁腿。
+        self.day_leg_equity: Dict[str, float] = {"CALL": 1.0, "PUT": 1.0}
+        self.cross_day_quarantined_legs: set[str] = set()
         # SPOT_THESIS 后短期同腿锁:leg -> 禁开至该 bar_index(含)
         self.leg_lock_until: Dict[str, int] = {}
         # 早盘 open30 结构否决延长至该 session_bar(含)
@@ -295,7 +302,11 @@ class ReplaySession:
         """
         emitted: List[ReplayEvent] = []
         if day_key is not None and day_key != self.cur_day:
-            self._reset_day(day_key)
+            self._reset_day(
+                day_key,
+                regime_vix_z=signal.regime_vix_z,
+                vx_curve_slope=signal.vx_curve_slope,
+            )
 
         if phase == BarPhase.CLOSE:
             mid = quotes.mid(self.default_leg)
@@ -483,6 +494,14 @@ class ReplaySession:
             return []
         if decision.leg in self.tick_stopped_legs:
             return []
+        if decision.leg in self.cross_day_quarantined_legs:
+            return []
+        # STRADDLE 含 PUT 暴露，PUT quarantine 日不可借跨式绕过。
+        if (
+            decision.leg == "STRADDLE"
+            and "PUT" in self.cross_day_quarantined_legs
+        ):
+            return []
         lock_until = self.leg_lock_until.get(str(decision.leg).upper())
         if lock_until is not None and bar_index <= int(lock_until):
             return []
@@ -547,11 +566,50 @@ class ReplaySession:
             return []
         return [self._close_position(bar_index, ts, quotes, reason, disaster=True)]
 
-    def _reset_day(self, day_key: Any) -> None:
+    def _reset_day(
+        self,
+        day_key: Any,
+        *,
+        regime_vix_z: Optional[float] = None,
+        vx_curve_slope: Optional[float] = None,
+    ) -> None:
+        put_quarantine_loss = getattr(
+            self.replay_cfg, "next_day_put_quarantine_loss", None
+        )
+        put_quarantine_vix_z_max = getattr(
+            self.replay_cfg, "next_day_put_quarantine_vix_z_max", None
+        )
+        put_quarantine_vx_slope_min = getattr(
+            self.replay_cfg, "next_day_put_quarantine_vx_slope_min", None
+        )
+        prev_put_contribution = self.day_leg_equity.get("PUT", 1.0) - 1.0
+        regime_ok = put_quarantine_vix_z_max is None or (
+            regime_vix_z is not None
+            and np.isfinite(regime_vix_z)
+            and float(regime_vix_z) <= float(put_quarantine_vix_z_max)
+        )
+        vx_curve_ok = put_quarantine_vx_slope_min is None or (
+            vx_curve_slope is not None
+            and np.isfinite(vx_curve_slope)
+            and float(vx_curve_slope) >= float(put_quarantine_vx_slope_min)
+        )
+        if (
+            self.cur_day is not None
+            and put_quarantine_loss is not None
+            and np.isfinite(prev_put_contribution)
+            and prev_put_contribution <= float(put_quarantine_loss)
+            and regime_ok
+            and vx_curve_ok
+        ):
+            self.cross_day_quarantined_legs = {"PUT"}
+        else:
+            self.cross_day_quarantined_legs.clear()
+
         self.cur_day = day_key
         self.trades_today = 0
         self.straddles_today = 0
         self.day_pnl = 0.0
+        self.day_leg_equity = {"CALL": 1.0, "PUT": 1.0}
         self.day_halted = False
         self.pending_entry_bar = None
         self.loss_streak = 0
@@ -875,6 +933,11 @@ class ReplaySession:
         if closed_leg == "STRADDLE":
             self.straddles_today += 1
         self.day_pnl += net_ret
+        if closed_leg in self.day_leg_equity:
+            position_frac = float(
+                getattr(self.replay_cfg, "position_frac", 1.0) or 1.0
+            )
+            self.day_leg_equity[closed_leg] *= 1.0 + position_frac * net_ret
         if net_ret < 0:
             self.loss_streak += 1
             self.loss_legs_today.add(closed_leg)

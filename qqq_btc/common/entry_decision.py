@@ -349,12 +349,14 @@ def choose_entry(
     if chosen_leg is None:
         return None
 
-    if chosen_leg == "CALL" and edge_q10 is not None:
-        # 0DTE:真实标签 p10 常为负,用 floor 而非强制 q10>0
-        floor = replay_cfg.edge_q10_floor
-        if floor is not None:
-            if not (np.isfinite(edge_q10) and edge_q10 > float(floor)):
-                return None
+    floor = replay_cfg.edge_q10_floor
+    apply_q10 = chosen_leg == "CALL" or (
+        chosen_leg == "PUT" and bool(getattr(replay_cfg, "apply_put_edge_q10", False))
+    )
+    if apply_q10 and edge_q10 is not None and floor is not None:
+        # 真实标签 p10 常为负,用 floor 而非强制 q10>0
+        if not (np.isfinite(edge_q10) and edge_q10 > float(floor)):
+            return None
 
     if chosen_leg == "PUT" and put_spread_pct is not None:
         if not np.isfinite(put_spread_pct) or put_spread_pct > replay_cfg.max_spread_pct:

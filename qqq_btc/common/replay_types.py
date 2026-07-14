@@ -42,6 +42,16 @@ class ReplayConfig:
     daily_loss_stop: Optional[float] = None
     loss_streak_n: Optional[int] = None
     loss_streak_cooldown_bars: int = 30
+    # 跨日腿级隔离：若前一交易日 PUT sleeve 的账户贡献
+    # prod(1 + position_frac * net_return) - 1 <= 此阈值，下一交易日禁开 PUT。
+    # None=关闭；例如 -0.02 表示 acct25 PUT 贡献不高于 -2%。
+    next_day_put_quarantine_loss: Optional[float] = None
+    # 可选的当日因果 regime 条件：仅当日前 lookback vix_z <= 此值才执行上述隔离。
+    # None=不加 regime 条件。该输入应由每个交易日前已完成数据计算，禁止用当日未来值。
+    next_day_put_quarantine_vix_z_max: Optional[float] = None
+    # 可选的 VX contango 条件：仅当日前已完成 VX 日线的 VX2/VX1-1 >= 此值。
+    # 使用无量纲期限结构而非 VIXY ETF 价格水平；None=不加此条件。
+    next_day_put_quarantine_vx_slope_min: Optional[float] = None
     straddle_entry_threshold: Optional[float] = None
     max_straddles_per_day: Optional[int] = None
     # 会话内 bar 序号(09:30=0)允许新开仓区间;None=不限制
@@ -66,6 +76,9 @@ class ReplayConfig:
     # True: PUT 腿也用 put_edge 分位抬高门槛。False:仅 CALL 用分位(PUT 仍用静态阈值)。
     # Jul W1 对拍:put_dyn 会把 13:10 大 PUT(edge~0.044)挡在 q80~0.06 外,丢掉 +38% 路径关键腿。
     apply_put_entry_quantile: bool = True
+    # 默认 False:仅 CALL 吃 edge_q10_floor(历史 Jul W1 PUT 赢家常带差 q10)。
+    # True:PUT 共用同一 floor(OPEN_DEFENSE profile / 高波动防御)。
+    apply_put_edge_q10: bool = False
     # --- PUT 腿行情开关(None=不门控) ---
     # PUT 只在恐慌/高波动 regime 有正期望:三时期审计显示 vix_level(归一化)
     # 最高四分位贡献了 PUT 几乎全部利润,低 VIX 时 PUT 持续放血且挤占 CALL

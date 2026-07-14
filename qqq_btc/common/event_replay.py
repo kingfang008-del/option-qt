@@ -124,6 +124,8 @@ def _signal_from_row(
         straddle_edge=_f(straddle_edge_col),
         edge_q10=_f(edge_q10_col),
         put_gate=_f(put_gate_col),
+        regime_vix_z=_f("regime_vix_z"),
+        vx_curve_slope=_f("vx_curve_slope"),
         open30_max_ret=_f("open30_max_ret"),
         open30_peak_dd=_f("open30_peak_dd"),
         spot_ret_5bar=_f("spot_ret_5bar"),
@@ -356,7 +358,11 @@ def run_event_replay(
                 spot_f = float(spot_v) if spot_v is not None and np.isfinite(spot_v) else None
             except (TypeError, ValueError):
                 spot_f = None
-            hold_sig = SessionSignal(spot_close=spot_f)
+            hold_sig = SessionSignal(
+                spot_close=spot_f,
+                regime_vix_z=signal.regime_vix_z,
+                vx_curve_slope=signal.vx_curve_slope,
+            )
             session.on_minute_bar(
                 bar_index, ts, session_bar, close_q, hold_sig,
                 day_key=day_key, phase=BarPhase.CLOSE, allow_signal=False,
@@ -366,7 +372,14 @@ def run_event_replay(
 
         if session.pending_entry_bar is not None and bar_index >= session.pending_entry_bar:
             session.on_minute_bar(
-                bar_index, ts, session_bar, entry_quotes, SessionSignal(),
+                bar_index,
+                ts,
+                session_bar,
+                entry_quotes,
+                SessionSignal(
+                    regime_vix_z=signal.regime_vix_z,
+                    vx_curve_slope=signal.vx_curve_slope,
+                ),
                 day_key=day_key, phase=BarPhase.CLOSE,
                 allow_signal=False,
                 allow_entry=True,

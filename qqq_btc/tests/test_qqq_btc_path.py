@@ -853,6 +853,98 @@ def test_replay_governance_resets_per_day():
     assert len(days) == 2
 
 
+def test_replay_next_day_put_quarantine_then_unlocks():
+    """前日 PUT sleeve 触阈后仅锁下一交易日，第三日自动恢复。"""
+    from dataclasses import replace
+
+    fm = OptionSpreadFillModel()
+    day1 = _make_dual_leg_df(n=20, put_drift=-0.10)
+    day2 = _make_dual_leg_df(n=20, put_drift=0.05)
+    day3 = _make_dual_leg_df(n=20, put_drift=0.05)
+    day2["timestamp"] = day2["timestamp"] + pd.Timedelta(days=1)
+    day3["timestamp"] = day3["timestamp"] + pd.Timedelta(days=2)
+    df = pd.concat([day1, day2, day3], ignore_index=True)
+    df["call_net_edge"] = 0.0
+    df["put_net_edge"] = 0.0
+    df.loc[[0, 20, 40], "put_net_edge"] = 0.05
+
+    base = ReplayConfig(
+        entry_threshold=0.015,
+        long_only=False,
+        cooldown_bars=0,
+        position_frac=0.25,
+    )
+    unlocked = run_strict_replay(
+        df,
+        fm,
+        base,
+        _FAST_EXIT_RAILS,
+        call_edge_col="call_net_edge",
+        put_edge_col="put_net_edge",
+    )
+    assert len(unlocked.trades) == 3
+    assert unlocked.trades[0].net_return < 0
+
+    quarantined = run_strict_replay(
+        df,
+        fm,
+        replace(base, next_day_put_quarantine_loss=-0.02),
+        _FAST_EXIT_RAILS,
+        call_edge_col="call_net_edge",
+        put_edge_col="put_net_edge",
+    )
+    assert len(quarantined.trades) == 2
+    trade_days = [pd.Timestamp(t.entry_ts).date().isoformat() for t in quarantined.trades]
+    assert trade_days == ["2026-06-01", "2026-06-03"]
+
+    # 当前日不满足低波 regime 条件时，不得仅凭前日亏损误锁。
+    df["regime_vix_z"] = 0.0
+    regime_filtered = run_strict_replay(
+        df,
+        fm,
+        replace(
+            base,
+            next_day_put_quarantine_loss=-0.02,
+            next_day_put_quarantine_vix_z_max=-0.75,
+        ),
+        _FAST_EXIT_RAILS,
+        call_edge_col="call_net_edge",
+        put_edge_col="put_net_edge",
+    )
+    assert len(regime_filtered.trades) == 3
+
+    # VX 曲线不够陡时同样不锁；期限结构输入必须来自当日前已完成数据。
+    df["vx_curve_slope"] = 0.01
+    vx_filtered = run_strict_replay(
+        df,
+        fm,
+        replace(
+            base,
+            next_day_put_quarantine_loss=-0.02,
+            next_day_put_quarantine_vx_slope_min=0.05,
+        ),
+        _FAST_EXIT_RAILS,
+        call_edge_col="call_net_edge",
+        put_edge_col="put_net_edge",
+    )
+    assert len(vx_filtered.trades) == 3
+
+
+def test_vx_rule_profile_selector():
+    from qqq_btc.common.rule_profiles import select_profile_name_vx
+
+    assert select_profile_name_vx(-0.01, qqq_up_frac=0.8, qqq_range_mean=0.02) == (
+        "OPEN_DEFENSE"
+    )
+    assert select_profile_name_vx(0.06, qqq_up_frac=0.4, qqq_range_mean=0.016) == (
+        "CHOP_NO_TRADE"
+    )
+    assert select_profile_name_vx(0.06, qqq_up_frac=0.8, qqq_range_mean=0.016) == (
+        "TREND_PUT_OK"
+    )
+    assert select_profile_name_vx(float("nan")) == "TREND_PUT_OK"
+
+
 def test_loss_call_put_term():
     """call/put 双腿损失:有符号标签 + rank 项参与总损失。"""
     import pytest

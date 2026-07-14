@@ -1,0 +1,48 @@
+{
+  "name": "rule_profiles_v2",
+  "description": "按因果现货状态切换入场规则（Apr 高波防御 + May/Jun 压缩震荡禁开）。相似≠可赚。",
+  "selector": {
+    "lookback_trading_days": 5,
+    "open_defense_vix_z_min": 0.5,
+    "chop_up_frac_max": 0.5,
+    "chop_range_mean_max": 0.019,
+    "chop_requires_vix_z_below_open_defense": true,
+    "note": "lookback=本日前 N 个交易日。优先级：OPEN_DEFENSE(vix_z高) > CHOP_NO_TRADE(压缩+弱涨占比) > TREND_PUT_OK。阈值由 2026-05/06 日收益对照网格提炼，并在 04/07 做压力。"
+  },
+  "vx_selector": {
+    "open_defense_curve_slope_max": 0.01,
+    "chop_curve_slope_min": 0.03,
+    "chop_up_frac_max": 0.5,
+    "chop_range_mean_min": 0.014,
+    "chop_range_mean_max": 0.019,
+    "note": "仅使用前一已完成 Databento VX UTC 日桶。VX2/VX1-1<=1% 为 backwardation/近乎平坦防御；>=3% 且 QQQ 中等压缩为 CHOP。"
+  },
+  "default_profile": "TREND_PUT_OK",
+  "profiles": {
+    "TREND_PUT_OK": {
+      "description": "默认/趋势可交易：CALL-only q10，09:45 开仓（Jul/多数 Jun）",
+      "overrides": {
+        "session_entry_start_bar": 15,
+        "apply_put_edge_q10": false,
+        "edge_q10_floor": -0.2
+      }
+    },
+    "OPEN_DEFENSE": {
+      "description": "高波动开盘防御：10:30 起 + PUT 也吃 q10（Apr 初）",
+      "overrides": {
+        "session_entry_start_bar": 60,
+        "apply_put_edge_q10": true,
+        "edge_q10_floor": -0.2
+      }
+    },
+    "CHOP_NO_TRADE": {
+      "description": "压缩波动+弱上涨占比：全日禁新开（May/Jun 阴跌磨盘日）",
+      "overrides": {
+        "session_entry_start_bar": 15,
+        "apply_put_edge_q10": false,
+        "edge_q10_floor": -0.2,
+        "max_trades_per_day": 0
+      }
+    }
+  }
+}
