@@ -1,0 +1,17 @@
+{
+  "period": "2026-05-01..2026-07-13",
+  "variant": "single_t30_rails",
+  "n_trades": 64,
+  "win_rate": 0.578125,
+  "avg_win": 0.42057579966270237,
+  "avg_loss": -0.2552342899937888,
+  "profit_loss_ratio_avg": 1.6478028860187133,
+  "gross_profit": 15.561304587519988,
+  "gross_loss": -6.891325829832297,
+  "profit_factor": 2.2581002512108292,
+  "trade_exp": 0.13546841808887014,
+  "account_total_ret": 2.527895180091548,
+  "account_maxdd": -0.25081956118897,
+  "n_days": 49,
+  "day_win_rate": 0.46938775510204084
+}

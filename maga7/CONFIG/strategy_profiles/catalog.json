@@ -7,13 +7,31 @@
   },
   "fill_frac": 0.8,
   "moneyness": "ATM",
-  "default_profile": "CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json",
-  "default_matches": "strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json",
+  "default_profile": "CONFIG/strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_v1.json",
+  "default_matches": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_v1.json",
   "profiles": [
+    {
+      "id": "single_qqq_open_ladder_atm5otm_t30_rails_p20_v1",
+      "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_v1.json",
+      "role": "causal_baseline",
+      "scheme": "single",
+      "reentry_mode": "cooldown_only",
+      "position_sizing": "concurrent",
+      "position_frac": 0.2,
+      "exit_mode": "none",
+      "hold_minutes": 30,
+      "contract_mode": "open_ladder",
+      "ladder_otm_rungs": 5,
+      "result_dir": "results/replay_single_t30_rails_p20_jan_jul_delay60",
+      "total_ret_causal_delay60": 8.636,
+      "maxdd_causal_delay60": -0.286,
+      "docs": "docs/causal_single_t30_rails_baseline.md",
+      "note": "Causal baseline 2026-07-16: first-only + T+30 TP/SL; delay=60. Optimize against this."
+    },
     {
       "id": "m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1",
       "path": "strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json",
-      "role": "production_temp_open_ladder",
+      "role": "legacy_pre_delay_and_mf_flip_control",
       "scheme": "m5_circuit",
       "reentry_mode": "only_win",
       "position_sizing": "concurrent",
@@ -25,7 +43,7 @@
       "parity_dir": "results/parity_open_ladder_otm5_mf_flip_p20_jan_jul",
       "total_ret_ladder": 33.751,
       "maxdd_ladder": -0.221,
-      "note": "Temporary production 2026-07-16."
+      "note": "Legacy control. +3375% is pre-delay illusion; causal delay60 ~+50%/-52%. Superseded by single_t30_rails baseline."
     },
     {
       "id": "m5c_baseline_v1",

@@ -1,0 +1,57 @@
+{
+  "period": "2026-01-02..2026-07-13",
+  "delay_seconds": 60,
+  "baseline": {
+    "name": "prod_m5c_mf_flip",
+    "scheme": "m5_circuit",
+    "hold_minutes": 30,
+    "exit_mode": "mf_flip",
+    "tp_mult": 1.6,
+    "sl_mult": 0.4,
+    "vol_z_min": 1.0,
+    "reentry_mode": "only_win",
+    "total_ret": 0.4982441530648163,
+    "maxdd": -0.5170941985640778,
+    "n_trades": 207,
+    "trade_win": 0.3671497584541063,
+    "trade_exp": 0.02232255972201836,
+    "end_equity": 149.82441530648163
+  },
+  "best_by_ret": {
+    "name": "single_t30_rails",
+    "scheme": "single",
+    "hold_minutes": 30,
+    "exit_mode": "none",
+    "tp_mult": 1.6,
+    "sl_mult": 0.4,
+    "vol_z_min": 1.0,
+    "reentry_mode": "only_win",
+    "total_ret": 8.635680144510655,
+    "maxdd": -0.2856372389084858,
+    "n_trades": 134,
+    "trade_win": 0.5522388059701493,
+    "trade_exp": 0.11426645990010455,
+    "end_equity": 963.5680144510656
+  },
+  "pick_ret_with_dd_gt_-45": {
+    "name": "single_t30_rails",
+    "scheme": "single",
+    "hold_minutes": 30,
+    "exit_mode": "none",
+    "tp_mult": 1.6,
+    "sl_mult": 0.4,
+    "vol_z_min": 1.0,
+    "reentry_mode": "only_win",
+    "total_ret": 8.635680144510655,
+    "maxdd": -0.2856372389084858,
+    "n_trades": 134,
+    "trade_win": 0.5522388059701493,
+    "trade_exp": 0.11426645990010455,
+    "end_equity": 963.5680144510656
+  },
+  "uplift_vs_baseline_pp": {
+    "best_ret": 8.13743599144584,
+    "pick": 8.13743599144584
+  },
+  "note": "All runs causal bar_availability_delay_seconds=60, open_ladder, concurrent p20. norails = tp_mult=999/sl_mult=0 pure time exit."
+}

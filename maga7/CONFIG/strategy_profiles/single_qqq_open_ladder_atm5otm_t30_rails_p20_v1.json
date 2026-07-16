@@ -1,11 +1,12 @@
 {
-  "profile": "m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1",
-  "profile_id": "m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1",
-  "description": "Temporary production: OTM5 open ladder + only_win + concurrent p20 + mf_flip exit. Under causal delay=60 this underperforms single+T+30 rails (see single_qqq_open_ladder_atm5otm_t30_rails_p20_v1). Headline +3375%/-22% is pre-delay only.",
-  "role": "legacy_pre_delay_and_mf_flip_control",
-  "result_tag": "jan_jul_m5c_qqq_onlywin_open_ladder_otm5_mf_flip_p20",
-  "parity_tag": "parity_open_ladder_otm5_mf_flip_p20_jan_jul",
-  "based_on": "strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p15_v1.json",
+  "profile": "single_qqq_open_ladder_atm5otm_t30_rails_p20_v1",
+  "profile_id": "single_qqq_open_ladder_atm5otm_t30_rails_p20_v1",
+  "description": "Causal baseline (2026-07-16): open_ladder OTM5 + QQQ regime + concurrent p20; first Rule-A only (scheme=single); exit=T+30 with TP1.6/SL0.4 rails (no mf_flip). Optimize future changes against this. Docs: docs/causal_single_t30_rails_baseline.md",
+  "role": "causal_baseline",
+  "result_tag": "replay_single_t30_rails_p20_jan_jul_delay60",
+  "based_on": "strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json",
+  "recommended_scheme": "single",
+  "baseline_doc": "docs/causal_single_t30_rails_baseline.md",
   "symbols": ["NVDA", "TSLA", "AAPL", "AMZN", "META", "MSFT", "AMD"],
   "signal": {
     "window_start": "10:30",
@@ -26,11 +27,11 @@
     "position_sizing": "concurrent",
     "max_concurrent_positions": 2,
     "cooldown_minutes": 5,
-    "max_entries_per_symbol": 5,
+    "max_entries_per_symbol": 1,
     "day_circuit": -0.05,
-    "reentry_mode": "only_win",
-    "only_reenter_after_win": true,
-    "exit_mode": "mf_flip",
+    "reentry_mode": "cooldown_only",
+    "only_reenter_after_win": false,
+    "exit_mode": "none",
     "exit_mf_grace_seconds": 60,
     "bar_availability_delay_seconds": 60,
     "moneyness": "ATM",
@@ -39,7 +40,7 @@
     "quote_source": "1s",
     "day_iv_half_spread_frac": 0.01,
     "clear_otm_ban_0dte_pct": 0.01,
-    "note": "Temp production 2026-07-16: alone 20%, second concurrent leg 10%, max 2 opens; mf10 flip exit."
+    "note": "scheme must be single. exit_mode=none means TP/SL/T+hold only; no mf_flip."
   },
   "regime": {
     "enabled": true,
@@ -84,12 +85,11 @@
     "allowed_dte": [0, 1, 2],
     "otm_rungs": 5
   },
-  "headline_jan_jul_1s": {
-    "scheme": "m5_circuit",
-    "open_ladder_total_ret": 33.751,
-    "open_ladder_maxdd": -0.221,
-    "day_lock_total_ret": 53.731,
-    "day_lock_maxdd": -0.232,
-    "note": "Pre bar_availability_delay research from open_ladder_ab_1s_otm5_ow_conc_p20_mf_flip_jan_jul; not current gate evidence."
+  "causal_evidence_2026_07_16": {
+    "delay_seconds": 60,
+    "may_jul": {"total_ret": 2.528, "maxdd": -0.251, "n_trades": 64},
+    "jan_jul": {"total_ret": 8.636, "maxdd": -0.286, "n_trades": 134},
+    "vs_old_prod_mf_flip_jan_jul": {"old_ret": 0.498, "old_maxdd": -0.517},
+    "ablation_tag": "exit_reentry_ablation_jan_jul/single_t30_rails"
   }
 }
