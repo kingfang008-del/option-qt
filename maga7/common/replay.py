@@ -27,6 +27,9 @@ from maga7.common.signals import (
     all_rule_a_times,
     attach_mf_features,
     build_topk_signals,
+    count_peer_align,
+    price_efficiency_ok,
+    sync_index,
     load_stock_month_files,
 )
 
@@ -130,7 +133,34 @@ def _prepare_stock_day(stock_day: pd.DataFrame | None) -> pd.DataFrame | None:
     day["_mf"] = day["mf10"].astype(float)
     day["_su"] = day["streak_up"].astype(int) if "streak_up" in day.columns else 0
     day["_sd"] = day["streak_dn"].astype(int) if "streak_dn" in day.columns else 0
+    if "net$" in day.columns:
+        day["_net"] = day["net$"].astype(float)
+        day["_net_csum"] = day["_net"].cumsum()
     return day
+
+
+def _cum_fav_flow(
+    day: pd.DataFrame | None,
+    entry_ts: pd.Timestamp,
+    visible_at: pd.Timestamp,
+    direction: str,
+) -> float | None:
+    """Post-entry cumulative favorable money flow (UP=inflow, DN=outflow)."""
+    if day is None or day.empty or "_ts_ns" not in day.columns or "_net_csum" not in day.columns:
+        return None
+    if direction not in ("UP", "DN"):
+        return None
+    ts_ns = day["_ts_ns"].to_numpy()
+    csum = day["_net_csum"].to_numpy()
+    i0 = int(np.searchsorted(ts_ns, entry_ts.value, side="left"))
+    i1 = int(np.searchsorted(ts_ns, visible_at.value, side="right") - 1)
+    if i1 < i0 or i0 >= len(csum):
+        return None
+    prev = float(csum[i0 - 1]) if i0 > 0 else 0.0
+    raw = float(csum[i1]) - prev
+    if not np.isfinite(raw):
+        return None
+    return raw if direction == "UP" else -raw
 
 
 def simulate_trade(
@@ -145,13 +175,30 @@ def simulate_trade(
     stock_day: pd.DataFrame | None = None,
     exit_mode: str | None = None,
     exit_mf_grace_seconds: int = 60,
+    exit_min_hold_minutes: float | None = None,
+    mtm_floor_ret: float | None = None,
+    flow_cum_floor: float | None = None,
+    stock_bar_delay_seconds: int = 0,
+    trail_activate: float | None = None,
+    trail_dd: float | None = None,
 ) -> SimResult | None:
-    """Option path fill with TP/SL/time, optional stock-window early exit.
+    """Option path fill with TP/SL/time, optional stock-window or MTM trail exit.
 
     ``exit_mode``:
       - ``None`` / ``none`` / ``rails``: TP/SL/T+hold only (default)
       - ``mf_flip``: exit when mf10 flips against ``direction`` (after grace)
+      - ``mf_reversal``: same as mf_flip but default min-hold ~10m before watching
+        (V-reversals often start ~10m after entry; avoids the old 60s grace trap)
       - ``streak_break``: exit when entry-dir streak resets and mf opposing
+      - ``mtm_trail`` / ``trail``: after peak MTM ret >= ``trail_activate``,
+        exit when ret falls by ``trail_dd`` from that peak (still respects TP/SL/T+hold)
+      - ``mtm_floor`` / ``mtm_defend``: after min-hold (default 10m), exit if MTM ret
+        <= ``mtm_floor_ret`` (default 0). Targets early V givebacks without shortening winners.
+      - ``flow_die`` / ``cum_fav``: after min-hold (default 5m), exit if post-entry
+        cumulative favorable stock net$ <= ``flow_cum_floor`` (default 0).
+        UP uses inflow (net$); DN uses outflow (-net$).
+      - ``flow_mtm`` / ``flow_soft``: same flow check, but only exit when option MTM
+        ret also <= ``mtm_floor_ret`` (default 0). Softens false cuts on winners.
     """
     if path is None or path.empty:
         return None
@@ -172,10 +219,29 @@ def simulate_trade(
     tp_lvl, sl_lvl = entry * tp_mult, entry * sl_mult
     reason, exit_px, exit_ts = "T+30", float(sell_px[-1]), ts_list[-1]
     mode = str(exit_mode or "none").strip().lower()
-    use_mf = mode in ("mf_flip", "streak_break") and direction in ("UP", "DN")
-    grace_until = entry_ts + pd.Timedelta(seconds=int(exit_mf_grace_seconds))
+    use_mf = mode in ("mf_flip", "mf_reversal", "streak_break") and direction in ("UP", "DN")
+    use_trail = mode in ("mtm_trail", "trail")
+    use_floor = mode in ("mtm_floor", "mtm_defend")
+    use_flow = mode in ("flow_die", "cum_fav", "flow_mtm", "flow_soft") and direction in ("UP", "DN")
+    require_mtm = mode in ("flow_mtm", "flow_soft")
+    act = float(trail_activate) if trail_activate is not None else 0.20
+    dd = float(trail_dd) if trail_dd is not None else 0.15
+    floor = float(mtm_floor_ret) if mtm_floor_ret is not None else 0.0
+    flow_floor = float(flow_cum_floor) if flow_cum_floor is not None else 0.0
+    peak_ret = -np.inf
+    trail_armed = False
+    # mf_reversal / mtm_floor: wait ~10m; flow_*: wait ~5m before soft exit.
+    min_hold_m = exit_min_hold_minutes
+    if min_hold_m is None and mode in ("mf_reversal", "mtm_floor", "mtm_defend"):
+        min_hold_m = 10.0
+    if min_hold_m is None and mode in ("flow_die", "cum_fav", "flow_mtm", "flow_soft"):
+        min_hold_m = 5.0
+    grace_secs = int(exit_mf_grace_seconds)
+    if min_hold_m is not None:
+        grace_secs = max(grace_secs, int(float(min_hold_m) * 60))
+    grace_until = entry_ts + pd.Timedelta(seconds=grace_secs)
     day = stock_day
-    if use_mf and day is not None and not day.empty:
+    if (use_mf or use_flow) and day is not None and not day.empty:
         day = _prepare_stock_day(day)
     for i, p in enumerate(sell_px):
         t = ts_list[i]
@@ -190,11 +256,31 @@ def simulate_trade(
         if t >= end_ts:
             reason, exit_px, exit_ts = "T+30", float(p), t
             break
+        cur_ret = float(p) / entry - 1.0
+        if use_trail:
+            if cur_ret > peak_ret:
+                peak_ret = cur_ret
+            if (not trail_armed) and peak_ret >= act:
+                trail_armed = True
+            if trail_armed and cur_ret <= peak_ret - dd:
+                reason, exit_px, exit_ts = "TRAIL", float(p), t
+                break
+        if use_floor and t >= grace_until and cur_ret <= floor:
+            reason, exit_px, exit_ts = "MTM_FLOOR", float(p), t
+            break
+        if use_flow and t >= grace_until:
+            visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
+            cum = _cum_fav_flow(day, entry_ts, visible_at, str(direction))
+            if cum is not None and cum <= flow_floor:
+                if (not require_mtm) or cur_ret <= floor:
+                    reason, exit_px, exit_ts = "FLOW_MTM" if require_mtm else "FLOW_DIE", float(p), t
+                    break
         if use_mf and t >= grace_until:
-            mf, su, sd = _stock_mf_at(day, t)
+            visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
+            mf, su, sd = _stock_mf_at(day, visible_at)
             if mf is None:
                 continue
-            if mode == "mf_flip":
+            if mode in ("mf_flip", "mf_reversal"):
                 if direction == "UP" and mf < 0:
                     reason, exit_px, exit_ts = "MF_FLIP", float(p), t
                     break
@@ -259,6 +345,7 @@ def run_offline_replay(
                 raw,
                 mf_window=int(sig_cfg.get("mf_window", 10)),
                 vol_ma_window=int(sig_cfg.get("vol_ma_window", 20)),
+                mf_confirm_bars=int(sig_cfg.get("mf_confirm_bars", 3)),
             )
 
     top2 = build_topk_signals(stock_by, sig_cfg)
@@ -275,7 +362,9 @@ def run_offline_replay(
     multi_lock_idx = None
     lock_idx = None
     ladder = contract_mode in ("open_ladder", "open_lock_ladder") or bool(trade.get("open_ladder"))
-    otm_rungs = int(trade.get("ladder_otm_rungs") or (profile.get("lock") or {}).get("otm_rungs") or (2 if ladder else 1))
+    from maga7.common.open_lock import resolve_otm_rungs
+
+    otm_rungs = resolve_otm_rungs(profile, default=2 if ladder else 1)
     if contract_mode in ("open_lock", "open", "open_ladder", "open_lock_ladder"):
         multi_lock_idx = load_multidte_lock_index(lock_path)
     else:
@@ -296,6 +385,19 @@ def run_offline_replay(
     if regime_gate is None:
         regime_gate = Mag7RegimeGate.from_profile(profile, months=months)
     n_regime_block = 0
+    n_peer_block = 0
+    n_si_block = 0
+    n_pe_block = 0
+    peer_align_min = sig_cfg.get("peer_align_min")
+    peer_align_min_i = int(peer_align_min) if peer_align_min is not None else None
+    peer_align_mode = str(sig_cfg.get("peer_align_mode", "mf10")).strip().lower()
+    peer_symbols = list(sig_cfg.get("peer_symbols") or profile.get("symbols") or [])
+    si_min = sig_cfg.get("si_min")
+    si_min_f = float(si_min) if si_min is not None else None
+    pe_min_ratio = sig_cfg.get("pe_min_ratio")
+    pe_min_ratio_f = float(pe_min_ratio) if pe_min_ratio is not None else None
+    pe_window = int(sig_cfg.get("pe_window", 10))
+    pe_lookback = int(sig_cfg.get("pe_lookback_bars", 780))
 
     def get_q(sym: str, date: str):
         k = (sym, date)
@@ -357,6 +459,8 @@ def run_offline_replay(
     daily_rows = []
     n_day_halt = 0
     loss_streak = 0
+    bar_delay_seconds = int(trade.get("bar_availability_delay_seconds", 0) or 0)
+    bar_delay = pd.Timedelta(seconds=bar_delay_seconds)
 
     for date, day_sigs in top2.groupby("date", sort=True):
         syms = list(day_sigs.sort_values("sig_ts")["symbol"].unique())
@@ -368,7 +472,10 @@ def run_offline_replay(
             n_day_halt += 1
 
         if not use_reentry:
-            events = [(to_ny(r.sig_ts), r.symbol, r.dir) for r in day_sigs.itertuples(index=False)]
+            events = [
+                (to_ny(r.sig_ts) + bar_delay, to_ny(r.sig_ts), r.symbol, r.dir)
+                for r in day_sigs.itertuples(index=False)
+            ]
         else:
             events = []
             for r in day_sigs.itertuples(index=False):
@@ -381,7 +488,8 @@ def run_offline_replay(
                     from_prev_abs=float(sig_cfg.get("from_prev_abs", 0.02)),
                     vol_z_min=float(sig_cfg.get("vol_z_min", 1.0)),
                 ):
-                    events.append((to_ny(ts), r.symbol, r.dir))
+                    feature_ts = to_ny(ts)
+                    events.append((feature_ts + bar_delay, feature_ts, r.symbol, r.dir))
             events.sort(key=lambda x: x[0])
 
         if skip_day:
@@ -392,7 +500,7 @@ def run_offline_replay(
         n_done = {s: 0 for s in syms}
         open_until = {s: None for s in syms}
 
-        for ts, sym, direction in events:
+        for ts, feature_ts, sym, direction in events:
             if halt:
                 break
             if use_reentry:
@@ -409,12 +517,58 @@ def run_offline_replay(
                     continue
 
             if regime_gate is not None:
-                dec = regime_gate.check(direction, ts)
+                dec = regime_gate.check(direction, feature_ts)
                 if not dec.allow:
                     n_regime_block += 1
                     continue
             else:
                 dec = None
+
+            peer_n = None
+            si_val = None
+            pe_val = None
+            pe_ma_val = None
+            if peer_align_min_i is not None and peer_align_min_i > 0:
+                peer_n = count_peer_align(
+                    stock_by,
+                    date=str(date),
+                    asof_ts=feature_ts,
+                    direction=str(direction),
+                    peer_symbols=peer_symbols,
+                    mode=peer_align_mode,
+                    streak_min=int(sig_cfg.get("streak_min", 8)),
+                )
+                if peer_n < peer_align_min_i:
+                    n_peer_block += 1
+                    continue
+
+            if si_min_f is not None:
+                si_val = sync_index(
+                    stock_by,
+                    date=str(date),
+                    asof_ts=feature_ts,
+                    peer_symbols=peer_symbols,
+                )
+                # Require SI aligned with trade direction and |SI| >= si_min
+                if si_val is None or abs(si_val) < si_min_f:
+                    n_si_block += 1
+                    continue
+                if (direction == "UP" and si_val < 0) or (direction == "DN" and si_val > 0):
+                    n_si_block += 1
+                    continue
+
+            if pe_min_ratio_f is not None:
+                allow_pe, pe_val, pe_ma_val = price_efficiency_ok(
+                    stock_by.get(sym),
+                    asof_ts=feature_ts,
+                    direction=str(direction),
+                    window=pe_window,
+                    min_ratio=pe_min_ratio_f,
+                    lookback_bars=pe_lookback,
+                )
+                if not allow_pe:
+                    n_pe_block += 1
+                    continue
 
             buckets = lock_idx.get((sym, date)) if lock_idx is not None else None
             day_ticker = None
@@ -422,7 +576,7 @@ def run_offline_replay(
                 bid = BUCKET_MAP[(direction, money)]
                 day_ticker = buckets.get(bid)
 
-            spot = spot_at(sym, date, ts)
+            spot = spot_at(sym, date, feature_ts)
             ticker = None
             pick_dte = None
             pick_source = None
@@ -536,6 +690,12 @@ def run_offline_replay(
                 stock_day=stock_day,
                 exit_mode=exit_mode,
                 exit_mf_grace_seconds=int(trade.get("exit_mf_grace_seconds", 60)),
+                exit_min_hold_minutes=trade.get("exit_min_hold_minutes"),
+                mtm_floor_ret=trade.get("mtm_floor_ret"),
+                flow_cum_floor=trade.get("flow_cum_floor"),
+                stock_bar_delay_seconds=bar_delay_seconds,
+                trail_activate=trade.get("trail_activate"),
+                trail_dd=trade.get("trail_dd"),
             )
             if sim is None:
                 continue
@@ -576,6 +736,7 @@ def run_offline_replay(
                 "sig_strike": strike_from_occ(ticker),
                 "sig_dte": pick_dte,
                 "sig_ts": ts,
+                "feature_ts": feature_ts,
                 "n_in_day": n_done[sym],
                 "entry": sim.entry,
                 "exit": sim.exit,
@@ -592,6 +753,14 @@ def run_offline_replay(
                 row["regime_qqq_fp"] = dec.qqq_from_prev
                 row["regime_vix_rev"] = dec.vix_reversal
                 row["regime_vixy_z"] = dec.vixy_z
+            if peer_n is not None:
+                row["peer_align_n"] = int(peer_n)
+            if si_val is not None:
+                row["si"] = float(si_val)
+            if pe_val is not None:
+                row["pe"] = float(pe_val)
+            if pe_ma_val is not None:
+                row["pe_ma"] = float(pe_ma_val)
             trades.append(row)
             if circuit is not None and (eq / day_start - 1.0) <= float(circuit):
                 halt = True
@@ -628,6 +797,13 @@ def run_offline_replay(
         "end_equity": float(eq),
         "n_signals_topk": int(len(top2)),
         "n_regime_block": int(n_regime_block),
+        "n_peer_block": int(n_peer_block),
+        "n_si_block": int(n_si_block),
+        "n_pe_block": int(n_pe_block),
+        "peer_align_min": peer_align_min_i,
+        "peer_align_mode": peer_align_mode if peer_align_min_i is not None else None,
+        "si_min": si_min_f,
+        "pe_min_ratio": pe_min_ratio_f,
         "n_day_halt": int(n_day_halt),
         "regime_enabled": bool(regime_gate is not None),
         "day_loss_streak_halt": day_loss_halt_n,

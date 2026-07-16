@@ -1,8 +1,9 @@
-# Mag7 开盘阶梯 + 实盘仓位/出场：当前结论（2026-07-16）
+# Mag7 开盘阶梯 + 实盘仓位/出场：当前结论（2026-07-17）
 
-> 窗口：`2026-01-02` ~ `2026-07-13`  
+> 主证据窗：`2026-05-01` ~ `2026-07-13`（Mag7+GOOGL）  
 > 成交：ATM，`fill_frac=0.8`，账户复利 MaxDD  
-> **当前因果基线**：[single + T+30 + TP/SL](causal_single_t30_rails_baseline.md)  
+> **当前因果基线**：[Mag7+GOOGL + peer_min3 + T+30](causal_single_t30_rails_baseline.md)（**+374.8% / -16.5%**）  
+> 旧 Mag7-only 基线对照：single + T+30（Jan–Jul +863.6% / -28.6%）  
 > 旧方案对照：`m5_circuit` + only_win + `mf_flip`（pre-delay +3375% 已作废）  
 > 选约：`open_ladder` OTM5（因果开盘阶梯）vs `day_lock`（前视对照）  
 > 详表与消融链：[`jan_jul_replay_versions.md`](jan_jul_replay_versions.md)
@@ -21,9 +22,10 @@
 
 | 项 | 值 |
 |---|---|
-| **基线 Profile** | [`single_qqq_open_ladder_atm5otm_t30_rails_p20_v1`](../CONFIG/strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_v1.json) |
+| **基线 Profile** | [`single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1`](../CONFIG/strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1.json) |
+| Universe / 过滤 | Mag7+GOOGL；`peer_align_min=3`（Mag7 mf10 同向） |
 | Scheme / 出场 | `single` + T+30 + TP1.6/SL0.4（无 mf_flip、无复入） |
-| 因果 Jan–Jul | **+863.6% / MaxDD -28.6%**（134 笔） |
+| 因果 May–Jul | **+374.8% / MaxDD -16.5%**（53 笔） |
 | 文档 | [`causal_single_t30_rails_baseline.md`](causal_single_t30_rails_baseline.md) |
 
 ### 1b. 旧临时包（仅对照，非基线）

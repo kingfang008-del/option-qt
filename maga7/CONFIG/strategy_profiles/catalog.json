@@ -1,19 +1,39 @@
 {
   "catalog": "maga7_strategy_profiles",
-  "updated": "2026-07-16",
+  "updated": "2026-07-17",
   "window": {
-    "start": "2026-01-02",
+    "start": "2026-05-01",
     "end": "2026-07-13"
   },
   "fill_frac": 0.8,
   "moneyness": "ATM",
-  "default_profile": "CONFIG/strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_v1.json",
-  "default_matches": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_v1.json",
+  "default_profile": "CONFIG/strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1.json",
+  "default_matches": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1.json",
   "profiles": [
+    {
+      "id": "single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1",
+      "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1.json",
+      "role": "causal_baseline",
+      "scheme": "single",
+      "reentry_mode": "cooldown_only",
+      "position_sizing": "concurrent",
+      "position_frac": 0.2,
+      "exit_mode": "none",
+      "hold_minutes": 30,
+      "contract_mode": "open_ladder",
+      "ladder_otm_rungs": 5,
+      "peer_align_min": 3,
+      "peer_align_mode": "mf10",
+      "result_dir": "results/replay_single_t30_rails_p20_mag7_googl_peer3_may_jul_delay60",
+      "total_ret_may_jul_delay60": 3.748,
+      "maxdd_may_jul_delay60": -0.165,
+      "docs": "docs/causal_single_t30_rails_baseline.md",
+      "note": "Causal baseline 2026-07-17: Mag7+GOOGL + peer_align_min=3 + T+30 rails; delay=60. Optimize against this."
+    },
     {
       "id": "single_qqq_open_ladder_atm5otm_t30_rails_p20_v1",
       "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_v1.json",
-      "role": "causal_baseline",
+      "role": "prior_causal_baseline_mag7_only",
       "scheme": "single",
       "reentry_mode": "cooldown_only",
       "position_sizing": "concurrent",
@@ -26,7 +46,7 @@
       "total_ret_causal_delay60": 8.636,
       "maxdd_causal_delay60": -0.286,
       "docs": "docs/causal_single_t30_rails_baseline.md",
-      "note": "Causal baseline 2026-07-16: first-only + T+30 TP/SL; delay=60. Optimize against this."
+      "note": "Prior Mag7-only baseline 2026-07-16. Superseded by googl_peer3_v1."
     },
     {
       "id": "m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1",

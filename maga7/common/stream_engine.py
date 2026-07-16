@@ -61,6 +61,7 @@ class StreamEngine:
     scheme: str = "single"
     regime_gate: Any = None
     n_regime_block: int = 0
+    n_peer_block: int = 0
     n_skip0_clear_otm: int = 0
     stock_by: dict[str, Any] = field(default_factory=dict)
 
@@ -141,7 +142,11 @@ class StreamEngine:
         sym = fire["symbol"]
         direction = fire["dir"]
         date = fire["date"]
-        ts = to_ny(fire["sig_ts"])
+        feature_ts = to_ny(fire["sig_ts"])
+        bar_delay_seconds = int(
+            trade.get("bar_availability_delay_seconds", 0) or 0
+        )
+        ts = feature_ts + pd.Timedelta(seconds=bar_delay_seconds)
         money = str(trade.get("moneyness", "ATM"))
         use_reentry = self.scheme.startswith("m5")
         max_n = int(trade.get("max_entries_per_symbol", 5)) if use_reentry else 1
@@ -158,10 +163,32 @@ class StreamEngine:
             return
 
         if self.regime_gate is not None:
-            dec = self.regime_gate.check(direction, ts)
+            dec = self.regime_gate.check(direction, feature_ts)
             if not dec.allow:
                 self.n_regime_block += 1
                 self.events.append({"type": "REGIME_BLOCK", **fire, "reason": dec.reason})
+                return
+
+        sig_cfg = self.profile.get("signal") or {}
+        peer_min = sig_cfg.get("peer_align_min")
+        if peer_min is not None and int(peer_min) > 0 and self.stock_by:
+            from maga7.common.signals import count_peer_align
+
+            peers = list(sig_cfg.get("peer_symbols") or self.profile.get("symbols") or [])
+            peer_n = count_peer_align(
+                self.stock_by,
+                date=str(date),
+                asof_ts=feature_ts,
+                direction=str(direction),
+                peer_symbols=peers,
+                mode=str(sig_cfg.get("peer_align_mode", "mf10")),
+                streak_min=int(sig_cfg.get("streak_min", 8)),
+            )
+            if peer_n < int(peer_min):
+                self.n_peer_block += 1
+                self.events.append(
+                    {"type": "PEER_BLOCK", **fire, "peer_align_n": peer_n, "peer_align_min": int(peer_min)}
+                )
                 return
 
         spot = float(fire["spot"]) if fire.get("spot") is not None else None
@@ -197,6 +224,12 @@ class StreamEngine:
             stock_day=stock_day,
             exit_mode=exit_mode,
             exit_mf_grace_seconds=int(trade.get("exit_mf_grace_seconds", 60)),
+            exit_min_hold_minutes=trade.get("exit_min_hold_minutes"),
+            mtm_floor_ret=trade.get("mtm_floor_ret"),
+            flow_cum_floor=trade.get("flow_cum_floor"),
+            stock_bar_delay_seconds=bar_delay_seconds,
+            trail_activate=trade.get("trail_activate"),
+            trail_dd=trade.get("trail_dd"),
         )
         if sim is None:
             return
@@ -319,6 +352,7 @@ def run_stream_replay(profile: dict[str, Any], *, scheme: str = "single") -> dic
             raw,
             mf_window=int(sig.get("mf_window", 10)),
             vol_ma_window=int(sig.get("vol_ma_window", 20)),
+            mf_confirm_bars=int(sig.get("mf_confirm_bars", 3)),
         )
         stock_by[sym] = feat
         feat = feat.copy()

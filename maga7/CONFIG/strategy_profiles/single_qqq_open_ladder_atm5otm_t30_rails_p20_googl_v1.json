@@ -1,13 +1,12 @@
 {
-  "profile": "single_qqq_open_ladder_atm5otm_t30_rails_p20_v1",
-  "profile_id": "single_qqq_open_ladder_atm5otm_t30_rails_p20_v1",
-  "description": "Prior Mag7-only causal baseline (2026-07-16): open_ladder OTM5 + QQQ + concurrent p20; single + T+30 rails. Superseded 2026-07-17 by Mag7+GOOGL peer_align_min=3. Docs: docs/causal_single_t30_rails_baseline.md",
-  "role": "prior_causal_baseline_mag7_only",
-  "result_tag": "replay_single_t30_rails_p20_jan_jul_delay60",
-  "based_on": "strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json",
+  "profile": "single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_v1",
+  "profile_id": "single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_v1",
+  "description": "Control: Mag7+GOOGL single+T+30 rails OTM5 without peer filter. Superseded as baseline by googl_peer3_v1 (peer_align_min=3).",
+  "role": "control_mag7_googl_no_peer",
+  "result_tag": "replay_single_t30_rails_p20_mag7_googl_may_jul_delay60",
+  "based_on": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_v1.json",
   "recommended_scheme": "single",
-  "baseline_doc": "docs/causal_single_t30_rails_baseline.md",
-  "symbols": ["NVDA", "TSLA", "AAPL", "AMZN", "META", "MSFT", "AMD"],
+  "symbols": ["NVDA", "TSLA", "AAPL", "AMZN", "META", "MSFT", "AMD", "GOOGL"],
   "signal": {
     "window_start": "10:30",
     "window_end": "14:00",
@@ -39,8 +38,7 @@
     "ladder_otm_rungs": 5,
     "quote_source": "1s",
     "day_iv_half_spread_frac": 0.01,
-    "clear_otm_ban_0dte_pct": 0.01,
-    "note": "scheme must be single. exit_mode=none means TP/SL/T+hold only; no mf_flip."
+    "clear_otm_ban_0dte_pct": 0.01
   },
   "regime": {
     "enabled": true,
@@ -68,28 +66,19 @@
     "option_1m_root": "~/data/new_option_data_s3",
     "day_iv_root": "~/train_data/nq_options_day_iv",
     "locked_map": "~/train_data/locked_targets_map_maga7_mf10_jan_jul.parquet",
-    "open_locked_map": "~/train_data/locked_targets_map_maga7_open_ladder_atm5otm_jan_jul.parquet",
+    "open_locked_map": "~/train_data/locked_targets_map_maga7_googl_open_ladder_atm5otm_jan_jul.parquet",
     "quote_1s_root": "/mnt/s990/data/raw_1s/maga7_mf10_open_ladder_otm5",
     "stock_1s_root": "/mnt/s990/data/raw_1s/stocks",
     "results_dir": "maga7/results"
   },
   "date_range": {
-    "start": "2026-01-02",
-    "end": "2026-07-13",
-    "known_stock_gap": ["2026-03-19", "2026-04-30"]
+    "start": "2026-05-01",
+    "end": "2026-07-13"
   },
   "lock": {
-    "config": "preprocess/CONFIG/anchor_stock_short_dte_old_lock.json",
     "dte_mode": "trading",
     "prefer_dte": 0,
     "allowed_dte": [0, 1, 2],
     "otm_rungs": 5
-  },
-  "causal_evidence_2026_07_16": {
-    "delay_seconds": 60,
-    "may_jul": {"total_ret": 2.528, "maxdd": -0.251, "n_trades": 64},
-    "jan_jul": {"total_ret": 8.636, "maxdd": -0.286, "n_trades": 134},
-    "vs_old_prod_mf_flip_jan_jul": {"old_ret": 0.498, "old_maxdd": -0.517},
-    "ablation_tag": "exit_reentry_ablation_jan_jul/single_t30_rails"
   }
 }
