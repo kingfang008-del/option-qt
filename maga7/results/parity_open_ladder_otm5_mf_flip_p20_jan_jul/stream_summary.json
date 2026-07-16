@@ -1,0 +1,13 @@
+{
+  "scheme": "m5_circuit",
+  "contract_mode": "open_ladder",
+  "n_trades": 247,
+  "total_ret": 33.750961292339156,
+  "maxdd": -0.22104930562551695,
+  "trade_win": 0.5141700404858299,
+  "trade_exp": 0.08793821651415161,
+  "end_equity": 3475.0961292339157,
+  "n_events": 8697,
+  "n_regime_block": 510,
+  "n_skip0_clear_otm": 0
+}

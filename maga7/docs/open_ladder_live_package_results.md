@@ -12,21 +12,23 @@
 
 | 项 | 值 |
 |---|---|
-| Profile | [`m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p15_v1`](../CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p15_v1.json) |
+| **临时生产 Profile** | [`m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1`](../CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json) |
 | 复入 | `reentry_mode=only_win` |
-| 仓位 | `position_sizing=concurrent`，`position_frac=0.15`（独处 15%；并发再开一笔 7.5%；最多 2 腿） |
+| 仓位 | `position_sizing=concurrent`，`position_frac=0.20`（独处 20%；并发再开一笔 10%；最多 2 腿） |
 | 出场 | `exit_mode=mf_flip`（mf10 翻向提前平，60s grace；仍保留 TP1.6 / SL0.4 / T+30） |
 | 选约 | `contract_mode=open_ladder`，`ladder_otm_rungs=5` |
+| 稳妥备选 | 同栈 `position_frac=0.15`（MaxDD 更低） |
 
 ```bash
-python -m maga7.tools.run_open_ladder_ab \
-  --ladder-profile maga7/CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p15_v1.json \
-  --quote-source 1s --scheme m5_circuit \
-  --reentry-mode only_win --position-sizing concurrent --position-frac 0.15 --exit-mode mf_flip \
-  --tag open_ladder_ab_1s_otm5_ow_conc_p15_mf_flip_jan_jul
+# 临时生产：offline vs stream 对拍
+python -m maga7.tools.run_stream_parity \
+  --profile maga7/CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json \
+  --scheme m5_circuit \
+  --tag parity_open_ladder_otm5_mf_flip_p20_jan_jul
 ```
 
-产物：`results/open_ladder_ab_1s_otm5_ow_conc_p15_mf_flip_jan_jul/`
+A/B 产物：`results/open_ladder_ab_1s_otm5_ow_conc_p20_mf_flip_jan_jul/`  
+对拍产物：`results/parity_open_ladder_otm5_mf_flip_p20_jan_jul/`（**已通过**：247 笔，ret/size/reason 全一致）
 
 ---
 
@@ -76,6 +78,8 @@ python -m maga7.tools.run_open_ladder_ab \
 
 ---
 
-## 5. 暂不宣称生产冻结
+## 5. 生产状态（2026-07-16）
 
-当前推荐包为 **研究默认**。旧生产稳定口径仍是 `m5c_qqq_onlywin_stable_v1`（day_lock + topk 均分 + only_win，无 mf_flip）。上线因果锁约前需再做 stream/live 对拍与纸面验证。
+**临时生产**：`m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1`（only_win + conc p20 + mf_flip + open_ladder OTM5）。
+
+旧稳定口径 `m5c_qqq_onlywin_stable_v1`（day_lock + topk）仍保留对照。上线前以 `run_stream_parity` 为准冻结。

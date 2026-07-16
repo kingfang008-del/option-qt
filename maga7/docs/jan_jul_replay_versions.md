@@ -13,9 +13,10 @@
 
 | role | profile_id | JSON | 正式结果目录 |
 |---|---|---|---|
-| **生产推荐 / 最平稳** | `m5c_qqq_onlywin_stable_v1` | [`CONFIG/strategy_profiles/m5c_qqq_onlywin_stable_v1.json`](../CONFIG/strategy_profiles/m5c_qqq_onlywin_stable_v1.json) | `results/jan_jul_m5c_qqq_onlywin` |
+| **临时生产：开盘阶梯+mf_flip p20** | `m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1` | [`CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json`](../CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json) | `results/open_ladder_ab_1s_otm5_ow_conc_p20_mf_flip_jan_jul` |
+| **生产推荐 / 最平稳（旧 day_lock）** | `m5c_qqq_onlywin_stable_v1` | [`CONFIG/strategy_profiles/m5c_qqq_onlywin_stable_v1.json`](../CONFIG/strategy_profiles/m5c_qqq_onlywin_stable_v1.json) | `results/jan_jul_m5c_qqq_onlywin` |
 | **收益最高** | `m5c_qqq_align_maxret_v1` | [`CONFIG/strategy_profiles/m5c_qqq_align_maxret_v1.json`](../CONFIG/strategy_profiles/m5c_qqq_align_maxret_v1.json) | `results/jan_jul_m5c_qqq_maxret` |
-| **研究推荐：开盘阶梯+mf_flip** | `m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p15_v1` | [`CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p15_v1.json`](../CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p15_v1.json) | `results/open_ladder_ab_1s_otm5_ow_conc_p15_mf_flip_jan_jul` |
+| **研究推荐：开盘阶梯+mf_flip p15** | `m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p15_v1` | [`CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p15_v1.json`](../CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p15_v1.json) | `results/open_ladder_ab_1s_otm5_ow_conc_p15_mf_flip_jan_jul` |
 | research mf=6 | `m5c_qqq_onlywin_mf6_research_v1` | [`CONFIG/strategy_profiles/m5c_qqq_onlywin_mf6_research_v1.json`](../CONFIG/strategy_profiles/m5c_qqq_onlywin_mf6_research_v1.json) | `results/jan_jul_m5c_qqq_onlywin_mf6` |
 | research 信号时 ATM | `m5c_qqq_onlywin_signal_atm_research_v1` | [`CONFIG/strategy_profiles/m5c_qqq_onlywin_signal_atm_research_v1.json`](../CONFIG/strategy_profiles/m5c_qqq_onlywin_signal_atm_research_v1.json) | `results/signal_atm_ab_jan_jul/` |
 | 仅赢复入 | `m5c_only_win_v1` | [`CONFIG/strategy_profiles/m5c_only_win_v1.json`](../CONFIG/strategy_profiles/m5c_only_win_v1.json) | 消融 `only_win` |

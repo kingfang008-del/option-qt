@@ -41,8 +41,14 @@ def compare_trades(off: pd.DataFrame, st: pd.DataFrame) -> dict:
     merged = a.merge(b, on="key", how="outer", suffixes=("_off", "_st"), indicator=True)
     both = merged[merged["_merge"] == "both"]
     ret_diff = None
+    size_diff = None
+    reason_mismatch = None
     if len(both):
         ret_diff = float((both["ret_off"] - both["ret_st"]).abs().max())
+        if "size_frac_off" in both.columns and "size_frac_st" in both.columns:
+            size_diff = float((both["size_frac_off"] - both["size_frac_st"]).abs().max())
+        if "reason_off" in both.columns and "reason_st" in both.columns:
+            reason_mismatch = int((both["reason_off"].astype(str) != both["reason_st"].astype(str)).sum())
     return {
         "n_offline": int(len(a)),
         "n_stream": int(len(b)),
@@ -50,6 +56,8 @@ def compare_trades(off: pd.DataFrame, st: pd.DataFrame) -> dict:
         "only_offline": int((merged["_merge"] == "left_only").sum()),
         "only_stream": int((merged["_merge"] == "right_only").sum()),
         "ret_max_abs_diff": ret_diff,
+        "size_frac_max_abs_diff": size_diff,
+        "reason_mismatch": reason_mismatch,
         "equity_off": None,
         "equity_st": None,
     }

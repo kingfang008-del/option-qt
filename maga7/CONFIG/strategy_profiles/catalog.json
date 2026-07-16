@@ -1,15 +1,32 @@
 {
   "catalog": "maga7_strategy_profiles",
-  "updated": "2026-07-15",
+  "updated": "2026-07-16",
   "window": {
     "start": "2026-01-02",
     "end": "2026-07-13"
   },
   "fill_frac": 0.8,
   "moneyness": "ATM",
-  "default_profile": "CONFIG/mf10_top2_v1.json",
-  "default_matches": "strategy_profiles/m5c_qqq_onlywin_stable_v1.json",
+  "default_profile": "CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json",
+  "default_matches": "strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json",
   "profiles": [
+    {
+      "id": "m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1",
+      "path": "strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json",
+      "role": "production_temp_open_ladder",
+      "scheme": "m5_circuit",
+      "reentry_mode": "only_win",
+      "position_sizing": "concurrent",
+      "position_frac": 0.2,
+      "exit_mode": "mf_flip",
+      "contract_mode": "open_ladder",
+      "ladder_otm_rungs": 5,
+      "result_dir": "results/open_ladder_ab_1s_otm5_ow_conc_p20_mf_flip_jan_jul",
+      "parity_dir": "results/parity_open_ladder_otm5_mf_flip_p20_jan_jul",
+      "total_ret_ladder": 33.751,
+      "maxdd_ladder": -0.221,
+      "note": "Temporary production 2026-07-16."
+    },
     {
       "id": "m5c_baseline_v1",
       "path": "strategy_profiles/m5c_baseline_v1.json",
@@ -113,5 +130,6 @@
       "result_dir": "results/open_ladder_ab_1s_otm5_ow_conc_p15_mf_flip_jan_jul",
       "note": "Recommended research live package: only_win+conc p15+mf_flip. lad ~+1445%/-17%."
     }
-  ]
+  ],
+  "production_temp_note": "2026-07-16: only_win+conc p20+mf_flip open_ladder OTM5 (replaces stable day_lock topk until live parity freezes)."
 }

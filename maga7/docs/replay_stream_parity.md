@@ -38,3 +38,18 @@ python -m maga7.tools.run_stream_parity \
 ```
 
 已通过：`results/parity_open_lock_clear_otm_jan_jul`（145 笔，ret 差 = 0）。
+
+```bash
+# 临时生产：开盘阶梯 OTM5 + only_win + concurrent p20 + mf_flip
+python -m maga7.tools.run_stream_parity \
+  --profile maga7/CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json \
+  --scheme m5_circuit \
+  --tag parity_open_ladder_otm5_mf_flip_p20_jan_jul
+```
+
+**已通过（2026-07-16）**：`results/parity_open_ladder_otm5_mf_flip_p20_jan_jul`  
+247 笔，`only_*=0`，`ret` / `size_frac` / `reason` 差 = 0，权益 3475.10 一致（total_ret +3375%）。
+
+**已通过（2026-07-16）**：`results/parity_open_ladder_otm5_mf_flip_p20_jan_jul`  
+247 笔，`only_*=0`，`ret` / `size_frac` / `reason` 差 = 0，权益 3475.1 一致（总收益 +3375%）。  
+冒烟：`parity_open_ladder_otm5_mf_flip_p20_may_smoke`（5/1–5/15，37 笔，同样全一致）。
