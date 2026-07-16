@@ -181,6 +181,9 @@ def simulate_trade(
     stock_bar_delay_seconds: int = 0,
     trail_activate: float | None = None,
     trail_dd: float | None = None,
+    hold_extend_minutes: int | None = None,
+    hold_extend_mtm_min: float | None = None,
+    hold_extend_require_mf: bool = True,
 ) -> SimResult | None:
     """Option path fill with TP/SL/time, optional stock-window or MTM trail exit.
 
@@ -199,6 +202,9 @@ def simulate_trade(
         UP uses inflow (net$); DN uses outflow (-net$).
       - ``flow_mtm`` / ``flow_soft``: same flow check, but only exit when option MTM
         ret also <= ``mtm_floor_ret`` (default 0). Softens false cuts on winners.
+      - ``hold_extend`` / ``extend_hold``: at base ``hold_minutes``, if option MTM
+        >= ``hold_extend_mtm_min`` (default 0) and (optional) mf10 still aligned,
+        extend deadline to ``hold_extend_minutes`` (default 45). Rails still apply.
     """
     if path is None or path.empty:
         return None
@@ -215,19 +221,29 @@ def simulate_trade(
     asks = after["ask"].astype(float).to_numpy()
     sell_px = fill.sell_series(bids, asks)
     ts_list = [to_ny(x) for x in after["timestamp"].tolist()]
-    end_ts = entry_ts + pd.Timedelta(minutes=hold_minutes)
+    base_hold = int(hold_minutes)
+    base_end = entry_ts + pd.Timedelta(minutes=base_hold)
+    end_ts = base_end
     tp_lvl, sl_lvl = entry * tp_mult, entry * sl_mult
-    reason, exit_px, exit_ts = "T+30", float(sell_px[-1]), ts_list[-1]
+    reason, exit_px, exit_ts = f"T+{base_hold}", float(sell_px[-1]), ts_list[-1]
     mode = str(exit_mode or "none").strip().lower()
     use_mf = mode in ("mf_flip", "mf_reversal", "streak_break") and direction in ("UP", "DN")
     use_trail = mode in ("mtm_trail", "trail")
     use_floor = mode in ("mtm_floor", "mtm_defend")
     use_flow = mode in ("flow_die", "cum_fav", "flow_mtm", "flow_soft") and direction in ("UP", "DN")
+    use_extend = mode in ("hold_extend", "extend_hold") and direction in ("UP", "DN")
     require_mtm = mode in ("flow_mtm", "flow_soft")
     act = float(trail_activate) if trail_activate is not None else 0.20
     dd = float(trail_dd) if trail_dd is not None else 0.15
     floor = float(mtm_floor_ret) if mtm_floor_ret is not None else 0.0
     flow_floor = float(flow_cum_floor) if flow_cum_floor is not None else 0.0
+    ext_hold = int(hold_extend_minutes) if hold_extend_minutes is not None else 45
+    if ext_hold <= base_hold:
+        ext_hold = base_hold
+    ext_end = entry_ts + pd.Timedelta(minutes=ext_hold)
+    ext_mtm_min = float(hold_extend_mtm_min) if hold_extend_mtm_min is not None else 0.0
+    require_mf_align = bool(hold_extend_require_mf)
+    extended = False
     peak_ret = -np.inf
     trail_armed = False
     # mf_reversal / mtm_floor: wait ~10m; flow_*: wait ~5m before soft exit.
@@ -241,7 +257,7 @@ def simulate_trade(
         grace_secs = max(grace_secs, int(float(min_hold_m) * 60))
     grace_until = entry_ts + pd.Timedelta(seconds=grace_secs)
     day = stock_day
-    if (use_mf or use_flow) and day is not None and not day.empty:
+    if (use_mf or use_flow or use_extend) and day is not None and not day.empty:
         day = _prepare_stock_day(day)
     for i, p in enumerate(sell_px):
         t = ts_list[i]
@@ -254,7 +270,26 @@ def simulate_trade(
             reason, exit_px, exit_ts = "SL", float(p), t
             break
         if t >= end_ts:
-            reason, exit_px, exit_ts = "T+30", float(p), t
+            if use_extend and (not extended) and end_ts == base_end and ext_hold > base_hold:
+                cur_ret = float(p) / entry - 1.0
+                mtm_ok = cur_ret >= ext_mtm_min
+                mf_ok = True
+                if require_mf_align:
+                    visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
+                    mf, _, _ = _stock_mf_at(day, visible_at)
+                    if mf is None:
+                        mf_ok = False
+                    elif direction == "UP":
+                        mf_ok = mf > 0
+                    else:
+                        mf_ok = mf < 0
+                if mtm_ok and mf_ok:
+                    extended = True
+                    end_ts = ext_end
+                    continue
+                reason, exit_px, exit_ts = f"T+{base_hold}", float(p), t
+                break
+            reason, exit_px, exit_ts = f"T+{ext_hold if extended else base_hold}", float(p), t
             break
         cur_ret = float(p) / entry - 1.0
         if use_trail:
@@ -696,6 +731,9 @@ def run_offline_replay(
                 stock_bar_delay_seconds=bar_delay_seconds,
                 trail_activate=trade.get("trail_activate"),
                 trail_dd=trade.get("trail_dd"),
+                hold_extend_minutes=trade.get("hold_extend_minutes"),
+                hold_extend_mtm_min=trade.get("hold_extend_mtm_min"),
+                hold_extend_require_mf=bool(trade.get("hold_extend_require_mf", True)),
             )
             if sim is None:
                 continue

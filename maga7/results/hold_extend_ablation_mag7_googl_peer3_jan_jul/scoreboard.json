@@ -1,0 +1,109 @@
+[
+  {
+    "name": "baseline_t30_rails",
+    "exit_mode": "none",
+    "hold_minutes": 30,
+    "total_ret": 12.992109088247298,
+    "maxdd": -0.3216637273855588,
+    "n_trades": 124,
+    "trade_win": 0.5564516129032258,
+    "trade_exp": 0.13716680859334918,
+    "end_equity": 1399.2109088247298,
+    "n_peer_block": 20,
+    "reason_counts": {
+      "T+30": 84,
+      "TP": 34,
+      "SL": 6
+    },
+    "n_t45_exits": 0,
+    "uplift_vs_baseline_pp": 0.0
+  },
+  {
+    "name": "t45_rails",
+    "exit_mode": "none",
+    "hold_minutes": 45,
+    "total_ret": 13.901724611842093,
+    "maxdd": -0.3566944486426086,
+    "n_trades": 124,
+    "trade_win": 0.5564516129032258,
+    "trade_exp": 0.13951427008557082,
+    "end_equity": 1490.1724611842094,
+    "n_peer_block": 20,
+    "reason_counts": {
+      "T+45": 68,
+      "TP": 45,
+      "SL": 11
+    },
+    "n_t45_exits": 68,
+    "uplift_vs_baseline_pp": 0.9096155235947947
+  },
+  {
+    "name": "extend_mtm_mf",
+    "exit_mode": "hold_extend",
+    "hold_minutes": 30,
+    "hold_extend_minutes": 45,
+    "hold_extend_mtm_min": 0.0,
+    "hold_extend_require_mf": true,
+    "total_ret": 14.82634683050312,
+    "maxdd": -0.3216637273855587,
+    "n_trades": 124,
+    "trade_win": 0.5,
+    "trade_exp": 0.1459976302041163,
+    "end_equity": 1582.6346830503119,
+    "n_peer_block": 20,
+    "reason_counts": {
+      "T+30": 54,
+      "TP": 44,
+      "T+45": 20,
+      "SL": 6
+    },
+    "n_t45_exits": 20,
+    "uplift_vs_baseline_pp": 1.8342377422558211
+  },
+  {
+    "name": "extend_mtm_only",
+    "exit_mode": "hold_extend",
+    "hold_minutes": 30,
+    "hold_extend_minutes": 45,
+    "hold_extend_mtm_min": 0.0,
+    "hold_extend_require_mf": false,
+    "total_ret": 15.498093039266386,
+    "maxdd": -0.3216637273855588,
+    "n_trades": 124,
+    "trade_win": 0.49193548387096775,
+    "trade_exp": 0.14841395660653509,
+    "end_equity": 1649.8093039266387,
+    "n_peer_block": 20,
+    "reason_counts": {
+      "T+30": 49,
+      "TP": 44,
+      "T+45": 25,
+      "SL": 6
+    },
+    "n_t45_exits": 25,
+    "uplift_vs_baseline_pp": 2.505983951019088
+  },
+  {
+    "name": "extend_mtm5_mf",
+    "exit_mode": "hold_extend",
+    "hold_minutes": 30,
+    "hold_extend_minutes": 45,
+    "hold_extend_mtm_min": 0.05,
+    "hold_extend_require_mf": true,
+    "total_ret": 14.141411694143859,
+    "maxdd": -0.3216637273855588,
+    "n_trades": 124,
+    "trade_win": 0.5080645161290323,
+    "trade_exp": 0.1438297253653397,
+    "end_equity": 1514.1411694143858,
+    "n_peer_block": 20,
+    "reason_counts": {
+      "T+30": 57,
+      "TP": 43,
+      "T+45": 18,
+      "SL": 6
+    },
+    "n_t45_exits": 18,
+    "uplift_vs_baseline_pp": 1.14930260589656
+  }
+]

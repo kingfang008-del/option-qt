@@ -109,7 +109,8 @@ python -m maga7.tools.run_replay_offline \
 相对 **本基线**（Mag7+GOOGL + peer_min3 + delay=60 + single + T+30 rails + OTM5）：
 
 - 补 Mag7+GOOGL+peer3 的 **Jan–Jul 全窗**成绩后再决定是否改冻结窗  
-- 出场：保持硬 T+30；勿默认启用 flow/MTM 软退出  
+- 出场：保持硬 T+30 rails 为默认；勿启用 flow/MTM **软退出**  
+- **条件化延长**（`hold_extend` T30→T45）：研究中，见 [`hold_extend_t30_t45_research.md`](hold_extend_t30_t45_research.md)；候选 `extend_mtm_mf`（更保守）/ `extend_mtm_only`（收益更高），尚未升格  
 - SI≥0.57 / PE：仅研究；勿替换 peer_min3  
 - MU/AVGO 扩池仍弱于 Mag7+GOOGL，不默认并入  
 - stream / live 对齐本 profile + `scheme=single`
