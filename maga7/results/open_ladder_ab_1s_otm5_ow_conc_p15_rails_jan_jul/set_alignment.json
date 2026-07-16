@@ -1,0 +1,22 @@
+{
+  "note": "only_day/only_lad under m5_circuit+only_win is mostly re-entry path dependence: different early P&L \u2192 different later n_in_day. With reentry_mode=cooldown_only, entry clocks align and only_* shrinks; residual gaps are circuit halt / quote misses. First entries (n_in_day==1) usually overlap; not a missing-quote issue.",
+  "n_day": 259,
+  "n_ladder": 264,
+  "n_both_keys": 239,
+  "only_day": {
+    "n": 20,
+    "ret_sum": 2.2290286587826724,
+    "ret_mean": 0.11145143293913362
+  },
+  "only_ladder": {
+    "n": 25,
+    "ret_sum": -1.9489280442629848,
+    "ret_mean": -0.07795712177051939
+  },
+  "first_entry_overlap": {
+    "both": 137,
+    "only_day": 3,
+    "only_ladder": 1
+  },
+  "paired_same_ticker_rate": 0.3179916317991632
+}

@@ -1,0 +1,65 @@
+{
+  "meta": {
+    "scheme": "m5_circuit",
+    "quote_source": "1s",
+    "reentry_mode": "only_win",
+    "position_sizing": "concurrent",
+    "exit_mode": "mf_flip",
+    "position_frac": 0.2,
+    "base_profile": "/home/kingfang007/\u6587\u6863/GitHub/option-qt/maga7/CONFIG/strategy_profiles/m5c_qqq_onlywin_open_lock_research_v1.json",
+    "ladder_profile": "maga7/CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_v1.json"
+  },
+  "arms": [
+    {
+      "arm": "day_lock",
+      "total_ret": 53.73130664065388,
+      "maxdd": -0.2324829352341643,
+      "n_trades": 248,
+      "trade_exp": 0.09929513756350224,
+      "trade_win": 0.5161290322580645,
+      "contract_mode": "day_lock",
+      "quote_source_mode": "1s",
+      "reentry_mode": "only_win",
+      "only_win_reenter": true,
+      "position_sizing": "concurrent",
+      "position_frac": 0.2,
+      "exit_mode": "mf_flip",
+      "n_size_full": 218,
+      "n_size_split": 30
+    },
+    {
+      "arm": "open_lock",
+      "total_ret": 4.370820803667949,
+      "maxdd": -0.14150695664869595,
+      "n_trades": 242,
+      "trade_exp": 0.04057712121376545,
+      "trade_win": 0.4669421487603306,
+      "contract_mode": "open_lock",
+      "quote_source_mode": "1s",
+      "reentry_mode": "only_win",
+      "only_win_reenter": true,
+      "position_sizing": "concurrent",
+      "position_frac": 0.2,
+      "exit_mode": "mf_flip",
+      "n_size_full": 209,
+      "n_size_split": 33
+    },
+    {
+      "arm": "open_ladder",
+      "total_ret": 33.750961292339156,
+      "maxdd": -0.22104930562551695,
+      "n_trades": 247,
+      "trade_exp": 0.08793821651415161,
+      "trade_win": 0.5141700404858299,
+      "contract_mode": "open_ladder",
+      "quote_source_mode": "1s",
+      "reentry_mode": "only_win",
+      "only_win_reenter": true,
+      "position_sizing": "concurrent",
+      "position_frac": 0.2,
+      "exit_mode": "mf_flip",
+      "n_size_full": 216,
+      "n_size_split": 31
+    }
+  ]
+}

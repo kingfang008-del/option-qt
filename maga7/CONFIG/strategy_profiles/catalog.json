@@ -1,0 +1,117 @@
+{
+  "catalog": "maga7_strategy_profiles",
+  "updated": "2026-07-15",
+  "window": {
+    "start": "2026-01-02",
+    "end": "2026-07-13"
+  },
+  "fill_frac": 0.8,
+  "moneyness": "ATM",
+  "default_profile": "CONFIG/mf10_top2_v1.json",
+  "default_matches": "strategy_profiles/m5c_qqq_onlywin_stable_v1.json",
+  "profiles": [
+    {
+      "id": "m5c_baseline_v1",
+      "path": "strategy_profiles/m5c_baseline_v1.json",
+      "role": "baseline",
+      "scheme": "m5_circuit",
+      "only_reenter_after_win": false,
+      "regime": "off",
+      "result_dir": "results/jan_jul_m5_circuit",
+      "total_ret": 10.575,
+      "maxdd": -0.376
+    },
+    {
+      "id": "m5c_only_win_v1",
+      "path": "strategy_profiles/m5c_only_win_v1.json",
+      "role": "reentry_control",
+      "scheme": "m5_circuit",
+      "only_reenter_after_win": true,
+      "regime": "off",
+      "result_dir": "results/regime_ablation_jan_jul",
+      "total_ret": 17.073,
+      "maxdd": -0.279
+    },
+    {
+      "id": "m5c_qqq_align_maxret_v1",
+      "path": "strategy_profiles/m5c_qqq_align_maxret_v1.json",
+      "role": "max_return",
+      "scheme": "m5_circuit",
+      "only_reenter_after_win": false,
+      "regime": "qqq_align_only",
+      "result_dir": "results/jan_jul_m5c_qqq_maxret",
+      "total_ret": 19.978,
+      "maxdd": -0.265
+    },
+    {
+      "id": "m5c_qqq_onlywin_stable_v1",
+      "path": "strategy_profiles/m5c_qqq_onlywin_stable_v1.json",
+      "role": "stable_recommended",
+      "scheme": "m5_circuit",
+      "only_reenter_after_win": true,
+      "regime": "qqq_align_only",
+      "result_dir": "results/jan_jul_m5c_qqq_onlywin",
+      "total_ret": 14.713,
+      "maxdd": -0.224
+    },
+    {
+      "id": "m5c_qqq_onlywin_mf6_research_v1",
+      "path": "strategy_profiles/m5c_qqq_onlywin_mf6_research_v1.json",
+      "role": "research_mf6",
+      "scheme": "m5_circuit",
+      "mf_window": 6,
+      "only_reenter_after_win": true,
+      "regime": "qqq_align_only",
+      "result_dir": "results/jan_jul_m5c_qqq_onlywin_mf6",
+      "total_ret": 17.878,
+      "maxdd": -0.209,
+      "note": "Research only; production stays mf=10"
+    },
+    {
+      "id": "m5c_qqq_onlywin_signal_atm_research_v1",
+      "path": "strategy_profiles/m5c_qqq_onlywin_signal_atm_research_v1.json",
+      "role": "research_signal_atm",
+      "scheme": "m5_circuit",
+      "only_reenter_after_win": true,
+      "regime": "qqq_align_only",
+      "contract_mode": "signal_atm",
+      "result_dir": "results/signal_atm_ab_1s_jan_jul",
+      "note": "1s A/B lost to day_lock; research only"
+    },
+    {
+      "id": "m5c_qqq_onlywin_open_lock_research_v1",
+      "path": "strategy_profiles/m5c_qqq_onlywin_open_lock_research_v1.json",
+      "role": "research_open_lock_causal",
+      "scheme": "m5_circuit",
+      "contract_mode": "open_lock",
+      "clear_otm_ban_0dte_pct": 0.01,
+      "result_dir": "results/open_lock_ab_dayiv_jan_jul",
+      "note": "Live-feasible: open multi-DTE lock; clearly OTM bans 0DTE. 1s backfill in progress."
+    },
+    {
+      "id": "m5c_qqq_cooldown_open_ladder_atm5otm_v1",
+      "path": "strategy_profiles/m5c_qqq_cooldown_open_ladder_atm5otm_v1.json",
+      "role": "research_open_ladder_cooldown",
+      "scheme": "m5_circuit",
+      "reentry_mode": "cooldown_only",
+      "only_reenter_after_win": false,
+      "contract_mode": "open_ladder",
+      "ladder_otm_rungs": 5,
+      "result_dir": "results/open_ladder_ab_1s_otm5_cooldown_jan_jul",
+      "note": "OTM5 ladder + cooldown re-entry (no only_win) to align trade sets vs day_lock."
+    },
+    {
+      "id": "m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p15_v1",
+      "path": "strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p15_v1.json",
+      "role": "research_open_ladder_mf_flip",
+      "scheme": "m5_circuit",
+      "reentry_mode": "only_win",
+      "position_sizing": "concurrent",
+      "position_frac": 0.15,
+      "exit_mode": "mf_flip",
+      "contract_mode": "open_ladder",
+      "result_dir": "results/open_ladder_ab_1s_otm5_ow_conc_p15_mf_flip_jan_jul",
+      "note": "Recommended research live package: only_win+conc p15+mf_flip. lad ~+1445%/-17%."
+    }
+  ]
+}

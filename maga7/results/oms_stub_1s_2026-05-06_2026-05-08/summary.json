@@ -1,0 +1,21 @@
+{
+  "mode": "MAG7_SHADOW",
+  "fill_frac": 0.8,
+  "max_qty": 1,
+  "redis_publish": false,
+  "n_signals": 6,
+  "n_trades": 6,
+  "n_orders": 12,
+  "n_published": 12,
+  "n_skipped": 0,
+  "total_ret": -0.04350490081519853,
+  "equity_end": 95.64950991848015,
+  "maxdd": -0.11361076708091644,
+  "trade_win": 0.3333333333333333,
+  "trade_exp": -0.05177812941383949,
+  "source": "maga7_mf10_top2",
+  "fill_audit_path": "/home/kingfang007/\u6587\u6863/GitHub/option-qt/maga7/results/oms_stub_1s_2026-05-06_2026-05-08/fill_audit_live.csv",
+  "ingest": "1s",
+  "start": "2026-05-06",
+  "end": "2026-05-08"
+}

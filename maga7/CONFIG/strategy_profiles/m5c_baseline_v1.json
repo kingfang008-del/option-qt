@@ -1,0 +1,77 @@
+{
+  "profile": "m5c_baseline_v1",
+  "profile_id": "m5c_baseline_v1",
+  "description": "m5_circuit baseline: reentry free, no regime. Reference for ablation.",
+  "result_tag": "jan_jul_m5_circuit",
+  "symbols": ["NVDA", "TSLA", "AAPL", "AMZN", "META", "MSFT", "AMD"],
+  "signal": {
+    "window_start": "10:30",
+    "window_end": "14:00",
+    "mf_window": 10,
+    "streak_min": 8,
+    "from_prev_abs": 0.02,
+    "vol_z_min": 1.0,
+    "vol_ma_window": 20,
+    "top_k": 2,
+    "rank_by": "earliest"
+  },
+  "trade": {
+    "tp_mult": 1.6,
+    "sl_mult": 0.4,
+    "hold_minutes": 30,
+    "position_frac": 0.25,
+    "cooldown_minutes": 5,
+    "max_entries_per_symbol": 5,
+    "day_circuit": -0.05,
+    "only_reenter_after_win": false,
+    "moneyness": "ATM"
+  },
+  "regime": {
+    "enabled": false,
+    "qqq_align": true,
+    "qqq_from_prev_eps": 0.0,
+    "vix_reversal_max": null,
+    "vix_reversal_window": 30,
+    "vix_reversal_pct": 0.0015,
+    "put_vixy_z_min": null,
+    "block_on_missing": false
+  },
+  "fill": {
+    "model": "spread_frac",
+    "entry_frac": 0.8,
+    "exit_frac": 0.8
+  },
+  "buckets": {
+    "UP_ATM": 2,
+    "UP_OTM": 3,
+    "DN_ATM": 0,
+    "DN_OTM": 1
+  },
+  "paths": {
+    "stock_root": "~/train_data/spnq_train",
+    "option_1m_root": "~/data/new_option_data_s3",
+    "day_iv_root": "~/train_data/nq_options_day_iv",
+    "locked_map": "~/train_data/locked_targets_map_maga7_mf10_jan_jul.parquet",
+    "quote_1s_root": "/mnt/s990/data/raw_1s/maga7_mf10_old_lock",
+    "stock_1s_root": "/mnt/s990/data/raw_1s/stocks",
+    "results_dir": "maga7/results"
+  },
+  "date_range": {
+    "start": "2026-01-02",
+    "end": "2026-07-13",
+    "known_stock_gap": ["2026-03-19", "2026-04-30"]
+  },
+  "lock": {
+    "config": "preprocess/CONFIG/anchor_stock_short_dte_old_lock.json",
+    "dte_mode": "trading",
+    "prefer_dte": 0,
+    "allowed_dte": [0, 1, 2]
+  },
+  "headline_jan_jul": {
+    "scheme": "m5_circuit",
+    "total_ret": 10.575,
+    "maxdd": -0.376,
+    "n_trades": 456,
+    "n_regime_block": 0
+  }
+}

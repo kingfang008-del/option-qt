@@ -1,0 +1,15 @@
+{
+  "scheme": "m5_circuit",
+  "moneyness": "ATM",
+  "fill_frac": 0.8,
+  "n_trades": 412,
+  "n_days": 97,
+  "total_ret": 3.5738407560004317,
+  "maxdd": -0.37629084093270115,
+  "day_win": 0.4536082474226804,
+  "trade_win": 0.4587378640776699,
+  "trade_exp": 0.0376692378548164,
+  "start_equity": 100.0,
+  "end_equity": 457.38407560004316,
+  "n_signals_topk": 184
+}

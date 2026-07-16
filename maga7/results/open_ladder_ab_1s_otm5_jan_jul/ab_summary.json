@@ -1,0 +1,32 @@
+[
+  {
+    "arm": "day_lock",
+    "total_ret": 14.713161337173776,
+    "maxdd": -0.2243583480314143,
+    "n_trades": 261,
+    "trade_exp": 0.09340177655766584,
+    "trade_win": 0.5210727969348659,
+    "contract_mode": "day_lock",
+    "quote_source_mode": "1s"
+  },
+  {
+    "arm": "open_lock",
+    "total_ret": 1.2588787725790191,
+    "maxdd": -0.17704528522263674,
+    "n_trades": 257,
+    "trade_exp": 0.02818707350372007,
+    "trade_win": 0.5058365758754864,
+    "contract_mode": "open_lock",
+    "quote_source_mode": "1s"
+  },
+  {
+    "arm": "open_ladder",
+    "total_ret": 7.180709781502918,
+    "maxdd": -0.25640876977242943,
+    "n_trades": 267,
+    "trade_exp": 0.07204474725309877,
+    "trade_win": 0.5205992509363296,
+    "contract_mode": "open_ladder",
+    "quote_source_mode": "1s"
+  }
+]

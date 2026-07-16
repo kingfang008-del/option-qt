@@ -1,0 +1,4 @@
+arm,scheme,moneyness,fill_frac,n_trades,n_days,total_ret,maxdd,day_win,trade_win,trade_exp,start_equity,end_equity,n_signals_topk,n_regime_block,n_day_halt,regime_enabled,day_loss_streak_halt,contract_mode,quote_source_mode,n_signal_atm,n_day_lock_fallback,n_quote_1s,n_quote_day_iv,pct_same_as_day_lock,pct_diff_contract,median_abs_moneyness
+day_lock_day_iv,m5_circuit,ATM,0.8,20,11,0.03200121448132842,-0.0936042958170884,0.18181818181818182,0.2,0.01503347902388646,100.0,103.20012144813285,20,46,0,True,,day_lock,day_iv,0,0,0,20,1.0,0.0,
+signal_atm_day_iv,m5_circuit,ATM,0.8,25,11,-0.02906744020061991,-0.14808469575223793,0.36363636363636365,0.44,-0.006270039137502392,100.0,97.09325597993801,20,46,0,True,,signal_atm,day_iv,25,0,0,25,0.2,0.8,0.0014080403961933968
+day_lock_1s_ref,m5_circuit,ATM,0.8,26,11,0.3853275644972729,-0.11120234485975211,0.6363636363636364,0.46153846153846156,0.10859112680897634,100.0,138.5327564497273,20,46,0,True,,day_lock,1s,0,0,26,0,,,

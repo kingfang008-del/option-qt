@@ -1,0 +1,4 @@
+arm,scheme,moneyness,fill_frac,n_trades,n_days,total_ret,maxdd,day_win,trade_win,trade_exp,start_equity,end_equity,n_signals_topk,n_regime_block,n_day_halt,regime_enabled,day_loss_streak_halt,contract_mode,quote_source_mode,n_signal_atm,n_day_lock_fallback,n_skip0_clear_otm,n_quote_1s,n_quote_day_iv,clear_otm_ban_0dte_pct
+day_lock_day_iv,m5_circuit,ATM,0.8,191,105,0.3505280169706959,-0.15258278819764493,0.2,0.2879581151832461,0.014453509226306996,100.0,135.05280169706958,200,542,0,True,,day_lock,day_iv,0,0,0,0,195,
+open_lock_nogate,m5_circuit,ATM,0.8,133,105,-0.009501926692806917,-0.12118484547021235,0.1523809523809524,0.3609022556390977,0.0005985926943961426,100.0,99.0498073307193,200,583,0,True,,open_lock,day_iv,0,0,0,0,248,
+open_lock_clear_otm,m5_circuit,ATM,0.8,133,105,-0.009501926692806917,-0.12118484547021235,0.1523809523809524,0.3609022556390977,0.0005985926943961426,100.0,99.0498073307193,200,583,0,True,,open_lock,day_iv,0,0,0,0,248,0.01

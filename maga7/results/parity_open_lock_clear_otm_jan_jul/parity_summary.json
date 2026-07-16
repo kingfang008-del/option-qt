@@ -1,0 +1,13 @@
+{
+  "n_offline": 145,
+  "n_stream": 145,
+  "matched": 145,
+  "only_offline": 0,
+  "only_stream": 0,
+  "ret_max_abs_diff": 0.0,
+  "equity_off": 111.88812533230684,
+  "equity_st": 111.88812533230684,
+  "total_ret_off": 0.11888125332306831,
+  "total_ret_st": 0.11888125332306831,
+  "ok": true
+}

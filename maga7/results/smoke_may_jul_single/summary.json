@@ -1,0 +1,15 @@
+{
+  "scheme": "single",
+  "moneyness": "ATM",
+  "fill_frac": 0.8,
+  "n_trades": 85,
+  "n_days": 49,
+  "total_ret": 2.943792482949918,
+  "maxdd": -0.18199626409733516,
+  "day_win": 0.6326530612244898,
+  "trade_win": 0.5058823529411764,
+  "trade_exp": 0.13931214040157974,
+  "start_equity": 100.0,
+  "end_equity": 394.3792482949918,
+  "n_signals_topk": 95
+}
