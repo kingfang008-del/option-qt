@@ -1,0 +1,18 @@
+{
+  "period": "2026-05-01..2026-07-13",
+  "base": "extend_mtm_only peer3 day_circuit=null",
+  "extend_baseline_ret": 4.011246732921062,
+  "best_by_ret": {
+    "name": "full_day",
+    "total_ret": 6.7327162613189,
+    "maxdd": -0.12169884169884171,
+    "n_trades": 44
+  },
+  "best_by_maxdd": {
+    "name": "core_plus1",
+    "total_ret": 5.427785803682372,
+    "maxdd": -0.12169884169884171,
+    "n_trades": 46
+  },
+  "note": "core=NVDA earnings AH + SpaceX IPO + FOMC decision; full adds 05-19 yield spike, 05-21 post-earn, 06-16/18 FOMC cluster."
+}

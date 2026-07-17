@@ -18,7 +18,7 @@ from maga7.common.config import load_profile
 from maga7.common.entry_contract import ContractBooks, resolve_entry_contract
 from maga7.common.reentry import resolve_only_win_reenter
 from maga7.common.replay import to_ny
-from maga7.common.signals import StreamSignalState
+from maga7.common.signals import StreamSignalState, count_peer_align
 
 logger = logging.getLogger("maga7.live.scanner")
 
@@ -114,6 +114,7 @@ class Mag7Scanner:
 
     profile: dict[str, Any]
     on_signal: Callable[[ScannerSignal], None] | None = None
+    is_symbol_active: Callable[[str], bool] | None = None
     states: dict[str, StreamSignalState] = field(default_factory=dict)
     day_fires: list[ScannerSignal] = field(default_factory=list)
     current_date: str | None = None
@@ -125,6 +126,15 @@ class Mag7Scanner:
     n_done: dict[str, int] = field(default_factory=dict)
     last_exit: dict[str, pd.Timestamp | None] = field(default_factory=dict)
     last_win: dict[str, bool] = field(default_factory=dict)
+    n_peer_block: int = 0
+    n_regime_block: int = 0
+    n_event_block: int = 0
+    event_blackout: set = field(default_factory=set)
+    event_blackout_meta: dict[str, Any] = field(default_factory=dict)
+    # Optional feature frames for peer_align parity with offline/stream.
+    # When set (stock-1s replay), peer uses count_peer_align(asof=feature_ts).
+    # When None (pure live), peer uses per-symbol live StreamSignalState mf.
+    stock_by: dict[str, Any] | None = None
 
     @classmethod
     def from_profile(cls, profile: dict[str, Any] | None = None, **kwargs) -> "Mag7Scanner":
@@ -157,6 +167,45 @@ class Mag7Scanner:
     def _topk(self) -> int:
         return int(self.profile["signal"].get("top_k", 2))
 
+    def _peer_align_n(self, direction: str, *, date: str, feature_ts: pd.Timestamp) -> int:
+        """Count peers aligned with ``direction`` (offline-compatible when stock_by set)."""
+        import math
+
+        sig_cfg = self.profile.get("signal") or {}
+        peer_min = sig_cfg.get("peer_align_min")
+        if peer_min is None or int(peer_min) <= 0:
+            return 0
+        peers = list(sig_cfg.get("peer_symbols") or self.profile.get("symbols") or [])
+        mode = str(sig_cfg.get("peer_align_mode", "mf10")).strip().lower()
+        streak_min = int(sig_cfg.get("streak_min", 8))
+        if self.stock_by:
+            return count_peer_align(
+                self.stock_by,
+                date=date,
+                asof_ts=feature_ts,
+                direction=direction,
+                peer_symbols=peers,
+                mode=mode,
+                streak_min=streak_min,
+            )
+        n = 0
+        for sym in peers:
+            st = self.states.get(sym)
+            if st is None or st.date != date:
+                continue
+            mf = float(st.mf10)
+            if mode == "streak":
+                ok = (direction == "UP" and int(st.streak_up) >= streak_min) or (
+                    direction == "DN" and int(st.streak_dn) >= streak_min
+                )
+            else:
+                ok = (direction == "UP" and math.isfinite(mf) and mf > 0) or (
+                    direction == "DN" and math.isfinite(mf) and mf < 0
+                )
+            if ok:
+                n += 1
+        return n
+
     def _roll_day(self, date: str) -> None:
         if self.current_date == date:
             return
@@ -166,6 +215,16 @@ class Mag7Scanner:
         self.last_exit = {s: None for s in self.profile["symbols"]}
         self.last_win = {s: True for s in self.profile["symbols"]}
 
+    def set_event_blackout(
+        self, blackout: set[str] | None, meta: dict[str, Any] | None = None
+    ) -> None:
+        self.event_blackout = set(blackout or ())
+        self.event_blackout_meta = dict(meta or {})
+
+    def is_event_blackout(self, date: str | None = None) -> bool:
+        d = date or self.current_date
+        return bool(d) and str(d) in self.event_blackout
+
     def on_stock_second(self, symbol: str, tick: dict[str, Any]) -> ScannerSignal | None:
         """Ingest 1s (or trade) print → maybe complete a 1m bar → Rule-A."""
         if self.minute_agg is None:
@@ -173,7 +232,11 @@ class Mag7Scanner:
         bar = self.minute_agg.on_second(symbol, tick)
         if bar is None:
             return None
-        bar = {**bar, "bar_source": "1s_agg"}
+        bar = {
+            **bar,
+            "bar_source": "1s_agg",
+            "available_ts": to_ny(tick["timestamp"]),
+        }
         return self.on_stock_bar(symbol, bar)
 
     def flush_seconds(self) -> list[ScannerSignal]:
@@ -189,14 +252,29 @@ class Mag7Scanner:
         return out
 
     def on_stock_bar(self, symbol: str, bar: dict[str, Any]) -> ScannerSignal | None:
-        ts = to_ny(bar["timestamp"])
-        date = ts.strftime("%Y-%m-%d")
+        feature_ts = to_ny(bar["timestamp"])
+        delay = int(
+            (self.profile.get("trade") or {}).get(
+                "bar_availability_delay_seconds",
+                0,
+            )
+            or 0
+        )
+        ts = to_ny(
+            bar.get("available_ts")
+            or (feature_ts + pd.Timedelta(seconds=delay))
+        )
+        date = feature_ts.strftime("%Y-%m-%d")
         self._roll_day(date)
         st = self.states.get(symbol)
         if st is None:
             return None
         fire = st.on_bar(bar)
         if fire is None:
+            return None
+        if self.is_event_blackout(date):
+            self.n_event_block += 1
+            logger.info("EVENT_BLACKOUT %s skip %s %s", date, symbol, fire.get("dir"))
             return None
 
         trade = self.profile.get("trade") or {}
@@ -211,19 +289,17 @@ class Mag7Scanner:
         if not already and len(self.day_fires) >= self._topk() and not use_reentry:
             return None
         # TopK admission: first fires of new symbols only until K filled
+        # (match stream/offline: reserve slot BEFORE regime — blocked names still fill K)
         if not already and len({f.symbol for f in self.day_fires}) >= self._topk():
             return None
         if use_reentry:
+            if self.is_symbol_active is not None and self.is_symbol_active(symbol):
+                return None
             if self.n_done.get(symbol, 0) >= max_n:
                 return None
             if self.last_exit.get(symbol) is not None and ts < self.last_exit[symbol] + pd.Timedelta(minutes=cooldown):
                 return None
             if only_win and self.n_done.get(symbol, 0) > 0 and not self.last_win.get(symbol, True):
-                return None
-
-        if self.regime_gate is not None:
-            dec = self.regime_gate.check(fire["dir"], ts)
-            if not dec.allow:
                 return None
 
         money = str(trade.get("moneyness", "ATM"))
@@ -261,13 +337,43 @@ class Mag7Scanner:
                 "sig_dte": pick.dte,
                 "sig_strike": pick.strike,
                 "contract_mode": books.mode,
+                "feature_ts": feature_ts.isoformat(),
+                "decision_ts": ts.isoformat(),
+                "bar_availability_delay_seconds": delay,
             },
         )
         if not already:
             self.day_fires.append(sig)
+
+        if self.regime_gate is not None:
+            dec = self.regime_gate.check(direction, feature_ts)
+            if not dec.allow:
+                self.n_regime_block += 1
+                return None
+
+        sig_cfg = self.profile.get("signal") or {}
+        peer_min = sig_cfg.get("peer_align_min")
+        if peer_min is not None and int(peer_min) > 0:
+            peer_n = self._peer_align_n(direction, date=date, feature_ts=feature_ts)
+            sig.meta["peer_align_n"] = peer_n
+            sig.meta["peer_align_min"] = int(peer_min)
+            if peer_n < int(peer_min):
+                self.n_peer_block += 1
+                logger.info(
+                    "PEER_BLOCK %s %s %s peer=%d<%d",
+                    date,
+                    symbol,
+                    direction,
+                    peer_n,
+                    int(peer_min),
+                )
+                return None
+
         self.signals.append(sig)
-        self.n_done[symbol] = self.n_done.get(symbol, 0) + 1
-        # last_exit/win updated by OMS after fill; scanner only tracks emits
+        # m5/emit_all: n_done + last_exit/win only after OMS record_fill (only_win sequencing).
+        # single TopK: count emit as taken (no re-entry path).
+        if not use_reentry:
+            self.n_done[symbol] = self.n_done.get(symbol, 0) + 1
         logger.info(
             "TOPK signal %s %s %s rank=%d contract=%s src=%s dte=%s",
             date,
@@ -281,6 +387,18 @@ class Mag7Scanner:
         if self.on_signal:
             self.on_signal(sig)
         return sig
+
+    def record_fill(
+        self,
+        symbol: str,
+        *,
+        exit_ts: pd.Timestamp,
+        won: bool,
+    ) -> None:
+        """OMS callback after a filled round-trip (m5 only_win / cooldown)."""
+        self.n_done[symbol] = self.n_done.get(symbol, 0) + 1
+        self.last_exit[symbol] = to_ny(exit_ts)
+        self.last_win[symbol] = bool(won)
 
 
 def write_signal_audit(signals: list[ScannerSignal], path: Path) -> None:

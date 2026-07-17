@@ -1,0 +1,94 @@
+{
+  "description": "Auto-synced Mag7 event blackout (Phase A). Safe for MAG7_EVENT_CALENDAR_PATH.",
+  "generated_at": "2026-07-17T07:56:26Z",
+  "range": {
+    "start": "2026-05-01",
+    "end": "2026-07-31"
+  },
+  "sources": [
+    "fomc_builtin(scrape_out_of_range)",
+    "polygon(missing_key)",
+    "manual"
+  ],
+  "dates": [
+    "2026-05-05",
+    "2026-05-06",
+    "2026-05-19",
+    "2026-05-20",
+    "2026-05-21",
+    "2026-06-12",
+    "2026-06-16",
+    "2026-06-17",
+    "2026-06-18",
+    "2026-07-28",
+    "2026-07-29"
+  ],
+  "events": [
+    {
+      "date": "2026-05-05",
+      "tag": "fomc_meeting",
+      "source": "fomc_builtin",
+      "symbol": null
+    },
+    {
+      "date": "2026-05-06",
+      "tag": "fomc_decision",
+      "source": "fomc_builtin",
+      "symbol": null
+    },
+    {
+      "date": "2026-05-19",
+      "tag": "ust_30y_spike",
+      "source": "manual",
+      "symbol": null
+    },
+    {
+      "date": "2026-05-20",
+      "tag": "nvda_earnings_ah",
+      "source": "manual",
+      "symbol": "NVDA"
+    },
+    {
+      "date": "2026-05-21",
+      "tag": "post_nvda_earnings",
+      "source": "manual",
+      "symbol": "NVDA"
+    },
+    {
+      "date": "2026-06-12",
+      "tag": "spacex_ipo",
+      "source": "manual",
+      "symbol": null
+    },
+    {
+      "date": "2026-06-16",
+      "tag": "fomc_meeting",
+      "source": "fomc_builtin",
+      "symbol": null
+    },
+    {
+      "date": "2026-06-17",
+      "tag": "fomc_decision",
+      "source": "fomc_builtin",
+      "symbol": null
+    },
+    {
+      "date": "2026-06-18",
+      "tag": "fomc_plus1",
+      "source": "manual",
+      "symbol": null
+    },
+    {
+      "date": "2026-07-28",
+      "tag": "fomc_meeting",
+      "source": "fomc_builtin",
+      "symbol": null
+    },
+    {
+      "date": "2026-07-29",
+      "tag": "fomc_decision",
+      "source": "fomc_builtin",
+      "symbol": null
+    }
+  ]
+}

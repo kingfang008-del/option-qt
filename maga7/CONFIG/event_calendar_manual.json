@@ -1,0 +1,40 @@
+{
+  "description": "Manual overlay for events APIs miss (IPO, rate spike, geopolitics). Merged by sync_event_calendar.py.",
+  "events": [
+    {
+      "date": "2026-05-19",
+      "tag": "ust_30y_spike",
+      "source": "manual",
+      "symbol": null,
+      "note": "Research full_day: long-end yield spike / Mag7 derate"
+    },
+    {
+      "date": "2026-06-12",
+      "tag": "spacex_ipo",
+      "source": "manual",
+      "symbol": null,
+      "note": "Research full_day: giant IPO day"
+    },
+    {
+      "date": "2026-05-20",
+      "tag": "nvda_earnings_ah",
+      "source": "manual",
+      "symbol": "NVDA",
+      "note": "Until FINNHUB/POLYGON earnings sync is keyed; matches research full_day"
+    },
+    {
+      "date": "2026-05-21",
+      "tag": "post_nvda_earnings",
+      "source": "manual",
+      "symbol": "NVDA",
+      "note": "Optional AH+1; keep until earnings provider maps next session"
+    },
+    {
+      "date": "2026-06-18",
+      "tag": "fomc_plus1",
+      "source": "manual",
+      "symbol": null,
+      "note": "FOMC decision next session (prefer trading-calendar expand in live)"
+    }
+  ]
+}

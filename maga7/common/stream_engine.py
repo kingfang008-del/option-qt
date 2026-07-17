@@ -9,7 +9,13 @@ import pandas as pd
 from maga7.common.contract_select import day_iv_path_as_quotes
 from maga7.common.entry_contract import ContractBooks, resolve_entry_contract
 from maga7.common.fills import FillSpec
-from maga7.common.position_size import resolve_size_frac
+from maga7.common.position_size import (
+    block_same_dir_after_win_enabled,
+    is_symbol_dir_big_win,
+    post_win_cooldown_action,
+    post_win_cooldown_sessions,
+    resolve_size_frac,
+)
 from maga7.common.reentry import resolve_only_win_reenter
 from maga7.common.replay import load_quotes, path_for_ticker, simulate_trade, to_ny
 from maga7.common.signals import StreamSignalState
@@ -58,9 +64,19 @@ class StreamEngine:
     peak: float = 100.0
     maxdd: float = 0.0
     day_halt: bool = False
+    prev_day_ret: float | None = None
+    post_win_left: int = 0
+    post_win_mode: str = ""
+    post_win_scale: float = 1.0
+    prev_big_win_dirs: set = field(default_factory=set)
+    day_big_win_dirs: set = field(default_factory=set)
+    n_same_dir_win_block: int = 0
     scheme: str = "single"
     regime_gate: Any = None
     n_regime_block: int = 0
+    n_regime_scale: int = 0
+    n_event_block: int = 0
+    event_blackout: set = field(default_factory=set)
     n_peer_block: int = 0
     n_skip0_clear_otm: int = 0
     stock_by: dict[str, Any] = field(default_factory=dict)
@@ -98,15 +114,69 @@ class StreamEngine:
     def _roll_day(self, date: str) -> None:
         if self.current_date == date:
             return
+        trade = self.profile.get("trade") or {}
+        if self.current_date is not None and self.day_start_equity > 0:
+            self.prev_day_ret = self.equity / self.day_start_equity - 1.0
+            thr = trade.get("post_win_cooldown_day_ret", 0.10)
+            mode = str(trade.get("post_win_cooldown_mode") or "off").lower()
+            if (
+                mode not in {"", "off", "none", "false", "0"}
+                and thr is not None
+                and self.prev_day_ret >= float(thr)
+            ):
+                self.post_win_left = post_win_cooldown_sessions(trade)
+            elif self.post_win_left > 0:
+                self.post_win_left -= 1
+            self.prev_big_win_dirs = set(self.day_big_win_dirs)
         self.current_date = date
         self.day_fires = []
         self.pending_fires = []
         self.positions = {}
         self.day_start_equity = self.equity
         self.day_halt = False
+        self.day_big_win_dirs = set()
+        self.post_win_mode, self.post_win_scale = post_win_cooldown_action(
+            trade,
+            prev_day_ret=self.prev_day_ret,
+            cooldown_left=self.post_win_left,
+        )
+        if self.post_win_mode == "skip":
+            self.day_halt = True
+        if not self.event_blackout:
+            self.event_blackout = self._build_event_blackout()
+        if date in self.event_blackout:
+            self.day_halt = True
+            self.n_event_block += 1
         self.n_done = {s: 0 for s in self.profile["symbols"]}
         self.last_exit = {s: None for s in self.profile["symbols"]}
         self.last_win = {s: True for s in self.profile["symbols"]}
+
+    def _build_event_blackout(self) -> set:
+        from maga7.common.event_calendar import resolve_event_blackout
+
+        trade = self.profile.get("trade") or {}
+        reg = self.profile.get("regime") or {}
+        cfg = {
+            **{k: reg[k] for k in (
+                "event_calendar_block", "event_calendar", "event_dates", "event_blackout_sessions",
+            ) if k in reg},
+            **{k: trade[k] for k in (
+                "event_calendar_block", "event_calendar", "event_dates", "event_blackout_sessions",
+            ) if k in trade},
+        }
+        sessions: list[str] = []
+        for sdf in self.stock_by.values():
+            if sdf is not None and not getattr(sdf, "empty", True) and "date" in sdf.columns:
+                sessions.extend(str(x) for x in sdf["date"].unique())
+        if not sessions:
+            start = str(self.profile.get("date_range", {}).get("start", ""))
+            end = str(self.profile.get("date_range", {}).get("end", ""))
+            if start and end:
+                sessions = [
+                    d.strftime("%Y-%m-%d")
+                    for d in pd.bdate_range(start, end)
+                ]
+        return resolve_event_blackout(cfg, session_dates=sessions)
 
     def _get_q(self, sym: str, date: str):
         k = (sym, date)
@@ -142,6 +212,19 @@ class StreamEngine:
         sym = fire["symbol"]
         direction = fire["dir"]
         date = fire["date"]
+        if block_same_dir_after_win_enabled(trade) and (
+            str(sym).upper(),
+            str(direction).upper(),
+        ) in self.prev_big_win_dirs:
+            self.n_same_dir_win_block += 1
+            self.events.append(
+                {
+                    "type": "SAME_DIR_WIN_BLOCK",
+                    **fire,
+                    "blocked": f"{sym}:{direction}",
+                }
+            )
+            return
         feature_ts = to_ny(fire["sig_ts"])
         bar_delay_seconds = int(
             trade.get("bar_availability_delay_seconds", 0) or 0
@@ -162,12 +245,14 @@ class StreamEngine:
         if only_win and self.n_done.get(sym, 0) > 0 and not self.last_win.get(sym, True):
             return
 
+        regime_scale = 1.0
         if self.regime_gate is not None:
             dec = self.regime_gate.check(direction, feature_ts)
             if not dec.allow:
                 self.n_regime_block += 1
                 self.events.append({"type": "REGIME_BLOCK", **fire, "reason": dec.reason})
                 return
+            regime_scale = float(getattr(dec, "size_scale", 1.0) or 1.0)
 
         sig_cfg = self.profile.get("signal") or {}
         peer_min = sig_cfg.get("peer_align_min")
@@ -230,6 +315,10 @@ class StreamEngine:
             stock_bar_delay_seconds=bar_delay_seconds,
             trail_activate=trade.get("trail_activate"),
             trail_dd=trade.get("trail_dd"),
+            hold_extend_minutes=trade.get("hold_extend_minutes"),
+            hold_extend_mtm_min=trade.get("hold_extend_mtm_min"),
+            hold_extend_require_mf=bool(trade.get("hold_extend_require_mf", True)),
+            early_exit_mode=trade.get("early_exit_mode"),
         )
         if sim is None:
             return
@@ -252,6 +341,13 @@ class StreamEngine:
                 }
             )
             return
+        if self.post_win_mode == "scale" and self.post_win_scale < 1.0:
+            size_frac = float(size_frac) * float(self.post_win_scale)
+            size_reason = f"{size_reason}+post_win_scale"
+        if regime_scale < 1.0:
+            size_frac = float(size_frac) * float(regime_scale)
+            size_reason = f"{size_reason}+regime_scale"
+            self.n_regime_scale += 1
         self.equity *= 1.0 + size_frac * sim.ret
         self.peak = max(self.peak, self.equity)
         self.maxdd = min(self.maxdd, self.equity / self.peak - 1.0)
@@ -285,9 +381,14 @@ class StreamEngine:
         }
         self.trades.append(row)
         self.events.append({"type": "TRADE", **row})
-        circuit = trade.get("day_circuit") if "circuit" in self.scheme else None
-        if circuit is not None and (self.equity / self.day_start_equity - 1.0) <= float(circuit):
-            self.day_halt = True
+        if block_same_dir_after_win_enabled(trade) and is_symbol_dir_big_win(
+            ret=float(sim.ret), reason=sim.reason, trade=trade
+        ):
+            self.day_big_win_dirs.add((str(sym).upper(), str(direction).upper()))
+        circuit_raw = trade.get("day_circuit", None)
+        if circuit_raw is not None and circuit_raw is not False:
+            if (self.equity / self.day_start_equity - 1.0) <= float(circuit_raw):
+                self.day_halt = True
 
     def on_stock_bar(self, symbol: str, bar: dict[str, Any]) -> None:
         ts = to_ny(bar["timestamp"])
@@ -325,40 +426,65 @@ class StreamEngine:
             "end_equity": float(self.equity),
             "n_events": len(self.events),
             "n_regime_block": int(self.n_regime_block),
+            "n_regime_scale": int(self.n_regime_scale),
+            "n_event_block": int(self.n_event_block),
             "n_skip0_clear_otm": int(self.n_skip0_clear_otm),
         }
 
 
-def run_stream_replay(profile: dict[str, Any], *, scheme: str = "single") -> dict[str, Any]:
-    """Drive StreamEngine with chronological 1m bars across all symbols."""
+def run_stream_replay(
+    profile: dict[str, Any],
+    *,
+    scheme: str = "single",
+    stock_by: dict[str, Any] | None = None,
+    regime_gate=None,
+) -> dict[str, Any]:
+    """Drive StreamEngine with chronological 1m bars across all symbols.
+
+    ``stock_by`` / ``regime_gate``: optional prebuilt frames (e.g. from stock 1s).
+    When omitted, loads pre-aggregated ``stock_root`` month files (research cache).
+    """
     from maga7.common.replay import month_list
-    from maga7.common.signals import attach_mf_features, load_stock_month_files
+    from maga7.common.signals import (
+        attach_mf_features,
+        load_stock_month_files,
+        resolve_mf_fast_window,
+    )
 
     paths = profile["_paths"]
     start = profile["date_range"]["start"]
     end = profile["date_range"]["end"]
     months = month_list(start, end)
     eng = StreamEngine.from_profile(profile, scheme=scheme)
+    if regime_gate is not None:
+        eng.regime_gate = regime_gate
     sig = profile.get("signal") or {}
 
     frames = []
-    stock_by: dict[str, Any] = {}
-    for sym in profile["symbols"]:
-        raw = load_stock_month_files(paths["stock_root"], sym, months)
-        if raw.empty:
+    if stock_by is None:
+        stock_by = {}
+        for sym in profile["symbols"]:
+            raw = load_stock_month_files(paths["stock_root"], sym, months)
+            if raw.empty:
+                continue
+            raw = raw[(raw["date"] >= start) & (raw["date"] <= end)].copy()
+            feat = attach_mf_features(
+                raw,
+                mf_window=int(sig.get("mf_window", 10)),
+                vol_ma_window=int(sig.get("vol_ma_window", 20)),
+                mf_fast_window=resolve_mf_fast_window(sig),
+            )
+            stock_by[sym] = feat
+    for sym, feat in stock_by.items():
+        if sym not in profile["symbols"]:
             continue
-        raw = raw[(raw["date"] >= start) & (raw["date"] <= end)].copy()
-        feat = attach_mf_features(
-            raw,
-            mf_window=int(sig.get("mf_window", 10)),
-            vol_ma_window=int(sig.get("vol_ma_window", 20)),
-            mf_confirm_bars=int(sig.get("mf_confirm_bars", 3)),
-        )
-        stock_by[sym] = feat
-        feat = feat.copy()
-        feat["symbol"] = sym
-        frames.append(feat[["symbol", "timestamp", "open", "high", "low", "close", "volume", "date"]])
-    eng.stock_by = stock_by
+        if feat is None or feat.empty:
+            continue
+        f = feat.copy()
+        f["symbol"] = sym
+        keep = [c for c in ("symbol", "timestamp", "open", "high", "low", "close", "volume", "date") if c in f.columns]
+        frames.append(f[keep])
+    eng.stock_by = {s: stock_by[s] for s in profile["symbols"] if s in stock_by}
     if not frames:
         return {"summary": eng.summary(), "trades": pd.DataFrame(), "events": eng.events}
     all_bars = pd.concat(frames, ignore_index=True).sort_values(["timestamp", "symbol"])

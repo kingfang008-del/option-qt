@@ -21,17 +21,140 @@ from maga7.common.contract_select import (
 )
 from maga7.common.open_lock import load_multidte_lock_index, resolve_open_lock_contract
 from maga7.common.fills import FillSpec
-from maga7.common.position_size import resolve_size_frac
+from maga7.common.position_size import (
+    block_same_dir_after_win_enabled,
+    is_symbol_dir_big_win,
+    post_win_cooldown_action,
+    post_win_cooldown_sessions,
+    resolve_size_frac,
+)
+from maga7.common.event_calendar import resolve_event_blackout
 from maga7.common.reentry import resolve_only_win_reenter
+from maga7.common.trend_purity import (
+    path_efficiency_features,
+    trend_purity_score,
+    trend_purity_size_scale,
+)
 from maga7.common.signals import (
+    _rule_a_kwargs_from_cfg,
     all_rule_a_times,
     attach_mf_features,
+    build_all_first_rule_a_signals,
     build_topk_signals,
     count_peer_align,
-    price_efficiency_ok,
-    sync_index,
     load_stock_month_files,
+    price_efficiency_ok,
+    resolve_mf_fast_window,
+    sync_index,
+    tod_mf_z_ok,
 )
+
+
+def _trade_flag(trade: dict[str, Any], key: str, default: bool = False) -> bool:
+    raw = trade.get(key, default)
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(raw)
+
+
+def _displace_score(
+    trade: dict[str, Any],
+    *,
+    from_prev: float | None,
+    peer_n: int | None,
+) -> float:
+    """Causal strength score for later-signal displacement gates."""
+    mode = str(trade.get("displace_score") or "none").strip().lower()
+    if mode in {"", "none", "off", "any"}:
+        return 1.0
+    if mode in {"abs_from_prev", "from_prev", "fp"}:
+        if from_prev is None or not np.isfinite(float(from_prev)):
+            return 0.0
+        return abs(float(from_prev))
+    if mode in {"peer_n", "peer"}:
+        return float(peer_n or 0)
+    return 1.0
+
+
+def _parse_commit_tod(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if s in {"", "none", "off", "false", "0"}:
+        return None
+    if ":" not in s:
+        return None
+    hh, mm = s.split(":", 1)
+    return f"{int(hh):02d}:{int(mm):02d}"
+
+
+def _topk_rank_score(
+    mode: str,
+    *,
+    from_prev: float | None,
+    peer_n: int | None,
+) -> float:
+    """Score for deferred TopK commit auction (higher wins)."""
+    m = str(mode or "abs_from_prev").strip().lower()
+    try:
+        afp = abs(float(from_prev)) if from_prev is not None and np.isfinite(float(from_prev)) else 0.0
+    except (TypeError, ValueError):
+        afp = 0.0
+    pn = float(peer_n or 0)
+    if m in {"peer_n", "peer"}:
+        return pn
+    if m in {"peer_fp", "peer_x_fp", "peer*fp", "peer_times_fp"}:
+        return pn * afp
+    # default: abs_from_prev
+    return afp
+
+
+def entry_confirm_ok(
+    stock_day: pd.DataFrame | None,
+    *,
+    direction: str,
+    feature_ts,
+    confirm_bars: int,
+    mode: str = "mf",
+) -> tuple[bool, pd.Timestamp | None, float | None, int, int]:
+    """After Rule-A, require N more 1m bars still aligned before entry.
+
+    Returns ``(ok, confirm_feature_ts, mf, streak_up, streak_dn)``.
+    ``confirm_feature_ts = feature_ts + confirm_bars minutes`` (bar clock).
+    """
+    n = int(confirm_bars or 0)
+    if n <= 0:
+        return True, None, None, 0, 0
+    confirm_ft = to_ny(feature_ts) + pd.Timedelta(minutes=n)
+    day = _prepare_stock_day(stock_day)
+    mf, su, sd = _stock_mf_at(day, confirm_ft)
+    m = str(mode or "mf").strip().lower()
+    dir_u = str(direction).upper()
+    mf_ok = True
+    streak_ok = True
+    if m in {"mf", "mf10", "both", "mf_streak", "all"}:
+        if mf is None:
+            mf_ok = False
+        elif dir_u == "UP":
+            mf_ok = mf > 0
+        elif dir_u == "DN":
+            mf_ok = mf < 0
+        else:
+            mf_ok = False
+    if m in {"streak", "both", "mf_streak", "all"}:
+        if dir_u == "UP":
+            streak_ok = su > 0
+        elif dir_u == "DN":
+            streak_ok = sd > 0
+        else:
+            streak_ok = False
+    if m in {"streak"}:
+        ok = streak_ok
+    elif m in {"both", "mf_streak", "all"}:
+        ok = mf_ok and streak_ok
+    else:
+        ok = mf_ok
+    return ok, confirm_ft, mf, su, sd
 
 NY = "America/New_York"
 BUCKET_MAP = {
@@ -184,6 +307,8 @@ def simulate_trade(
     hold_extend_minutes: int | None = None,
     hold_extend_mtm_min: float | None = None,
     hold_extend_require_mf: bool = True,
+    force_exit_ts=None,
+    early_exit_mode: str | None = None,
 ) -> SimResult | None:
     """Option path fill with TP/SL/time, optional stock-window or MTM trail exit.
 
@@ -205,10 +330,17 @@ def simulate_trade(
       - ``hold_extend`` / ``extend_hold``: at base ``hold_minutes``, if option MTM
         >= ``hold_extend_mtm_min`` (default 0) and (optional) mf10 still aligned,
         extend deadline to ``hold_extend_minutes`` (default 45). Rails still apply.
+
+    Soft cuts may be **stacked** on extend via ``exit_mode="hold_extend+mtm_floor"``
+    (or ``+mf_flip`` / ``+mf_reversal``), or via ``early_exit_mode``.
+
+    ``force_exit_ts``: if set, exit at the first quote at/after this time with
+    reason ``DISPLACE`` (after TP/SL checks). Used by later-signal displacement.
     """
     if path is None or path.empty:
         return None
     entry_ts = to_ny(entry_ts)
+    force_ts = to_ny(force_exit_ts) if force_exit_ts is not None else None
     after = path[path["timestamp"] >= entry_ts]
     if after.empty:
         return None
@@ -227,12 +359,21 @@ def simulate_trade(
     tp_lvl, sl_lvl = entry * tp_mult, entry * sl_mult
     reason, exit_px, exit_ts = f"T+{base_hold}", float(sell_px[-1]), ts_list[-1]
     mode = str(exit_mode or "none").strip().lower()
-    use_mf = mode in ("mf_flip", "mf_reversal", "streak_break") and direction in ("UP", "DN")
-    use_trail = mode in ("mtm_trail", "trail")
-    use_floor = mode in ("mtm_floor", "mtm_defend")
-    use_flow = mode in ("flow_die", "cum_fav", "flow_mtm", "flow_soft") and direction in ("UP", "DN")
-    use_extend = mode in ("hold_extend", "extend_hold") and direction in ("UP", "DN")
-    require_mtm = mode in ("flow_mtm", "flow_soft")
+    early = str(early_exit_mode or "").strip().lower()
+    if early and early not in {"", "none", "off"} and early not in mode:
+        mode = f"{mode}+{early}" if mode not in {"", "none"} else early
+    blob = mode.replace(",", "+").replace("|", "+")
+    use_mf_flip = ("mf_flip" in blob or "mf_reversal" in blob) and direction in ("UP", "DN")
+    use_streak = "streak_break" in blob and direction in ("UP", "DN")
+    use_mf = use_mf_flip or use_streak
+    use_trail = "mtm_trail" in blob or blob in {"trail"}
+    use_floor = "mtm_floor" in blob or "mtm_defend" in blob
+    use_flow = any(x in blob for x in ("flow_die", "cum_fav", "flow_mtm", "flow_soft")) and direction in (
+        "UP",
+        "DN",
+    )
+    use_extend = ("hold_extend" in blob or "extend_hold" in blob) and direction in ("UP", "DN")
+    require_mtm = "flow_mtm" in blob or "flow_soft" in blob
     act = float(trail_activate) if trail_activate is not None else 0.20
     dd = float(trail_dd) if trail_dd is not None else 0.15
     floor = float(mtm_floor_ret) if mtm_floor_ret is not None else 0.0
@@ -248,9 +389,9 @@ def simulate_trade(
     trail_armed = False
     # mf_reversal / mtm_floor: wait ~10m; flow_*: wait ~5m before soft exit.
     min_hold_m = exit_min_hold_minutes
-    if min_hold_m is None and mode in ("mf_reversal", "mtm_floor", "mtm_defend"):
+    if min_hold_m is None and ("mf_reversal" in blob or use_floor):
         min_hold_m = 10.0
-    if min_hold_m is None and mode in ("flow_die", "cum_fav", "flow_mtm", "flow_soft"):
+    if min_hold_m is None and use_flow:
         min_hold_m = 5.0
     grace_secs = int(exit_mf_grace_seconds)
     if min_hold_m is not None:
@@ -268,6 +409,9 @@ def simulate_trade(
             break
         if p <= sl_lvl:
             reason, exit_px, exit_ts = "SL", float(p), t
+            break
+        if force_ts is not None and t >= force_ts:
+            reason, exit_px, exit_ts = "DISPLACE", float(p), t
             break
         if t >= end_ts:
             if use_extend and (not extended) and end_ts == base_end and ext_hold > base_hold:
@@ -315,14 +459,14 @@ def simulate_trade(
             mf, su, sd = _stock_mf_at(day, visible_at)
             if mf is None:
                 continue
-            if mode in ("mf_flip", "mf_reversal"):
+            if use_mf_flip:
                 if direction == "UP" and mf < 0:
                     reason, exit_px, exit_ts = "MF_FLIP", float(p), t
                     break
                 if direction == "DN" and mf > 0:
                     reason, exit_px, exit_ts = "MF_FLIP", float(p), t
                     break
-            elif mode == "streak_break":
+            elif use_streak:
                 if direction == "UP" and su == 0 and mf <= 0:
                     reason, exit_px, exit_ts = "STREAK0", float(p), t
                     break
@@ -366,11 +510,23 @@ def run_offline_replay(
     end = profile["date_range"]["end"]
     months = month_list(start, end)
     symbols = list(profile["symbols"])
+    exclude_raw = trade.get("symbol_exclude") or sig_cfg.get("symbol_exclude") or []
+    if isinstance(exclude_raw, str):
+        exclude_raw = [exclude_raw]
+    symbol_exclude = {str(x).upper() for x in exclude_raw}
+    if symbol_exclude:
+        symbols = [s for s in symbols if str(s).upper() not in symbol_exclude]
+    symbol_size_scale = {
+        str(k).upper(): float(v)
+        for k, v in (trade.get("symbol_size_scale") or {}).items()
+    }
     money = str(trade.get("moneyness", "ATM"))
 
     if stock_by is None:
         stock_by = {}
-        for sym in symbols:
+        # Load excluded names too if they remain in peer_symbols (breadth only).
+        load_syms = list(dict.fromkeys(list(symbols) + list(sig_cfg.get("peer_symbols") or [])))
+        for sym in load_syms:
             raw = load_stock_month_files(paths["stock_root"], sym, months)
             if raw.empty:
                 continue
@@ -380,10 +536,38 @@ def run_offline_replay(
                 raw,
                 mf_window=int(sig_cfg.get("mf_window", 10)),
                 vol_ma_window=int(sig_cfg.get("vol_ma_window", 20)),
-                mf_confirm_bars=int(sig_cfg.get("mf_confirm_bars", 3)),
+                mf_fast_window=resolve_mf_fast_window(sig_cfg),
             )
 
-    top2 = build_topk_signals(stock_by, sig_cfg)
+    # TopK only among tradeable symbols — ignore ref frames (QQQ/VIXY) that may
+    # be present in stock_by for regime / peer helpers.
+    trade_stock = {s: stock_by[s] for s in symbols if s in stock_by and stock_by[s] is not None}
+    all_first = build_all_first_rule_a_signals(trade_stock, sig_cfg)
+    top2 = build_topk_signals(trade_stock, sig_cfg)
+    displace_on = _trade_flag(trade, "displace_on_later", False)
+    commit_tod = _parse_commit_tod(
+        trade.get("topk_commit_tod", sig_cfg.get("topk_commit_tod"))
+    )
+    commit_rank = str(
+        trade.get("topk_rank") or sig_cfg.get("topk_rank") or "abs_from_prev"
+    ).strip().lower()
+    post_commit_fill = _trade_flag(trade, "topk_post_commit_fill", True)
+    if commit_tod is not None:
+        # Deferred auction needs the full first-Rule-A universe, not earliest-TopK.
+        event_sigs = all_first
+        displace_universe = "all_first"
+    else:
+        displace_universe = str(
+            trade.get("displace_universe") or ("all_first" if displace_on else "topk")
+        ).strip().lower()
+        if displace_universe in {"all_first", "all", "universe", "first_rule_a"}:
+            event_sigs = all_first
+        else:
+            event_sigs = top2
+    # Research-only: expand event universe without kicking (free slots after exits).
+    if _trade_flag(trade, "late_signal_universe_all_first", False):
+        event_sigs = all_first
+        displace_universe = "all_first"
     contract_mode = str(trade.get("contract_mode", "day_lock")).lower()
     quote_source = str(trade.get("quote_source", "1s")).lower()  # 1s | day_iv | auto
     half_spread = float(trade.get("day_iv_half_spread_frac", 0.01))
@@ -420,9 +604,11 @@ def run_offline_replay(
     if regime_gate is None:
         regime_gate = Mag7RegimeGate.from_profile(profile, months=months)
     n_regime_block = 0
+    n_regime_scale = 0
     n_peer_block = 0
     n_si_block = 0
     n_pe_block = 0
+    n_tod_z_block = 0
     peer_align_min = sig_cfg.get("peer_align_min")
     peer_align_min_i = int(peer_align_min) if peer_align_min is not None else None
     peer_align_mode = str(sig_cfg.get("peer_align_mode", "mf10")).strip().lower()
@@ -433,6 +619,24 @@ def run_offline_replay(
     pe_min_ratio_f = float(pe_min_ratio) if pe_min_ratio is not None else None
     pe_window = int(sig_cfg.get("pe_window", 10))
     pe_lookback = int(sig_cfg.get("pe_lookback_bars", 780))
+    tod_z_min = sig_cfg.get("tod_mf_z_min")
+    tod_z_min_f = float(tod_z_min) if tod_z_min is not None else None
+    tod_z_lookback = int(sig_cfg.get("tod_mf_z_lookback_days", 20))
+    confirm_bars_raw = trade.get("entry_confirm_bars", sig_cfg.get("entry_confirm_bars"))
+    confirm_bars_n = int(confirm_bars_raw) if confirm_bars_raw is not None else 0
+    confirm_mode = str(
+        trade.get("entry_confirm_mode") or sig_cfg.get("entry_confirm_mode") or "mf"
+    ).strip().lower()
+    n_confirm_block = 0
+    purity_on = _trade_flag(trade, "trend_purity_sizing", False)
+    purity_fp_ref = float(trade.get("trend_purity_fp_ref", 0.025) or 0.025)
+    purity_features = str(
+        trade.get("trend_purity_features") or "momentum"
+    ).strip().lower()
+    purity_path_window = int(trade.get("trend_purity_path_window", 20) or 20)
+    purity_adverse_ref = float(trade.get("trend_purity_adverse_ref", 0.005) or 0.005)
+    n_purity_skip = 0
+    n_purity_scaled = 0
 
     def get_q(sym: str, date: str):
         k = (sym, date)
@@ -471,21 +675,61 @@ def run_offline_replay(
     pos = float(trade.get("position_frac", 0.25))
     cooldown = int(trade.get("cooldown_minutes", 5))
     max_n = int(trade.get("max_entries_per_symbol", 5))
-    circuit = trade.get("day_circuit", None)
+    # Honor trade.day_circuit whenever set (single / m5 / m5_circuit).
+    # Legacy gate required "circuit" in scheme name; that left peer3 single
+    # unprotected despite profile day_circuit=-0.05. Opt out with null / false.
+    circuit_raw = trade.get("day_circuit", None)
+    if circuit_raw is False or circuit_raw is None:
+        circuit = None
+    else:
+        circuit = float(circuit_raw)
     only_win = resolve_only_win_reenter(trade)
     use_reentry = scheme.startswith("m5")
-    use_circuit = "circuit" in scheme
-    if not use_circuit:
-        circuit = None
     n_size_full = 0
+    n_circuit_halt = 0
     n_size_split = 0
     n_skip_max_concurrent = 0
+    n_post_win_skip = 0
+    n_post_win_scale = 0
+    n_same_dir_win_block = 0
     sizing_mode_seen = None
+    block_same_dir = block_same_dir_after_win_enabled(trade)
+    prev_big_win_dirs: set[tuple[str, str]] = set()
 
     reg_cfg = profile.get("regime") or {}
     # After N consecutive losing days, skip the next session (flat day resets streak).
     day_loss_halt = reg_cfg.get("day_loss_streak_halt")
     day_loss_halt_n = int(day_loss_halt) if day_loss_halt is not None else None
+    # Event calendar blackout (FOMC / mega earnings / giant IPO).
+    # Prefer regime.*; trade.* keys accepted as alias for research profiles.
+    event_cfg = {
+        **{k: reg_cfg[k] for k in (
+            "event_calendar_block",
+            "event_calendar",
+            "event_dates",
+            "event_blackout_sessions",
+        ) if k in reg_cfg},
+        **{k: trade[k] for k in (
+            "event_calendar_block",
+            "event_calendar",
+            "event_dates",
+            "event_blackout_sessions",
+        ) if k in trade},
+    }
+    session_dates = sorted(str(d) for d in event_sigs["date"].unique()) if len(event_sigs) else []
+    # Also include stock calendar so +N sessions expand beyond TopK-only days.
+    for sdf in stock_by.values():
+        if sdf is not None and not getattr(sdf, "empty", True) and "date" in sdf.columns:
+            session_dates.extend(str(x) for x in sdf["date"].unique())
+    session_dates = sorted(set(session_dates))
+    event_blackout = resolve_event_blackout(event_cfg, session_dates=session_dates)
+    n_event_block = 0
+    n_displace = 0
+    n_displace_skip_score = 0
+    n_commit_days = 0
+    n_commit_pool = 0
+    n_commit_selected = 0
+    n_commit_post_fill = 0
 
     trades: list[dict[str, Any]] = []
     eq = 100.0
@@ -494,50 +738,167 @@ def run_offline_replay(
     daily_rows = []
     n_day_halt = 0
     loss_streak = 0
+    prev_day_ret: float | None = None
+    post_win_left = 0
+    post_win_sessions = post_win_cooldown_sessions(trade)
+    post_win_thr = trade.get("post_win_cooldown_day_ret", 0.10)
     bar_delay_seconds = int(trade.get("bar_availability_delay_seconds", 0) or 0)
     bar_delay = pd.Timedelta(seconds=bar_delay_seconds)
+    displace_ratio = float(trade.get("displace_min_score_ratio", 1.0) or 1.0)
+    sim_kwargs_common = dict(
+        fill=fill,
+        tp_mult=float(trade.get("tp_mult", 1.6)),
+        sl_mult=float(trade.get("sl_mult", 0.4)),
+        hold_minutes=int(trade.get("hold_minutes", 30)),
+        exit_mf_grace_seconds=int(trade.get("exit_mf_grace_seconds", 60)),
+        exit_min_hold_minutes=trade.get("exit_min_hold_minutes"),
+        mtm_floor_ret=trade.get("mtm_floor_ret"),
+        flow_cum_floor=trade.get("flow_cum_floor"),
+        stock_bar_delay_seconds=bar_delay_seconds,
+        trail_activate=trade.get("trail_activate"),
+        trail_dd=trade.get("trail_dd"),
+        hold_extend_minutes=trade.get("hold_extend_minutes"),
+        hold_extend_mtm_min=trade.get("hold_extend_mtm_min"),
+        hold_extend_require_mf=bool(trade.get("hold_extend_require_mf", True)),
+        early_exit_mode=trade.get("early_exit_mode"),
+    )
 
-    for date, day_sigs in top2.groupby("date", sort=True):
+    for date, day_sigs in event_sigs.groupby("date", sort=True):
         syms = list(day_sigs.sort_values("sig_ts")["symbol"].unique())
+        # Keep concurrent cap tied to configured top_k even when universe expands.
         n_sym = max(int(sig_cfg.get("top_k", 2)), 1)
         day_start = eq
         halt = False
         skip_day = bool(day_loss_halt_n is not None and loss_streak >= day_loss_halt_n)
+        post_win_mode, post_win_scale = post_win_cooldown_action(
+            trade, prev_day_ret=prev_day_ret, cooldown_left=post_win_left
+        )
+        if post_win_mode == "skip":
+            skip_day = True
+            n_post_win_skip += 1
+        if str(date) in event_blackout:
+            skip_day = True
+            n_event_block += 1
         if skip_day:
             n_day_halt += 1
 
         if not use_reentry:
-            events = [
-                (to_ny(r.sig_ts) + bar_delay, to_ny(r.sig_ts), r.symbol, r.dir)
-                for r in day_sigs.itertuples(index=False)
-            ]
-        else:
             events = []
             for r in day_sigs.itertuples(index=False):
-                for ts in all_rule_a_times(
+                fp = getattr(r, "from_prev", None)
+                try:
+                    fp_f = float(fp) if fp is not None and pd.notna(fp) else None
+                except (TypeError, ValueError):
+                    fp_f = None
+                events.append(
+                    (to_ny(r.sig_ts) + bar_delay, to_ny(r.sig_ts), r.symbol, r.dir, fp_f)
+                )
+        else:
+            events = []
+            rule_kw = _rule_a_kwargs_from_cfg(sig_cfg)
+            for r in day_sigs.itertuples(index=False):
+                fp = getattr(r, "from_prev", None)
+                try:
+                    fp_f = float(fp) if fp is not None and pd.notna(fp) else None
+                except (TypeError, ValueError):
+                    fp_f = None
+                for ts0 in all_rule_a_times(
                     stock_by[r.symbol][stock_by[r.symbol]["date"] == date],
                     r.dir,
-                    window_start=str(sig_cfg.get("window_start", "10:30")),
-                    window_end=str(sig_cfg.get("window_end", "14:00")),
-                    streak_min=int(sig_cfg.get("streak_min", 8)),
-                    from_prev_abs=float(sig_cfg.get("from_prev_abs", 0.02)),
-                    vol_z_min=float(sig_cfg.get("vol_z_min", 1.0)),
+                    **rule_kw,
                 ):
-                    feature_ts = to_ny(ts)
-                    events.append((feature_ts + bar_delay, feature_ts, r.symbol, r.dir))
+                    feature_ts = to_ny(ts0)
+                    events.append((feature_ts + bar_delay, feature_ts, r.symbol, r.dir, fp_f))
             events.sort(key=lambda x: x[0])
 
         if skip_day:
             events = []
 
+        # Deferred TopK commit: collect pre-commit fires → rank → enter at commit clock.
+        if commit_tod is not None and events and not use_reentry:
+            commit_ts = pd.Timestamp(f"{date} {commit_tod}", tz=NY)
+            commit_entry = commit_ts + bar_delay
+            pre: list[dict[str, Any]] = []
+            post: list[tuple] = []
+            for ts, feature_ts, sym, direction, sig_from_prev in events:
+                if block_same_dir and (str(sym).upper(), str(direction).upper()) in prev_big_win_dirs:
+                    n_same_dir_win_block += 1
+                    continue
+                if regime_gate is not None:
+                    dec0 = regime_gate.check(direction, feature_ts)
+                    if not dec0.allow:
+                        n_regime_block += 1
+                        continue
+                peer_n0 = None
+                if peer_align_min_i is not None and peer_align_min_i > 0:
+                    peer_n0 = count_peer_align(
+                        stock_by,
+                        date=str(date),
+                        asof_ts=feature_ts,
+                        direction=str(direction),
+                        peer_symbols=peer_symbols,
+                        mode=peer_align_mode,
+                        streak_min=int(sig_cfg.get("streak_min", 8)),
+                    )
+                    if peer_n0 < peer_align_min_i:
+                        n_peer_block += 1
+                        continue
+                score = _topk_rank_score(
+                    commit_rank, from_prev=sig_from_prev, peer_n=peer_n0
+                )
+                item = {
+                    "ts": ts,
+                    "feature_ts": feature_ts,
+                    "sym": sym,
+                    "direction": direction,
+                    "sig_from_prev": sig_from_prev,
+                    "peer_n": peer_n0,
+                    "score": score,
+                }
+                if feature_ts <= commit_ts:
+                    pre.append(item)
+                else:
+                    post.append((ts, feature_ts, sym, direction, sig_from_prev))
+            pre.sort(
+                key=lambda c: (-float(c["score"]), to_ny(c["feature_ts"]), str(c["sym"]))
+            )
+            winners = pre[:n_sym]
+            n_commit_days += 1
+            n_commit_pool += len(pre)
+            n_commit_selected += len(winners)
+            new_events: list[tuple] = []
+            for c in winners:
+                # Enter at commit clock (causal: selection uses only info ≤ commit).
+                new_events.append(
+                    (
+                        commit_entry,
+                        c["feature_ts"],
+                        c["sym"],
+                        c["direction"],
+                        c["sig_from_prev"],
+                    )
+                )
+            if post_commit_fill:
+                won = {c["sym"] for c in winners}
+                for ev in post:
+                    if ev[2] in won:
+                        continue
+                    new_events.append(ev)
+                    n_commit_post_fill += 1
+            events = new_events
+
         last_exit = {s: None for s in syms}
         last_win = {s: True for s in syms}
         n_done = {s: 0 for s in syms}
         open_until = {s: None for s in syms}
+        day_big_win_dirs: set[tuple[str, str]] = set()
 
-        for ts, feature_ts, sym, direction in events:
+        for ts, feature_ts, sym, direction, sig_from_prev in events:
             if halt:
                 break
+            if block_same_dir and (str(sym).upper(), str(direction).upper()) in prev_big_win_dirs:
+                n_same_dir_win_block += 1
+                continue
             if use_reentry:
                 if n_done[sym] >= max_n:
                     continue
@@ -604,6 +965,40 @@ def run_offline_replay(
                 if not allow_pe:
                     n_pe_block += 1
                     continue
+
+            tod_z_val = None
+            if tod_z_min_f is not None:
+                allow_z, tod_z_val = tod_mf_z_ok(
+                    stock_by.get(sym),
+                    asof_ts=feature_ts,
+                    direction=str(direction),
+                    lookback_days=tod_z_lookback,
+                    z_min=tod_z_min_f,
+                )
+                if not allow_z:
+                    n_tod_z_block += 1
+                    continue
+
+            # Entry confirm: wait N bars after Rule-A; keep peer/regime at fire time.
+            confirm_ft = None
+            confirm_mf = None
+            if confirm_bars_n > 0:
+                sdf_c = stock_by.get(sym)
+                stock_day_c = None
+                if sdf_c is not None and not sdf_c.empty:
+                    stock_day_c = sdf_c[sdf_c["date"] == date]
+                ok_c, confirm_ft, confirm_mf, _, _ = entry_confirm_ok(
+                    stock_day_c,
+                    direction=str(direction),
+                    feature_ts=feature_ts,
+                    confirm_bars=confirm_bars_n,
+                    mode=confirm_mode,
+                )
+                if not ok_c:
+                    n_confirm_block += 1
+                    continue
+                # Shift fill clock to confirm bar + availability delay.
+                ts = to_ny(confirm_ft) + bar_delay
 
             buckets = lock_idx.get((sym, date)) if lock_idx is not None else None
             day_ticker = None
@@ -717,23 +1112,10 @@ def run_offline_replay(
             sim = simulate_trade(
                 path,
                 ts,
-                fill=fill,
-                tp_mult=float(trade.get("tp_mult", 1.6)),
-                sl_mult=float(trade.get("sl_mult", 0.4)),
-                hold_minutes=int(trade.get("hold_minutes", 30)),
                 direction=direction,
                 stock_day=stock_day,
                 exit_mode=exit_mode,
-                exit_mf_grace_seconds=int(trade.get("exit_mf_grace_seconds", 60)),
-                exit_min_hold_minutes=trade.get("exit_min_hold_minutes"),
-                mtm_floor_ret=trade.get("mtm_floor_ret"),
-                flow_cum_floor=trade.get("flow_cum_floor"),
-                stock_bar_delay_seconds=bar_delay_seconds,
-                trail_activate=trade.get("trail_activate"),
-                trail_dd=trade.get("trail_dd"),
-                hold_extend_minutes=trade.get("hold_extend_minutes"),
-                hold_extend_mtm_min=trade.get("hold_extend_mtm_min"),
-                hold_extend_require_mf=bool(trade.get("hold_extend_require_mf", True)),
+                **sim_kwargs_common,
             )
             if sim is None:
                 continue
@@ -744,9 +1126,160 @@ def run_offline_replay(
                 symbol=sym,
                 entry_ts=sim.entry_ts,
             )
+            if not allow and displace_on:
+                # Kick oldest still-open position if later signal clears score gate.
+                open_syms = [
+                    s
+                    for s, until in open_until.items()
+                    if s != sym and until is not None and until > sim.entry_ts
+                ]
+                victims: list[tuple[pd.Timestamp, int, str]] = []
+                for s in open_syms:
+                    for i in range(len(trades) - 1, -1, -1):
+                        row_i = trades[i]
+                        if str(row_i.get("date")) != str(date) or row_i.get("symbol") != s:
+                            continue
+                        if to_ny(row_i["exit_ts"]) > sim.entry_ts:
+                            victims.append((to_ny(row_i["entry_ts"]), i, s))
+                        break
+                victims.sort(key=lambda x: x[0])
+                displaced = False
+                if victims:
+                    _, vic_i, vic_sym = victims[0]
+                    old_row = trades[vic_i]
+                    new_score = _displace_score(
+                        trade, from_prev=sig_from_prev, peer_n=peer_n
+                    )
+                    old_score = _displace_score(
+                        trade,
+                        from_prev=old_row.get("sig_from_prev"),
+                        peer_n=old_row.get("peer_align_n"),
+                    )
+                    score_mode = str(trade.get("displace_score") or "none").strip().lower()
+                    score_ok = True
+                    if score_mode not in {"", "none", "off", "any"}:
+                        score_ok = new_score + 1e-12 >= displace_ratio * float(old_score)
+                    if not score_ok:
+                        n_displace_skip_score += 1
+                    else:
+                        vic_path, _ = get_path(vic_sym, date, old_row["ticker"])
+                        sdf_v = stock_by.get(vic_sym)
+                        stock_day_v = None
+                        if sdf_v is not None and not sdf_v.empty:
+                            stock_day_v = sdf_v[sdf_v["date"] == date]
+                        sim_v = simulate_trade(
+                            vic_path,
+                            old_row["entry_ts"],
+                            direction=str(old_row.get("dir")),
+                            stock_day=stock_day_v,
+                            exit_mode=exit_mode,
+                            force_exit_ts=sim.entry_ts,
+                            **sim_kwargs_common,
+                        )
+                        if sim_v is not None and str(sim_v.reason) == "DISPLACE":
+                            old_sf = float(old_row["size_frac"])
+                            old_ret = float(old_row["ret"])
+                            factor = 1.0 + old_sf * old_ret
+                            if factor > 1e-12:
+                                eq /= factor
+                            eq *= 1.0 + old_sf * float(sim_v.ret)
+                            peak = max(peak, eq)
+                            maxdd = min(maxdd, eq / peak - 1.0)
+                            old_row["exit"] = sim_v.exit
+                            old_row["ret"] = sim_v.ret
+                            old_row["reason"] = sim_v.reason
+                            old_row["exit_ts"] = sim_v.exit_ts
+                            old_row["displaced_by"] = sym
+                            old_row["displaced_at"] = sim.entry_ts
+                            open_until[vic_sym] = sim_v.exit_ts
+                            last_exit[vic_sym] = sim_v.exit_ts
+                            last_win[vic_sym] = sim_v.ret > 0
+                            n_displace += 1
+                            displaced = True
+                            size_frac, sizing_mode, n_conc, allow, size_reason = resolve_size_frac(
+                                trade,
+                                top_k=n_sym,
+                                open_until=open_until,
+                                symbol=sym,
+                                entry_ts=sim.entry_ts,
+                            )
+                            size_reason = f"{size_reason}+displace"
+                if not displaced:
+                    n_skip_max_concurrent += 1
+                    continue
+            elif not allow:
+                n_skip_max_concurrent += 1
+                continue
             if not allow:
                 n_skip_max_concurrent += 1
                 continue
+            if post_win_mode == "scale" and post_win_scale < 1.0:
+                size_frac = float(size_frac) * float(post_win_scale)
+                size_reason = f"{size_reason}+post_win_scale"
+                n_post_win_scale += 1
+            if dec is not None and float(getattr(dec, "size_scale", 1.0) or 1.0) < 1.0:
+                size_frac = float(size_frac) * float(dec.size_scale)
+                size_reason = f"{size_reason}+regime_scale"
+                n_regime_scale += 1
+            sym_scale = float(symbol_size_scale.get(str(sym).upper(), 1.0))
+            if sym_scale <= 0.0:
+                continue
+            if abs(sym_scale - 1.0) > 1e-12:
+                size_frac = float(size_frac) * sym_scale
+                size_reason = f"{size_reason}+sym_scale:{sym_scale:.2f}"
+            purity_score = None
+            purity_parts = None
+            purity_scale = None
+            if purity_on:
+                # mf/streak/SI at fire time (causal purity; no EOD).
+                sdf_p = stock_by.get(sym)
+                stock_day_p = None
+                if sdf_p is not None and not sdf_p.empty:
+                    stock_day_p = sdf_p[sdf_p["date"] == date]
+                mf_p, su_p, sd_p = _stock_mf_at(_prepare_stock_day(stock_day_p), feature_ts)
+                streak_p = su_p if str(direction).upper() == "UP" else sd_p
+                si_p = si_val
+                if si_p is None:
+                    si_p = sync_index(
+                        stock_by,
+                        date=str(date),
+                        asof_ts=feature_ts,
+                        peer_symbols=peer_symbols,
+                    )
+                qfp = float(dec.qqq_from_prev) if dec is not None and dec.qqq_from_prev is not None else None
+                path_feats = path_efficiency_features(
+                    stock_day_p,
+                    asof_ts=feature_ts,
+                    direction=str(direction),
+                    window=purity_path_window,
+                )
+                purity_score, purity_parts = trend_purity_score(
+                    direction=str(direction),
+                    from_prev=sig_from_prev,
+                    peer_n=peer_n,
+                    peer_min=int(peer_align_min_i or 0),
+                    peer_universe=max(len(peer_symbols), 1),
+                    mf10=mf_p,
+                    streak=streak_p,
+                    streak_min=int(sig_cfg.get("streak_min", 8)),
+                    qqq_from_prev=qfp,
+                    si=si_p,
+                    fp_ref=purity_fp_ref,
+                    features=purity_features,
+                    path_eff=path_feats.get("path_eff"),
+                    range_eff=path_feats.get("range_eff"),
+                    dir_frac=path_feats.get("dir_frac"),
+                    adverse=path_feats.get("adverse"),
+                    adverse_ref=purity_adverse_ref,
+                )
+                purity_scale, purity_tag = trend_purity_size_scale(purity_score, trade)
+                if purity_scale <= 0.0:
+                    n_purity_skip += 1
+                    continue
+                if purity_scale < 1.0 - 1e-12:
+                    size_frac = float(size_frac) * float(purity_scale)
+                    size_reason = f"{size_reason}+{purity_tag}:{purity_scale:.2f}"
+                    n_purity_scaled += 1
             sizing_mode_seen = sizing_mode
             if n_conc <= 1:
                 n_size_full += 1
@@ -797,10 +1330,32 @@ def run_offline_replay(
                 row["si"] = float(si_val)
             if pe_val is not None:
                 row["pe"] = float(pe_val)
+            if tod_z_val is not None:
+                row["tod_mf_z"] = float(tod_z_val)
             if pe_ma_val is not None:
                 row["pe_ma"] = float(pe_ma_val)
+            if sig_from_prev is not None:
+                row["sig_from_prev"] = float(sig_from_prev)
+            if confirm_ft is not None:
+                row["confirm_ts"] = confirm_ft
+                row["entry_confirm_bars"] = int(confirm_bars_n)
+                if confirm_mf is not None:
+                    row["confirm_mf"] = float(confirm_mf)
+            if purity_score is not None:
+                row["trend_purity"] = float(purity_score)
+                if purity_scale is not None:
+                    row["trend_purity_scale"] = float(purity_scale)
+                if purity_parts is not None:
+                    for pk, pv in purity_parts.items():
+                        row[f"purity_{pk}"] = float(pv)
             trades.append(row)
+            if block_same_dir and is_symbol_dir_big_win(
+                ret=float(sim.ret), reason=sim.reason, trade=trade
+            ):
+                day_big_win_dirs.add((str(sym).upper(), str(direction).upper()))
             if circuit is not None and (eq / day_start - 1.0) <= float(circuit):
+                if not halt:
+                    n_circuit_halt += 1
                 halt = True
 
         day_ret = eq / day_start - 1.0
@@ -810,13 +1365,24 @@ def run_offline_replay(
                 "equity": eq,
                 "day_ret": day_ret,
                 "n": sum(n_done.values()),
-                "day_halt": bool(skip_day),
+                "day_halt": bool(skip_day or halt),
             }
         )
         if day_ret < 0:
             loss_streak += 1
         else:
             loss_streak = 0
+        prev_day_ret = float(day_ret)
+        prev_big_win_dirs = day_big_win_dirs
+        if (
+            post_win_thr is not None
+            and str(trade.get("post_win_cooldown_mode") or "off").lower()
+            not in {"", "off", "none", "false", "0"}
+            and day_ret >= float(post_win_thr)
+        ):
+            post_win_left = int(post_win_sessions)
+        elif post_win_left > 0:
+            post_win_left -= 1
 
     trades_df = pd.DataFrame(trades)
     daily_df = pd.DataFrame(daily_rows)
@@ -835,14 +1401,34 @@ def run_offline_replay(
         "end_equity": float(eq),
         "n_signals_topk": int(len(top2)),
         "n_regime_block": int(n_regime_block),
+        "n_regime_scale": int(n_regime_scale),
+        "n_event_block": int(n_event_block),
+        "event_blackout_dates": sorted(event_blackout),
         "n_peer_block": int(n_peer_block),
         "n_si_block": int(n_si_block),
         "n_pe_block": int(n_pe_block),
+        "n_tod_z_block": int(n_tod_z_block),
+        "n_confirm_block": int(n_confirm_block),
+        "entry_confirm_bars": int(confirm_bars_n) if confirm_bars_n > 0 else None,
+        "entry_confirm_mode": confirm_mode if confirm_bars_n > 0 else None,
+        "trend_purity_sizing": bool(purity_on),
+        "trend_purity_features": purity_features if purity_on else None,
+        "n_purity_skip": int(n_purity_skip),
+        "n_purity_scaled": int(n_purity_scaled),
         "peer_align_min": peer_align_min_i,
         "peer_align_mode": peer_align_mode if peer_align_min_i is not None else None,
         "si_min": si_min_f,
         "pe_min_ratio": pe_min_ratio_f,
+        "tod_mf_z_min": tod_z_min_f,
         "n_day_halt": int(n_day_halt),
+        "n_circuit_halt": int(n_circuit_halt),
+        "day_circuit": circuit,
+        "n_post_win_skip": int(n_post_win_skip),
+        "n_post_win_scale": int(n_post_win_scale),
+        "post_win_cooldown_mode": str(trade.get("post_win_cooldown_mode") or "off"),
+        "post_win_cooldown_day_ret": trade.get("post_win_cooldown_day_ret"),
+        "block_same_dir_after_win": bool(block_same_dir),
+        "n_same_dir_win_block": int(n_same_dir_win_block),
         "regime_enabled": bool(regime_gate is not None),
         "day_loss_streak_halt": day_loss_halt_n,
         "contract_mode": contract_mode,
@@ -861,6 +1447,19 @@ def run_offline_replay(
         "n_size_full": int(n_size_full),
         "n_size_split": int(n_size_split),
         "n_skip_max_concurrent": int(n_skip_max_concurrent),
+        "n_displace": int(n_displace),
+        "n_displace_skip_score": int(n_displace_skip_score),
+        "displace_on_later": bool(displace_on),
+        "displace_universe": displace_universe,
+        "displace_score": str(trade.get("displace_score") or "none"),
+        "n_signals_all_first": int(len(all_first)),
+        "topk_commit_tod": commit_tod,
+        "topk_rank": commit_rank if commit_tod else None,
+        "topk_post_commit_fill": bool(post_commit_fill) if commit_tod else None,
+        "n_commit_days": int(n_commit_days),
+        "n_commit_pool": int(n_commit_pool),
+        "n_commit_selected": int(n_commit_selected),
+        "n_commit_post_fill_events": int(n_commit_post_fill),
         "exit_mode": str(trade.get("exit_mode") or trade.get("stock_exit") or "none"),
     }
     return {"summary": summary, "trades": trades_df, "daily": daily_df, "topk": top2}
