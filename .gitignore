@@ -201,10 +201,11 @@ qqq_wf_*/
 *.lmdb-lock
 
 # --- 实验产物 / 大数据缓存（不入库，约 13GB+ parquet） ---
-# factor_lab / qqq_btc / stock_options 回测与 gate 结果
+# factor_lab / qqq_btc / stock_options / maga7 回测与 gate 结果
 factor_lab/results/
 qqq_btc/results/
 stock_options/results/
+maga7/results/
 
 # production 本地数据 dump
 production/*.parquet

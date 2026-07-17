@@ -43,8 +43,10 @@ from maga7.common.signals import (
     build_topk_signals,
     count_peer_align,
     load_stock_month_files,
+    mf_idio_ok,
     price_efficiency_ok,
     resolve_mf_fast_window,
+    rolling_idio_beta,
     sync_index,
     tod_mf_z_ok,
 )
@@ -522,16 +524,43 @@ def run_offline_replay(
     }
     money = str(trade.get("moneyness", "ATM"))
 
+    mf_idio_mode = str(sig_cfg.get("mf_idio_mode") or "off").strip().lower()
+    mf_idio_on = mf_idio_mode not in {"", "off", "none", "false", "0"}
+    mf_idio_min_frac = float(sig_cfg.get("mf_idio_min_frac", 0.0) or 0.0)
+    mf_idio_beta_days = int(sig_cfg.get("mf_idio_beta_days", 5) or 5)
+    mf_idio_beta_on = str(sig_cfg.get("mf_idio_beta_on") or "ret").strip().lower()
+    mf_idio_block_missing = bool(sig_cfg.get("mf_idio_block_missing", False))
+    # block = reject entry (default); scale = keep entry, cut size_frac
+    mf_idio_action = str(sig_cfg.get("mf_idio_action") or "block").strip().lower()
+    if mf_idio_action not in {"block", "scale", "size", "half"}:
+        mf_idio_action = "block"
+    if mf_idio_action in {"size", "half"}:
+        mf_idio_action = "scale"
+    mf_idio_scale = float(sig_cfg.get("mf_idio_scale", 0.5) or 0.5)
+    mf_idio_scale = max(0.0, min(mf_idio_scale, 1.0))
+    # Only arm the gate after N consecutive losing days (None/0 = always on).
+    _als = sig_cfg.get("mf_idio_after_loss_streak")
+    mf_idio_after_loss_streak = int(_als) if _als is not None else None
+    # Prior sessions for beta need bars before ``start``.
+    load_start = start
+    if mf_idio_on:
+        load_start = (pd.Timestamp(start) - pd.Timedelta(days=max(14, mf_idio_beta_days * 3))).strftime(
+            "%Y-%m-%d"
+        )
+        months = month_list(load_start, end)
+
     if stock_by is None:
         stock_by = {}
         # Load excluded names too if they remain in peer_symbols (breadth only).
         load_syms = list(dict.fromkeys(list(symbols) + list(sig_cfg.get("peer_symbols") or [])))
+        if mf_idio_on and "QQQ" not in {str(s).upper() for s in load_syms}:
+            load_syms.append("QQQ")
         for sym in load_syms:
             raw = load_stock_month_files(paths["stock_root"], sym, months)
             if raw.empty:
                 continue
-            # clip date range
-            raw = raw[(raw["date"] >= start) & (raw["date"] <= end)]
+            # clip date range (keep lookback when residual-MF gate is on)
+            raw = raw[(raw["date"] >= load_start) & (raw["date"] <= end)]
             stock_by[sym] = attach_mf_features(
                 raw,
                 mf_window=int(sig_cfg.get("mf_window", 10)),
@@ -541,7 +570,13 @@ def run_offline_replay(
 
     # TopK only among tradeable symbols — ignore ref frames (QQQ/VIXY) that may
     # be present in stock_by for regime / peer helpers.
-    trade_stock = {s: stock_by[s] for s in symbols if s in stock_by and stock_by[s] is not None}
+    # Signal universe stays inside the requested date_range even if lookback bars remain.
+    trade_stock = {}
+    for s in symbols:
+        sdf = stock_by.get(s)
+        if sdf is None or getattr(sdf, "empty", True):
+            continue
+        trade_stock[s] = sdf[(sdf["date"] >= start) & (sdf["date"] <= end)].copy()
     all_first = build_all_first_rule_a_signals(trade_stock, sig_cfg)
     top2 = build_topk_signals(trade_stock, sig_cfg)
     displace_on = _trade_flag(trade, "displace_on_later", False)
@@ -606,6 +641,8 @@ def run_offline_replay(
     n_regime_block = 0
     n_regime_scale = 0
     n_peer_block = 0
+    n_mf_idio_block = 0
+    n_mf_idio_scale = 0
     n_si_block = 0
     n_pe_block = 0
     n_tod_z_block = 0
@@ -613,6 +650,84 @@ def run_offline_replay(
     peer_align_min_i = int(peer_align_min) if peer_align_min is not None else None
     peer_align_mode = str(sig_cfg.get("peer_align_mode", "mf10")).strip().lower()
     peer_symbols = list(sig_cfg.get("peer_symbols") or profile.get("symbols") or [])
+    qqq_frame = stock_by.get("QQQ")
+    mf_idio_beta_cache: dict[tuple[str, str], float | None] = {}
+
+    def _mf_idio_armed(loss_streak_n: int) -> bool:
+        if not mf_idio_on:
+            return False
+        if mf_idio_after_loss_streak is None or int(mf_idio_after_loss_streak) <= 0:
+            return True
+        return int(loss_streak_n) >= int(mf_idio_after_loss_streak)
+
+    def _mf_idio_fail(
+        sym: str,
+        direction: str,
+        feature_ts: pd.Timestamp,
+        date: str,
+        *,
+        loss_streak_n: int,
+    ) -> bool:
+        """True when residual-MF gate fails (and is armed)."""
+        if not _mf_idio_armed(loss_streak_n):
+            return False
+        key = (str(sym).upper(), str(date))
+        if key not in mf_idio_beta_cache and mf_idio_mode not in {"diff_pos", "diff", "mf_diff"}:
+            mf_idio_beta_cache[key] = rolling_idio_beta(
+                stock_by.get(sym),
+                qqq_frame,
+                asof_date=str(date),
+                n_days=mf_idio_beta_days,
+                on=mf_idio_beta_on,
+            )
+        beta = mf_idio_beta_cache.get(key)
+        ok, _meta = mf_idio_ok(
+            stock_by.get(sym),
+            qqq_frame,
+            date=str(date),
+            asof_ts=feature_ts,
+            direction=str(direction),
+            mode=mf_idio_mode,
+            min_frac=mf_idio_min_frac,
+            beta_days=mf_idio_beta_days,
+            beta_on=mf_idio_beta_on,
+            beta=beta,
+            block_missing=mf_idio_block_missing,
+        )
+        return not ok
+
+    def _mf_idio_allows_entry(
+        sym: str,
+        direction: str,
+        feature_ts: pd.Timestamp,
+        date: str,
+        *,
+        loss_streak_n: int,
+    ) -> bool:
+        nonlocal n_mf_idio_block
+        if mf_idio_action == "scale":
+            return True
+        if _mf_idio_fail(sym, direction, feature_ts, date, loss_streak_n=loss_streak_n):
+            n_mf_idio_block += 1
+            return False
+        return True
+
+    def _mf_idio_size_mult(
+        sym: str,
+        direction: str,
+        feature_ts: pd.Timestamp,
+        date: str,
+        *,
+        loss_streak_n: int,
+    ) -> float:
+        nonlocal n_mf_idio_scale
+        if mf_idio_action != "scale":
+            return 1.0
+        if _mf_idio_fail(sym, direction, feature_ts, date, loss_streak_n=loss_streak_n):
+            n_mf_idio_scale += 1
+            return float(mf_idio_scale)
+        return 1.0
+
     si_min = sig_cfg.get("si_min")
     si_min_f = float(si_min) if si_min is not None else None
     pe_min_ratio = sig_cfg.get("pe_min_ratio")
@@ -721,7 +836,7 @@ def run_offline_replay(
     for sdf in stock_by.values():
         if sdf is not None and not getattr(sdf, "empty", True) and "date" in sdf.columns:
             session_dates.extend(str(x) for x in sdf["date"].unique())
-    session_dates = sorted(set(session_dates))
+    session_dates = sorted(d for d in set(session_dates) if start <= d <= end)
     event_blackout = resolve_event_blackout(event_cfg, session_dates=session_dates)
     n_event_block = 0
     n_displace = 0
@@ -843,6 +958,10 @@ def run_offline_replay(
                     if peer_n0 < peer_align_min_i:
                         n_peer_block += 1
                         continue
+                if not _mf_idio_allows_entry(
+                    sym, direction, feature_ts, str(date), loss_streak_n=loss_streak
+                ):
+                    continue
                 score = _topk_rank_score(
                     commit_rank, from_prev=sig_from_prev, peer_n=peer_n0
                 )
@@ -937,6 +1056,11 @@ def run_offline_replay(
                 if peer_n < peer_align_min_i:
                     n_peer_block += 1
                     continue
+
+            if not _mf_idio_allows_entry(
+                sym, direction, feature_ts, str(date), loss_streak_n=loss_streak
+            ):
+                continue
 
             if si_min_f is not None:
                 si_val = sync_index(
@@ -1221,6 +1345,12 @@ def run_offline_replay(
                 size_frac = float(size_frac) * float(dec.size_scale)
                 size_reason = f"{size_reason}+regime_scale"
                 n_regime_scale += 1
+            idio_mult = _mf_idio_size_mult(
+                sym, direction, feature_ts, str(date), loss_streak_n=loss_streak
+            )
+            if idio_mult < 1.0 - 1e-12:
+                size_frac = float(size_frac) * float(idio_mult)
+                size_reason = f"{size_reason}+mf_idio_scale:{idio_mult:.2f}"
             sym_scale = float(symbol_size_scale.get(str(sym).upper(), 1.0))
             if sym_scale <= 0.0:
                 continue
@@ -1405,6 +1535,15 @@ def run_offline_replay(
         "n_event_block": int(n_event_block),
         "event_blackout_dates": sorted(event_blackout),
         "n_peer_block": int(n_peer_block),
+        "n_mf_idio_block": int(n_mf_idio_block),
+        "n_mf_idio_scale": int(n_mf_idio_scale),
+        "mf_idio_mode": mf_idio_mode if mf_idio_on else None,
+        "mf_idio_action": mf_idio_action if mf_idio_on else None,
+        "mf_idio_scale": mf_idio_scale if mf_idio_on and mf_idio_action == "scale" else None,
+        "mf_idio_after_loss_streak": mf_idio_after_loss_streak if mf_idio_on else None,
+        "mf_idio_min_frac": mf_idio_min_frac if mf_idio_on and mf_idio_mode in {"frac", "min_frac", "fraction"} else None,
+        "mf_idio_beta_days": mf_idio_beta_days if mf_idio_on else None,
+        "mf_idio_beta_on": mf_idio_beta_on if mf_idio_on else None,
         "n_si_block": int(n_si_block),
         "n_pe_block": int(n_pe_block),
         "n_tod_z_block": int(n_tod_z_block),
