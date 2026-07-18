@@ -20,10 +20,16 @@ def live_label_shift_seconds() -> int:
         return 60
 
 
-def live_session_bar(value: Any) -> int:
+def live_end_label_ts(value: Any) -> pd.Timestamp:
+    """FCS start-label → 离线 end-label 时间戳。"""
     if isinstance(value, (int, float)):
         ts = pd.Timestamp(float(value), unit="s", tz="UTC")
     else:
         ts = pd.Timestamp(value)
-    ts = ts + pd.Timedelta(seconds=live_label_shift_seconds())
-    return int(session_minute(pd.Series([ts])).iloc[0])
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts + pd.Timedelta(seconds=live_label_shift_seconds())
+
+
+def live_session_bar(value: Any) -> int:
+    return int(session_minute(pd.Series([live_end_label_ts(value)])).iloc[0])

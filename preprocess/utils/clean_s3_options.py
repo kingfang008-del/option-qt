@@ -9,8 +9,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ================= 配置区域 =================
-SRC_DIR = "/home/kingfang007/data/new_option_data_s3"
-DEST_DIR = "/home/kingfang007/data/new_option_data_s3_clean"
+SRC_DIR = "/mnt/s990/new_option_data_s3"
+DEST_DIR = "/mnt/s990/new_option_data_s3_clean"
 MAX_WORKERS = 8  # 并发线程数，可根据机器配置调整
 
 def process_file(src_path):

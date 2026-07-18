@@ -471,6 +471,68 @@ def apply_oms_patches(*, tick_exits_mode: str = "disaster_only") -> None:
     oex.OrchestratorExecution._execute_exit = _patched_execute_exit
     logger.info("patched OrchestratorExecution REALTIME_DRY exit fill → fill_model 0.775")
 
+    _orig_execute_entry = oex.OrchestratorExecution._execute_entry
+
+    async def _patched_execute_entry(self, sym, sig, stock_price, curr_ts, batch_idx):
+        """按 sig.meta['position_size_mult'] 缩放 POSITION_RATIO（跨日半仓防御）。"""
+        meta = dict((sig or {}).get("meta") or {})
+        mult = meta.get("position_size_mult")
+        if mult is None:
+            try:
+                from qqq_btc.live.session_governor import get_session_governor
+
+                mult = get_session_governor().position_size_mult(str(sym))
+            except Exception:
+                mult = 1.0
+        try:
+            mult_f = float(mult)
+        except (TypeError, ValueError):
+            mult_f = 1.0
+        if not math.isfinite(mult_f) or mult_f <= 0.0:
+            mult_f = 1.0
+        if abs(mult_f - 1.0) < 1e-12:
+            return await _orig_execute_entry(self, sym, sig, stock_price, curr_ts, batch_idx)
+
+        meta["position_size_mult"] = mult_f
+        if "position_frac" not in meta:
+            try:
+                from qqq_btc.live.session_governor import get_session_governor
+
+                meta["position_frac"] = get_session_governor().effective_position_frac(
+                    str(sym)
+                )
+            except Exception:
+                pass
+        sig = dict(sig or {})
+        sig["meta"] = meta
+
+        orig_cfg = self._cfg_value
+
+        def _scaled_cfg(key, default):
+            val = orig_cfg(key, default)
+            if str(key) == "POSITION_RATIO":
+                try:
+                    return max(0.0, min(1.0, float(val) * mult_f))
+                except (TypeError, ValueError):
+                    return val
+            return val
+
+        self._cfg_value = _scaled_cfg
+        try:
+            logger.info(
+                "📉 [qqq_btc size] %s POSITION_RATIO x%.3f (all-leg defense)",
+                sym,
+                mult_f,
+            )
+            return await _orig_execute_entry(self, sym, sig, stock_price, curr_ts, batch_idx)
+        finally:
+            self._cfg_value = orig_cfg
+
+    oex.OrchestratorExecution._execute_entry = _patched_execute_entry
+    logger.info(
+        "patched OrchestratorExecution._execute_entry → position_size_mult scaling"
+    )
+
     if tick_exits_mode != "legacy":
         _ORIG_TICK_EXITS = eex.ExecutionEngineV8._evaluate_second_dynamic_exits
 
@@ -554,12 +616,29 @@ def apply_oms_patches(*, tick_exits_mode: str = "disaster_only") -> None:
                 mid_p = 0.5 * (put_bid + put_ask)
                 ctx["put_spread_pct"] = (put_ask - put_bid) / mid_p if mid_p > 0 else 0.0
             sym = str(item.get("symbol", "") or "")
+            st = self.states.get(sym) if sym else None
             if sym and ctx_curr_price > 0.01:
                 from qqq_btc.live.session_governor import get_session_governor
 
                 get_session_governor().record_minute_mid(sym, float(ctx_curr_price), float(curr_ts))
+            # 空仓即喂 edge：覆盖 stale/zombie/global_cd 等未进入 decide_entry 的分钟。
+            # 与 decide_entry 内调用通过 last_edge_session_bar 去重。
+            try:
+                from qqq_btc.live.strategy_entry_bridge import record_session_edges_from_ctx
+
+                pos = (
+                    int(getattr(st, "position", 0) or 0)
+                    if st is not None
+                    else int(ctx.get("position", 0) or 0)
+                )
+                ctx["position"] = pos
+                ctx.setdefault("is_ready", True)
+                ctx.setdefault("symbol", sym)
+                ctx.setdefault("curr_ts", float(curr_ts))
+                record_session_edges_from_ctx(ctx)
+            except Exception:
+                pass
             holding = ctx.get("holding")
-            st = self.states.get(sym) if sym else None
             if holding and st is not None and int(getattr(st, "position", 0) or 0) != 0:
                 if ctx_curr_price > 0.01:
                     st.qqq_btc_last_valid_mtm = float(ctx_curr_price)
@@ -590,6 +669,10 @@ def apply_oms_patches(*, tick_exits_mode: str = "disaster_only") -> None:
                     holding["qqq_btc_exit_rails"] = st.qqq_btc_exit_rails
                 if getattr(st, "qqq_btc_entry_bar", None) is not None:
                     holding["entry_bar"] = int(st.qqq_btc_entry_bar)
+                if getattr(st, "qqq_btc_entry_spot", None) is not None:
+                    holding["entry_spot"] = float(st.qqq_btc_entry_spot)
+                if getattr(st, "qqq_btc_position_spot_closes", None) is not None:
+                    holding["qqq_btc_spot_closes"] = st.qqq_btc_position_spot_closes
             return ctx, market_opt_price, ctx_curr_price, ctx_bid, ctx_ask
 
         eex.ExecutionEngineV8._build_strategy_ctx = _patched_build_ctx

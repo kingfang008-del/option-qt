@@ -81,3 +81,11 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("stopped by user")
+    finally:
+        # governor 位于 OMS 的 strategy_entry_bridge；正常退出时再做一次兜底落盘。
+        try:
+            from qqq_btc.live.session_governor import persist_session_governor
+
+            persist_session_governor()
+        except Exception as exc:
+            logger.warning("session governor persist skipped: %s", exc)

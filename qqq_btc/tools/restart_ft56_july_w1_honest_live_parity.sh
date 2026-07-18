@@ -25,6 +25,14 @@ cd "$REPO"
 PY="${PYTHON:-$HOME/anaconda3/envs/ibkr/bin/python}"
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 
+# 离线/流式共享同一策略配方；显式 env 仍可作紧急覆盖。
+STRATEGY_PROFILE="${QQQ_BTC_STRATEGY_PROFILE:-$REPO/qqq_btc/CONFIG/strategy_profiles/ft56_honest_vx_production_v1.json}"
+if [[ ! -f "$STRATEGY_PROFILE" ]]; then
+  echo "missing strategy profile: $STRATEGY_PROFILE" >&2
+  exit 2
+fi
+eval "$("$PY" -m qqq_btc.common.strategy_profile --profile "$STRATEGY_PROFILE" --shell-env)"
+
 # --- 诚实实盘模拟栈 ---
 export OMS_MOCK_IBKR=1
 export REDIS_STREAM_SIM=1
@@ -42,6 +50,9 @@ unset QQQ_BTC_PUT_GATE_5M_FEATURE || true
 # 例: QQQ_BTC_EDGE_Q10_FLOOR=-0.2 bash ...
 # QQQ_BTC_PUT_GATE_MIN / PUT_EARLY_VIX_MIN / EDGE_Q10_FLOOR
 export QQQ_BTC_USE_LIVE_REPLAY="${QQQ_BTC_USE_LIVE_REPLAY:-1}"
+# 默认值来自共享 strategy profile；调用方 env 可显式覆盖。
+export QQQ_BTC_RULE_PROFILE_SELECTOR="${QQQ_BTC_RULE_PROFILE_SELECTOR:-vx}"
+export QQQ_BTC_TICK_EXITS="${QQQ_BTC_TICK_EXITS:-off}"
 # FCS alpha_label_ts 是分钟起点；交易/audit 使用结束标签与离线 timestamp 对齐。
 export QQQ_BTC_LIVE_LABEL_SHIFT_SEC="${QQQ_BTC_LIVE_LABEL_SHIFT_SEC:-60}"
 export EXECUTION_DELAY_BARS=0
@@ -76,12 +87,8 @@ fi
 OUT_DIR="${HONEST_OUT_DIR:-$REPO/qqq_btc/results/july_w1_ft56_honest_live_parity}"
 # 跨日复用 entry_quantile 缓冲（单日进程重启否则永远 < min_obs=300，dyn_th 恒空）
 export QQQ_BTC_GOVERNOR_STATE="${QQQ_BTC_GOVERNOR_STATE:-$OUT_DIR/governor_quantile.pkl}"
-# 单日入场窗约 285 bar；与离线 LIVE_REPLAY 默认 min_obs=300 对齐，
-# 使跨日 governor 缓冲在 Jul6 前能点亮 dyn_th（拦早盘 CALL、让出午后 PUT）。
-# 仍可用 env 覆盖。
-export QQQ_BTC_ENTRY_QUANTILE_MIN_OBS="${QQQ_BTC_ENTRY_QUANTILE_MIN_OBS:-300}"
-# CALL-only 分位：put_dyn 会挡掉 Jul6 13:10 大 PUT（逼近离线 +38% 的关键腿）
-export QQQ_BTC_APPLY_PUT_ENTRY_QUANTILE="${QQQ_BTC_APPLY_PUT_ENTRY_QUANTILE:-0}"
+# entry_quantile_min_obs / apply_put_entry_quantile 由 profile 的 ReplayConfig 统一提供；
+# 调用方仍可通过同名 QQQ_BTC_* env 做临时诊断覆盖。
 export SLOW_FEATURE_CONFIG="${SLOW_FEATURE_CONFIG:-$REPO/qqq_btc/CONFIG/slow_feature_qqq_v4.json}"
 if [[ "$(basename "$SLOW_FEATURE_CONFIG")" == *v2* ]]; then
   export SLOW_FEATURE_CONFIG="$REPO/qqq_btc/CONFIG/slow_feature_qqq_v4.json"
@@ -100,10 +107,41 @@ fi
 mkdir -p "$OUT_DIR"
 LOG="$OUT_DIR/run.log"
 : > "$LOG"
+"$PY" -m qqq_btc.common.strategy_profile \
+  --profile "$STRATEGY_PROFILE" --snapshot \
+  > "$OUT_DIR/strategy_profile.resolved.json"
+PROFILE_SHA="$("$PY" - <<'PY'
+from qqq_btc.common.strategy_profile import load_active_strategy_profile
+p = load_active_strategy_profile()
+print(p.sha256 if p else "")
+PY
+)"
+PROFILE_ID="$("$PY" - <<'PY'
+from qqq_btc.common.strategy_profile import load_active_strategy_profile
+p = load_active_strategy_profile()
+print(p.profile_id if p else "")
+PY
+)"
+GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || true)"
+GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+  GIT_DIRTY=true
+else
+  GIT_DIRTY=false
+fi
 
 cat > "$OUT_DIR/manifest.json" <<EOF
 {
   "mode": "honest_live_parity",
+  "git": {
+    "commit": "$GIT_COMMIT",
+    "branch": "$GIT_BRANCH",
+    "dirty": $GIT_DIRTY
+  },
+  "strategy_profile_id": "$PROFILE_ID",
+  "strategy_profile": "$STRATEGY_PROFILE",
+  "strategy_profile_sha256": "$PROFILE_SHA",
+  "strategy_profile_snapshot": "$OUT_DIR/strategy_profile.resolved.json",
   "gates": ["1_raw", "2_norm", "3_trade"],
   "meaning": "simulate live: no greek-parity, no put_gate/regime gold files, frozen_norm=deploy",
   "crutches_disabled": [
@@ -115,6 +153,8 @@ cat > "$OUT_DIR/manifest.json" <<EOF
   ],
   "norm": "$FROZEN_NORM",
   "put_gate": "${QQQ_BTC_PUT_GATE_MODE:-vixy_z}",
+  "rule_profile_selector": "${QQQ_BTC_RULE_PROFILE_SELECTOR:-vx}",
+  "tick_exits": "${QQQ_BTC_TICK_EXITS:-off}",
   "regime_gold": "off",
   "checkpoint": "$CKPT",
   "option_root": "$OPT_ROOT",
@@ -150,6 +190,11 @@ echo "offline_norm=$OFFLINE_NORM" | tee -a "$LOG"
 echo "out=$OUT_DIR" | tee -a "$LOG"
 echo "days=${DAY_ARR[*]}" | tee -a "$LOG"
 echo "mode=HONEST 3-gate: raw → norm → trade | FCS_DEBUG_RAW=1" | tee -a "$LOG"
+
+SIM_MAX_ARGS=()
+if [[ -n "${MAX_SESSION_BARS:-}" ]]; then
+  SIM_MAX_ARGS=(--max-session-bars "$MAX_SESSION_BARS")
+fi
 
 prev=""
 for d in "${DAY_ARR[@]}"; do
@@ -187,6 +232,7 @@ for d in "${DAY_ARR[@]}"; do
     --frozen-norm "$FROZEN_NORM" \
     --speed "$SPEED" \
     --fcs-wait "$FCS_WAIT" \
+    "${SIM_MAX_ARGS[@]}" \
     2>&1 | tee -a "$LOG" | tee "$OUT_DIR/stream_${d}.log"
 
   if [[ -f "$audit" ]]; then

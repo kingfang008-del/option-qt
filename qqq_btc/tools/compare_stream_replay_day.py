@@ -520,8 +520,14 @@ def run_redis_stream(
         cmd.extend(["--checkpoint", str(Path(checkpoint).expanduser().resolve())])
     if not sync:
         cmd.append("--no-sync")
+    child_env = os.environ.copy()
+    # 默认做分钟级 honest KPI 对拍；调用方仍可显式覆盖为生产 profile/tick 模式。
+    child_env.setdefault("QQQ_BTC_USE_LIVE_REPLAY", "1")
+    child_env.setdefault("QQQ_BTC_EDGE_Q10_FLOOR", "-0.2")
+    child_env.setdefault("QQQ_BTC_RULE_PROFILE_SELECTOR", "off")
+    child_env.setdefault("QQQ_BTC_TICK_EXITS", "off")
     print("[redis]", " ".join(cmd))
-    subprocess.run(cmd, check=True, cwd=str(_REPO))
+    subprocess.run(cmd, check=True, cwd=str(_REPO), env=child_env)
     if not signals.exists():
         # 目标日无 PASS 信号时 audit 文件不会创建，写空头占位以便后续 diff
         signals.parent.mkdir(parents=True, exist_ok=True)
@@ -582,6 +588,8 @@ def replay_baseline_signals(
     warmup_from_day: str | None = None,
     warmup_through_day: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    from dataclasses import replace
+
     import pandas as pd
     from qqq_btc.common.signal_collect import collect_decision_signals, collect_replay_signals
     from qqq_btc.qqq import config as qcfg
@@ -589,16 +597,18 @@ def replay_baseline_signals(
     through = warmup_through_day or date
     df = pd.read_parquet(parquet)
     df = attach_exec_quotes_for_replay(df, date)
+    # 诚实流式按已完成分钟立即成交；对拍基准不可使用延迟一根的 REPLAY。
+    parity_cfg = replace(qcfg.LIVE_REPLAY, edge_q10_floor=-0.2)
     decision = collect_decision_signals(
         df,
         warmup_from_day=warmup_from_day,
         warmup_through_day=through,
         target_day=date,
-        replay_cfg=qcfg.REPLAY,
+        replay_cfg=parity_cfg,
     )
     operational = collect_replay_signals(
         df,
-        replay_cfg=qcfg.REPLAY,
+        replay_cfg=parity_cfg,
         warmup_from_day=warmup_from_day,
         warmup_through_day=through,
         target_day=date,

@@ -112,11 +112,13 @@ def ensure_month(ym: str, *, skip_build: bool) -> dict[str, Path]:
 def attach_causal_put_gate(inf: pd.DataFrame, raw1_path: Path) -> pd.DataFrame:
     out = inf.copy()
     out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
-    out = out.drop(columns=[c for c in out.columns if c == "put_gate"], errors="ignore")
-    raw1 = pd.read_parquet(raw1_path, columns=["timestamp", "vix_level"])
+    out = out.drop(columns=["put_gate", "vix_proxy_close"], errors="ignore")
+    raw1 = pd.read_parquet(
+        raw1_path, columns=["timestamp", "vix_level", "vix_proxy_close"]
+    )
     raw1["timestamp"] = pd.to_datetime(raw1["timestamp"], utc=True)
     raw1 = raw1.sort_values("timestamp").drop_duplicates("timestamp")
-    s = raw1.copy()
+    s = raw1[["timestamp", "vix_level"]].copy()
     s["timestamp"] = s["timestamp"] + pd.Timedelta(minutes=1)
     m = pd.merge_asof(
         out[["timestamp"]].reset_index(drop=True),
@@ -125,6 +127,14 @@ def attach_causal_put_gate(inf: pd.DataFrame, raw1_path: Path) -> pd.DataFrame:
         direction="backward",
     )
     out["put_gate"] = m["put_gate"].to_numpy()
+    # 方向确认使用当前已完成分钟的 VIXY proxy；不沿用 put_gate 的 +1min
+    # 安全位移，否则会把 15m 收益再额外滞后一根。
+    out = pd.merge_asof(
+        out.sort_values("timestamp"),
+        raw1[["timestamp", "vix_proxy_close"]],
+        on="timestamp",
+        direction="backward",
+    ).sort_index()
     return out
 
 
@@ -138,9 +148,11 @@ def daily_from_trades(trades: pd.DataFrame) -> list[dict[str, Any]]:
     eq = 1.0
     for date_s, g in t.groupby("date", sort=True):
         day_eq = 1.0
-        for r in g["net_return"]:
-            day_eq *= 1 + 0.25 * float(r)
-            eq *= 1 + 0.25 * float(r)
+        for _, trade in g.iterrows():
+            frac = float(trade.get("position_frac", 0.25))
+            r = float(trade["net_return"])
+            day_eq *= 1 + frac * r
+            eq *= 1 + frac * r
         daily.append(
             {
                 "date": date_s,
@@ -330,9 +342,11 @@ def regime_profile_stitch(
         tf = part["trades_frame"]
         if tf is not None and len(tf):
             tf = tf.copy().sort_values("entry_ts")
-            for r in tf["net_return"]:
-                seg_eq *= 1 + 0.25 * float(r)
-                eq *= 1 + 0.25 * float(r)
+            for _, trade in tf.iterrows():
+                frac = float(trade.get("position_frac", 0.25))
+                r = float(trade["net_return"])
+                seg_eq *= 1 + frac * r
+                eq *= 1 + frac * r
             all_trades.append(tf)
         segments.append(
             {
@@ -373,12 +387,18 @@ def run_month(
     put_quarantine_loss: float | None = None,
     put_quarantine_vix_z_max: float | None = None,
     put_quarantine_vx_slope_min: float | None = None,
+    base_replay_cfg=None,
 ) -> dict[str, Any]:
     inf = attach_causal_put_gate(pd.read_parquet(paths["infer"]), paths["raw1"])
     inf["timestamp"] = pd.to_datetime(inf["timestamp"], utc=True)
     trading_days = sorted(inf["timestamp"].dt.tz_convert("America/New_York").dt.date.unique())
 
-    base = replace(qcfg.LIVE_REPLAY, edge_q10_floor=-0.2)
+    # 新入口可传入由 strategy profile 物化的 cfg；旧研究入口保持原口径。
+    base = (
+        base_replay_cfg
+        if base_replay_cfg is not None
+        else replace(qcfg.LIVE_REPLAY, edge_q10_floor=-0.2)
+    )
     baseline_cfg = apply_rule_profile(base, "TREND_PUT_OK", profiles_cfg=profiles_cfg)
     # true default baseline = current production-like (TREND_PUT_OK equals reverted gates)
     base_res = replay_with_cfg(inf, baseline_cfg)
@@ -420,7 +440,11 @@ def run_month(
             day_profiles[d]["vx_cm30_level_z63"] = float(
                 row["vx_cm30_level_z63"]
             )
-    if selector_source == "vx":
+    if selector_source == "off":
+        for d in trading_days:
+            day_profiles[d]["profile"] = "TREND_PUT_OK"
+            day_profiles[d]["selector_source"] = "off"
+    elif selector_source == "vx":
         for d in trading_days:
             meta = day_profiles[d]
             meta["profile"] = select_profile_name_vx(

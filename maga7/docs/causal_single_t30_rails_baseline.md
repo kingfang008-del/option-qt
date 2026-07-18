@@ -111,6 +111,12 @@ python -m maga7.tools.run_replay_offline \
 - 补 Mag7+GOOGL+peer3 的 **Jan–Jul 全窗**成绩后再决定是否改冻结窗  
 - 出场：保持硬 T+30 rails 为默认；勿启用 flow/MTM **软退出**  
 - **条件化延长**（`hold_extend` T30→T45）：研究中，见 [`hold_extend_t30_t45_research.md`](hold_extend_t30_t45_research.md)；候选 `extend_mtm_mf`（更保守）/ `extend_mtm_only`（收益更高），尚未升格  
+- **mf10 + 快窗提前开火**（`early_on_mf_fast` / `mf_fast_window` 3\|5）：研究中，见 [`mf_fast_early_research.md`](mf_fast_early_research.md)；候选 `early_mf5_s6`（MaxDD 更好），勿默认写入本基线  
+- **Regime 翻面 / Put–VIXY / QQQ mf10 对齐**：见 [`regime_flip_research.md`](regime_flip_research.md)；候选 `qqq_mf10_align`（MaxDD -16.5%→-12.2%，ret 有代价）；裸 `qqq_day_flip_mode=block` / `put_vixy_z_min=0` 过猛，勿默认  
+- **事件日禁入**（`event_calendar_block`）：见 [`event_calendar_full_day.md`](event_calendar_full_day.md)、[`event_calendar_block_research.md`](event_calendar_block_research.md)；叠 `extend_mtm_only` 时 `full_day` May–Jul **+673% / -12.2%**；研究候选，日历需维护/API 接入  
+- **07-07~09 选标失误**（事件日历未覆盖）：见 [`jul7_9_mover_vs_pick_analysis.md`](jul7_9_mover_vs_pick_analysis.md) — TopK 抢最早信号，错过 TSLA/META 主趋势  
+
+
 - SI≥0.57 / PE：仅研究；勿替换 peer_min3  
 - MU/AVGO 扩池仍弱于 Mag7+GOOGL，不默认并入  
 - stream / live 对齐本 profile + `scheme=single`

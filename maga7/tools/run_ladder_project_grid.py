@@ -105,7 +105,9 @@ def main() -> None:
 
     profile = load_profile(args.ladder_profile)
     trade = profile.get("trade") or {}
-    otm_rungs = int(trade.get("ladder_otm_rungs") or (profile.get("lock") or {}).get("otm_rungs") or 5)
+    from maga7.common.open_lock import resolve_otm_rungs
+
+    otm_rungs = resolve_otm_rungs(profile, default=5)
     quote_root = Path(profile["_paths"]["quote_1s_root"])
     lock_path = Path(profile["_paths"]["open_locked_map"])
     mp = pd.read_parquet(lock_path)

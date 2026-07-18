@@ -33,12 +33,16 @@ def to_ny(ts) -> pd.Timestamp:
 
 
 def trading_dte(exp_date, trade_date) -> int:
-    """Weekday-count DTE (0 = same session / 0DTE). Matches short-DTE lock approx."""
-    a = np.datetime64(pd.Timestamp(trade_date).date())
-    b = np.datetime64(pd.Timestamp(exp_date).date())
-    if b < a:
+    """NYSE-session DTE (0=same session), including exchange holidays."""
+    trade = pd.Timestamp(trade_date).normalize()
+    expiry = pd.Timestamp(exp_date).normalize()
+    if expiry < trade:
         return -1
-    return int(np.busday_count(a, b))
+    if expiry == trade:
+        return 0
+    from preprocess.download.dte_utils import trading_sessions_between
+
+    return int(trading_sessions_between(trade, expiry))
 
 
 def _normalize_ticker(t: str) -> str:

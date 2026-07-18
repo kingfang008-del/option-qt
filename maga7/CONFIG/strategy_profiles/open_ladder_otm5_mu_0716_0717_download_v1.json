@@ -1,0 +1,26 @@
+{
+  "profile": "open_ladder_otm5_mu_0716_0717_download_v1",
+  "profile_id": "open_ladder_otm5_mu_0716_0717_download_v1",
+  "description": "Download-only: MU open_ladder OTM5 lock+1s for 2026-07-16..2026-07-17 research.",
+  "role": "data_download",
+  "symbols": ["MU"],
+  "trade": {
+    "contract_mode": "open_ladder",
+    "ladder_otm_rungs": 5,
+    "clear_otm_ban_0dte_pct": 0.01,
+    "quote_source": "1s",
+    "bar_availability_delay_seconds": 60,
+    "moneyness": "ATM"
+  },
+  "paths": {
+    "stock_root": "~/train_data/spnq_train",
+    "option_1m_root": "/mnt/s990/new_option_data_s3",
+    "day_iv_root": "~/train_data/nq_options_day_iv",
+    "open_locked_map": "~/train_data/locked_targets_map_mu_0716_0717_research.parquet",
+    "quote_1s_root": "/mnt/s990/data/raw_1s/maga7_mf10_open_ladder_otm5",
+    "stock_1s_root": "/mnt/s990/data/raw_1s/stocks",
+    "results_dir": "maga7/results"
+  },
+  "date_range": {"start": "2026-07-16", "end": "2026-07-17"},
+  "lock": {"dte_mode": "trading", "prefer_dte": 0, "allowed_dte": [0, 1, 2], "otm_rungs": 5}
+}

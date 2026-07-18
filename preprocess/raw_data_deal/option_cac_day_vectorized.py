@@ -1,3 +1,4 @@
+import argparse
 import datetime
 import pandas as pd
 import numpy as np
@@ -13,6 +14,12 @@ import multiprocessing
 import gc
 import warnings
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+DEFAULT_TARGET_SYMBOLS = [
+    "QQQ", "NVDA", "TSLA", "AMD", "INTC", "MSFT",
+    "AMZN", "GOOGL", "META", "AAPL", "MU", "AVGO",
+]
+MAG7_SYMBOLS = ["NVDA", "TSLA", "AAPL", "AMZN", "META", "MSFT", "AMD", "GOOGL"]
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -374,12 +381,23 @@ def compute_single_day_file(args):
 # ==============================================================================
 # 主调度类
 # ==============================================================================
+def _day_str_from_option_path(parquet_path: str, symbol: str) -> str:
+    filename = os.path.basename(parquet_path)
+    return filename.replace(".parquet", "").removeprefix(f"{symbol}_")
+
+
 class OptionIVCalculator:
     def __init__(self, data_root: str, db_path: str, option_root: str, iv_option_root: str):
         self.db_path = db_path
         self.data_root = data_root  # Underlying stock directory
         self.option_root = option_root # The raw S3 option directory (PROCESSED_DIR)
         self.iv_option_root = iv_option_root
+
+        self.symbols_override: list[str] | None = None
+        self.start_date: str | None = None  # YYYY-MM-DD inclusive
+        self.end_date: str | None = None    # YYYY-MM-DD inclusive
+        self.day_workers: int = 6
+        self.skip_existing: bool = True
         
         self.risk_free_cache = None
         self.risk_free_cache_file = '/home/kingfang007/risk_free_rates.parquet'
@@ -427,19 +445,27 @@ class OptionIVCalculator:
         return self.risk_free_cache
 
     def get_target_symbols(self) -> list[str]:
-        # 从本地股票池获取我们需要的标的
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        #from config import TARGET_SYMBOLS
-        TARGET_SYMBOLS =   ['QQQ','NVDA', 'TSLA', 'AMD', 'INTC', 'MSFT', 'AMZN', 'GOOG', 'META', 'AAPL' ]
+        wanted = list(self.symbols_override) if self.symbols_override else list(DEFAULT_TARGET_SYMBOLS)
+        wanted = [s.strip().upper() for s in wanted if s and str(s).strip()]
+        if not wanted:
+            return []
 
-         
-        placeholders = ','.join(['?'] * len(TARGET_SYMBOLS))
-        query = f"SELECT symbol FROM stocks_us WHERE symbol IN ({placeholders})"
-        cursor.execute(query, TARGET_SYMBOLS)
-        symbols = [row[0] for row in cursor.fetchall()]
-        conn.close()
-        return symbols
+        # Prefer DB order/filter when available; fall back to requested list.
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            placeholders = ",".join(["?"] * len(wanted))
+            query = f"SELECT symbol FROM stocks_us WHERE symbol IN ({placeholders})"
+            cursor.execute(query, wanted)
+            symbols = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            if symbols:
+                # Keep caller order
+                rank = {s: i for i, s in enumerate(wanted)}
+                return sorted(symbols, key=lambda s: rank.get(s, 999))
+        except Exception as e:
+            logger.warning("stocks.db lookup failed (%s); using --symbols as-is", e)
+        return wanted
 
     def _get_underlying_df(self, symbol: str) -> pd.DataFrame | None:
         try:
@@ -465,6 +491,24 @@ class OptionIVCalculator:
         except Exception:
             return None
 
+    def _filter_day_files(self, symbol: str, parquet_files: list[str], iv_dir: str) -> list[str]:
+        start = self.start_date
+        end = self.end_date
+        out = []
+        for fp in sorted(parquet_files):
+            day = _day_str_from_option_path(fp, symbol)
+            if start and day < start:
+                continue
+            if end and day > end:
+                continue
+            if self.skip_existing:
+                iv_filename = os.path.join(iv_dir, os.path.basename(fp))
+                high_feat = os.path.join(iv_dir, f"{symbol}_{day}_high_features.parquet")
+                if os.path.exists(iv_filename) and os.path.exists(high_feat):
+                    continue
+            out.append(fp)
+        return out
+
     def process_symbol_task_entry(self, symbol):
         logger.info(f"🚀 [Process Start] {symbol}")
         
@@ -485,31 +529,50 @@ class OptionIVCalculator:
             
         iv_dir = os.path.join(self.iv_option_root, symbol)
         os.makedirs(iv_dir, exist_ok=True)
-        
-        day_tasks = []
-        for fp in parquet_files:
-            day_tasks.append((fp, symbol, underlying_df, iv_dir))
 
-        # 3. 按日级别并发计算
+        parquet_files = self._filter_day_files(symbol, parquet_files, iv_dir)
+        if not parquet_files:
+            logger.info(f"✅ {symbol} Done. Nothing to process (filters/skip_existing).")
+            return
+        
+        day_tasks = [(fp, symbol, underlying_df, iv_dir) for fp in parquet_files]
+        workers = max(1, int(self.day_workers))
+        logger.info(
+            "%s: %d day(s) to compute (day_workers=%d, start=%s end=%s)",
+            symbol, len(day_tasks), workers, self.start_date, self.end_date,
+        )
+
+        # 3. 按日级别并发计算（默认低并发，避免 12×20 过度订阅）
         success_count = 0
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            for day_str in executor.map(compute_single_day_file, day_tasks):
-                if day_str: success_count += 1
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for day_str in tqdm(
+                executor.map(compute_single_day_file, day_tasks),
+                total=len(day_tasks),
+                desc=f"{symbol} days",
+                leave=False,
+            ):
+                if day_str:
+                    success_count += 1
                 
         # 清理内存
         del underlying_df
         gc.collect()
-        logger.info(f"✅ {symbol} Done. Processed {success_count} valid days.")
+        logger.info(f"✅ {symbol} Done. Processed {success_count}/{len(day_tasks)} valid days.")
 
 
-    def run(self, max_concurrent_stocks=5):
+    def run(self, max_concurrent_stocks=4):
         symbols = self.get_target_symbols()
-        if not symbols: return
+        if not symbols:
+            logger.warning("No symbols to process.")
+            return
     
         rfr_df = self._load_risk_free_rates(datetime.date(2020, 1, 1), datetime.date.today())
         rfr_series = rfr_df['DGS3MO']
 
-        logger.info(f"Starting ProcessPool with {max_concurrent_stocks} workers for {len(symbols)} symbols...")
+        logger.info(
+            "Starting ProcessPool workers=%d symbols=%s start=%s end=%s day_workers=%d",
+            max_concurrent_stocks, symbols, self.start_date, self.end_date, self.day_workers,
+        )
         
         with ProcessPoolExecutor(max_workers=max_concurrent_stocks, 
                                  initializer=init_worker_rfr, 
@@ -526,24 +589,55 @@ class OptionIVCalculator:
     
         logger.info("All processed.")
 
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Compute day_iv + high_features from S3 option 1m (vectorized)."
+    )
+    p.add_argument(
+        "--symbols",
+        default=None,
+        help="Comma-separated symbols. Default: full TARGET list. "
+             "Shortcut: mag7 → NVDA,TSLA,AAPL,AMZN,META,MSFT,AMD,GOOGL",
+    )
+    p.add_argument("--start", default=None, help="Inclusive YYYY-MM-DD filter on option day files")
+    p.add_argument("--end", default=None, help="Inclusive YYYY-MM-DD filter on option day files")
+    p.add_argument("--stock-workers", type=int, default=4, help="ProcessPool size (default 4)")
+    p.add_argument("--day-workers", type=int, default=6, help="Per-symbol ThreadPool size (default 6)")
+    p.add_argument(
+        "--no-skip-existing",
+        action="store_true",
+        help="Recompute even when day_iv + high_features already exist",
+    )
+    p.add_argument("--db-path", default="/home/kingfang007/notebook/stocks.db")
+    p.add_argument("--option-root", default="/mnt/s990/new_option_data_s3")
+    p.add_argument("--data-root", default="/home/kingfang007/train_data/spnq_train_resampled")
+    p.add_argument("--iv-option-root", default="/home/kingfang007/train_data/nq_options_day_iv")
+    return p.parse_args()
+
+
 if __name__ == "__main__":
     try:
         multiprocessing.set_start_method('fork')
     except RuntimeError:
         pass 
 
-    # 修改此处路径配置，对齐你的 S3 下载数据
+    args = _parse_args()
     calculator = OptionIVCalculator(
-        db_path="/home/kingfang007/notebook/stocks.db",
-        # option_root 是 S3 清洗出来的路径，包含按天存的 [AAPL_2026-01-01.parquet] 等文件,
-        #下载每日全量期权交易数据， 再通过交易数据来定位需要下载的合约，
-        #
-        option_root="/home/kingfang007/data/new_option_data_s3", 
-        data_root="/home/kingfang007/train_data/spnq_train_resampled",
-        # 结果输出路径
-        iv_option_root="/home/kingfang007/train_data/nq_options_day_iv"
+        db_path=args.db_path,
+        option_root=args.option_root,
+        data_root=args.data_root,
+        iv_option_root=args.iv_option_root,
     )
-    
-    # 既然已经按天打包极大优化了读写瓶颈，我们可以直接提高计算股票并发度
-    calculator.run(max_concurrent_stocks=12)
+    if args.symbols:
+        raw = args.symbols.strip()
+        if raw.lower() == "mag7":
+            calculator.symbols_override = list(MAG7_SYMBOLS)
+        else:
+            calculator.symbols_override = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    calculator.start_date = args.start
+    calculator.end_date = args.end
+    calculator.day_workers = max(1, int(args.day_workers))
+    calculator.skip_existing = not args.no_skip_existing
+    calculator.run(max_concurrent_stocks=max(1, int(args.stock_workers)))
 

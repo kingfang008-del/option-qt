@@ -32,10 +32,12 @@ from maga7.common.reentry import resolve_only_win_reenter
 from maga7.common.regime import Mag7RegimeGate
 from maga7.common.replay import BUCKET_MAP, load_lock_index, month_list, to_ny
 from maga7.common.signals import (
+    _rule_a_kwargs_from_cfg,
     all_rule_a_times,
     attach_mf_features,
     build_topk_signals,
     load_stock_month_files,
+    resolve_mf_fast_window,
 )
 
 
@@ -72,6 +74,7 @@ def collect_picks(profile: dict, *, scheme: str) -> pd.DataFrame:
             raw,
             mf_window=int(sig_cfg.get("mf_window", 10)),
             vol_ma_window=int(sig_cfg.get("vol_ma_window", 20)),
+            mf_fast_window=resolve_mf_fast_window(sig_cfg),
         )
 
     top2 = build_topk_signals(stock_by, sig_cfg)
@@ -98,15 +101,12 @@ def collect_picks(profile: dict, *, scheme: str) -> pd.DataFrame:
             events = [(to_ny(r.sig_ts), r.symbol, r.dir) for r in day_sigs.itertuples(index=False)]
         else:
             events = []
+            rule_kw = _rule_a_kwargs_from_cfg(sig_cfg)
             for r in day_sigs.itertuples(index=False):
                 for ts in all_rule_a_times(
                     stock_by[r.symbol][stock_by[r.symbol]["date"] == date],
                     r.dir,
-                    window_start=str(sig_cfg.get("window_start", "10:30")),
-                    window_end=str(sig_cfg.get("window_end", "14:00")),
-                    streak_min=int(sig_cfg.get("streak_min", 8)),
-                    from_prev_abs=float(sig_cfg.get("from_prev_abs", 0.02)),
-                    vol_z_min=float(sig_cfg.get("vol_z_min", 1.0)),
+                    **rule_kw,
                 ):
                     events.append((to_ny(ts), r.symbol, r.dir))
             events.sort(key=lambda x: x[0])

@@ -126,8 +126,24 @@ def build_categorical_mask(feature_names: list[str], feat_config: dict[str, dict
     return mask
 
 
-def _feature_dirs(stage: str, symbol: str, *, pre_norm: bool = True) -> tuple[Path, Path | None]:
+def _feature_dirs(
+    stage: str,
+    symbol: str,
+    *,
+    pre_norm: bool = True,
+    features_raw_root: Path | None = None,
+) -> tuple[Path, Path | None]:
     leaf = Path("regular") / "09:30-16:00" / "1min"
+    if features_raw_root is not None:
+        root = Path(features_raw_root).expanduser()
+        # 允许传 quote_features_raw 根，或已含 SYM/.../1min 的叶子
+        if (root / symbol / leaf).is_dir():
+            data_dir = root / symbol / leaf
+        elif root.name == "1min" or list(root.glob("*.parquet")):
+            data_dir = root
+        else:
+            data_dir = root / symbol / leaf
+        return data_dir, None
     data_root = Path.home() / "train_data" / (
         "quote_features_raw" if pre_norm else f"quote_features_{stage}"
     )
@@ -232,6 +248,7 @@ def export_frozen_norm(
     upto_month: str | None = None,
     upto_date: str | None = None,
     pre_norm: bool = True,
+    features_raw_root: Path | None = None,
 ) -> Path:
     feat_names = load_fcs_feature_names(fast_config, slow_config)
     feat_config = load_fcs_feature_config(fast_config, slow_config)
@@ -240,7 +257,12 @@ def export_frozen_norm(
     if upto_date and not upto_month:
         upto_month = str(pd.Timestamp(upto_date).strftime("%Y-%m"))
 
-    feat_dir, stage_filter_dir = _feature_dirs(stage, symbol, pre_norm=pre_norm)
+    feat_dir, stage_filter_dir = _feature_dirs(
+        stage,
+        symbol,
+        pre_norm=pre_norm,
+        features_raw_root=features_raw_root,
+    )
     if not feat_dir.exists():
         raise FileNotFoundError(f"feature dir not found: {feat_dir}")
 
@@ -283,7 +305,7 @@ def export_frozen_norm(
     print(
         f"[export] {output} | symbol={symbol} stage={stage} dims={len(feat_names)} "
         f"files={len(files)} frames={stats['count']} buffer={stats['buffer'].shape[0]} "
-        f"upto={upto_date or upto_month or 'ALL'}"
+        f"upto={upto_date or upto_month or 'ALL'} source={feat_dir}"
     )
     return output
 
@@ -315,6 +337,14 @@ def main() -> int:
         help="从 quote_features_{stage} 已归一化 parquet 导出(默认用 quote_features_raw 预归一化值)",
     )
     parser.add_argument(
+        "--features-raw-root",
+        default=None,
+        help=(
+            "离线 raw 特征根（quote_features_raw 或 …/1min 叶子）。"
+            "默认 ~/train_data/quote_features_raw"
+        ),
+    )
+    parser.add_argument(
         "--output",
         default=None,
         help="输出 .npz 路径(默认 qqq_btc/CONFIG/frozen_norm_{symbol}_{stage}.npz)",
@@ -343,6 +373,9 @@ def main() -> int:
         upto_month=args.upto_month,
         upto_date=args.upto_date,
         pre_norm=not args.post_norm,
+        features_raw_root=(
+            Path(args.features_raw_root).expanduser() if args.features_raw_root else None
+        ),
     )
     return 0
 

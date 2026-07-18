@@ -216,7 +216,65 @@ def first_rule_a_day(
         out["streak"] = int(bar["streak_up"])
     elif d == "DN" and "streak_dn" in bar.index and pd.notna(bar["streak_dn"]):
         out["streak"] = int(bar["streak_dn"])
+    # Session / recent notional at fire (for TopK rank_by dollar-vol variants).
+    day_sorted = g.sort_values("timestamp")
+    up_to = day_sorted[day_sorted["timestamp"] <= ts]
+    if not up_to.empty and "volume" in up_to.columns and "close" in up_to.columns:
+        notion = up_to["close"].astype(float) * up_to["volume"].astype(float)
+        out["dollar_vol"] = float(notion.sum())
+        out["dollar_vol_10"] = float(notion.tail(10).sum())
+        out["share_vol"] = float(up_to["volume"].astype(float).sum())
+    if "vol_z" in bar.index and pd.notna(bar["vol_z"]):
+        out["vol_z"] = float(bar["vol_z"])
     return out
+
+
+def _session_dollar_vol_at(
+    df: pd.DataFrame,
+    *,
+    date: str,
+    asof_ts: pd.Timestamp,
+) -> float | None:
+    """Causal session notional (close*volume cum) at/before ``asof_ts``."""
+    if df is None or df.empty:
+        return None
+    day = df[df["date"].astype(str) == str(date)]
+    if day.empty or "volume" not in day.columns or "close" not in day.columns:
+        return None
+    asof = pd.Timestamp(asof_ts)
+    if asof.tzinfo is None:
+        asof = asof.tz_localize(NY)
+    else:
+        asof = asof.tz_convert(NY)
+    up_to = day[day["timestamp"] <= asof]
+    if up_to.empty:
+        return None
+    notion = up_to["close"].astype(float) * up_to["volume"].astype(float)
+    total = float(notion.sum())
+    return total if np.isfinite(total) else None
+
+
+def _cs_dollar_vol_rank(
+    stock_by_symbol: dict[str, pd.DataFrame],
+    *,
+    date: str,
+    asof_ts: pd.Timestamp,
+    symbol: str,
+) -> tuple[int | None, float | None]:
+    """1-based cross-sectional rank by session dollar vol at ``asof_ts`` (higher vol → rank 1)."""
+    scores: dict[str, float] = {}
+    for sym, df in stock_by_symbol.items():
+        v = _session_dollar_vol_at(df, date=date, asof_ts=asof_ts)
+        if v is not None:
+            scores[str(sym).upper()] = v
+    if not scores:
+        return None, None
+    ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
+    sym_u = str(symbol).upper()
+    for i, (s, v) in enumerate(ordered, start=1):
+        if s == sym_u:
+            return i, v
+    return None, scores.get(sym_u)
 
 
 def all_rule_a_times(
@@ -611,7 +669,11 @@ def build_all_first_rule_a_signals(
     stock_by_symbol: dict[str, pd.DataFrame],
     cfg_signal: dict[str, Any],
 ) -> pd.DataFrame:
-    """Per-symbol first Rule-A fire each day (no TopK trim)."""
+    """Per-symbol first Rule-A fire each day (no TopK trim).
+
+    Rows are sorted by ``(date, sig_ts, symbol)`` with a provisional time-rank.
+    Call ``build_topk_signals`` to re-rank via ``signal.rank_by``.
+    """
     rule_kw = _rule_a_kwargs_from_cfg(cfg_signal)
     rows = []
     for sym, df in stock_by_symbol.items():
@@ -629,16 +691,93 @@ def build_all_first_rule_a_signals(
     return sig.reset_index(drop=True)
 
 
+def _rank_score_series(sig: pd.DataFrame, rank_by: str) -> pd.Series:
+    """Higher score → better rank (rank 1)."""
+    m = str(rank_by or "earliest").strip().lower()
+    n = len(sig)
+    if m in {"earliest", "time", "sig_ts"}:
+        # Invert time rank: earlier → higher score
+        return -pd.to_datetime(sig["sig_ts"]).astype("int64").astype(float)
+    fp = sig["from_prev"].astype(float) if "from_prev" in sig.columns else pd.Series(np.nan, index=sig.index)
+    afp = fp.abs()
+    dvol = sig["dollar_vol"].astype(float) if "dollar_vol" in sig.columns else pd.Series(0.0, index=sig.index)
+    dvol10 = sig["dollar_vol_10"].astype(float) if "dollar_vol_10" in sig.columns else dvol
+    dvol = dvol.fillna(0.0)
+    dvol10 = dvol10.fillna(0.0)
+    afp = afp.fillna(0.0)
+    if m in {"dollar_vol", "notional", "turnover", "dvol"}:
+        return dvol
+    if m in {"dollar_vol_10", "dvol10", "turnover_10"}:
+        return dvol10
+    if m in {"abs_from_prev", "from_prev", "fp"}:
+        return afp
+    if m in {"fp_x_dvol", "fp_dollar", "fp*dvol", "fp_times_dvol"}:
+        return afp * dvol
+    if m in {"fp_x_dvol10", "fp_dollar_10"}:
+        return afp * dvol10
+    if m in {"cs_dollar_vol", "cs_dvol", "cs_notional"}:
+        # Prefer lower cs_rank (1=highest vol); score = -rank
+        if "cs_dvol_rank" in sig.columns:
+            return -sig["cs_dvol_rank"].astype(float)
+        return dvol
+    return -pd.to_datetime(sig["sig_ts"]).astype("int64").astype(float)
+
+
 def build_topk_signals(
     stock_by_symbol: dict[str, pd.DataFrame],
     cfg_signal: dict[str, Any],
 ) -> pd.DataFrame:
-    """Per-symbol first Rule-A, then TopK earliest within each date."""
+    """Per-symbol first Rule-A, then TopK within each date via ``rank_by``.
+
+    ``signal.rank_by``:
+      - ``earliest`` (default): first ``top_k`` by ``sig_ts``
+      - ``dollar_vol`` / ``dvol``: session notional (close×vol cum) at fire — **day-batch
+        re-rank** (mild lookahead vs pure online earliest; entry times unchanged)
+      - ``dollar_vol_10``: last-10m notional at fire (same batch caveat)
+      - ``abs_from_prev`` / ``fp``: |from_prev| at fire
+      - ``fp_x_dvol``: |from_prev| × session notional
+      - ``cs_dollar_vol``: keep fires whose **causal** cross-sectional dollar-vol
+        rank in the universe at ``sig_ts`` is ≤ ``top_k``, then take earliest ``top_k``
+    """
     sig = build_all_first_rule_a_signals(stock_by_symbol, cfg_signal)
     if sig.empty:
         return sig
     top_k = int(cfg_signal.get("top_k", 2))
-    return sig[sig["rank"] <= top_k].reset_index(drop=True)
+    rank_by = str(cfg_signal.get("rank_by", "earliest")).strip().lower()
+
+    if rank_by in {"cs_dollar_vol", "cs_dvol", "cs_notional"}:
+        ranks: list[int | None] = []
+        for r in sig.itertuples(index=False):
+            rk, _ = _cs_dollar_vol_rank(
+                stock_by_symbol,
+                date=str(r.date),
+                asof_ts=r.sig_ts,
+                symbol=str(r.symbol),
+            )
+            ranks.append(rk)
+        sig = sig.copy()
+        sig["cs_dvol_rank"] = ranks
+        # Causal gate: only names that are top_k by session notional in universe at fire.
+        gated = sig[sig["cs_dvol_rank"].notna() & (sig["cs_dvol_rank"] <= top_k)].copy()
+        if gated.empty:
+            return gated
+        gated = gated.sort_values(["date", "sig_ts", "symbol"])
+        gated["rank"] = gated.groupby("date").cumcount() + 1
+        return gated[gated["rank"] <= top_k].reset_index(drop=True)
+
+    if rank_by in {"earliest", "time", "sig_ts", ""}:
+        return sig[sig["rank"] <= top_k].reset_index(drop=True)
+
+    # Score re-rank within day (entry clock = original sig_ts).
+    parts: list[pd.DataFrame] = []
+    for _, day in sig.groupby("date", sort=True):
+        d = day.copy()
+        d["_score"] = _rank_score_series(d, rank_by)
+        d = d.sort_values(["_score", "sig_ts", "symbol"], ascending=[False, True, True])
+        d["rank"] = np.arange(1, len(d) + 1)
+        parts.append(d.drop(columns=["_score"]))
+    out = pd.concat(parts, ignore_index=True) if parts else sig
+    return out[out["rank"] <= top_k].reset_index(drop=True)
 
 class StreamSignalState:
     """Causal per-symbol Rule-A state for streaming parity."""

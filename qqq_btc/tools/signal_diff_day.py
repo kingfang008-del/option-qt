@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
@@ -45,6 +46,11 @@ from qqq_btc.common.exit_lifecycle import (
     load_fill_audit_exits,
 )
 from qqq_btc.qqq import config as qcfg
+
+
+def _parity_replay_cfg():
+    """历史 honest KPI / 流式统一使用 immediate LIVE 与 q10=-0.2。"""
+    return replace(qcfg.LIVE_REPLAY, edge_q10_floor=-0.2)
 
 
 def _limit_session_bar(df: pd.DataFrame, max_session_bar: int) -> pd.DataFrame:
@@ -115,7 +121,7 @@ def load_se_alpha_decisions(
         warmup_from_day=target_day,
         warmup_through_day=target_day,
         target_day=target_day,
-        replay_cfg=qcfg.REPLAY,
+        replay_cfg=_parity_replay_cfg(),
     )
 
 
@@ -134,9 +140,10 @@ def run_day_diff(
 ) -> dict:
     df = pd.read_parquet(parquet)
     through = warmup_through_day or date
+    parity_cfg = _parity_replay_cfg()
     replay_sig = collect_replay_signals(
         df,
-        replay_cfg=qcfg.REPLAY,
+        replay_cfg=parity_cfg,
         warmup_from_day=warmup_from_day,
         warmup_through_day=through,
         target_day=date,
@@ -146,6 +153,7 @@ def run_day_diff(
     )
     live_sig = collect_live_sim_signals(
         df,
+        replay_cfg=parity_cfg,
         warmup_from_day=warmup_from_day,
         warmup_through_day=through,
         target_day=date,
@@ -155,14 +163,14 @@ def run_day_diff(
         warmup_from_day=warmup_from_day,
         warmup_through_day=through,
         target_day=date,
-        replay_cfg=qcfg.REPLAY,
+        replay_cfg=parity_cfg,
     )
     decision_live = collect_decision_signals(
         df,
         warmup_from_day=warmup_from_day,
         warmup_through_day=through,
         target_day=date,
-        replay_cfg=qcfg.LIVE_REPLAY,
+        replay_cfg=parity_cfg,
     )
 
     if max_session_bar is not None:

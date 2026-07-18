@@ -66,6 +66,8 @@ def choose_entry(
     open30_max_ret: Optional[float] = None,
     open30_peak_dd: Optional[float] = None,
     spot_ret_5bar: Optional[float] = None,
+    spot_ret_15bar: Optional[float] = None,
+    vix_ret_15bar: Optional[float] = None,
     trend_ret_30m: Optional[float] = None,
     trend_r2_30m: Optional[float] = None,
     vix_reversal_count_30m: Optional[float] = None,
@@ -82,6 +84,7 @@ def choose_entry(
     call_threshold_mult: float = 1.0,
     put_threshold_mult: float = 1.0,
     put_structure_veto_until_bar: Optional[int] = None,
+    vixy_open_shock_regime_active: bool = False,
 ) -> Optional[EntryDecision]:
     """
     单 bar 入场决策。spread 门控在调用方二次校验(各腿 spread 不同)。
@@ -269,6 +272,40 @@ def choose_entry(
         and session_bar <= int(put_structure_veto_until_bar)
     ):
         put_blocked = True
+    # Jul13 型早盘假下跌：双腿 edge 仅微弱偏 PUT，但 QQQ 15m 不跌且
+    # VIXY 15m 不升。vix_level 是局部 z-score，不能替代实际方向确认。
+    cross_end = getattr(replay_cfg, "put_early_cross_confirm_end_bar", None)
+    cross_gap = getattr(
+        replay_cfg, "put_early_cross_confirm_edge_gap_max", None
+    )
+    low_conf_early_put = (
+        cross_end is not None
+        and cross_gap is not None
+        and session_bar is not None
+        and int(session_bar) < int(cross_end)
+        and call_edge is not None
+        and put_edge is not None
+        and np.isfinite(call_edge)
+        and np.isfinite(put_edge)
+        and float(put_edge) > float(call_edge)
+        and abs(float(put_edge) - float(call_edge)) < float(cross_gap)
+    )
+    if low_conf_early_put and (
+        spot_ret_15bar is None
+        or vix_ret_15bar is None
+        or not np.isfinite(spot_ret_15bar)
+        or not np.isfinite(vix_ret_15bar)
+    ):
+        # 门控已启用但方向确认数据退化时 fail-closed；否则流式缺列会静默放行，
+        # 与拥有完整 parquet 的离线 replay 分叉。
+        return None
+    if (
+        low_conf_early_put
+        and float(spot_ret_15bar) >= 0.0
+        and float(vix_ret_15bar) <= 0.0
+    ):
+        # 不回退到几乎同 edge 的 CALL；该场景本质是方向低置信，整 bar 弃权。
+        return None
 
     # 方向头一致性:与 edge 选腿打架时禁对应腿(字段缺失不拦)
     if bool(getattr(replay_cfg, "require_leg_side_agree", False)):
@@ -293,6 +330,15 @@ def choose_entry(
                 put_blocked = True
             if float(spot_up_prob) <= float(spot_down_prob):
                 call_blocked = True
+    # 现货日收益同向:CALL 需 spot_day_ret>eps, PUT 需 spot_day_ret<-eps
+    if bool(getattr(replay_cfg, "require_leg_spot_day_agree", False)):
+        eps = float(getattr(replay_cfg, "spot_day_agree_eps", 0.0) or 0.0)
+        if spot_day_ret is not None and np.isfinite(spot_day_ret):
+            sdr = float(spot_day_ret)
+            if sdr <= eps:
+                call_blocked = True
+            if sdr >= -eps:
+                put_blocked = True
 
     th_static = replay_cfg.threshold_at(session_bar)
     th = th_static
@@ -317,6 +363,45 @@ def choose_entry(
     if dual_mode and call_edge is not None and put_edge is not None:
         ec = call_edge if np.isfinite(call_edge) else -np.inf
         ep = put_edge if np.isfinite(put_edge) else -np.inf
+        # OPEN_SHOCK_CHOP：只在异常状态日启用旧的双腿硬币面弃权；
+        # 同时早段不追 PUT，后段低 gap PUT 要求 QQQ/VIXY/趋势三重确认。
+        if vixy_open_shock_regime_active and np.isfinite(ec) and np.isfinite(ep):
+            abs_gap = abs(float(ep) - float(ec))
+            if abs_gap < float(
+                replay_cfg.vixy_open_shock_min_dual_leg_edge_gap
+            ):
+                return None
+            block_end = int(replay_cfg.vixy_open_shock_put_block_end_bar)
+            if session_bar is None or int(session_bar) < block_end:
+                put_blocked = True
+            elif abs_gap <= float(replay_cfg.vixy_open_shock_low_conf_gap_max):
+                confirm_vals = (
+                    spot_ret_15bar,
+                    vix_ret_15bar,
+                    trend_ret_30m,
+                    trend_r2_30m,
+                )
+                if any(v is None or not np.isfinite(v) for v in confirm_vals):
+                    put_blocked = True
+                elif not (
+                    float(spot_ret_15bar)
+                    <= float(replay_cfg.vixy_open_shock_spot_ret_15_max)
+                    and float(vix_ret_15bar)
+                    >= float(replay_cfg.vixy_open_shock_vix_ret_15_min)
+                    and float(trend_ret_30m) < 0.0
+                    and float(trend_r2_30m)
+                    >= float(replay_cfg.vixy_open_shock_confirm_r2_min)
+                ):
+                    put_blocked = True
+        # 双腿都有有效 edge 且差距过小 → 模型无方向确信,整 bar 弃权
+        gap_min = getattr(replay_cfg, "min_dual_leg_edge_gap", None)
+        if (
+            gap_min is not None
+            and np.isfinite(ec)
+            and np.isfinite(ep)
+            and abs(float(ec) - float(ep)) < float(gap_min)
+        ):
+            return None
         if replay_cfg.long_only or not has_put or not put_gate_ok or put_blocked:
             ep = -np.inf
         candidates = [

@@ -54,6 +54,10 @@ class ScannerSignal:
                 **self.meta,
                 "strategy": "maga7_mf10_top2_v1",
                 "fill_frac": self.meta.get("fill_frac", 0.8),
+                "watchdog_state": self.meta.get("watchdog_state"),
+                "watchdog_reason": self.meta.get("watchdog_reason"),
+                "route": self.meta.get("route"),
+                "event_source": self.meta.get("event_source", "baseline"),
             },
         }
 
@@ -98,6 +102,10 @@ class ScannerSignal:
                     "contract_source": self.meta.get("contract_source"),
                     "sig_dte": self.meta.get("sig_dte"),
                     "strategy": "maga7_mf10_top2_v1",
+                    "watchdog_state": self.meta.get("watchdog_state"),
+                    "watchdog_reason": self.meta.get("watchdog_reason"),
+                    "route": self.meta.get("route"),
+                    "event_source": self.meta.get("event_source", "baseline"),
                 },
             },
         }
@@ -122,6 +130,12 @@ class Mag7Scanner:
     signals: list[ScannerSignal] = field(default_factory=list)
     minute_agg: MultiSymbolMinuteAgg | None = None
     regime_gate: Any = None
+    watchdog: Any = None
+    _watchdog_snap: dict[str, Any] = field(default_factory=dict)
+    _watchdog_date: str | None = None
+    _watchdog_state: str = "off"
+    _watchdog_reason: str = "off"
+    _watchdog_route: str = "baseline"
     emit_all: bool = False
     n_done: dict[str, int] = field(default_factory=dict)
     last_exit: dict[str, pd.Timestamp | None] = field(default_factory=dict)
@@ -154,12 +168,25 @@ class Mag7Scanner:
             regime_gate = Mag7RegimeGate.from_profile(cfg, months=month_list(start, end))
         except Exception:
             regime_gate = None
+        watchdog = None
+        watchdog_snap: dict[str, Any] = {}
+        try:
+            from maga7.common.watchdog import RegimeWatchdog, snapshot_regime
+
+            watchdog = RegimeWatchdog.from_profile(cfg)
+            if watchdog is not None and regime_gate is not None:
+                watchdog_snap = snapshot_regime(regime_gate.cfg)
+        except Exception:
+            watchdog = None
+            watchdog_snap = {}
         return cls(
             profile=cfg,
             states=states,
             books=books,
             minute_agg=agg,
             regime_gate=regime_gate,
+            watchdog=watchdog,
+            _watchdog_snap=watchdog_snap,
             emit_all=emit_all,
             **kwargs,
         )
@@ -214,6 +241,52 @@ class Mag7Scanner:
         self.n_done = {s: 0 for s in self.profile["symbols"]}
         self.last_exit = {s: None for s in self.profile["symbols"]}
         self.last_win = {s: True for s in self.profile["symbols"]}
+        self._refresh_watchdog(date)
+
+    def _refresh_watchdog(self, date: str) -> None:
+        """Day-scoped Watchdog evaluate + regime overlay (needs stock_by for rules)."""
+        if self.watchdog is None:
+            self._watchdog_date = str(date)
+            self._watchdog_state = "off"
+            self._watchdog_reason = "off"
+            self._watchdog_route = "baseline"
+            return
+        if self._watchdog_date == str(date):
+            return
+        self._watchdog_date = str(date)
+        if not self.stock_by:
+            self._watchdog_state = "normal"
+            self._watchdog_reason = "no_stock_by"
+            self._watchdog_route = "baseline"
+            logger.info("WATCHDOG %s skip evaluate (no stock_by)", date)
+            return
+        try:
+            symbols = list(self.profile.get("symbols") or [])
+            qqq = self.stock_by.get("QQQ")
+            dec = self.watchdog.begin_day(
+                str(date),
+                stock_by=self.stock_by,
+                qqq_df=qqq,
+                symbols=symbols,
+            )
+            if self.regime_gate is not None and self._watchdog_snap is not None:
+                self.watchdog.apply_to_regime(self.regime_gate.cfg, self._watchdog_snap)
+            self._watchdog_state = dec.state.value
+            self._watchdog_reason = dec.reason
+            self._watchdog_route = dec.overlay.route_tag or "baseline"
+            logger.info(
+                "WATCHDOG %s state=%s reason=%s route=%s hunt_armed=%s",
+                date,
+                self._watchdog_state,
+                self._watchdog_reason,
+                self._watchdog_route,
+                bool(self.watchdog.hunt_armed),
+            )
+        except Exception as exc:
+            self._watchdog_state = "normal"
+            self._watchdog_reason = f"error:{type(exc).__name__}"
+            self._watchdog_route = "baseline"
+            logger.warning("WATCHDOG %s evaluate failed: %s", date, exc)
 
     def set_event_blackout(
         self, blackout: set[str] | None, meta: dict[str, Any] | None = None
@@ -340,6 +413,10 @@ class Mag7Scanner:
                 "feature_ts": feature_ts.isoformat(),
                 "decision_ts": ts.isoformat(),
                 "bar_availability_delay_seconds": delay,
+                "watchdog_state": self._watchdog_state,
+                "watchdog_reason": self._watchdog_reason,
+                "route": self._watchdog_route,
+                "event_source": "baseline",
             },
         )
         if not already:
@@ -347,6 +424,8 @@ class Mag7Scanner:
 
         if self.regime_gate is not None:
             dec = self.regime_gate.check(direction, feature_ts)
+            sig.meta["regime_reason"] = getattr(dec, "reason", None)
+            sig.meta["regime_size_scale"] = float(getattr(dec, "size_scale", 1.0) or 1.0)
             if not dec.allow:
                 self.n_regime_block += 1
                 return None
@@ -375,7 +454,7 @@ class Mag7Scanner:
         if not use_reentry:
             self.n_done[symbol] = self.n_done.get(symbol, 0) + 1
         logger.info(
-            "TOPK signal %s %s %s rank=%d contract=%s src=%s dte=%s",
+            "TOPK signal %s %s %s rank=%d contract=%s src=%s dte=%s wd=%s route=%s r_scale=%s",
             date,
             symbol,
             direction,
@@ -383,6 +462,9 @@ class Mag7Scanner:
             pick.ticker,
             pick.source,
             pick.dte,
+            self._watchdog_state,
+            self._watchdog_route,
+            sig.meta.get("regime_size_scale", 1.0),
         )
         if self.on_signal:
             self.on_signal(sig)

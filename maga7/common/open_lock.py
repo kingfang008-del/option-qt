@@ -40,6 +40,18 @@ def ladder_bucket_id(side: str, rung: int) -> int:
     return (4 + 2 * (r - 2)) if side == "p" else (5 + 2 * (r - 2))
 
 
+def resolve_otm_rungs(profile: dict[str, Any] | None, *, default: int = 2) -> int:
+    """Read ladder width; ``0`` means ATM-only (must not treat 0 as missing)."""
+    profile = profile or {}
+    trade = profile.get("trade") or {}
+    lock = profile.get("lock") or {}
+    if trade.get("ladder_otm_rungs") is not None:
+        return int(trade["ladder_otm_rungs"])
+    if lock.get("otm_rungs") is not None:
+        return int(lock["otm_rungs"])
+    return int(default)
+
+
 def direction_ladder_buckets(direction: str, otm_rungs: int = 2) -> list[int]:
     """Bucket ids locked for one trade direction (ATM + OTM1..OTMk)."""
     side = "c" if str(direction).upper() == "UP" else "p"
@@ -351,12 +363,21 @@ def build_open_lock_map(
     rows: list[dict[str, Any]] = []
     for sym in symbols:
         if dates is None:
-            files = sorted(
-                p
-                for p in (Path(day_iv_root) / sym).glob(f"{sym}_*.parquet")
-                if "_high_features" not in p.name
-            )
-            sym_dates = [p.stem.split("_", 1)[1] for p in files]
+            # Prefer day_iv calendar; fall back / union option_1m when day_iv missing
+            # (e.g. MU/AVGO have option_1m but no nq_options_day_iv for 2026).
+            day_set: set[str] = set()
+            iv_dir = Path(day_iv_root) / sym
+            if iv_dir.is_dir():
+                for p in iv_dir.glob(f"{sym}_*.parquet"):
+                    if "_high_features" in p.name:
+                        continue
+                    day_set.add(p.stem.split("_", 1)[1])
+            if option_1m_root is not None:
+                m1_dir = Path(option_1m_root) / sym
+                if m1_dir.is_dir():
+                    for p in m1_dir.glob(f"{sym}_*.parquet"):
+                        day_set.add(p.stem.split("_", 1)[1])
+            sym_dates = sorted(day_set)
             if start:
                 sym_dates = [d for d in sym_dates if d >= start]
             if end:

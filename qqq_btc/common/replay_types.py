@@ -52,6 +52,17 @@ class ReplayConfig:
     # 可选的 VX contango 条件：仅当日前已完成 VX 日线的 VX2/VX1-1 >= 此值。
     # 使用无量纲期限结构而非 VIXY ETF 价格水平；None=不加此条件。
     next_day_put_quarantine_vx_slope_min: Optional[float] = None
+    # 账户级次日防御：若前一日实际仓位复利贡献 <= 此阈值，次日所有腿进入防御。
+    # 与 PUT quarantine 不同，它不锁腿；可组合减仓、延后入场和提高 q10。
+    next_day_all_leg_defense_loss: Optional[float] = None
+    # 防御日使用的绝对账户仓位比例；None=仍使用 position_frac。
+    next_day_all_leg_defense_position_frac: Optional[float] = None
+    # 防御日最早允许入场的 session bar；None=不额外延后。
+    next_day_all_leg_defense_entry_start_bar: Optional[int] = None
+    # 防御日所有腿共用的最低 edge_q10；缺失视为不通过。None=不额外收紧。
+    next_day_all_leg_defense_edge_q10_floor: Optional[float] = None
+    # 可选 VX contango 条件：仅当前一完成日桶 slope >= 此值才启用全腿防御。
+    next_day_all_leg_defense_vx_slope_min: Optional[float] = None
     straddle_entry_threshold: Optional[float] = None
     max_straddles_per_day: Optional[int] = None
     # 会话内 bar 序号(09:30=0)允许新开仓区间;None=不限制
@@ -151,6 +162,27 @@ class ReplayConfig:
     put_early_vix_ban_hi: Optional[float] = None
     put_early_open30_max_min: Optional[float] = None
     put_early_range30_min: Optional[float] = None
+    # 早盘低置信 PUT 的 QQQ/VIXY 15m 反向确认：
+    # session_bar < end 且 put-call gap < max 时，若 QQQ 15m>=0 且 VIXY 15m<=0，
+    # 说明现货不跌、波动率不升，拒绝 PUT。任一收益缺失时不拦截。
+    put_early_cross_confirm_end_bar: Optional[int] = None
+    put_early_cross_confirm_edge_gap_max: Optional[float] = None
+    # --- 因果盘中 VIXY regime：开盘急跌后低 R² 震荡 ---
+    # detect 窗内一旦满足 open30 跌幅/回撤 + 低趋势 R²，状态保持到日切。
+    # 状态激活后先禁早盘 PUT；随后仅对低 gap PUT 要求 QQQ 下跌、VIXY 上涨
+    # 和负向趋势确认。所有输入均来自已完成分钟。
+    vixy_open_shock_regime_enabled: bool = False
+    vixy_open_shock_detect_start_bar: int = 30
+    vixy_open_shock_detect_end_bar: int = 45
+    vixy_open_shock_open30_ret_max: float = 0.0
+    vixy_open_shock_peak_dd_max: float = -0.003
+    vixy_open_shock_detect_r2_max: float = 0.10
+    vixy_open_shock_put_block_end_bar: int = 60
+    vixy_open_shock_min_dual_leg_edge_gap: float = 0.001
+    vixy_open_shock_low_conf_gap_max: float = 0.005
+    vixy_open_shock_spot_ret_15_max: float = -0.0005
+    vixy_open_shock_vix_ret_15_min: float = 0.0
+    vixy_open_shock_confirm_r2_min: float = 0.15
     # --- CALL TREND_SPENT 禁开(None=关闭) ---
     # 日振幅已走到高位 + 波动压缩 + 午后时点 → 禁 CALL(不碰 PUT)。
     # July10 型:上午慢爬后追涨 CALL 系统性亏;W1+7/10 消融推荐
@@ -166,6 +198,13 @@ class ReplayConfig:
     require_leg_side_agree: bool = False
     # PUT 要求 spot_down>spot_up; CALL 要求 spot_up>spot_down。
     require_leg_spot_agree: bool = False
+    # 双腿 edge 绝对差 < 该值时整 bar 弃权(Jul13 型硬币面;None=关闭)。
+    # Apr–Jun 正常 gap 中位~0.05;Jul13 病态日中位~0.0008。
+    min_dual_leg_edge_gap: Optional[float] = None
+    # CALL 要求 spot_day_ret > eps; PUT 要求 spot_day_ret < -eps(字段缺失不拦)。
+    # 比模型 spot_up/down 概率更稳:用当日已实现现货方向确认选腿。
+    require_leg_spot_day_agree: bool = False
+    spot_day_agree_eps: float = 0.0
 
     def threshold_at(self, session_bar: Optional[int]) -> float:
         if self.entry_threshold_schedule is None or session_bar is None:
@@ -200,6 +239,8 @@ class Trade:
     bars_held: int
     signal_edge: float
     leg: str = "CALL"
+    # 该笔实际账户仓位；允许跨日防御在不改变权利金 ROI 的情况下动态减仓。
+    position_frac: float = 1.0
 
 
 @dataclass
@@ -259,6 +300,7 @@ class ReplayResult:
                     "exit_reason": t.exit_reason,
                     "bars_held": t.bars_held,
                     "signal_edge": t.signal_edge,
+                    "position_frac": t.position_frac,
                 }
                 for t in self.trades
             ]

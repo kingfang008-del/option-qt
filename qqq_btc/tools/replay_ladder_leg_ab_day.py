@@ -268,7 +268,7 @@ def main() -> int:
     )
     ap.add_argument(
         "--fullchain",
-        default="/home/kingfang007/data/new_option_data_s3/QQQ/QQQ_2026-07-01.parquet",
+        default="/mnt/s990/new_option_data_s3/QQQ/QQQ_2026-07-01.parquet",
     )
     ap.add_argument(
         "--primary-map",

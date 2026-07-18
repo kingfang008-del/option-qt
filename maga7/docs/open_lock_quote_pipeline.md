@@ -21,9 +21,13 @@ export PYTHONPATH=$PWD
 
 | 输入 | 路径（profile） |
 |---|---|
-| 正股 1m | `paths.stock_root` → `~/train_data/spnq_train` |
+| 正股 1s 事实源 | `paths.stock_1s_root` → `/mnt/s990/data/raw_1s/stocks` |
+| 正股派生 1m 缓存 | `paths.stock_root` → `~/train_data/spnq_train` |
 | day_iv | `paths.day_iv_root` → `~/train_data/nq_options_day_iv` |
-| option_1m（早盘补 0DTE） | `paths.option_1m_root` → `~/data/new_option_data_s3` |
+| option_1m（早盘补 0DTE） | `paths.option_1m_root` → `/mnt/s990/new_option_data_s3` |
+
+锁约工具当前可读取派生 1m 缓存取得开盘 spot，但该缓存的上游权威仍是股票 1s
+事实源；其时间戳只表示分钟归属，不单独决定策略可用时刻。
 
 ## 流水线步骤
 
@@ -49,7 +53,7 @@ lock → seed → miss → quotes → merge → status
 | miss 锁约表 | `~/train_data/locked_targets_map_maga7_open_miss_1s.parquet` |
 | 主 1s 目录 | `/mnt/s990/data/raw_1s/maga7_mf10_open_lock` |
 | 旁路 miss 1s | `/mnt/s990/data/raw_1s/maga7_mf10_open_lock_miss` |
-| 正股 1s（可选） | `/mnt/s990/data/raw_1s/stocks` |
+| 正股 1s 事实源 | `/mnt/s990/data/raw_1s/stocks` |
 
 seed 来源（存在才用）：
 

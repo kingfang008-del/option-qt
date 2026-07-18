@@ -59,7 +59,9 @@ class ContractBooks:
         clear_otm = float(clear) if clear is not None else None
         paths = profile.get("_paths") or {}
         ladder = mode in ("open_ladder", "open_lock_ladder")
-        otm_rungs = int(trade.get("ladder_otm_rungs") or (profile.get("lock") or {}).get("otm_rungs") or (2 if ladder else 1))
+        from maga7.common.open_lock import resolve_otm_rungs
+
+        otm_rungs = resolve_otm_rungs(profile, default=2 if ladder else 1)
 
         flat = None
         multi = None

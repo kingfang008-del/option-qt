@@ -80,6 +80,12 @@ def prepare_minute_frame(df: pd.DataFrame) -> pd.DataFrame:
     out["_minute_key"] = out["timestamp"].map(_minute_key)
     if "close" in out.columns and "spot_ret_5bar" not in out.columns:
         out["spot_ret_5bar"] = out.groupby("_day", sort=False)["close"].pct_change(5)
+    if "close" in out.columns and "spot_ret_15bar" not in out.columns:
+        out["spot_ret_15bar"] = out.groupby("_day", sort=False)["close"].pct_change(15)
+    if "vix_proxy_close" in out.columns and "vix_ret_15bar" not in out.columns:
+        out["vix_ret_15bar"] = out.groupby("_day", sort=False)[
+            "vix_proxy_close"
+        ].pct_change(15)
     if "vix_proxy_close" in out.columns and "vix_reversal_count_30m" not in out.columns:
         out = add_vix_regime_features(out)
     if "close" in out.columns and "spot_day_ret" not in out.columns:
@@ -126,9 +132,12 @@ def _signal_from_row(
         put_gate=_f(put_gate_col),
         regime_vix_z=_f("regime_vix_z"),
         vx_curve_slope=_f("vx_curve_slope"),
+        open30_ret=_f("open30_ret"),
         open30_max_ret=_f("open30_max_ret"),
         open30_peak_dd=_f("open30_peak_dd"),
         spot_ret_5bar=_f("spot_ret_5bar"),
+        spot_ret_15bar=_f("spot_ret_15bar"),
+        vix_ret_15bar=_f("vix_ret_15bar"),
         trend_ret_30m=_f("trend_fit_ret_30m"),
         trend_r2_30m=_f("trend_fit_r2_30m"),
         vix_reversal_count_30m=_f("vix_reversal_count_30m"),
@@ -319,7 +328,10 @@ def run_event_replay(
                         and row["close"] is not None
                         and np.isfinite(row["close"])
                         else None
-                    )
+                    ),
+                    open30_ret=signal.open30_ret,
+                    open30_peak_dd=signal.open30_peak_dd,
+                    trend_r2_30m=signal.trend_r2_30m,
                 ),
                 day_key=day_key,
                 phase=BarPhase.CLOSE,
@@ -362,6 +374,9 @@ def run_event_replay(
                 spot_close=spot_f,
                 regime_vix_z=signal.regime_vix_z,
                 vx_curve_slope=signal.vx_curve_slope,
+                open30_ret=signal.open30_ret,
+                open30_peak_dd=signal.open30_peak_dd,
+                trend_r2_30m=signal.trend_r2_30m,
             )
             session.on_minute_bar(
                 bar_index, ts, session_bar, close_q, hold_sig,

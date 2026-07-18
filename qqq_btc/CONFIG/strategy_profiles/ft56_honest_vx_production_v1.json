@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "profile_id": "ft56_honest_vx_production_v1",
+  "description": "FT56 honest production parity: LIVE_REPLAY + causal VIXY gate + VX selector + tick risk exits",
+  "base_replay": "LIVE_REPLAY",
+  "model": {
+    "checkpoint": "checkpoint/checkpoints_qqq_ft56_julw1/best.pth"
+  },
+  "inputs": {
+    "infer_by_month": {
+      "2026-07": "qqq_btc/results/ft56_julw1_honest_infer_fixed5m_post_gatefix/test_infer.parquet"
+    },
+    "raw1_by_month": {
+      "2026-07": "~/train_data/july_w1_v4_honest_openwin/quote_features_raw/QQQ/regular/09:30-16:00/1min/2026-07.parquet"
+    }
+  },
+  "replay_overrides": {
+    "edge_q10_floor": -0.2,
+    "apply_put_entry_quantile": false,
+    "next_day_put_quarantine_loss": -0.02,
+    "next_day_put_quarantine_vx_slope_min": 0.06,
+    "next_day_all_leg_defense_loss": -0.05,
+    "next_day_all_leg_defense_position_frac": 0.125,
+    "next_day_all_leg_defense_vx_slope_min": 0.06
+  },
+  "selector": {
+    "mode": "vx",
+    "rule_profiles": "qqq_btc/CONFIG/rule_profiles.json",
+    "vx_term_structure": "/mnt/s990/data/raw_1m/vix_futures_databento/vx_term_structure_1d.parquet",
+    "spot_root": "~/train_data/spnq_train_resampled"
+  },
+  "execution": {
+    "put_gate_mode": "vixy_z",
+    "tick_exits": "disaster_only",
+    "live_label_shift_sec": 60,
+    "fill_spread_frac": 0.775,
+    "execution_delay_bars": 0,
+    "oms_signal_delay_bars": 0
+  },
+  "features": {
+    "slow_feature_config": "qqq_btc/CONFIG/slow_feature_qqq_v4.json",
+    "frozen_norm": "qqq_btc/CONFIG/frozen_norm_qqq_daily.npz",
+    "honest_feature_root": "~/train_data/july_w1_v4_honest_openwin"
+  }
+}

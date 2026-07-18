@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "description": "Dashboard 配方索引：Offline Replay 与 Stream Parity 共用 strategy profile；Download 不含归一化。",
+  "recipes": [
+    {
+      "recipe_id": "v4_honest_jul1_13_old_lock",
+      "title": "V4 · Jul1–13（W1 + Jul13 old_lock）",
+      "priority": 0,
+      "strategy_profile": "qqq_btc/CONFIG/strategy_profiles/v4_honest_jul1_13_old_lock_v1.json",
+      "stream_script": null,
+      "offline_cmd": "python qqq_btc/tools/replay_offline_live_aligned.py --months 2026-07 --strategy-profile qqq_btc/CONFIG/strategy_profiles/v4_honest_jul1_13_old_lock_v1.json --out-name v4_honest_jul1_13_old_lock_v1_offline",
+      "stream_cmd": null,
+      "offline_result": "qqq_btc/results/offline_live_aligned/v4_honest_jul1_13_old_lock_v1_offline",
+      "result_name_prefixes": [
+        "jul1_13_v4_old_lock_"
+      ],
+      "baseline_acct25_pct": 53.56,
+      "baseline_trades": 15,
+      "docs": [
+        "qqq_btc/docs/strategy_profile_replay_stream_parity.md"
+      ],
+      "notes": "默认：W1 honest infer/raw（01–10）+ old_lock Jul13。已修复 QQQ July 股价右标签；纯 old_lock 期权≠W1，勿与 +65% 直接比。修股价脚本: qqq_btc/tools/fix_qqq_july_right_label_1min.py"
+    },
+    {
+      "recipe_id": "v4_honest_v0_gated",
+      "title": "V0 · V4 honest W1 无 VX（正式三闸门）",
+      "priority": 1,
+      "strategy_profile": "qqq_btc/CONFIG/strategy_profiles/v4_honest_v0_parity_v1.json",
+      "stream_script": "qqq_btc/tools/run_v4_v0_stream_parity.sh",
+      "offline_cmd": "python qqq_btc/tools/replay_offline_live_aligned.py --months 2026-07 --strategy-profile qqq_btc/CONFIG/strategy_profiles/v4_honest_v0_parity_v1.json --out-name v4_honest_v0_parity_v1_offline",
+      "stream_cmd": "bash qqq_btc/tools/run_v4_v0_stream_parity.sh",
+      "offline_result": "qqq_btc/results/offline_live_aligned/v4_honest_v0_parity_v1_offline",
+      "result_name_prefixes": [
+        "july_w1_v4_v0_gated_",
+        "july_w1_v4_stream_final_aligned"
+      ],
+      "baseline_acct25_pct": 65.09,
+      "baseline_trades": 12,
+      "docs": [
+        "qqq_btc/docs/strategy_profile_replay_stream_parity.md",
+        "qqq_btc/docs/v4_july_w1_stream_parity_final_aligned_20260714.md"
+      ],
+      "notes": "W1 冻结对拍（july_w1_v4_honest_openwin）。Jul1–9 正式 gated 目标约 ±2pp 内对齐离线 +65.09%/12。"
+    },
+    {
+      "recipe_id": "ft56_honest_vx_parity",
+      "title": "FT56 · honest VX 逻辑对拍（tick off）",
+      "priority": 2,
+      "strategy_profile": "qqq_btc/CONFIG/strategy_profiles/ft56_honest_vx_parity_v1.json",
+      "stream_script": "qqq_btc/tools/restart_ft56_july_w1_honest_live_parity.sh",
+      "offline_cmd": "python qqq_btc/tools/replay_offline_live_aligned.py --months 2026-07 --strategy-profile qqq_btc/CONFIG/strategy_profiles/ft56_honest_vx_parity_v1.json --out-name ft56_honest_vx_parity_v1_offline",
+      "stream_cmd": "QQQ_BTC_STRATEGY_PROFILE=$PWD/qqq_btc/CONFIG/strategy_profiles/ft56_honest_vx_parity_v1.json bash qqq_btc/tools/restart_ft56_july_w1_honest_live_parity.sh",
+      "offline_result": "qqq_btc/results/offline_live_aligned/ft56_profile_v1_july",
+      "result_name_prefixes": [
+        "july_w1_ft56_honest_live_parity",
+        "july_w1_ft56_honest_3gate"
+      ],
+      "baseline_acct25_pct": 22.33,
+      "baseline_trades": 9,
+      "docs": [
+        "qqq_btc/docs/strategy_profile_replay_stream_parity.md",
+        "qqq_btc/docs/honest_live_kpi_finetune_replay.md"
+      ],
+      "notes": "分钟逻辑对拍控制组；tick_exits=off。"
+    },
+    {
+      "recipe_id": "ft56_honest_vx_production",
+      "title": "FT56 · honest VX 生产（tick disaster_only）",
+      "priority": 3,
+      "strategy_profile": "qqq_btc/CONFIG/strategy_profiles/ft56_honest_vx_production_v1.json",
+      "stream_script": "qqq_btc/tools/restart_ft56_july_w1_honest_live_parity.sh",
+      "offline_cmd": "python qqq_btc/tools/replay_offline_live_aligned.py --months 2026-07 --strategy-profile qqq_btc/CONFIG/strategy_profiles/ft56_honest_vx_production_v1.json --out-name ft56_honest_vx_production_v1_offline",
+      "stream_cmd": "QQQ_BTC_STRATEGY_PROFILE=$PWD/qqq_btc/CONFIG/strategy_profiles/ft56_honest_vx_production_v1.json bash qqq_btc/tools/restart_ft56_july_w1_honest_live_parity.sh",
+      "offline_result": "qqq_btc/results/offline_live_aligned/ft56_production_profile_v1_july",
+      "result_name_prefixes": [
+        "july_w1_ft56_honest_live_parity"
+      ],
+      "baseline_acct25_pct": 22.33,
+      "baseline_trades": 9,
+      "docs": [
+        "qqq_btc/docs/strategy_profile_replay_stream_parity.md"
+      ],
+      "notes": "贴近当前生产执行路径的对拍；restart 脚本默认 profile。匹配优先看 manifest.strategy_profile_id。"
+    },
+    {
+      "recipe_id": "v4_vx_live_aligned",
+      "title": "V4 · VX live-aligned 离线标准",
+      "priority": 4,
+      "strategy_profile": "qqq_btc/CONFIG/strategy_profiles/v4_vx_live_aligned_v1.json",
+      "stream_script": null,
+      "offline_cmd": "python qqq_btc/tools/replay_offline_live_aligned.py --strategy-profile qqq_btc/CONFIG/strategy_profiles/v4_vx_live_aligned_v1.json",
+      "stream_cmd": null,
+      "offline_result": "qqq_btc/results/offline_live_aligned/v4_profile_v1_july",
+      "result_name_prefixes": [],
+      "baseline_acct25_pct": 55.67,
+      "baseline_trades": 7,
+      "docs": [
+        "qqq_btc/docs/strategy_profile_replay_stream_parity.md",
+        "qqq_btc/docs/replay_version_lineage_and_result_reconciliation.md"
+      ],
+      "notes": "D7 V4+VX 离线基线；流式入口尚未固化为独立脚本。"
+    }
+  ]
+}

@@ -43,7 +43,31 @@
     "ladder_otm_rungs": 5,
     "quote_source": "1s",
     "day_iv_half_spread_frac": 0.01,
-    "clear_otm_ban_0dte_pct": 0.01
+    "clear_otm_ban_0dte_pct": 0.01,
+    "risk": {
+      "max_stock_staleness_sec": 2.0,
+      "max_option_staleness_sec": 5.0,
+      "max_spread_pct": 0.25,
+      "max_entry_mid_jump_pct": 0.15,
+      "max_exit_mid_jump_pct": 0.20,
+      "max_gap_hold_ticks": 3,
+      "max_fill_spread_frac": 0.95,
+      "max_exit_chase": 3,
+      "day_circuit_force_flatten": true,
+      "halt_entries_on_gap": true,
+      "requote": {
+        "enabled": true,
+        "entry_timeout_sec": 3.0,
+        "exit_timeout_sec": 2.0,
+        "max_entry_requotes": 3,
+        "max_exit_requotes": 3,
+        "entry_frac_step": 0.05,
+        "entry_max_slippage_pct": 0.08,
+        "entry_step_cap_pct": 0.03,
+        "exit_step": 0.01,
+        "cancel_settle_sec": 0.5
+      }
+    }
   },
   "regime": {
     "enabled": true,
@@ -68,7 +92,7 @@
   },
   "paths": {
     "stock_root": "~/train_data/spnq_train",
-    "option_1m_root": "~/data/new_option_data_s3",
+    "option_1m_root": "/mnt/s990/new_option_data_s3",
     "day_iv_root": "~/train_data/nq_options_day_iv",
     "locked_map": "~/train_data/locked_targets_map_maga7_mf10_jan_jul.parquet",
     "open_locked_map": "~/train_data/locked_targets_map_maga7_googl_open_ladder_atm5otm_jan_jul.parquet",

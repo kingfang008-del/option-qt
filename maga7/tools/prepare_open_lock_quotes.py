@@ -42,7 +42,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from maga7.common.config import load_profile
-from maga7.common.open_lock import build_open_lock_map
+from maga7.common.open_lock import build_open_lock_map, resolve_otm_rungs
 from maga7.common.replay import month_list
 from maga7.common.signals import load_stock_month_files
 
@@ -109,7 +109,7 @@ def _paths(profile: dict) -> dict[str, Path]:
         "quote_miss_root": Path(str(quote) + "_miss"),
         "stock_1s_root": Path(p.get("stock_1s_root") or "/mnt/s990/data/raw_1s/stocks"),
         "day_iv_root": Path(p["day_iv_root"]),
-        "option_1m_root": Path(p.get("option_1m_root") or Path.home() / "data/new_option_data_s3"),
+        "option_1m_root": Path(p.get("option_1m_root") or "/mnt/s990/new_option_data_s3"),
         "stock_root": Path(p["stock_root"]),
         "miss_map": Path.home()
         / "train_data"
@@ -185,11 +185,7 @@ def step_lock(
         allowed_dte=(profile.get("lock") or {}).get("allowed_dte") or [0, 1, 2],
         stock_by=stock_by,
         option_1m_root=paths.get("option_1m_root"),
-        otm_rungs=int(
-            (profile.get("trade") or {}).get("ladder_otm_rungs")
-            or (profile.get("lock") or {}).get("otm_rungs")
-            or 1
-        ),
+        otm_rungs=resolve_otm_rungs(profile, default=1),
     )
     if df.empty:
         raise SystemExit("empty open lock map — check day_iv / option_1m coverage")
@@ -373,7 +369,8 @@ def step_quotes(
         window_start,
         "--window-end",
         window_end,
-        "--no-download-stock",
+        # Ensure missing 1s underlyings are filled before option quotes (no 1m ffill).
+        "--download-stock",
         "--allow-partial",
         "--global-pool",
     ]

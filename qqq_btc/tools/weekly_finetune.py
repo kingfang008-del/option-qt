@@ -15,6 +15,7 @@
 用法:
   python qqq_btc/tools/weekly_finetune.py
   python qqq_btc/tools/weekly_finetune.py --train-months 2026-05,2026-06 --val-months 2026-06
+  python qqq_btc/tools/weekly_finetune.py --suggest-train-months --regime-query 2026-07-01:2026-07-08 --dry-run
   python qqq_btc/tools/weekly_finetune.py --dry-run
 """
 from __future__ import annotations
@@ -26,11 +27,13 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 REPO = Path(__file__).resolve().parents[2]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 DEFAULT_POLICY = REPO / "qqq_btc/CONFIG/weekly_finetune_policy.json"
 
 logger = logging.getLogger("weekly_finetune")
@@ -41,11 +44,60 @@ def _expand(p: str | Path) -> Path:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def load_policy(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def suggest_train_months_via_regime(
+    policy: dict[str, Any],
+    *,
+    regime_query: str,
+    available: list[str],
+    out_dir: Path | None = None,
+) -> tuple[list[str], dict[str, Any]]:
+    """调用 match_week_regime，返回过滤后的 train months + 完整建议包。"""
+    from qqq_btc.tools.match_week_regime import run_regime_match, suggest_train_months
+
+    rm = policy.get("regime_match") or {}
+    apply = str(rm.get("apply", "blend_on_shift"))
+    recent_n = int(rm.get("recent_months", policy.get("windows", {}).get("train_lookback_months", 2)))
+    report = run_regime_match(
+        query=regime_query,
+        spot_root=rm.get("spot_root", "~/train_data/spnq_train_resampled"),
+        history_start=str(rm.get("history_start", "2024-01-01")),
+        top=int(rm.get("top", 15)),
+        recent_months=recent_n,
+        mode=str(rm.get("mode", "rolling")),
+        metric=str(rm.get("metric", "cosine")),
+        out_dir=out_dir,
+        quiet=True,
+    )
+    suggestion = suggest_train_months(
+        report,
+        apply=apply,
+        available=available,
+        recent_lookback=recent_n,
+    )
+    report["train_months_suggestion"] = suggestion
+    if out_dir is not None:
+        out_dir = _expand(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "regime_match.json").write_text(
+            json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        (out_dir / "train_months_suggestion.json").write_text(
+            json.dumps(suggestion, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+    months = list(suggestion.get("train_months") or [])
+    if not months:
+        raise SystemExit(
+            "regime suggest produced empty train_months after filtering available features; "
+            f"dropped={suggestion.get('dropped_unavailable')} available_tail={available[-6:]}"
+        )
+    return months, {"report": report, "suggestion": suggestion}
 
 
 class StatusWriter:
@@ -206,6 +258,22 @@ def main() -> int:
     ap.add_argument("--policy", default=str(DEFAULT_POLICY))
     ap.add_argument("--train-months", default=None, help="comma months, e.g. 2026-05,2026-06")
     ap.add_argument("--val-months", default=None, help="comma months, e.g. 2026-06")
+    ap.add_argument(
+        "--suggest-train-months",
+        action="store_true",
+        help="用 match_week_regime 自动建议 --train-months（需 --regime-query；显式 --train-months 优先）",
+    )
+    ap.add_argument(
+        "--regime-query",
+        default=None,
+        help="状态匹配查询窗 YYYY-MM-DD 或 start:end；配合 --suggest-train-months",
+    )
+    ap.add_argument(
+        "--regime-apply",
+        default=None,
+        choices=("blend_on_shift", "always_blend", "suggest_only"),
+        help="覆盖 policy.regime_match.apply",
+    )
     ap.add_argument("--base-checkpoint", default=None)
     ap.add_argument("--feature-train-root", default=None)
     ap.add_argument("--feature-oos-root", default=None)
@@ -223,6 +291,9 @@ def main() -> int:
         policy["paths"]["feature_oos_root"] = args.feature_oos_root
     if args.option_1m_oos_root:
         policy["paths"]["option_1m_oos_root"] = args.option_1m_oos_root
+    if args.regime_apply:
+        policy.setdefault("regime_match", {})
+        policy["regime_match"]["apply"] = args.regime_apply
 
     seed = int(policy.get("seed", 42))
     os.environ["QQQ_BTC_SEED"] = str(seed)
@@ -230,7 +301,6 @@ def main() -> int:
 
     train_months = [x.strip() for x in args.train_months.split(",") if x.strip()] if args.train_months else None
     val_months = [x.strip() for x in args.val_months.split(",") if x.strip()] if args.val_months else None
-    train_yms, val_yms = resolve_windows(policy, train_months=train_months, val_months=val_months)
 
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     runs_root = _expand(policy["paths"]["runs_root"])
@@ -248,6 +318,50 @@ def main() -> int:
     )
 
     status = StatusWriter(run_dir)
+    regime_meta: dict[str, Any] | None = None
+    want_suggest = bool(args.suggest_train_months or (policy.get("regime_match") or {}).get("auto_suggest"))
+    if train_months is None and want_suggest:
+        regime_query = args.regime_query or (policy.get("regime_match") or {}).get("query")
+        if not regime_query:
+            status.update(
+                stage="regime_suggest",
+                pct=3,
+                message="--suggest-train-months 需要 --regime-query 或 policy.regime_match.query",
+                ok=False,
+            )
+            return 2
+        feat_root = _expand(policy["paths"]["feature_train_root"])
+        available = list_months(feat_root / "1min")
+        status.update(stage="regime_suggest", pct=3, message=f"matching regime for {regime_query}")
+        try:
+            train_months, regime_meta = suggest_train_months_via_regime(
+                policy,
+                regime_query=str(regime_query),
+                available=available,
+                out_dir=run_dir / "regime_match",
+            )
+        except Exception as e:
+            status.update(stage="regime_suggest", pct=3, message=f"regime suggest failed: {e}", ok=False)
+            return 2
+        sug = regime_meta["suggestion"]
+        logger.info(
+            "regime suggest apply=%s reason=%s shift=%s train_months=%s dropped=%s action=%s",
+            sug.get("apply"),
+            sug.get("reason"),
+            sug.get("regime_shift"),
+            sug.get("train_months_csv"),
+            sug.get("dropped_unavailable"),
+            sug.get("action"),
+        )
+        status.update(
+            stage="regime_suggest",
+            pct=4,
+            message=f"train_months←{sug.get('train_months_csv')} ({sug.get('reason')})",
+            regime_suggestion=sug,
+        )
+
+    train_yms, val_yms = resolve_windows(policy, train_months=train_months, val_months=val_months)
+
     py = os.environ.get("PYTHON", sys.executable)
     symbol = policy.get("symbol", "QQQ")
     config = str(_expand(policy["config"]) if not Path(policy["config"]).is_absolute() else policy["config"])
@@ -285,6 +399,7 @@ def main() -> int:
             "results_root": str(results_root),
         },
         windows={"train_months": train_yms, "val_months": val_yms},
+        regime_suggestion=(regime_meta or {}).get("suggestion") if regime_meta else None,
     )
 
     # preflight
@@ -311,7 +426,9 @@ def main() -> int:
         "feature_train_root": str(feat_train_root),
         "feature_oos_root": str(feat_oos_root),
         "option_1m_oos_root": str(opt_oos_root),
-        "note": "底座保留；仅 OOS 门禁通过才晋升 production link",
+        "regime_suggestion": (regime_meta or {}).get("suggestion") if regime_meta else None,
+        "regime_query": args.regime_query or (policy.get("regime_match") or {}).get("query"),
+        "note": "底座保留；仅 OOS 门禁通过才晋升 production link；regime suggest 只改 train 窗不改门禁",
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -436,6 +553,7 @@ def main() -> int:
         "finished_at": _now(),
         "seed": seed,
         "windows": {"train_months": train_yms, "val_months": val_yms},
+        "regime_suggestion": (regime_meta or {}).get("suggestion") if regime_meta else None,
         "base_checkpoint": str(base_ckpt),
         "candidate_checkpoint": str(cand_ckpt),
         "production_link": str(prod_link),

@@ -108,18 +108,29 @@ def record_session_edges_from_ctx(ctx: dict, replay_cfg: Any = None) -> None:
     """
     if not ctx.get("is_ready", False):
         return
-    if int(ctx.get("position", 0) or 0) != 0:
-        return
 
     from qqq_btc.live.session_governor import resolve_replay_cfg
 
     cfg = resolve_replay_cfg(replay_cfg)
     session_bar = _session_bar_from_ctx(ctx)
+    sym = str(ctx.get("symbol", "QQQ") or "QQQ")
+    curr_ts = float(ctx.get("curr_ts", 0.0) or 0.0)
+    gov = get_session_governor(cfg)
+    if curr_ts > 0:
+        gov.maybe_reset_day(sym, curr_ts)
+    # 状态识别必须观察持仓分钟；edge 分位缓冲仍只记录空仓分钟。
+    gov.note_vixy_open_shock_regime(
+        sym,
+        session_bar=session_bar,
+        open30_ret=_f_ctx(ctx, "open30_ret"),
+        open30_peak_dd=_f_ctx(ctx, "open30_peak_dd"),
+        trend_r2_30m=_f_ctx(ctx, "trend_fit_r2_30m"),
+    )
+    if int(ctx.get("position", 0) or 0) != 0:
+        return
     if not cfg.session_allows_entry(session_bar):
         return
 
-    sym = str(ctx.get("symbol", "QQQ") or "QQQ")
-    curr_ts = float(ctx.get("curr_ts", 0.0) or 0.0)
     edge = float(ctx.get("net_edge_raw", ctx.get("alpha_z", 0.0)) or 0.0)
     call_edge = float(ctx.get("call_edge", edge) or edge)
     put_edge = float(ctx.get("put_edge", 0.0) or 0.0)
@@ -135,9 +146,23 @@ def record_session_edges_from_ctx(ctx: dict, replay_cfg: Any = None) -> None:
     day_range_pos = _f_ctx(ctx, "day_range_pos")
     bb_width = _f_ctx(ctx, "bb_width")
 
-    gov = get_session_governor(cfg)
-    if curr_ts > 0:
-        gov.maybe_reset_day(sym, curr_ts)
+    spot_px = _f_ctx(ctx, "spot_close")
+    if spot_px is None:
+        spot_px = _f_ctx(ctx, "stock_price")
+    if spot_px is None:
+        spot_px = _f_ctx(ctx, "close")
+    gov.record_bounce_inputs(
+        sym,
+        spot_close=spot_px,
+        vwap_log_return=_f_ctx(ctx, "vwap_log_return"),
+        ts=curr_ts,
+    )
+    gov.record_cross_asset_inputs(
+        sym,
+        spot_close=spot_px,
+        vix_proxy_close=_f_ctx(ctx, "vix_proxy_close"),
+        ts=curr_ts,
+    )
     gov.record_edges(
         sym,
         session_bar=session_bar,
@@ -237,18 +262,29 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
     gov = get_session_governor(replay_cfg)
     if curr_ts > 0:
         gov.maybe_reset_day(sym, curr_ts)
-    # bounce-cut 输入:与 replay 分钟 CLOSE 追加 spot/vwap 对齐
+    # 日切后生效配置可能已套 OPEN_DEFENSE/CHOP；后续门控必须用 gov.replay_cfg。
+    replay_cfg = gov.replay_cfg
+    # bounce/cross-asset 输入已在 record_session_edges_from_ctx 中于 V0 门控前记录，
+    # 此处只读取，避免被 pre_conditions 拦掉的分钟造成历史断裂。
     spot_px = _f_ctx(ctx, "spot_close")
     if spot_px is None:
         spot_px = _f_ctx(ctx, "stock_price")
     if spot_px is None:
         spot_px = _f_ctx(ctx, "close")
-    gov.record_bounce_inputs(
+    gov.record_cross_asset_inputs(
         sym,
         spot_close=spot_px,
-        vwap_log_return=_f_ctx(ctx, "vwap_log_return"),
+        vix_proxy_close=_f_ctx(ctx, "vix_proxy_close"),
         ts=float(curr_ts) if curr_ts and curr_ts > 0 else 0.0,
     )
+    rolling_spot_15, rolling_vix_15 = gov.cross_asset_returns(sym, bars=15)
+    # FCS history 可直接给出严格 15-bar 收益；governor 为重启/接线兼容兜底。
+    spot_ret_15bar = _f_ctx(ctx, "spot_ret_15bar")
+    if spot_ret_15bar is None:
+        spot_ret_15bar = rolling_spot_15
+    vix_ret_15bar = _f_ctx(ctx, "vix_ret_15bar")
+    if vix_ret_15bar is None:
+        vix_ret_15bar = rolling_vix_15
 
     blocked, block_reason = gov.blocked_for_entry(
         sym,
@@ -261,6 +297,22 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         record_entry_signal_audit(
             ctx=ctx,
             block_reason=block_reason,
+            session_bar=session_bar,
+            mode=getattr(self, "mode", ""),
+        )
+        return None
+
+    gated, gate_reason = gov.cross_day_gates(
+        sym,
+        session_bar=session_bar,
+        edge_q10=edge_q10,
+    )
+    if gated:
+        self._trace("E9.qqq_btc_cross_day", "block", gate_reason)
+        self._last_reject_reason = gate_reason
+        record_entry_signal_audit(
+            ctx=ctx,
+            block_reason=gate_reason,
             session_bar=session_bar,
             mode=getattr(self, "mode", ""),
         )
@@ -290,6 +342,13 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         put_edge=put_edge,
         open30_max_ret=_f_ctx(ctx, "open30_max_ret"),
     )
+    gov.note_vixy_open_shock_regime(
+        sym,
+        session_bar=session_bar,
+        open30_ret=_f_ctx(ctx, "open30_ret"),
+        open30_peak_dd=_f_ctx(ctx, "open30_peak_dd"),
+        trend_r2_30m=trend_r2_30m,
+    )
     c_mult, p_mult = gov.entry_threshold_mults(sym)
 
     decision = choose_entry(
@@ -313,6 +372,8 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         open30_max_ret=_f_ctx(ctx, "open30_max_ret"),
         open30_peak_dd=_f_ctx(ctx, "open30_peak_dd"),
         spot_ret_5bar=spot_ret_5bar,
+        spot_ret_15bar=spot_ret_15bar,
+        vix_ret_15bar=vix_ret_15bar,
         trend_ret_30m=trend_ret_30m,
         trend_r2_30m=trend_r2_30m,
         vix_reversal_count_30m=vix_rev,
@@ -329,6 +390,7 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         call_threshold_mult=c_mult,
         put_threshold_mult=p_mult,
         put_structure_veto_until_bar=gov.put_structure_veto_until_bar(sym),
+        vixy_open_shock_regime_active=gov.vixy_open_shock_regime_active(sym),
     )
 
     if decision is None:
@@ -353,6 +415,25 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         record_entry_signal_audit(
             ctx=ctx,
             block_reason="qqq_btc_entry",
+            session_bar=session_bar,
+            dyn_threshold=dyn_th,
+            put_dyn_threshold=put_dyn_th,
+            mode=getattr(self, "mode", ""),
+        )
+        return None
+
+    gated_leg, gate_leg_reason = gov.cross_day_gates(
+        sym,
+        session_bar=session_bar,
+        edge_q10=edge_q10,
+        leg=decision.leg,
+    )
+    if gated_leg:
+        self._trace("E9.qqq_btc_cross_day", "block", gate_leg_reason)
+        self._last_reject_reason = gate_leg_reason
+        record_entry_signal_audit(
+            ctx=ctx,
+            block_reason=gate_leg_reason,
             session_bar=session_bar,
             dyn_threshold=dyn_th,
             put_dyn_threshold=put_dyn_th,
@@ -396,6 +477,13 @@ def decide_entry_via_replay(self, ctx: dict) -> Optional[dict]:
         "legacy_tag": option_legacy_tag(direction),
         "score": abs(decision.edge),
         "reason": f"QQQ_BTC_ENTRY|{decision.leg}|E:{decision.edge:.3f}(Th:{decision.threshold:.3f})",
+        "meta": {
+            "position_frac": gov.effective_position_frac(sym),
+            "position_size_mult": gov.position_size_mult(sym),
+            "all_leg_defense": gov.all_leg_defense_active(sym),
+            "vx_curve_slope": getattr(gov._state(sym), "vx_curve_slope", None),
+            "active_profile": getattr(gov._state(sym), "active_profile", None),
+        },
     }
 
     # 流动性/审计盘口切到选定腿,避免 PUT 仍用 CALL bid/ask

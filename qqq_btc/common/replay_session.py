@@ -155,9 +155,13 @@ class SessionSignal:
     regime_vix_z: Optional[float] = None
     # 前一已完成 VX 日线的期限结构 VX2/VX1-1。
     vx_curve_slope: Optional[float] = None
+    open30_ret: Optional[float] = None
     open30_max_ret: Optional[float] = None
     open30_peak_dd: Optional[float] = None
     spot_ret_5bar: Optional[float] = None
+    # 早盘低置信 PUT 的跨资产确认输入。
+    spot_ret_15bar: Optional[float] = None
+    vix_ret_15bar: Optional[float] = None
     # 30min 拟合趋势收益(trend_fit_ret_30m);PUT 趋势对齐门控输入
     trend_ret_30m: Optional[float] = None
     # 30min 拟合优度(trend_fit_r2_30m);CALL 震荡过滤门控输入
@@ -213,6 +217,8 @@ class OpenPosition:
     last_valid_mtm: float = 0.0
     # 入场时现货价;SPOT_THESIS 相对入场证伪
     entry_spot: Optional[float] = None
+    # 入场时锁定实际账户仓位，避免跨日状态变化影响已开仓。
+    position_frac: float = 1.0
 
 
 class ReplaySession:
@@ -254,10 +260,14 @@ class ReplaySession:
         # 跨日腿级隔离：按账户仓位复利累计当日各腿贡献；日切时决定下一日锁腿。
         self.day_leg_equity: Dict[str, float] = {"CALL": 1.0, "PUT": 1.0}
         self.cross_day_quarantined_legs: set[str] = set()
+        self.day_account_equity = 1.0
+        self.cross_day_all_leg_defense = False
         # SPOT_THESIS 后短期同腿锁:leg -> 禁开至该 bar_index(含)
         self.leg_lock_until: Dict[str, int] = {}
         # 早盘 open30 结构否决延长至该 session_bar(含)
         self.put_structure_veto_until: Optional[int] = None
+        # 开盘急跌后低 R² 震荡态；一旦触发保持到日切。
+        self.vixy_open_shock_regime_active = False
 
         self.cur_day = None
         self.trades_today = 0
@@ -309,6 +319,9 @@ class ReplaySession:
             )
 
         if phase == BarPhase.CLOSE:
+            # regime 是会话观察状态，持仓期间也必须持续更新；否则首次入场跨过
+            # 检测窗时，平仓后永远无法识别该状态。
+            self._maybe_trip_vixy_open_shock_regime(session_bar, signal)
             mid = quotes.mid(self.default_leg)
             if np.isfinite(mid) and mid > 0:
                 self._day_mids.append(float(mid))
@@ -489,6 +502,27 @@ class ReplaySession:
         quotes: SessionQuotes,
         signal: SessionSignal,
     ) -> List[ReplayEvent]:
+        if self.cross_day_all_leg_defense:
+            defense_start = getattr(
+                self.replay_cfg, "next_day_all_leg_defense_entry_start_bar", None
+            )
+            if (
+                defense_start is not None
+                and session_bar is not None
+                and session_bar < int(defense_start)
+            ):
+                return []
+            defense_q10 = getattr(
+                self.replay_cfg, "next_day_all_leg_defense_edge_q10_floor", None
+            )
+            if defense_q10 is not None:
+                q10 = signal.edge_q10
+                if (
+                    q10 is None
+                    or not np.isfinite(q10)
+                    or float(q10) < float(defense_q10)
+                ):
+                    return []
         decision = self._choose_entry(session_bar, quotes, signal)
         if decision is None:
             return []
@@ -583,6 +617,7 @@ class ReplaySession:
             self.replay_cfg, "next_day_put_quarantine_vx_slope_min", None
         )
         prev_put_contribution = self.day_leg_equity.get("PUT", 1.0) - 1.0
+        prev_account_contribution = self.day_account_equity - 1.0
         regime_ok = put_quarantine_vix_z_max is None or (
             regime_vix_z is not None
             and np.isfinite(regime_vix_z)
@@ -605,11 +640,31 @@ class ReplaySession:
         else:
             self.cross_day_quarantined_legs.clear()
 
+        all_leg_defense_loss = getattr(
+            self.replay_cfg, "next_day_all_leg_defense_loss", None
+        )
+        all_leg_defense_vx_min = getattr(
+            self.replay_cfg, "next_day_all_leg_defense_vx_slope_min", None
+        )
+        all_leg_defense_vx_ok = all_leg_defense_vx_min is None or (
+            vx_curve_slope is not None
+            and np.isfinite(vx_curve_slope)
+            and float(vx_curve_slope) >= float(all_leg_defense_vx_min)
+        )
+        self.cross_day_all_leg_defense = bool(
+            self.cur_day is not None
+            and all_leg_defense_loss is not None
+            and np.isfinite(prev_account_contribution)
+            and prev_account_contribution <= float(all_leg_defense_loss)
+            and all_leg_defense_vx_ok
+        )
+
         self.cur_day = day_key
         self.trades_today = 0
         self.straddles_today = 0
         self.day_pnl = 0.0
         self.day_leg_equity = {"CALL": 1.0, "PUT": 1.0}
+        self.day_account_equity = 1.0
         self.day_halted = False
         self.pending_entry_bar = None
         self.loss_streak = 0
@@ -618,6 +673,7 @@ class ReplaySession:
         self.loss_legs_today.clear()
         self.leg_lock_until.clear()
         self.put_structure_veto_until = None
+        self.vixy_open_shock_regime_active = False
         self._day_mids = []
         self._spot_closes = []
         self._vwap_lrs: List[float] = []
@@ -723,6 +779,8 @@ class ReplaySession:
             open30_max_ret=signal.open30_max_ret,
             open30_peak_dd=signal.open30_peak_dd,
             spot_ret_5bar=signal.spot_ret_5bar,
+            spot_ret_15bar=signal.spot_ret_15bar,
+            vix_ret_15bar=signal.vix_ret_15bar,
             trend_ret_30m=signal.trend_ret_30m,
             trend_r2_30m=signal.trend_r2_30m,
             vix_reversal_count_30m=signal.vix_reversal_count_30m,
@@ -739,6 +797,35 @@ class ReplaySession:
             call_threshold_mult=c_mult,
             put_threshold_mult=p_mult,
             put_structure_veto_until_bar=self.put_structure_veto_until,
+            vixy_open_shock_regime_active=self.vixy_open_shock_regime_active,
+        )
+
+    def _maybe_trip_vixy_open_shock_regime(
+        self, session_bar: Optional[int], signal: SessionSignal
+    ) -> None:
+        """用已完成分钟识别开盘急跌后的低趋势震荡态，并保持到日切。"""
+        rc = self.replay_cfg
+        if (
+            self.vixy_open_shock_regime_active
+            or not bool(getattr(rc, "vixy_open_shock_regime_enabled", False))
+            or session_bar is None
+        ):
+            return
+        if not (
+            int(rc.vixy_open_shock_detect_start_bar)
+            <= int(session_bar)
+            <= int(rc.vixy_open_shock_detect_end_bar)
+        ):
+            return
+        vals = (signal.open30_ret, signal.open30_peak_dd, signal.trend_r2_30m)
+        if any(v is None or not np.isfinite(v) for v in vals):
+            return
+        self.vixy_open_shock_regime_active = bool(
+            float(signal.open30_ret) < float(rc.vixy_open_shock_open30_ret_max)
+            and float(signal.open30_peak_dd)
+            <= float(rc.vixy_open_shock_peak_dd_max)
+            and float(signal.trend_r2_30m)
+            < float(rc.vixy_open_shock_detect_r2_max)
         )
 
     def _maybe_trip_put_structure_veto(
@@ -833,6 +920,15 @@ class ReplaySession:
             and bool(getattr(self.rails_cfg, "bounce_cut_enabled", False))
             and str(leg).upper() == "PUT"
         )
+        position_frac = float(
+            getattr(self.replay_cfg, "position_frac", 1.0) or 1.0
+        )
+        if self.cross_day_all_leg_defense:
+            defense_frac = getattr(
+                self.replay_cfg, "next_day_all_leg_defense_position_frac", None
+            )
+            if defense_frac is not None:
+                position_frac = float(defense_frac)
         self.position = OpenPosition(
             leg=leg,
             entry_price=float(fill_px),
@@ -845,6 +941,7 @@ class ReplaySession:
             vol_scale=vol_scale,
             last_valid_mtm=float(fill_px),
             entry_spot=float(entry_spot) if entry_spot is not None else None,
+            position_frac=position_frac,
         )
         ev = ReplayEvent(
             kind="ENTER",
@@ -853,7 +950,12 @@ class ReplaySession:
             leg=leg,
             price=float(fill_px),
             edge=self.pending_edge,
-            extra={"vol_scale": vol_scale, "bounce_cut": bounce_on},
+            extra={
+                "vol_scale": vol_scale,
+                "bounce_cut": bounce_on,
+                "position_frac": position_frac,
+                "all_leg_defense": self.cross_day_all_leg_defense,
+            },
         )
         self.events.append(ev)
         return ev
@@ -899,10 +1001,11 @@ class ReplaySession:
                 bars_held=bar_index - pos.entry_bar,
                 signal_edge=pos.signal_edge,
                 leg=pos.leg,
+                position_frac=pos.position_frac,
             )
         )
         # 账户权益按 position_frac 下注;Trade.net_return 仍记权利金 ROI
-        f = float(getattr(self.replay_cfg, "position_frac", 1.0) or 1.0)
+        f = float(pos.position_frac)
         self.equity *= 1.0 + f * net_ret
         self.result.equity_curve.append(self.equity)
 
@@ -933,11 +1036,9 @@ class ReplaySession:
         if closed_leg == "STRADDLE":
             self.straddles_today += 1
         self.day_pnl += net_ret
+        self.day_account_equity *= 1.0 + f * net_ret
         if closed_leg in self.day_leg_equity:
-            position_frac = float(
-                getattr(self.replay_cfg, "position_frac", 1.0) or 1.0
-            )
-            self.day_leg_equity[closed_leg] *= 1.0 + position_frac * net_ret
+            self.day_leg_equity[closed_leg] *= 1.0 + f * net_ret
         if net_ret < 0:
             self.loss_streak += 1
             self.loss_legs_today.add(closed_leg)

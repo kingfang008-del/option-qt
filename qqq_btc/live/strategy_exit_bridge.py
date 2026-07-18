@@ -8,6 +8,7 @@ StrategyCore.check_exit → qqq_btc exit_rails 桥接(分钟 mid 口径)。
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
 
 from qqq_btc.common.exit_rails import (
@@ -19,6 +20,8 @@ from qqq_btc.common.exit_rails import (
 )
 from qqq_btc.live.live_clock import live_session_bar
 from qqq_btc.qqq import config as qcfg
+
+logger = logging.getLogger("qqq_btc.live.strategy_exit")
 
 
 def _session_bar_from_ctx(ctx: dict) -> int:
@@ -108,6 +111,15 @@ def check_exit_via_rails(
             entry_spot=float(pos["entry_spot"]),
             held=held,
         )
+        if rails.spot_thesis_against_entry is not None:
+            logger.debug(
+                "bounce thesis check leg=%s held=%s spot=%.4f entry_spot=%.4f result=%s",
+                pos.get("leg") or pos.get("chosen_leg"),
+                held,
+                spot_px,
+                float(pos["entry_spot"]),
+                thesis,
+            )
         if thesis:
             return {"action": "SELL", "reason": f"QQQ_BTC_{thesis}", "dir": pos.get("dir", 1)}
 

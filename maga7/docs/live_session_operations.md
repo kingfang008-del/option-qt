@@ -38,9 +38,22 @@ export MAG7_EVENT_CALENDAR_PATH=maga7/CONFIG/event_calendar_live.json
 启动后若今日命中，日志会出现 `EVENT_BLACKOUT active today=...`，OMS `day_halted`。  
 研究消融见 [`event_calendar_block_research.md`](event_calendar_block_research.md)。
 
+## 盘前一天流式对拍（开盘前 / 改代码后）
+
+对齐 production：打一天数据 → `trade_log` → 对 offline 开平仓：
+
+```bash
+cd maga7/SHELL
+./run_day_stream_check.sh                 # 默认 2026-05-28；有 Redis 走 S5
+./run_day_stream_check.sh 2026-06-02 --force-local
+```
+
+详见 [`premarket_hardening.md`](premarket_hardening.md)。通过仍不能替代下方 G4/G5/G6 真实 session 证据。
+
 ## 前置条件
 
 - IB Gateway/TWS 已开启 API，Paper 默认端口 `4002`，Live 默认 `4001`。
+
 - Paper/Live 必须显式传入 `--account`；账户不在 IBKR managed accounts 时 fail closed。
 - 行情账户具备美股和 OPRA 实时权限；`market_data_type=3/4` 只能观察，不能通过 G4/G6。
 - Redis 可用；实时默认 DB 0，Replay 默认 DB 1，避免相互污染。
@@ -210,10 +223,11 @@ python -m maga7.tools.run_live_session \
 4. 确认 broker 与 `oms_state.json` 均为空；
 5. 再停止会话进程。
 
-全流程面板：
+全流程面板（分层同 `qqq_btc/dashboard`）：
 
 ```bash
 python dash/run.py
 ```
 
-Dashboard 只读，不提供发单、武装或停进程按钮。
+侧栏：Download → Offline Replay → Stream Parity → Live。  
+对拍与实盘共用同一 profile；Dashboard 只读，不提供发单、武装或停进程按钮。

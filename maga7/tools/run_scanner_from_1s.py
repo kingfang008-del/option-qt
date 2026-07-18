@@ -21,6 +21,15 @@ from maga7.common.config import load_profile
 from maga7.live.scanner import Mag7Scanner, write_signal_audit
 
 
+PROD_TEMP = (
+    Path(__file__).resolve().parents[2]
+    / "maga7"
+    / "CONFIG"
+    / "strategy_profiles"
+    / "m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json"
+)
+
+
 def _dates(start: str, end: str) -> list[str]:
     days = pd.bdate_range(start, end)
     return [d.strftime("%Y-%m-%d") for d in days]
@@ -28,9 +37,10 @@ def _dates(start: str, end: str) -> list[str]:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Mag7 scanner from stock 1s (S2 ingest path)")
-    p.add_argument("--profile", default=None)
+    p.add_argument("--profile", default=str(PROD_TEMP))
     p.add_argument("--start-date", required=True)
     p.add_argument("--end-date", default=None)
+    p.add_argument("--scheme", default="m5_circuit")
     p.add_argument("--stock-1s-root", default=None, help="override paths.stock_1s_root")
     p.add_argument("--out", default=None, help="audit jsonl path")
     args = p.parse_args()
@@ -41,7 +51,9 @@ def main() -> None:
     profile["date_range"]["end"] = end
 
     stock_1s = Path(args.stock_1s_root) if args.stock_1s_root else profile["_paths"]["stock_1s_root"]
-    scanner = Mag7Scanner.from_profile(profile)
+    # S2 audit only: no OMS fill feedback → only_win/cooldown not applied (optimistic emit).
+    # Use run_oms_live_stub / run_oms_dry_run for production-aligned sequencing.
+    scanner = Mag7Scanner.from_profile(profile, scheme=args.scheme)
 
     frames = []
     missing = []

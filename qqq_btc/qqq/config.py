@@ -157,13 +157,42 @@ REPLAY = ReplayConfig(
     call_spent_min_session_bar=210,
     # 早盘 PUT 要求 open30 曾翻红(>0):挡 Jul1 阴跌无结构 09:46 PUT(-22.6%),保留 Jul7。
     put_early_open30_max_min=0.0,
+    # 10:30 前低 gap PUT：QQQ 15m 不跌且 VIXY 15m 不升时否决。
+    # gap<0.0015 限定为低置信场景；消融挡 Jul13 10:03，Apr–Jun/JulW1 不变。
+    put_early_cross_confirm_end_bar=60,
+    put_early_cross_confirm_edge_gap_max=0.0015,
     # 方向头一致性门控默认关:当前 best_side/spot_dir 头近常数(NONE≈0.42,up≈0.47),
     # 开启会系统性误杀赢家(Jul7 +89% 等)。代码保留可选。
     block_when_side_none=False,
     require_leg_side_agree=False,
     require_leg_spot_agree=False,
+    # 全局 gap=0.001 会误杀 Jul7 FT56 大 PUT，使 Jul W1 +49% 降至约 +18%。
+    # 改由下方因果 OPEN_SHOCK_CHOP 状态仅在异常日收紧低 gap PUT。
+    min_dual_leg_edge_gap=None,
+    vixy_open_shock_regime_enabled=True,
+    vixy_open_shock_detect_start_bar=30,
+    vixy_open_shock_detect_end_bar=45,
+    vixy_open_shock_open30_ret_max=0.0,
+    vixy_open_shock_peak_dd_max=-0.003,
+    vixy_open_shock_detect_r2_max=0.10,
+    vixy_open_shock_put_block_end_bar=60,
+    vixy_open_shock_min_dual_leg_edge_gap=0.001,
+    vixy_open_shock_low_conf_gap_max=0.005,
+    vixy_open_shock_spot_ret_15_max=-0.0005,
+    vixy_open_shock_vix_ret_15_min=0.0,
+    vixy_open_shock_confirm_r2_min=0.15,
+    require_leg_spot_day_agree=False,
+    spot_day_agree_eps=0.0,
     # 半 Kelly(~0.45 的一半):单笔权利金 ROI ±30% 时禁止全仓复利
     position_frac=0.25,
+    # --- 跨日风险叠加（VX 因果日桶）---
+    # PUT sleeve 账户贡献 <= -2% 且 VX2/VX1-1>=6% → 次日禁 PUT
+    next_day_put_quarantine_loss=-0.02,
+    next_day_put_quarantine_vx_slope_min=0.06,
+    # 前日账户收益 <= -5% 且 VX>=6% → 次日全腿半仓(12.5%)
+    next_day_all_leg_defense_loss=-0.05,
+    next_day_all_leg_defense_position_frac=0.125,
+    next_day_all_leg_defense_vx_slope_min=0.06,
 )
 
 # 实盘入场:bar 收盘决策后立即下单(不 pending 下一根 bar,不 OMS 延迟队列)。

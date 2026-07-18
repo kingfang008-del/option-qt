@@ -24,6 +24,6 @@
 
   "paths": {
     "raw_iv_dir": "~/train_data/nq_options_day_iv",
-    "locked_targets_output": "~/train_data/locked_targets_map_1dte_4bucket_probe.parquet"
+    "locked_targets_output": "~/train_data/locked_targets_map_old_style_trading_1dte.parquet"
   }
 }

@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "profile_id": "v4_honest_jul1_15_ungated_v1",
+  "description": "Jul1–15 hybrid ungated: no q10 / put_gate / quantile / open-shock / chase / spent; selector off.",
+  "base_replay": "LIVE_REPLAY",
+  "model": {
+    "checkpoint": "checkpoint/checkpoints_qqq_v4/best.pth"
+  },
+  "inputs": {
+    "infer_by_month": {
+      "2026-07": "qqq_btc/results/v4_jul_1_15_hybrid_w1_plus_oldlock/test_infer.parquet"
+    },
+    "raw1_by_month": {
+      "2026-07": "~/train_data/dte1_options_old_lock_feat/quote_features_raw/QQQ/regular/09:30-16:00/1min/2026-07_hybrid_w1_plus_15.parquet"
+    },
+    "opt1m_by_month": {
+      "2026-07": "/mnt/s990/data/raw_1s/dte1_options_old_lock/options_1m"
+    }
+  },
+  "replay_overrides": {
+    "edge_q10_floor": null,
+    "entry_quantile": null,
+    "apply_put_entry_quantile": false,
+    "put_gate_min": null,
+    "put_early_session_bar": null,
+    "put_early_vix_min": null,
+    "morning_fade_min_ret": null,
+    "morning_fade_max_peak_dd": null,
+    "morning_fade_session_end_bar": null,
+    "block_call_on_rapid_drop": false,
+    "put_trend_max_ret": null,
+    "call_trend_r2_min": null,
+    "call_chase_vix_rev_min": null,
+    "call_chase_spot_day_ret_min": null,
+    "put_spot_day_ret_min": null,
+    "call_spike_range30_min": null,
+    "call_spent_day_range_pos_min": null,
+    "call_spent_bb_width_max": null,
+    "call_spent_min_session_bar": null,
+    "put_early_open30_max_min": null,
+    "put_early_cross_confirm_end_bar": null,
+    "put_early_cross_confirm_edge_gap_max": null,
+    "min_dual_leg_edge_gap": null,
+    "vixy_open_shock_regime_enabled": false,
+    "vixy_open_shock_min_dual_leg_edge_gap": null,
+    "next_day_put_quarantine_loss": null,
+    "next_day_put_quarantine_vix_z_max": null,
+    "next_day_put_quarantine_vx_slope_min": null,
+    "next_day_all_leg_defense_loss": null,
+    "next_day_all_leg_defense_position_frac": null,
+    "next_day_all_leg_defense_entry_start_bar": null,
+    "next_day_all_leg_defense_edge_q10_floor": null,
+    "next_day_all_leg_defense_vx_slope_min": null,
+    "regime_vix_reversal_max": null
+  },
+  "selector": {
+    "mode": "off",
+    "rule_profiles": "qqq_btc/CONFIG/rule_profiles.json",
+    "spot_root": "~/train_data/spnq_train_resampled"
+  },
+  "execution": {
+    "put_gate_mode": "off",
+    "tick_exits": "off",
+    "live_label_shift_sec": 60,
+    "fill_spread_frac": 0.775,
+    "execution_delay_bars": 0,
+    "oms_signal_delay_bars": 0
+  },
+  "features": {
+    "slow_feature_config": "qqq_btc/CONFIG/slow_feature_qqq_v4.json",
+    "frozen_norm": "qqq_btc/CONFIG/frozen_norm_qqq_daily.npz",
+    "honest_feature_root": "~/train_data/july_w1_v4_honest_openwin"
+  },
+  "notes": {
+    "scope_label": "July_W1_plus_Jul13_15_ungated",
+    "compared_to": "v4_honest_jul1_15_old_lock_v1"
+  }
+}

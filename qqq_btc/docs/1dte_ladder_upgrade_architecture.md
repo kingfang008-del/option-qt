@@ -54,7 +54,7 @@
 
 ### 2.3 全链分钟数据烟雾验证（0DTE 动态定位）
 
-数据：`/home/kingfang007/data/new_option_data_s3/QQQ`（全日全约分钟 bar）。  
+数据：`/mnt/s990/new_option_data_s3/QQQ`（全日全约分钟 bar）。  
 样例日 `2026-06-09`：开盘 ±2% ladder + 波动加速选约 vs 开盘 ATM。
 
 - 动态定位 15min 均收益略正；开盘 ATM 在大趋势日大量失效 / 无报价。  

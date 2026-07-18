@@ -1,0 +1,309 @@
+"""Async Redis consumer joining live fused frames, scanner, and broker OMS."""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from dataclasses import dataclass
+from typing import Any
+
+import pandas as pd
+
+from maga7.live.redis_fused import run_keys, unpack_batch
+from maga7.live.redis_fused import pack_obj
+from maga7.live.scanner_state import scanner_snapshot, write_scanner_snapshot
+
+logger = logging.getLogger("maga7.live.engine")
+
+
+@dataclass
+class LiveEngineMetrics:
+    frames: int = 0
+    rejected: int = 0
+    duplicates: int = 0
+    foreign: int = 0
+    signals: int = 0
+    last_frame_ts: float = 0.0
+    last_frame_id: str = ""
+
+
+class Mag7LiveFrameEngine:
+    def __init__(
+        self,
+        *,
+        redis_client: Any,
+        session_id: str,
+        scanner: Any,
+        oms: Any,
+        connector: Any,
+        consumer_name: str,
+    ):
+        self.redis = redis_client
+        self.session_id = session_id
+        self.keys = run_keys(session_id)
+        self.scanner = scanner
+        self.oms = oms
+        self.connector = connector
+        self.consumer_name = consumer_name
+        self.metrics = LiveEngineMetrics()
+        self.seen: set[str] = set()
+        self._stop = asyncio.Event()
+        self._last_disk_snapshot = 0.0
+        self._ensure_group()
+        self._restore_progress()
+
+    @property
+    def health_key(self) -> str:
+        return f"maga7:live_engine:{self.session_id}"
+
+    @property
+    def scanner_state_key(self) -> str:
+        return f"maga7:scanner_state:{self.session_id}"
+
+    def _ensure_group(self) -> None:
+        try:
+            self.redis.xgroup_create(
+                self.keys["stream"],
+                self.keys["group"],
+                id="0-0",
+                mkstream=True,
+            )
+        except Exception as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+
+    def _restore_progress(self) -> None:
+        raw = self.redis.hgetall(self.health_key) or {}
+
+        def _get(name: str) -> str:
+            value = raw.get(name.encode()) if name.encode() in raw else raw.get(name)
+            return value.decode() if isinstance(value, bytes) else str(value or "")
+
+        frame_id = _get("last_frame_id")
+        frame_ts = _get("last_frame_ts")
+        if frame_id:
+            self.seen.add(frame_id)
+            self.metrics.last_frame_id = frame_id
+        try:
+            self.metrics.last_frame_ts = float(frame_ts or 0.0)
+        except ValueError:
+            self.metrics.last_frame_ts = 0.0
+
+    def _publish_health(self, state: str, error: str = "") -> None:
+        payload = {
+            **self.metrics.__dict__,
+            "state": state,
+            "error": error,
+            "session_id": self.session_id,
+            "consumer": self.consumer_name,
+            "updated_at": time.time(),
+        }
+        self.redis.hset(
+            self.health_key,
+            mapping={
+                key: json.dumps(value) if isinstance(value, (dict, list)) else str(value)
+                for key, value in payload.items()
+            },
+        )
+
+    def _ingest_options(self, payload: dict[str, Any], frame_ts: float) -> None:
+        symbol = str(payload.get("symbol") or "").upper()
+        for row in payload.get("option_contracts") or []:
+            local = str(
+                row.get("localSymbol")
+                or row.get("ticker")
+                or row.get("contract")
+                or ""
+            ).replace("O:", "").strip()
+            bid = float(row.get("bid") or row.get("b") or 0.0)
+            ask = float(row.get("ask") or row.get("a") or 0.0)
+            if local and ask >= bid > 0:
+                self.connector.option_quotes[(symbol, local)] = {
+                    **row,
+                    "ts": float(row.get("ts") or frame_ts),
+                    "bid": bid,
+                    "ask": ask,
+                    "mid": (bid + ask) / 2.0,
+                }
+
+    def _process_message(self, message_id: Any, fields: dict[Any, Any]) -> None:
+        raw = fields.get(b"batch") if b"batch" in fields else fields.get("batch")
+        batch = unpack_batch(raw)
+        if not isinstance(batch, list) or not batch:
+            raise ValueError("empty live fused batch")
+        run_ids = {str(row.get("run_id") or "") for row in batch if isinstance(row, dict)}
+        if run_ids != {self.session_id}:
+            self.metrics.foreign += 1
+            raise ValueError(f"foreign run ids: {run_ids}")
+        frame_ids = {str(row.get("frame_id") or "") for row in batch}
+        frame_ts_values = {float(row.get("ts") or 0.0) for row in batch}
+        symbols = [str(row.get("symbol") or "").upper() for row in batch]
+        if len(frame_ids) != 1 or len(frame_ts_values) != 1:
+            raise ValueError("mixed frame id or timestamp")
+        if len(symbols) != len(set(symbols)):
+            raise ValueError("duplicate symbol in frame")
+        frame_id = next(iter(frame_ids))
+        frame_ts = next(iter(frame_ts_values))
+        if frame_id in self.seen:
+            self.metrics.duplicates += 1
+            self.redis.xack(self.keys["stream"], self.keys["group"], message_id)
+            return
+        if self.metrics.last_frame_ts and frame_ts <= self.metrics.last_frame_ts:
+            raise ValueError(
+                f"out-of-order frame {frame_ts} <= {self.metrics.last_frame_ts}"
+            )
+
+        # Same-second option quotes become visible before stock/minute decisions.
+        # Drop callback-time/future quotes; OMS may only see quotes serialized in
+        # this completed frame.
+        self.connector.option_quotes = {}
+        for payload in batch:
+            self._ingest_options(payload, frame_ts)
+
+        def _stock_tick(payload: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+            stock = payload.get("stock") or {}
+            if not stock:
+                return None
+            symbol = str(payload["symbol"]).upper()
+            tick = {
+                "timestamp": pd.Timestamp(frame_ts, unit="s", tz="UTC").tz_convert(
+                    "America/New_York"
+                ),
+                "open": float(stock.get("open") or stock.get("close") or 0.0),
+                "high": float(stock.get("high") or stock.get("close") or 0.0),
+                "low": float(stock.get("low") or stock.get("close") or 0.0),
+                "close": float(stock.get("close") or 0.0),
+                "volume": float(stock.get("volume") or 0.0),
+                "previous_close": float(stock.get("previous_close") or 0.0),
+            }
+            return symbol, tick
+
+        # Complete reference bars first so a Mag7 decision for minute M sees
+        # the completed QQQ/VIXY minute M, never M-1 due to payload ordering.
+        for payload in batch:
+            item = _stock_tick(payload)
+            if item is None:
+                continue
+            symbol, tick = item
+            last_ticks = getattr(self.connector, "last_stock_tick", None)
+            if isinstance(last_ticks, dict):
+                last_ticks[symbol] = float(frame_ts)
+            if symbol not in self.scanner.states:
+                gate = getattr(self.scanner, "regime_gate", None)
+                if gate is not None and hasattr(gate, "on_stock_second"):
+                    gate.on_stock_second(symbol, tick)
+
+        signals = []
+        for payload in batch:
+            item = _stock_tick(payload)
+            if item is None:
+                continue
+            symbol, tick = item
+            if symbol not in self.scanner.states:
+                continue
+            previous_close = float(tick.get("previous_close") or 0.0)
+            state = self.scanner.states.get(symbol)
+            if (
+                state is not None
+                and getattr(state, "prev_close", None) is None
+                and previous_close > 0
+            ):
+                state.prev_close = previous_close
+            signal = self.scanner.on_stock_second(symbol, tick)
+            if signal is not None:
+                signals.append(signal)
+
+        # Scanner states now include every completed minute in this cross-symbol
+        # frame. Resolve exits first, then admit new entries.
+        self.oms.evaluate_exits(frame_ts)
+        for signal in signals:
+            if self.oms.process_signal(signal):
+                self.metrics.signals += 1
+
+        self.seen.add(frame_id)
+        self.metrics.frames += 1
+        self.metrics.last_frame_ts = frame_ts
+        self.metrics.last_frame_id = frame_id
+        state_payload = None
+        if hasattr(self.scanner, "day_fires"):
+            state_payload = {
+                **scanner_snapshot(self.scanner),
+                "session_id": self.session_id,
+                "frame_id": frame_id,
+                "frame_ts": frame_ts,
+                "live_fingerprint": self.oms.profile_hash,
+            }
+        pipe = self.redis.pipeline(transaction=True)
+        pipe.xack(self.keys["stream"], self.keys["group"], message_id)
+        pipe.set(self.keys["ack_ts"], str(frame_ts))
+        pipe.set(self.keys["ack_frame"], frame_id)
+        if state_payload is not None:
+            pipe.set(self.scanner_state_key, pack_obj(state_payload))
+        pipe.execute()
+        if (
+            state_payload is not None
+            and time.time() - self._last_disk_snapshot >= 5.0
+        ):
+            write_scanner_snapshot(
+                self.oms.session_dir / "scanner_state.json",
+                state_payload,
+            )
+            self._last_disk_snapshot = time.time()
+        self._publish_health("RUNNING")
+
+    def _claim_stale(self) -> None:
+        try:
+            result = self.redis.xautoclaim(
+                self.keys["stream"],
+                self.keys["group"],
+                self.consumer_name,
+                min_idle_time=0,
+                start_id="0-0",
+                count=100,
+            )
+            messages = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else []
+            for message_id, fields in messages:
+                self._process_message(message_id, fields)
+        except Exception as exc:
+            # Redis < 6.2 has no XAUTOCLAIM; a new live session normally starts
+            # with a fresh group, so this is observable but not fatal.
+            logger.warning("pending claim skipped: %s", exc)
+
+    def _read_messages(self, block_ms: int = 1000):
+        return self.redis.xreadgroup(
+            self.keys["group"],
+            self.consumer_name,
+            {self.keys["stream"]: ">"},
+            count=10,
+            block=block_ms,
+        )
+
+    def _process_messages(self, messages) -> int:
+        count = 0
+        for _, entries in messages or []:
+            for message_id, fields in entries:
+                try:
+                    self._process_message(message_id, fields)
+                except Exception as exc:
+                    self.metrics.rejected += 1
+                    self._publish_health("ERROR", error=str(exc))
+                    raise
+                count += 1
+        return count
+
+    def poll_once(self, block_ms: int = 1000) -> int:
+        return self._process_messages(self._read_messages(block_ms))
+
+    async def run(self) -> None:
+        self._claim_stale()
+        self._publish_health("RUNNING")
+        while not self._stop.is_set():
+            messages = await asyncio.to_thread(self._read_messages, 1000)
+            # Process on the IB asyncio thread; placeOrder/cancelOrder and
+            # ib_insync events are not safe from the Redis worker thread.
+            self._process_messages(messages)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._publish_health("STOPPED")

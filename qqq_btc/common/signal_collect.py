@@ -148,6 +148,7 @@ def collect_decision_signals(
 def collect_live_sim_signals(
     df: pd.DataFrame,
     *,
+    replay_cfg: Optional[ReplayConfig] = None,
     warmup_through_day: Optional[str] = None,
     warmup_from_day: Optional[str] = None,
     target_day: Optional[str] = None,
@@ -155,7 +156,7 @@ def collect_live_sim_signals(
     """Live 路径: LIVE_REPLAY(immediate_entry) → ENTER 事件即同 bar 决策。"""
     return collect_replay_signals(
         df,
-        replay_cfg=qcfg.LIVE_REPLAY,
+        replay_cfg=replay_cfg or qcfg.LIVE_REPLAY,
         warmup_through_day=warmup_through_day,
         warmup_from_day=warmup_from_day,
         target_day=target_day,

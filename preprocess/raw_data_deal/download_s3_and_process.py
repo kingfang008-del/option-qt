@@ -1,11 +1,3 @@
-# 秒级成交（默认）
-#python preprocess/raw_data_deal/download_s3_and_process.py
-# 仍下分钟
-#S3_DATA_KIND=minute python preprocess/raw_data_deal/download_s3_and_process.py
-# 盘口（慎用，体积大）
-#S3_DATA_KIND=quotes python preprocess/raw_data_deal/download_s3_and_process.py
-
-
 import boto3
 import os
 import datetime
@@ -20,7 +12,6 @@ import shutil
 import time
 from polygon import RESTClient
 
-
 # ================= 配置区域 =================
 
 # [S3 凭证] 请从 Polygon Dashboard -> Flat Files 获取
@@ -30,38 +21,18 @@ ENDPOINT_URL = "https://files.polygon.io"
 BUCKET_NAME = "flatfiles" 
 
 # [下载设置]
-# Polygon OPRA flat files 无独立 second_aggs；秒级用 trades（tick）再可选聚合成 1s。
-#   minute  → us_options_opra/minute_aggs_v1   （分钟 OHLCV，已有）
-#   trades  → us_options_opra/trades_v1        （成交 tick / 秒级，体积适中）
-#   quotes  → us_options_opra/quotes_v1        （盘口 tick，单日可达 100GB+，需分块）
-DATA_KIND = os.environ.get("S3_DATA_KIND", "trades").strip().lower()  # minute | trades | quotes
-S3_PREFIX_BY_KIND = {
-    "minute": "us_options_opra/minute_aggs_v1",
-    "trades": "us_options_opra/trades_v1",
-    "quotes": "us_options_opra/quotes_v1",
-}
-if DATA_KIND not in S3_PREFIX_BY_KIND:
-    raise ValueError(f"DATA_KIND must be one of {sorted(S3_PREFIX_BY_KIND)}, got {DATA_KIND!r}")
-S3_PREFIX = S3_PREFIX_BY_KIND[DATA_KIND]
-# trades → 聚合成 1s OHLCV（v/o/c/h/l/t/n）；False 则保留 tick
-AGGREGATE_TRADES_TO_1S = os.environ.get("S3_AGG_1S", "1").strip() not in {"0", "false", "False"}
-# quotes → 每合约每秒最后一档盘口
-AGGREGATE_QUOTES_TO_1S = os.environ.get("S3_QUOTE_AGG_1S", "1").strip() not in {"0", "false", "False"}
-
-START_DATE = datetime.date(2026, 3, 1)
-END_DATE = datetime.date(2026, 7, 10)  # 先下 Jul1 烟雾；需要多天再改 END_DATE
+S3_PREFIX = "us_options_opra/minute_aggs_v1"
+START_DATE = datetime.date(2026, 3, 18)
+END_DATE = datetime.date(2026, 7, 15) # 示例：下载5天
 
 # [路径]
 # RAW_DIR: 临时存放 S3 原始大文件的目录 (处理完会删除)
-RAW_DIR = f"./data/temp_s3_raw_{DATA_KIND}"
-# PROCESSED_DIR: 最终存放清洗后数据（按 kind 分目录，避免覆盖分钟 parquet）
-_PROCESSED_ROOT = "/home/kingfang007/data/new_option_data_s3"
-PROCESSED_DIR = (
-    _PROCESSED_ROOT if DATA_KIND == "minute" else f"{_PROCESSED_ROOT}_{DATA_KIND}"
-)
+RAW_DIR = "./data/temp_s3_raw"
+# PROCESSED_DIR: 最终存放清洗后数据的目录 (按股票分文件夹)
+PROCESSED_DIR = "/mnt/s990/new_option_data_s3"
 #from config import TARGET_SYMBOLS
 # [目标股票列表] (Tier 1 ~ Tier 5 + Macro)
-TARGET_SYMBOLS =   ['QQQ','NVDA', 'TSLA', 'AMD', 'INTC', 'MSFT', 'AMZN', 'GOOG', 'META', 'AAPL' ]
+TARGET_SYMBOLS =  ['MU', 'AVGO']
 
 # [Polygon API Token] 用于预检合约
 API_KEY = "JXuIcG_dpoRiCE6jP7c73nVWweEVSpUp"
@@ -245,7 +216,7 @@ class S3Pipeline:
 
     def download_day(self, date_obj):
         """下载某一天的 S3 文件到临时目录"""
-        # 目录结构: {S3_PREFIX}/YYYY/MM/YYYY-MM-DD.csv.gz
+        # Polygon S3 Minute Aggs directory structure: us_options_opra/minute_aggs_v1/YYYY/MM/YYYY-MM-DD.csv.gz
         date_month_str = date_obj.strftime('%Y/%m')
         date_file_str = date_obj.strftime('%Y-%m-%d')
         prefix = f"{S3_PREFIX}/{date_month_str}/{date_file_str}"
@@ -254,20 +225,18 @@ class S3Pipeline:
             # 列出文件
             resp = self.s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix=prefix)
             if 'Contents' not in resp:
-                logger.warning(f"📅 {date_file_str}: S3 无数据 (可能休市) prefix={prefix}")
+                logger.warning(f"📅 {date_file_str}: S3 无数据 (可能休市)")
                 return []
             
             downloaded_files = []
             for obj in resp['Contents']:
                 key = obj['Key']
-                size_gb = obj['Size'] / 1e9
                 # 保持文件名唯一，防止覆盖
                 fname = key.replace('/', '_')
                 local_path = os.path.join(RAW_DIR, fname)
                 
                 # 下载
                 if not os.path.exists(local_path) or os.path.getsize(local_path) != obj['Size']:
-                    logger.info(f"⬇️ 下载 {key} ({size_gb:.2f} GB) → {local_path}")
                     self.s3.download_file(BUCKET_NAME, key, local_path)
                 
                 downloaded_files.append(local_path)
@@ -277,210 +246,63 @@ class S3Pipeline:
             logger.error(f"❌ 下载失败 {date_file_str}: {e}")
             return []
 
-    @staticmethod
-    def _add_underlying(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df["clean_ticker"] = df["ticker"].astype(str).str.replace("O:", "", regex=False)
-        df["underlying"] = df["clean_ticker"].str.extract(r"^([A-Z]+)\d")
-        return df
-
-    def _save_symbol_day(self, sym: str, date_str: str, group: pd.DataFrame):
-        unique_contracts = group["ticker"].unique()
-        self.contract_cache[sym].update(unique_contracts)
-        sym_dir = os.path.join(PROCESSED_DIR, sym)
-        os.makedirs(sym_dir, exist_ok=True)
-        save_path = os.path.join(sym_dir, f"{sym}_{date_str}.parquet")
-        drop_cols = [c for c in ("clean_ticker", "underlying") if c in group.columns]
-        group_to_save = group.drop(columns=drop_cols)
-        if os.path.exists(save_path):
-            df_exist = pd.read_parquet(save_path)
-            df_merged = pd.concat([df_exist, group_to_save], ignore_index=True)
-            # 1s 聚合跨 chunk 可能重复同一 (ticker,timestamp)，再压一遍
-            if (
-                DATA_KIND == "trades"
-                and AGGREGATE_TRADES_TO_1S
-                and {"ticker", "timestamp", "o", "h", "l", "c", "v"}.issubset(df_merged.columns)
-            ):
-                agg_map = {
-                    "o": ("o", "first"),
-                    "h": ("h", "max"),
-                    "l": ("l", "min"),
-                    "c": ("c", "last"),
-                    "v": ("v", "sum"),
-                }
-                if "n" in df_merged.columns:
-                    agg_map["n"] = ("n", "sum")
-                if "t" in df_merged.columns:
-                    agg_map["t"] = ("t", "first")
-                df_merged = (
-                    df_merged.sort_values("timestamp")
-                    .groupby(["ticker", "timestamp"], as_index=False)
-                    .agg(**agg_map)
-                )
-            elif DATA_KIND == "quotes" and AGGREGATE_QUOTES_TO_1S and {"ticker", "timestamp"}.issubset(
-                df_merged.columns
-            ):
-                df_merged = (
-                    df_merged.sort_values("timestamp")
-                    .groupby(["ticker", "timestamp"], as_index=False)
-                    .tail(1)
-                    .reset_index(drop=True)
-                )
-            else:
-                df_merged = df_merged.drop_duplicates()
-            df_merged.to_parquet(save_path, index=False)
-        else:
-            group_to_save.to_parquet(save_path, index=False)
-
-    def _process_minute_chunk(self, df: pd.DataFrame, date_str: str):
-        df = df.rename(
-            columns={
-                "volume": "v",
-                "open": "o",
-                "close": "c",
-                "high": "h",
-                "low": "l",
-                "window_start": "t",
-                "transactions": "n",
-            },
-            errors="ignore",
-        )
-        if "t" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["t"], unit="ns", utc=True).dt.tz_convert("America/New_York")
-        df = self._add_underlying(df)
-        df_filtered = df[df["underlying"].isin(TARGET_SYMBOLS)]
-        if df_filtered.empty:
-            return
-        for sym, group in df_filtered.groupby("underlying"):
-            self._save_symbol_day(sym, date_str, group)
-
-    def _process_trades_chunk(self, df: pd.DataFrame, date_str: str):
-        # trades_v1: ticker, price, size, sip_timestamp, exchange, conditions, ...
-        need = {"ticker", "price", "size", "sip_timestamp"}
-        if not need.issubset(df.columns):
-            raise ValueError(f"trades chunk missing cols: {need - set(df.columns)}")
-        df = self._add_underlying(df)
-        df = df[df["underlying"].isin(TARGET_SYMBOLS)].copy()
-        if df.empty:
-            return
-        df["timestamp"] = pd.to_datetime(df["sip_timestamp"], unit="ns", utc=True).dt.tz_convert(
-            "America/New_York"
-        )
-        if AGGREGATE_TRADES_TO_1S:
-            df["sec"] = df["timestamp"].dt.floor("s")
-            rows = []
-            for (sym, ticker), g in df.groupby(["underlying", "ticker"], sort=False):
-                g = g.sort_values("timestamp")
-                agg = (
-                    g.groupby("sec", sort=True)
-                    .agg(
-                        o=("price", "first"),
-                        h=("price", "max"),
-                        l=("price", "min"),
-                        c=("price", "last"),
-                        v=("size", "sum"),
-                        n=("price", "count"),
-                    )
-                    .reset_index()
-                )
-                agg["ticker"] = ticker
-                agg["underlying"] = sym
-                agg["timestamp"] = agg["sec"]
-                agg["t"] = agg["sec"].astype("int64")  # ns since epoch (tz-aware → int64)
-                rows.append(agg.drop(columns=["sec"]))
-            if not rows:
-                return
-            out = pd.concat(rows, ignore_index=True)
-            for sym, group in out.groupby("underlying"):
-                self._save_symbol_day(sym, date_str, group)
-        else:
-            keep = [
-                c
-                for c in (
-                    "ticker",
-                    "underlying",
-                    "clean_ticker",
-                    "timestamp",
-                    "sip_timestamp",
-                    "price",
-                    "size",
-                    "exchange",
-                    "conditions",
-                    "correction",
-                    "participant_timestamp",
-                )
-                if c in df.columns
-            ]
-            for sym, group in df[keep].groupby("underlying"):
-                self._save_symbol_day(sym, date_str, group)
-
-    def _process_quotes_chunk(self, df: pd.DataFrame, date_str: str):
-        need = {"ticker", "sip_timestamp", "bid_price", "ask_price"}
-        if not need.issubset(df.columns):
-            raise ValueError(f"quotes chunk missing cols: {need - set(df.columns)}")
-        df = self._add_underlying(df)
-        df = df[df["underlying"].isin(TARGET_SYMBOLS)].copy()
-        if df.empty:
-            return
-        df["timestamp"] = pd.to_datetime(df["sip_timestamp"], unit="ns", utc=True).dt.tz_convert(
-            "America/New_York"
-        )
-        if AGGREGATE_QUOTES_TO_1S:
-            df["sec"] = df["timestamp"].dt.floor("s")
-            # 每秒最后一档
-            df = df.sort_values("timestamp").groupby(["underlying", "ticker", "sec"], as_index=False).tail(1)
-            df["timestamp"] = df["sec"]
-            df = df.drop(columns=["sec"])
-        keep = [
-            c
-            for c in (
-                "ticker",
-                "underlying",
-                "clean_ticker",
-                "timestamp",
-                "sip_timestamp",
-                "bid_price",
-                "bid_size",
-                "ask_price",
-                "ask_size",
-            )
-            if c in df.columns
-        ]
-        for sym, group in df[keep].groupby("underlying"):
-            self._save_symbol_day(sym, date_str, group)
-
     def process_and_filter(self, file_paths, date_obj):
         """读取下载的 CSV，筛选目标股票，分发存储，提取合约，统一格式"""
-        if not file_paths:
-            return
+        if not file_paths: return
 
-        date_str = date_obj.strftime("%Y-%m-%d")
-        logger.info(f"⚙️ 正在处理清洗 {date_str} | kind={DATA_KIND} | prefix={S3_PREFIX}")
-
-        # quotes / trades 可能很大：分块读
-        chunksize = 1_000_000 if DATA_KIND in {"trades", "quotes"} else None
+        date_str = date_obj.strftime('%Y-%m-%d')
+        logger.info(f"⚙️ 正在处理清洗 {date_str} 的数据...")
 
         for fp in file_paths:
             try:
-                if DATA_KIND == "minute":
-                    df = pd.read_csv(fp)
-                    self._process_minute_chunk(df, date_str)
-                elif DATA_KIND == "trades":
-                    for chunk in pd.read_csv(fp, chunksize=chunksize):
-                        self._process_trades_chunk(chunk, date_str)
-                elif DATA_KIND == "quotes":
-                    usecols = [
-                        "ticker",
-                        "sip_timestamp",
-                        "bid_price",
-                        "bid_size",
-                        "ask_price",
-                        "ask_size",
-                    ]
-                    for chunk in pd.read_csv(fp, chunksize=chunksize, usecols=usecols):
-                        self._process_quotes_chunk(chunk, date_str)
-                else:
-                    raise ValueError(DATA_KIND)
+                # 读取 S3 中的原始 .csv.gz 文件
+                df = pd.read_csv(fp)
+                
+                # S3 文件包含的列：ticker, volume, open, close, high, low, window_start, transactions
+                # 需要重命名以对齐通过 REST API 获取时生成的列名 (v, o, c, h, l, t, n)
+                df.rename(columns={
+                    'volume': 'v',
+                    'open': 'o',
+                    'close': 'c',
+                    'high': 'h',
+                    'low': 'l',
+                    'window_start': 't',
+                    'transactions': 'n'
+                }, inplace=True, errors='ignore')
+                
+                # 't' 在 S3 中是纳秒级，需要转换为带时区的毫秒级别时间对象
+                if 't' in df.columns:
+                    # 也可以保留纳秒只除以百万变毫秒：df['t'] = df['t'] // 1000000
+                    df['timestamp'] = pd.to_datetime(df['t'], unit='ns', utc=True).dt.tz_convert('America/New_York')
+                
+                # 增加一个 underlying 列用于筛选
+                df['clean_ticker'] = df['ticker'].str.replace('O:', '', regex=False)
+                df['underlying'] = df['clean_ticker'].str.extract(r'^([A-Z]+)\d')
+                
+                # 筛选目标标的
+                df_filtered = df[df['underlying'].isin(TARGET_SYMBOLS)].copy()
+                
+                if df_filtered.empty: continue
+
+                # 按股票分组保存并清理临时列
+                for sym, group in df_filtered.groupby('underlying'):
+                    unique_contracts = group['ticker'].unique()
+                    self.contract_cache[sym].update(unique_contracts)
+                    
+                    sym_dir = os.path.join(PROCESSED_DIR, sym)
+                    os.makedirs(sym_dir, exist_ok=True)
+                    
+                    save_path = os.path.join(sym_dir, f"{sym}_{date_str}.parquet")
+                    
+                    group_to_save = group.drop(columns=['clean_ticker', 'underlying'])
+                    
+                    if os.path.exists(save_path):
+                        df_exist = pd.read_parquet(save_path)
+                        df_merged = pd.concat([df_exist, group_to_save]).drop_duplicates()
+                        df_merged.to_parquet(save_path, index=False)
+                    else:
+                        group_to_save.to_parquet(save_path, index=False)
+                        
             except Exception as e:
                 logger.error(f"❌ 处理文件失败 {fp}: {e}")
 
@@ -531,17 +353,10 @@ class S3Pipeline:
         logger.info("✅ 所有任务完成！数据已清洗并归档。")
 
 if __name__ == "__main__":
-    print(f"DATA_KIND: {DATA_KIND}")
-    print(f"S3_PREFIX: {S3_PREFIX}")
-    print(f"目标股票池: {len(TARGET_SYMBOLS)} 支 → {TARGET_SYMBOLS}")
-    print(f"日期: {START_DATE} → {END_DATE}")
+    # 再次确认配置是否正确
+    print(f"目标股票池: {len(TARGET_SYMBOLS)} 支")
     print(f"数据存放于: {PROCESSED_DIR}")
     print(f"临时缓存于: {RAW_DIR} (处理后自动删除)")
-    if DATA_KIND == "trades":
-        print(f"AGGREGATE_TRADES_TO_1S: {AGGREGATE_TRADES_TO_1S}")
-    if DATA_KIND == "quotes":
-        print(f"AGGREGATE_QUOTES_TO_1S: {AGGREGATE_QUOTES_TO_1S}")
-        print("⚠️ quotes 单日可达 ~100GB+，确认磁盘空间后再跑")
-
+    
     pipeline = S3Pipeline()
     pipeline.run()

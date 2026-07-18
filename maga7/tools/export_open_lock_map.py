@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from maga7.common.config import load_profile
-from maga7.common.open_lock import build_open_lock_map
+from maga7.common.open_lock import build_open_lock_map, resolve_otm_rungs
 from maga7.common.signals import load_stock_month_files
 from maga7.common.replay import month_list
 
@@ -42,11 +42,7 @@ def main() -> None:
     end = args.end_date or profile["date_range"]["end"]
     otm_rungs = args.otm_rungs
     if otm_rungs is None:
-        otm_rungs = int(
-            (profile.get("trade") or {}).get("ladder_otm_rungs")
-            or (profile.get("lock") or {}).get("otm_rungs")
-            or 1
-        )
+        otm_rungs = resolve_otm_rungs(profile, default=1)
     months = month_list(start, end)
     stock_by = {}
     for sym in profile["symbols"]:

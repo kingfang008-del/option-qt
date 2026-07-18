@@ -1,0 +1,45 @@
+{
+  "profile": "open_ladder_otm5_googl_may_jul_download_v1",
+  "profile_id": "open_ladder_otm5_googl_may_jul_download_v1",
+  "description": "Download-only: GOOGL open_ladder OTM5 lock+1s for 2026-05-01..2026-07-13. Separate map; does not overwrite Mag7.",
+  "role": "data_download",
+  "symbols": ["GOOGL"],
+  "signal": {
+    "window_start": "10:30",
+    "window_end": "14:00",
+    "mf_window": 10,
+    "streak_min": 8,
+    "from_prev_abs": 0.02,
+    "vol_z_min": 1.0,
+    "vol_ma_window": 20,
+    "top_k": 2,
+    "rank_by": "earliest"
+  },
+  "trade": {
+    "contract_mode": "open_ladder",
+    "ladder_otm_rungs": 5,
+    "clear_otm_ban_0dte_pct": 0.01,
+    "quote_source": "1s",
+    "bar_availability_delay_seconds": 60,
+    "moneyness": "ATM"
+  },
+  "paths": {
+    "stock_root": "~/train_data/spnq_train",
+    "option_1m_root": "/mnt/s990/new_option_data_s3",
+    "day_iv_root": "~/train_data/nq_options_day_iv",
+    "open_locked_map": "~/train_data/locked_targets_map_maga7_open_ladder_atm5otm_googl_may_jul.parquet",
+    "quote_1s_root": "/mnt/s990/data/raw_1s/maga7_mf10_open_ladder_otm5",
+    "stock_1s_root": "/mnt/s990/data/raw_1s/stocks",
+    "results_dir": "maga7/results"
+  },
+  "date_range": {
+    "start": "2026-05-01",
+    "end": "2026-07-13"
+  },
+  "lock": {
+    "dte_mode": "trading",
+    "prefer_dte": 0,
+    "allowed_dte": [0, 1, 2],
+    "otm_rungs": 5
+  }
+}

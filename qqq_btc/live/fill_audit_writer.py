@@ -167,9 +167,31 @@ def apply_fill_audit_patch() -> None:
                         leg0 = p
                         break
             st.qqq_btc_entry_bar = live_session_bar(float(entry_ts))
-            rails, vol_scale = get_session_governor().scaled_exit_rails(sym, leg=leg0 or None)
+            gov = get_session_governor()
+            rails, vol_scale = gov.scaled_exit_rails(sym, leg=leg0 or None)
             st.qqq_btc_exit_rails = rails
             st.qqq_btc_vol_scale = float(vol_scale)
+            day_state = gov._state(sym)
+            # ExecutionEngine 每分钟重建 holding dict；仓位级现货 thesis 状态必须
+            # 挂在持久的 OMS symbol state 上，再由 ctx bridge 注入。
+            st.qqq_btc_entry_spot = (
+                float(day_state.spot_closes[-1])
+                if day_state.spot_closes
+                else float(stock_price)
+            )
+            mom_window = max(1, int(rails.spot_thesis_mom_window or 3))
+            # 离线 thesis 使用全日 close 历史；实盘至少携带入场前 mom_window 根，
+            # 否则会人为多等 1 根才具备动量判定数据。
+            st.qqq_btc_position_spot_closes = list(
+                day_state.spot_closes[-(mom_window + 1) :]
+            )
+            logger.info(
+                "qqq_btc entry rails leg=%s bounce=%s spot_tail=%s vwap_tail=%s",
+                leg0,
+                rails.spot_thesis_against_entry is not None,
+                day_state.spot_closes[-7:],
+                day_state.vwap_lrs[-2:],
+            )
         except Exception as e:
             logger.warning("qqq_btc entry rails scale skipped: %s", e)
         meta = dict(sig.get("meta", {}) or {})
@@ -254,17 +276,21 @@ def apply_fill_audit_patch() -> None:
                 pass
             nr2 = net_return_from_prices(entry_px, float(fill_price), commission_drag=comm)
             # 与 entry 共用同一 singleton governor（含 LIVE_REPLAY env）
-            streak_until = get_session_governor().record_trade_close(
+            gov = get_session_governor()
+            streak_until = gov.record_trade_close(
                 sym,
                 net_ret=nr2,
                 curr_ts=float(curr_ts),
                 leg=leg,
                 reason=str(reason or ""),
+                position_frac=gov.effective_position_frac(sym),
             )
             if streak_until > 0 and hasattr(st, "cooldown_until"):
                 st.cooldown_until = max(float(getattr(st, "cooldown_until", 0.0) or 0.0), streak_until)
         except Exception as e:
             logger.warning("session_governor trade_close skipped: %s", e)
+        st.qqq_btc_entry_spot = None
+        st.qqq_btc_position_spot_closes = []
 
     oac.OrchestratorAccounting._process_open_accounting = _wrapped_open
     oac.OrchestratorAccounting._process_exit_accounting = _wrapped_exit

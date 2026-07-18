@@ -63,7 +63,7 @@
   },
   "paths": {
     "stock_root": "~/train_data/spnq_train",
-    "option_1m_root": "~/data/new_option_data_s3",
+    "option_1m_root": "/mnt/s990/new_option_data_s3",
     "day_iv_root": "~/train_data/nq_options_day_iv",
     "locked_map": "~/train_data/locked_targets_map_maga7_mf10_jan_jul.parquet",
     "open_locked_map": "~/train_data/locked_targets_map_maga7_googl_open_ladder_atm5otm_jan_jul.parquet",

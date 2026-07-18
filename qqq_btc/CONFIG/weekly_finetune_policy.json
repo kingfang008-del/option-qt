@@ -1,6 +1,6 @@
 {
   "name": "weekly_finetune_v1",
-  "description": "生产周更微调规范：V4 底座 + 近月微调 + OOS 门禁 + 产物归档。不通过门禁不替换生产权重。",
+  "description": "生产周更微调规范：V4 底座 + 近月微调 + OOS 门禁 + 产物归档。不通过门禁不替换生产权重。可选 regime match 自动建议 train months。",
   "seed": 42,
   "base_checkpoint": "checkpoint/checkpoints_qqq_v4/best.pth",
   "production_checkpoint_link": "checkpoint/checkpoints_qqq_prod/best.pth",
@@ -12,6 +12,18 @@
     "train_lookback_months": 2,
     "val_lookback_months": 1,
     "note": "train=最近 N 个完整月特征；val=最近 M 个月（通常含在 train 内）；OOS=单独指定的最近一周特征根"
+  },
+  "regime_match": {
+    "auto_suggest": false,
+    "query": null,
+    "apply": "blend_on_shift",
+    "recent_months": 2,
+    "top": 15,
+    "mode": "rolling",
+    "metric": "cosine",
+    "history_start": "2024-01-01",
+    "spot_root": "~/train_data/spnq_train_resampled",
+    "note": "auto_suggest=true 或 CLI --suggest-train-months 时，在无显式 --train-months 下用 match_week_regime 填 train 窗。blend_on_shift=仅 SHIFT 混合；always_blend=总是混合近月∪相似月。仍须 OOS 门禁。"
   },
   "train": {
     "epochs": 20,

@@ -29,7 +29,7 @@ END_DATE = datetime.date(2026, 3, 7) # 示例：下载5天
 # RAW_DIR: 临时存放 S3 原始大文件的目录 (处理完会删除)
 RAW_DIR = "./data/temp_s3_raw"
 # PROCESSED_DIR: 最终存放清洗后数据的目录 (按股票分文件夹)
-PROCESSED_DIR = "/home/kingfang007/data/new_option_data_s3"
+PROCESSED_DIR = "/mnt/s990/new_option_data_s3"
 
 # [目标股票列表] (Tier 1 ~ Tier 5 + Macro)
 from config import TARGET_SYMBOLS

@@ -16,9 +16,10 @@ import numpy as np
 import pandas as pd
 
 from maga7.common.fills import FillSpec
-from maga7.common.replay import load_quotes, path_for_ticker, simulate_trade, to_ny
+from maga7.common.replay import to_ny
 from maga7.live.oms_dry import DryOrder, DryTrade
-from maga7.live.scanner import ScannerSignal
+from maga7.live.oms_fill_session import PendingRedisSignal, QuoteSimSession
+from maga7.live.scanner import Mag7Scanner, ScannerSignal
 from qqq_btc.common.fill_model import OptionSpreadFillModel
 from qqq_btc.live.oms_adapter import audit_fill, limit_price_from_quote
 
@@ -101,11 +102,19 @@ class Mag7OmsStub:
     redis_stream: str = "orch_trade_signals"
     fill_audit_path: Path | None = None
     equity: float = 100_000.0  # notional dollars for qty sizing (paper)
+    scanner: Mag7Scanner | None = None
+    prefer_redis_quotes: bool = False
     orders: list[DryOrder] = field(default_factory=list)
     trades: list[DryTrade] = field(default_factory=list)
     published: list[dict[str, Any]] = field(default_factory=list)
     skipped: list[dict[str, Any]] = field(default_factory=list)
     _redis: Any = field(default=None, repr=False)
+    _session: QuoteSimSession | None = field(default=None, repr=False)
+    _eq: float = 100.0
+    _peak: float = 100.0
+    _maxdd: float = 0.0
+    _daily: dict[str, float] = field(default_factory=dict)
+    _n_sig: int = 0
 
     def __post_init__(self) -> None:
         fill_cfg = self.profile.get("fill") or {}
@@ -117,8 +126,7 @@ class Mag7OmsStub:
             entry_frac=self.fill.entry_frac,
             exit_frac=self.fill.exit_frac,
         )
-        self.quote_root = self.profile["_paths"]["quote_1s_root"]
-        self.quote_cache: dict[tuple[str, str], pd.DataFrame | None] = {}
+        self._session = QuoteSimSession(self.profile, prefer_redis=self.prefer_redis_quotes)
         if self.fill_audit_path is None:
             env_p = os.environ.get("MAG7_FILL_AUDIT_PATH", "").strip()
             if env_p:
@@ -140,12 +148,6 @@ class Mag7OmsStub:
             redis_publish=redis_publish,
             **kwargs,
         )
-
-    def _get_q(self, sym: str, date: str):
-        k = (sym, date)
-        if k not in self.quote_cache:
-            self.quote_cache[k] = load_quotes(self.quote_root, sym, date)
-        return self.quote_cache[k]
 
     def _connect_redis(self):
         if self._redis is not None:
@@ -201,22 +203,21 @@ class Mag7OmsStub:
             return
         append_mag7_fill_audit(self._audit_row(order, qty, net_return), self.fill_audit_path)
 
-    def size_qty(self, limit_px: float) -> int:
-        """Sleeve = position_frac; concurrent split only when open_until is known."""
-        if limit_px <= 0:
+    def size_qty(
+        self,
+        limit_px: float,
+        *,
+        symbol: str,
+        entry_ts: pd.Timestamp,
+        regime_scale: float = 1.0,
+    ) -> int:
+        """Sleeve = position_frac; concurrent split via QuoteSimSession.open_until."""
+        if limit_px <= 0 or self._session is None:
             return 1
-        trade = self.profile.get("trade") or {}
-        from maga7.common.position_size import resolve_size_frac
-
-        open_until = getattr(self, "open_until", None) or {}
-        size_frac, _, _, allow, _ = resolve_size_frac(
-            trade,
-            top_k=max(int(self.profile["signal"].get("top_k", 2)), 1),
-            open_until=open_until,
-            symbol=None,
-            entry_ts=pd.Timestamp.now(tz="America/New_York"),
+        size_frac, allow, _ = self._session.size_frac_for(
+            symbol, entry_ts, regime_scale=regime_scale
         )
-        if not allow:
+        if not allow or size_frac <= 0:
             return 0
         notional = self.equity * size_frac
         raw = int(notional // (limit_px * 100.0))
@@ -286,146 +287,288 @@ class Mag7OmsStub:
         )
         return fill
 
-    def run_signals(self, signals: list[ScannerSignal]) -> dict[str, Any]:
-        """Process TopK signals: stub entry/exit via 1s path (parity with S3/offline)."""
-        trade_cfg = self.profile["trade"]
-        tp = float(trade_cfg.get("tp_mult", 1.6))
-        sl = float(trade_cfg.get("sl_mult", 0.4))
-        hold = int(trade_cfg.get("hold_minutes", 30))
-        pos_frac = float(trade_cfg.get("position_frac", 0.25))
-        top_k = max(int(self.profile["signal"].get("top_k", 2)), 1)
-        qty_frac = pos_frac / top_k
+    def ingest_option_contracts(
+        self,
+        symbol: str,
+        ts: float,
+        contracts: list[dict[str, Any]],
+        *,
+        resolve_pending: bool = True,
+    ) -> None:
+        assert self._session is not None
+        self._session.ingest_redis_contracts(symbol, ts, contracts)
+        if self.prefer_redis_quotes and resolve_pending:
+            self.try_resolve_pending(asof_ts=ts)
 
-        eq = 100.0
-        peak = 100.0
-        maxdd = 0.0
-        daily: dict[str, float] = {}
-
-        for sig in signals:
-            if not sig.contract:
-                self.skipped.append({"date": sig.date, "symbol": sig.symbol, "reason": "no_contract"})
+    def try_resolve_pending(self, *, asof_ts: float | pd.Timestamp | None = None) -> list[DryTrade]:
+        """Resolve deferred Redis signals once quote book covers hold / early exit."""
+        assert self._session is not None
+        if not self._session.pending:
+            return []
+        asof = None
+        if asof_ts is not None:
+            if isinstance(asof_ts, (int, float)) and not isinstance(asof_ts, bool):
+                asof = pd.Timestamp(float(asof_ts), unit="s", tz="UTC").tz_convert("America/New_York")
+            else:
+                asof = to_ny(asof_ts)
+        done: list[DryTrade] = []
+        still: list[PendingRedisSignal] = []
+        for pend in self._session.pending:
+            sig = pend.sig
+            path, src = self._session.get_path(
+                sig.symbol, sig.date, sig.contract or "", allow_disk_fallback=False
+            )
+            if path is None or path.empty or src != "redis":
+                still.append(pend)
                 continue
-            path = path_for_ticker(self._get_q(sig.symbol, sig.date), sig.contract)
-            if path is None or path.empty:
-                self.skipped.append({"date": sig.date, "symbol": sig.symbol, "reason": "no_quote"})
-                continue
-            sim = simulate_trade(path, sig.sig_ts, fill=self.fill, tp_mult=tp, sl_mult=sl, hold_minutes=hold)
+            sim = self._session.simulate_on_path(sig, path)
             if sim is None:
-                self.skipped.append({"date": sig.date, "symbol": sig.symbol, "reason": "sim_failed"})
+                still.append(pend)
                 continue
+            hold_end = to_ny(sig.sig_ts) + pd.Timedelta(minutes=pend.hold_minutes)
+            path_max = to_ny(path["timestamp"].iloc[-1])
+            early = sim.reason in ("TP", "SL", "MF_FLIP", "STREAK0")
+            ready = False
+            if early and (asof is None or to_ny(sim.exit_ts) <= asof):
+                ready = True
+            elif path_max >= hold_end and (asof is None or asof >= hold_end):
+                ready = True
+            if not ready:
+                still.append(pend)
+                continue
+            trade = self._commit_sim(sig, sim, path=path, quote_source="redis")
+            if trade is not None:
+                done.append(trade)
+        self._session.pending = still
+        return done
 
-            after = path[path["timestamp"] >= to_ny(sig.sig_ts)]
-            e_bid, e_ask = float(after.iloc[0]["bid"]), float(after.iloc[0]["ask"])
-            qty = self.size_qty(sim.entry)
-            buy = self.submit_buy(bid=e_bid, ask=e_ask, qty=qty, ts=sim.entry_ts, sig=sig)
-            # Align fill to sim (1s path) for offline parity; limit still from adapter.
-            buy.fill_px = float(sim.entry)
-            buy_rec = audit_fill(e_bid, e_ask, buy.fill_px, "BUY", self.fm)
-            buy.fill_spread_frac = float(buy_rec.fill_spread_frac)
-
-            at_exit = path[path["timestamp"] == to_ny(sim.exit_ts)]
-            if at_exit.empty:
-                at_exit = path[path["timestamp"] >= to_ny(sim.exit_ts)]
-            x_bid = float(at_exit.iloc[0]["bid"])
-            x_ask = float(at_exit.iloc[0]["ask"])
-            sell = self.submit_sell(
-                bid=x_bid, ask=x_ask, qty=qty, ts=sim.exit_ts, sig=sig, reason=sim.reason
+    def flush_pending(self) -> list[DryTrade]:
+        """Force-resolve remaining pendings (end of day / stream)."""
+        assert self._session is not None
+        if not self._session.pending:
+            return []
+        # allow resolve without asof gate
+        done: list[DryTrade] = []
+        still: list[PendingRedisSignal] = []
+        for pend in self._session.pending:
+            sig = pend.sig
+            path, src = self._session.get_path(
+                sig.symbol, sig.date, sig.contract or "", allow_disk_fallback=False
             )
-            sell.fill_px = float(sim.exit)
-            sell_rec = audit_fill(x_bid, x_ask, sell.fill_px, "SELL", self.fm)
-            sell.fill_spread_frac = float(sell_rec.fill_spread_frac)
-
-            open_o = DryOrder(
-                ts=buy.ts.isoformat(),
-                date=sig.date,
-                symbol=sig.symbol,
-                contract=sig.contract,
-                side="BUY",
-                action="OPEN",
-                limit_px=buy.limit_px,
-                fill_px=buy.fill_px,
-                bid=e_bid,
-                ask=e_ask,
-                fill_spread_frac=buy.fill_spread_frac,
-                model_frac=buy.model_frac,
-                rank=sig.rank,
-                direction=sig.direction,
-                reason="ENTRY",
-                mode=self.mode,
-                meta={"qty": qty},
-            )
-            close_o = DryOrder(
-                ts=sell.ts.isoformat(),
-                date=sig.date,
-                symbol=sig.symbol,
-                contract=sig.contract,
-                side="SELL",
-                action="CLOSE",
-                limit_px=sell.limit_px,
-                fill_px=sell.fill_px,
-                bid=x_bid,
-                ask=x_ask,
-                fill_spread_frac=sell.fill_spread_frac,
-                model_frac=sell.model_frac,
-                rank=sig.rank,
-                direction=sig.direction,
-                reason=sim.reason,
-                mode=self.mode,
-                meta={"qty": qty, "ret": sim.ret},
-            )
-            self.orders.extend([open_o, close_o])
-            self._write_audit(open_o, qty)
-            self._write_audit(close_o, qty, net_return=float(sim.ret))
-
-            pnl = eq * qty_frac * sim.ret
-            eq = eq + pnl
-            peak = max(peak, eq)
-            maxdd = min(maxdd, eq / peak - 1.0)
-            daily[sig.date] = eq
-            self.trades.append(
-                DryTrade(
-                    date=sig.date,
-                    symbol=sig.symbol,
-                    direction=sig.direction,
-                    contract=sig.contract,
-                    rank=sig.rank,
-                    entry=float(sim.entry),
-                    exit=float(sim.exit),
-                    ret=float(sim.ret),
-                    reason=sim.reason,
-                    entry_ts=to_ny(sim.entry_ts).isoformat(),
-                    exit_ts=to_ny(sim.exit_ts).isoformat(),
-                    entry_bid=e_bid,
-                    entry_ask=e_ask,
-                    exit_bid=x_bid,
-                    exit_ask=x_ask,
-                    qty_frac=qty_frac,
-                    pnl_equity=float(pnl),
+            if path is None or path.empty:
+                self.skipped.append(
+                    {"date": sig.date, "symbol": sig.symbol, "reason": "redis_path_missing"}
                 )
-            )
+                still.append(pend)
+                continue
+            sim = self._session.simulate_on_path(sig, path)
+            if sim is None:
+                self.skipped.append(
+                    {"date": sig.date, "symbol": sig.symbol, "reason": "sim_failed_flush"}
+                )
+                continue
+            trade = self._commit_sim(sig, sim, path=path, quote_source=src)
+            if trade is not None:
+                done.append(trade)
+        self._session.pending = still
+        return done
 
+    def _commit_sim(
+        self,
+        sig: ScannerSignal,
+        sim: Any,
+        *,
+        path: pd.DataFrame,
+        quote_source: str,
+    ) -> DryTrade | None:
+        assert self._session is not None
+        from maga7.common.position_size import regime_scale_from_meta
+
+        r_scale = regime_scale_from_meta(sig.meta)
+        qty_frac, allow, _ = self._session.size_frac_for(
+            sig.symbol, sim.entry_ts, regime_scale=r_scale
+        )
+        if not allow:
+            self.skipped.append(
+                {"date": sig.date, "symbol": sig.symbol, "reason": "max_concurrent"}
+            )
+            return None
+
+        after = path[path["timestamp"] >= to_ny(sig.sig_ts)]
+        if after.empty:
+            self.skipped.append(
+                {"date": sig.date, "symbol": sig.symbol, "reason": "no_entry_quote"}
+            )
+            return None
+        e_bid, e_ask = float(after.iloc[0]["bid"]), float(after.iloc[0]["ask"])
+        qty = self.size_qty(
+            sim.entry, symbol=sig.symbol, entry_ts=sim.entry_ts, regime_scale=r_scale
+        )
+        if qty <= 0:
+            self.skipped.append({"date": sig.date, "symbol": sig.symbol, "reason": "qty_zero"})
+            return None
+
+        buy = self.submit_buy(bid=e_bid, ask=e_ask, qty=qty, ts=sim.entry_ts, sig=sig)
+        buy.fill_px = float(sim.entry)
+        buy_rec = audit_fill(e_bid, e_ask, buy.fill_px, "BUY", self.fm)
+        buy.fill_spread_frac = float(buy_rec.fill_spread_frac)
+
+        at_exit = path[path["timestamp"] == to_ny(sim.exit_ts)]
+        if at_exit.empty:
+            at_exit = path[path["timestamp"] >= to_ny(sim.exit_ts)]
+        if at_exit.empty:
+            at_exit = path.iloc[[-1]]
+        x_bid = float(at_exit.iloc[0]["bid"])
+        x_ask = float(at_exit.iloc[0]["ask"])
+        sell = self.submit_sell(
+            bid=x_bid, ask=x_ask, qty=qty, ts=sim.exit_ts, sig=sig, reason=sim.reason
+        )
+        sell.fill_px = float(sim.exit)
+        sell_rec = audit_fill(x_bid, x_ask, sell.fill_px, "SELL", self.fm)
+        sell.fill_spread_frac = float(sell_rec.fill_spread_frac)
+
+        open_o = DryOrder(
+            ts=buy.ts.isoformat(),
+            date=sig.date,
+            symbol=sig.symbol,
+            contract=sig.contract or "",
+            side="BUY",
+            action="OPEN",
+            limit_px=buy.limit_px,
+            fill_px=buy.fill_px,
+            bid=e_bid,
+            ask=e_ask,
+            fill_spread_frac=buy.fill_spread_frac,
+            model_frac=buy.model_frac,
+            rank=sig.rank,
+            direction=sig.direction,
+            reason="ENTRY",
+            mode=self.mode,
+            meta={"qty": qty, "size_frac": qty_frac, "quote_source": quote_source},
+        )
+        close_o = DryOrder(
+            ts=sell.ts.isoformat(),
+            date=sig.date,
+            symbol=sig.symbol,
+            contract=sig.contract or "",
+            side="SELL",
+            action="CLOSE",
+            limit_px=sell.limit_px,
+            fill_px=sell.fill_px,
+            bid=x_bid,
+            ask=x_ask,
+            fill_spread_frac=sell.fill_spread_frac,
+            model_frac=sell.model_frac,
+            rank=sig.rank,
+            direction=sig.direction,
+            reason=sim.reason,
+            mode=self.mode,
+            meta={"qty": qty, "ret": sim.ret, "size_frac": qty_frac, "quote_source": quote_source},
+        )
+        self.orders.extend([open_o, close_o])
+        self._write_audit(open_o, qty)
+        self._write_audit(close_o, qty, net_return=float(sim.ret))
+
+        pnl = self._eq * qty_frac * sim.ret
+        self._eq = self._eq + pnl
+        self._peak = max(self._peak, self._eq)
+        self._maxdd = min(self._maxdd, self._eq / self._peak - 1.0)
+        self._daily[sig.date] = self._eq
+        self._session.mark_closed(sig.symbol, sim.exit_ts)
+        if self.scanner is not None:
+            self.scanner.record_fill(sig.symbol, exit_ts=sim.exit_ts, won=sim.ret > 0)
+
+        trade = DryTrade(
+            date=sig.date,
+            symbol=sig.symbol,
+            direction=sig.direction,
+            contract=sig.contract or "",
+            rank=sig.rank,
+            entry=float(sim.entry),
+            exit=float(sim.exit),
+            ret=float(sim.ret),
+            reason=sim.reason,
+            entry_ts=to_ny(sim.entry_ts).isoformat(),
+            exit_ts=to_ny(sim.exit_ts).isoformat(),
+            entry_bid=e_bid,
+            entry_ask=e_ask,
+            exit_bid=x_bid,
+            exit_ask=x_ask,
+            qty_frac=qty_frac,
+            pnl_equity=float(pnl),
+        )
+        self.trades.append(trade)
+        return trade
+
+    def process_one(self, sig: ScannerSignal) -> DryTrade | None:
+        """Fill one signal; call from scanner.on_signal for interleaved m5."""
+        assert self._session is not None
+        self._n_sig += 1
+        if not sig.contract:
+            self.skipped.append({"date": sig.date, "symbol": sig.symbol, "reason": "no_contract"})
+            return None
+
+        # Redis-prefer: defer until the causal quote book covers an exit.
+        if self.prefer_redis_quotes:
+            hold = self._session.hold_minutes()
+            self._session.pending.append(PendingRedisSignal(sig=sig, hold_minutes=hold))
+            # Block same-symbol reentry until hold window (scanner cooldown uses last_exit).
+            if self.scanner is not None:
+                self.scanner.last_exit[sig.symbol] = to_ny(sig.sig_ts) + pd.Timedelta(minutes=hold)
+            # Try immediately in case book already has coverage (warm or pitcher ahead).
+            done = self.try_resolve_pending(asof_ts=sig.sig_ts)
+            return done[-1] if done else None
+
+        sim = self._session.simulate_signal(sig)
+        if sim is None:
+            self.skipped.append({"date": sig.date, "symbol": sig.symbol, "reason": "sim_failed"})
+            return None
+        path, src = self._session.get_path(sig.symbol, sig.date, sig.contract)
+        if path is None or path.empty:
+            self.skipped.append({"date": sig.date, "symbol": sig.symbol, "reason": "no_quote"})
+            return None
+        return self._commit_sim(sig, sim, path=path, quote_source=src)
+
+    def run_signals(self, signals: list[ScannerSignal]) -> dict[str, Any]:
+        """Process signals: stub entry/exit via 1s path (mf_flip + concurrent)."""
+        for sig in signals:
+            self.process_one(sig)
+        if self.prefer_redis_quotes:
+            self.flush_pending()
+        return self.finalize_summary(n_signals=len(signals))
+
+    def finalize_summary(self, *, n_signals: int | None = None) -> dict[str, Any]:
         n = len(self.trades)
         wins = sum(1 for t in self.trades if t.ret > 0)
+        trade_cfg = self.profile.get("trade") or {}
+        sess = self._session
         summary = {
             "mode": self.mode,
             "fill_frac": self.fill.entry_frac,
+            "exit_mode": str(trade_cfg.get("exit_mode") or "none"),
+            "position_sizing": str(trade_cfg.get("position_sizing") or "topk"),
+            "prefer_redis_quotes": self.prefer_redis_quotes,
+            "n_path_redis": int(getattr(sess, "n_path_redis", 0) or 0),
+            "n_path_disk": int(getattr(sess, "n_path_disk", 0) or 0),
+            "n_redis_quote_updates": int(getattr(getattr(sess, "quote_book", None), "n_updates", 0) or 0),
+            "n_pending_left": int(len(getattr(sess, "pending", []) or [])),
             "max_qty": self.max_qty,
             "redis_publish": self.redis_publish,
-            "n_signals": len(signals),
+            "n_signals": n_signals if n_signals is not None else self._n_sig,
             "n_trades": n,
             "n_orders": len(self.orders),
             "n_published": len(self.published),
             "n_skipped": len(self.skipped),
-            "total_ret": eq / 100.0 - 1.0,
-            "equity_end": eq,
-            "maxdd": maxdd,
+            "total_ret": self._eq / 100.0 - 1.0,
+            "equity_end": self._eq,
+            "maxdd": self._maxdd,
             "trade_win": (wins / n) if n else float("nan"),
             "trade_exp": float(np.mean([t.ret for t in self.trades])) if n else float("nan"),
             "source": "maga7_mf10_top2",
             "fill_audit_path": str(self.fill_audit_path) if self.fill_audit_path else None,
         }
         self.summary = summary
-        self.daily = [{"date": d, "equity": daily[d]} for d in sorted(daily)]
+        self.daily = [{"date": d, "equity": self._daily[d]} for d in sorted(self._daily)]
         return summary
 
     def write(self, out_dir: Path) -> None:
@@ -435,6 +578,9 @@ class Mag7OmsStub:
                 f.write(json.dumps(o.to_row(), default=str) + "\n")
         pd.DataFrame([o.to_row() for o in self.orders]).to_csv(out_dir / "orders_stub.csv", index=False)
         pd.DataFrame([asdict(t) for t in self.trades]).to_csv(out_dir / "trades.csv", index=False)
+        from maga7.common.trade_log import write_trade_log
+
+        write_trade_log(self.trades, out_dir)
         audit_rows = [self._audit_row(o, int((o.meta or {}).get("qty", 1)), o.meta.get("ret", "")) for o in self.orders]
         pd.DataFrame(audit_rows).to_csv(out_dir / "fill_audit.csv", index=False)
         # also mirror to session audit path if set and different

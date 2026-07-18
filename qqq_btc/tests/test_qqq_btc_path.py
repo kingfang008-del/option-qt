@@ -930,6 +930,71 @@ def test_replay_next_day_put_quarantine_then_unlocks():
     assert len(vx_filtered.trades) == 3
 
 
+def test_replay_next_day_all_leg_defense_size_time_and_q10():
+    """账户日亏触发次日全腿防御；减仓或过滤仅持续一个交易日。"""
+    from dataclasses import replace
+
+    fm = OptionSpreadFillModel()
+    day1 = _make_dual_leg_df(n=20, put_drift=-0.10)
+    day2 = _make_dual_leg_df(n=20, put_drift=0.05)
+    day3 = _make_dual_leg_df(n=20, put_drift=0.05)
+    day2["timestamp"] = day2["timestamp"] + pd.Timedelta(days=1)
+    day3["timestamp"] = day3["timestamp"] + pd.Timedelta(days=2)
+    df = pd.concat([day1, day2, day3], ignore_index=True)
+    df["call_net_edge"] = 0.0
+    df["put_net_edge"] = 0.0
+    df["net_edge_q10"] = 0.0
+    df.loc[[0, 20, 40], "put_net_edge"] = 0.05
+
+    base = ReplayConfig(
+        entry_threshold=0.015,
+        long_only=False,
+        cooldown_bars=0,
+        position_frac=0.25,
+        next_day_all_leg_defense_loss=-0.02,
+    )
+    sized = run_strict_replay(
+        df,
+        fm,
+        replace(base, next_day_all_leg_defense_position_frac=0.125),
+        _FAST_EXIT_RAILS,
+        edge_q10_col="net_edge_q10",
+        call_edge_col="call_net_edge",
+        put_edge_col="put_net_edge",
+    )
+    assert len(sized.trades) == 3
+    assert [t.position_frac for t in sized.trades] == [0.25, 0.125, 0.25]
+
+    delayed = run_strict_replay(
+        df,
+        fm,
+        replace(base, next_day_all_leg_defense_entry_start_bar=60),
+        _FAST_EXIT_RAILS,
+        edge_q10_col="net_edge_q10",
+        call_edge_col="call_net_edge",
+        put_edge_col="put_net_edge",
+    )
+    delayed_days = [
+        pd.Timestamp(t.entry_ts).date().isoformat() for t in delayed.trades
+    ]
+    assert delayed_days == ["2026-06-01", "2026-06-03"]
+
+    df.loc[20, "net_edge_q10"] = -0.20
+    q10_filtered = run_strict_replay(
+        df,
+        fm,
+        replace(base, next_day_all_leg_defense_edge_q10_floor=-0.10),
+        _FAST_EXIT_RAILS,
+        edge_q10_col="net_edge_q10",
+        call_edge_col="call_net_edge",
+        put_edge_col="put_net_edge",
+    )
+    q10_days = [
+        pd.Timestamp(t.entry_ts).date().isoformat() for t in q10_filtered.trades
+    ]
+    assert q10_days == ["2026-06-01", "2026-06-03"]
+
+
 def test_vx_rule_profile_selector():
     from qqq_btc.common.rule_profiles import select_profile_name_vx
 
@@ -1513,6 +1578,377 @@ def test_choose_entry_rapid_drop_blocks_call():
         spot_ret_5bar=-0.005,
     )
     assert d2 is None
+
+
+def test_choose_entry_min_dual_leg_edge_gap_blocks_coin_flip():
+    """Jul13 型: call/put edge 几乎相等时整 bar 弃权。"""
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02,
+        long_only=False,
+        max_spread_pct=0.06,
+        min_dual_leg_edge_gap=0.001,
+        put_gate_min=None,
+    )
+    common = dict(
+        session_bar=60,
+        dual_mode=True,
+        spread_pct=0.02,
+        put_spread_pct=0.02,
+        has_put=True,
+        edge_q10=-0.10,
+    )
+    # gap 0.0004 < 0.001 → 弃权
+    assert (
+        choose_entry(rc, call_edge=0.04366, put_edge=0.04326, **common) is None
+    )
+    # gap 足够大 → 选较强 CALL
+    d = choose_entry(rc, call_edge=0.05, put_edge=0.03, **common)
+    assert d is not None and d.leg == "CALL"
+
+
+def test_choose_entry_early_put_cross_asset_contradiction_veto():
+    """低 gap PUT 在 QQQ 15m 不跌且 VIXY 15m 不升时应被否决。"""
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02,
+        long_only=False,
+        max_spread_pct=0.06,
+        min_dual_leg_edge_gap=0.001,
+        put_gate_min=None,
+        put_early_cross_confirm_end_bar=60,
+        put_early_cross_confirm_edge_gap_max=0.0015,
+    )
+    common = dict(
+        dual_mode=True,
+        call_edge=0.0501,
+        put_edge=0.0514,
+        spread_pct=0.02,
+        put_spread_pct=0.02,
+        has_put=True,
+        edge_q10=-0.10,
+    )
+    # Jul13 10:03 型：gap 刚过全局门槛，但 QQQ/VIXY 均不确认下跌。
+    assert (
+        choose_entry(
+            rc,
+            session_bar=33,
+            spot_ret_15bar=0.0012,
+            vix_ret_15bar=-0.0024,
+            **common,
+        )
+        is None
+    )
+    # 任一市场确认后不触发“双重矛盾”否决。
+    d = choose_entry(
+        rc,
+        session_bar=33,
+        spot_ret_15bar=-0.001,
+        vix_ret_15bar=-0.0024,
+        **common,
+    )
+    assert d is not None and d.leg == "PUT"
+    # 10:30 后不适用；早盘低置信 PUT 缺确认数据时 fail-closed。
+    assert (
+        choose_entry(
+            rc,
+            session_bar=60,
+            spot_ret_15bar=0.0012,
+            vix_ret_15bar=-0.0024,
+            **common,
+        )
+        is not None
+    )
+    assert choose_entry(rc, session_bar=33, **common) is None
+
+
+def test_choose_entry_vixy_open_shock_regime_scopes_low_gap_put_gate():
+    """全局 gap 关闭；仅 OPEN_SHOCK_CHOP 日收紧早盘/低 gap PUT。"""
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02,
+        long_only=False,
+        max_spread_pct=0.06,
+        min_dual_leg_edge_gap=None,
+        put_gate_min=None,
+        vixy_open_shock_regime_enabled=True,
+    )
+    common = dict(
+        dual_mode=True,
+        call_edge=0.0500,
+        put_edge=0.0530,
+        spread_pct=0.02,
+        put_spread_pct=0.02,
+        has_put=True,
+        edge_q10=-0.10,
+    )
+    # 正常日不再被全局 gap 误杀。
+    d = choose_entry(rc, session_bar=35, **common)
+    assert d is not None and d.leg == "PUT"
+    # 状态日 10:30 前禁止追 PUT。
+    d = choose_entry(
+        rc,
+        session_bar=35,
+        vixy_open_shock_regime_active=True,
+        **common,
+    )
+    assert d is not None and d.leg == "CALL"
+    # 10:30 后低 gap PUT 必须得到 QQQ/VIXY/趋势共同确认。
+    d = choose_entry(
+        rc,
+        session_bar=90,
+        spot_ret_15bar=0.0002,
+        vix_ret_15bar=-0.001,
+        trend_ret_30m=-0.001,
+        trend_r2_30m=0.30,
+        vixy_open_shock_regime_active=True,
+        **common,
+    )
+    assert d is not None and d.leg == "CALL"
+    d = choose_entry(
+        rc,
+        session_bar=90,
+        spot_ret_15bar=-0.001,
+        vix_ret_15bar=0.001,
+        trend_ret_30m=-0.001,
+        trend_r2_30m=0.30,
+        vixy_open_shock_regime_active=True,
+        **common,
+    )
+    assert d is not None and d.leg == "PUT"
+    assert (
+        choose_entry(
+            rc,
+            session_bar=90,
+            call_edge=0.0526,
+            put_edge=0.0530,
+            spread_pct=0.02,
+            put_spread_pct=0.02,
+            has_put=True,
+            dual_mode=True,
+            vixy_open_shock_regime_active=True,
+        )
+        is None
+    )
+
+
+def test_live_governor_latches_vixy_open_shock_regime():
+    from qqq_btc.live.session_governor import LiveSessionGovernor
+
+    rc = ReplayConfig(
+        entry_quantile=None,
+        vixy_open_shock_regime_enabled=True,
+    )
+    gov = LiveSessionGovernor(rc)
+    gov.note_vixy_open_shock_regime(
+        "QQQ",
+        session_bar=35,
+        open30_ret=-0.002,
+        open30_peak_dd=-0.004,
+        trend_r2_30m=0.05,
+    )
+    assert gov.vixy_open_shock_regime_active("QQQ")
+    # 后续趋势恢复也不解除；状态只在日切重置。
+    gov.note_vixy_open_shock_regime(
+        "QQQ",
+        session_bar=40,
+        open30_ret=0.002,
+        open30_peak_dd=-0.001,
+        trend_r2_30m=0.80,
+    )
+    assert gov.vixy_open_shock_regime_active("QQQ")
+
+
+def test_live_governor_cross_asset_returns_are_minute_deduped():
+    from qqq_btc.common.replay_types import ReplayConfig
+    from qqq_btc.live.session_governor import LiveSessionGovernor
+
+    gov = LiveSessionGovernor(ReplayConfig(entry_quantile=None))
+    ts = 1_788_000_000.0
+    for minute in range(16):
+        gov.record_cross_asset_inputs(
+            "QQQ",
+            spot_close=100.0 + minute,
+            vix_proxy_close=20.0 - minute * 0.1,
+            ts=ts + minute * 60,
+        )
+    # 同分钟更新不应多算一根 bar。
+    gov.record_cross_asset_inputs(
+        "QQQ",
+        spot_close=116.0,
+        vix_proxy_close=18.4,
+        ts=ts + 15 * 60 + 10,
+    )
+    spot_ret, vix_ret = gov.cross_asset_returns("QQQ", bars=15)
+    assert spot_ret is not None and abs(spot_ret - 0.16) < 1e-9
+    assert vix_ret is not None and abs(vix_ret - (18.4 / 20.0 - 1.0)) < 1e-9
+    assert len(gov._state("QQQ").cross_asset_samples) == 16
+
+
+def test_live_bounce_inputs_are_transported_and_minute_deduped(monkeypatch):
+    import numpy as np
+
+    from qqq_btc.common.replay_types import ReplayConfig
+    from qqq_btc.live.regime_ctx import extract_regime_ctx
+    from qqq_btc.live.se_feature_bridge import _SymbolBarHistory
+    from qqq_btc.live.session_governor import LiveSessionGovernor
+    from qqq_btc.qqq import config as qcfg
+
+    history = _SymbolBarHistory()
+    history.append(1_788_000_000.0, 99.0)
+    history.append(1_788_000_060.0, 100.0)
+    extracted = extract_regime_ctx(
+        {"features_dict": {"vwap_log_return": np.array([[0.0, 0.002]])}},
+        ["QQQ"],
+        history_store={"QQQ": history},
+    )
+    assert extracted["QQQ"]["vwap_log_return"] == 0.002
+    assert extracted["QQQ"]["spot_close"] == 100.0
+
+    monkeypatch.setenv("QQQ_BTC_RULE_PROFILE_SELECTOR", "off")
+    monkeypatch.setattr(
+        "qqq_btc.live.vx_term_live.prior_vx_curve_slope",
+        lambda trading_day, *, path=None: None,
+    )
+    gov = LiveSessionGovernor(ReplayConfig(entry_quantile=None))
+    ts = 1_788_000_000.0
+    for minute, spot in enumerate((100.0, 99.0, 98.0, 97.0, 96.0, 95.0, 96.0)):
+        gov.record_bounce_inputs(
+            "QQQ",
+            spot_close=spot,
+            vwap_log_return=0.002 if minute == 6 else 0.0,
+            ts=ts + minute * 60,
+        )
+    # 同分钟重算只能覆盖末值，不能伪造额外一根 bar。
+    gov.record_bounce_inputs(
+        "QQQ",
+        spot_close=96.5,
+        vwap_log_return=0.0025,
+        ts=ts + 6 * 60 + 10,
+    )
+    st = gov._state("QQQ")
+    assert len(st.spot_closes) == 7
+    assert len(st.vwap_lrs) == 7
+    rails, _ = gov.scaled_exit_rails("QQQ", qcfg.EXIT_RAILS, leg="PUT")
+    assert rails.spot_thesis_against_entry == qcfg.EXIT_RAILS.bounce_spot_thesis_against_entry
+
+
+def test_live_entry_observer_records_bounce_before_v0_gates(monkeypatch):
+    from datetime import datetime, timedelta
+
+    import pytz
+
+    from qqq_btc.live.session_governor import _GOVERNORS, get_session_governor
+    from qqq_btc.live.strategy_entry_bridge import record_session_edges_from_ctx
+    from qqq_btc.qqq import config as qcfg
+
+    monkeypatch.setenv("QQQ_BTC_USE_LIVE_REPLAY", "1")
+    monkeypatch.setenv("QQQ_BTC_RULE_PROFILE_SELECTOR", "off")
+    monkeypatch.setattr(
+        "qqq_btc.live.vx_term_live.prior_vx_curve_slope",
+        lambda trading_day, *, path=None: None,
+    )
+    _GOVERNORS.clear()
+    ny = pytz.timezone("America/New_York")
+    start = ny.localize(datetime(2026, 7, 1, 10, 40))
+    spots = (100.0, 99.0, 98.0, 97.0, 96.0, 95.0, 96.0)
+    for minute, spot in enumerate(spots):
+        now = start + timedelta(minutes=minute)
+        record_session_edges_from_ctx(
+            {
+                "is_ready": True,
+                "position": 0,
+                "symbol": "QQQ",
+                "time": now,
+                "curr_ts": now.timestamp(),
+                "spot_close": spot,
+                "vwap_log_return": 0.002 if minute == 6 else 0.0,
+                "net_edge_raw": 0.01,
+                "call_edge": 0.01,
+                "put_edge": 0.01,
+            }
+        )
+    rails, _ = get_session_governor().scaled_exit_rails(
+        "QQQ", qcfg.EXIT_RAILS, leg="PUT"
+    )
+    assert rails.spot_thesis_against_entry == qcfg.EXIT_RAILS.bounce_spot_thesis_against_entry
+    _GOVERNORS.clear()
+
+
+def test_live_governor_applies_vx_rule_profile_on_day_cut(monkeypatch):
+    """日切应按 VX selector 套用 OPEN_DEFENSE。"""
+    from datetime import datetime
+
+    import pytz
+
+    from qqq_btc.common.replay_types import ReplayConfig
+    from qqq_btc.live.session_governor import LiveSessionGovernor
+
+    monkeypatch.setenv("QQQ_BTC_RULE_PROFILE_SELECTOR", "vx")
+    monkeypatch.setattr(
+        "qqq_btc.live.vx_term_live.prior_vx_curve_slope",
+        lambda trading_day, *, path=None: 0.0,
+    )
+    monkeypatch.setattr(
+        "qqq_btc.live.rule_profile_live.qqq_lookback_for_day",
+        lambda trading_day, lookback=5, root=None: {
+            "qqq_up_frac": 0.6,
+            "qqq_range_mean": 0.02,
+            "window": ("2026-07-01", "2026-07-07"),
+        },
+    )
+
+    gov = LiveSessionGovernor(
+        ReplayConfig(
+            entry_quantile=None,
+            session_entry_start_bar=15,
+            apply_put_edge_q10=False,
+            max_trades_per_day=4,
+        )
+    )
+    ny = pytz.timezone("America/New_York")
+    ts = ny.localize(datetime(2026, 7, 8, 9, 35)).timestamp()
+    gov.maybe_reset_day("QQQ", ts)
+    st = gov._state("QQQ")
+    assert st.active_profile == "OPEN_DEFENSE"
+    assert gov.replay_cfg.session_entry_start_bar == 60
+    assert gov.replay_cfg.apply_put_edge_q10 is True
+    assert gov._base_replay_cfg.session_entry_start_bar == 15
+
+
+def test_choose_entry_require_leg_spot_day_agree():
+    from qqq_btc.common.entry_decision import choose_entry
+
+    rc = ReplayConfig(
+        entry_threshold=0.02,
+        long_only=False,
+        max_spread_pct=0.06,
+        require_leg_spot_day_agree=True,
+        spot_day_agree_eps=0.0,
+        put_gate_min=None,
+    )
+    common = dict(
+        session_bar=60,
+        dual_mode=True,
+        call_edge=0.05,
+        put_edge=0.03,
+        spread_pct=0.02,
+        put_spread_pct=0.02,
+        has_put=True,
+        edge_q10=-0.10,
+    )
+    # 日收益为负 → 禁 CALL,可走 PUT(若 put 更强或 call 被挡)
+    d = choose_entry(rc, spot_day_ret=-0.001, **common)
+    assert d is None or d.leg == "PUT"
+    # 日收益为正 → 允许 CALL
+    d2 = choose_entry(rc, spot_day_ret=0.001, **common)
+    assert d2 is not None and d2.leg == "CALL"
+    # 字段缺失不拦
+    d3 = choose_entry(rc, spot_day_ret=None, **common)
+    assert d3 is not None and d3.leg == "CALL"
 
 
 def test_choose_entry_put_trend_gate():
@@ -2371,6 +2807,7 @@ def test_regime_ctx_extract_and_merge():
     batch = {
         "features_dict": {
             "vix_level": np.full((1, 30), 0.35, dtype=np.float32),
+            "vix_proxy_close": np.linspace(20.0, 19.0, 30, dtype=np.float32)[None, :],
         }
     }
     out = extract_regime_ctx(batch, ["QQQ"], history_store={"QQQ": hist})
@@ -2378,13 +2815,23 @@ def test_regime_ctx_extract_and_merge():
     assert out["QQQ"].get("spot_day_ret") is not None
     assert abs(out["QQQ"].get("vix_level", 0) - 0.35) < 1e-5
     assert out["QQQ"].get("trend_fit_r2_30m", 0) > 0.5
+    assert out["QQQ"].get("spot_ret_15bar", 0) > 0
+    assert out["QQQ"].get("vix_ret_15bar", 0) < 0
 
     ctx = {"symbol": "QQQ"}
-    item = {"spot_day_ret": 0.01, "trend_fit_r2_30m": 0.2, "vix_reversal_count_30m": 3.0}
+    item = {
+        "spot_day_ret": 0.01,
+        "trend_fit_r2_30m": 0.2,
+        "vix_reversal_count_30m": 3.0,
+        "spot_ret_15bar": 0.001,
+        "vix_ret_15bar": -0.002,
+    }
     merge_regime_into_ctx(ctx, item)
     assert ctx["spot_day_ret"] == 0.01
     assert ctx["trend_fit_r2_30m"] == 0.2
     assert ctx["vix_reversal_count_30m"] == 3.0
+    assert ctx["spot_ret_15bar"] == 0.001
+    assert ctx["vix_ret_15bar"] == -0.002
 
 
 def test_extract_regime_ctx_short_history_falls_back_to_features_dict():
@@ -2593,6 +3040,98 @@ def test_live_session_governor_frequency():
     gov2.record_trade_close("QQQ", net_ret=0.01, curr_ts=ts, leg="CALL")
     blocked, reason = gov2.blocked_for_entry("QQQ", curr_ts=ts + 60)
     assert blocked and reason == "max_trades_per_day"
+
+
+def test_live_session_governor_all_leg_defense_and_put_quarantine(tmp_path, monkeypatch):
+    """日亏触发次日半仓 + PUT 隔离；仓位乘数写入 OMS 缩放路径。"""
+    from datetime import date, datetime
+
+    import pandas as pd
+    from pytz import timezone
+
+    from qqq_btc.common.replay_types import ReplayConfig
+    from qqq_btc.live import vx_term_live
+    from qqq_btc.live.session_governor import LiveSessionGovernor
+
+    vx_path = tmp_path / "vx_term.parquet"
+    ny = timezone("America/New_York")
+    d0 = date(2026, 5, 5)
+    pd.DataFrame(
+        {
+            "date": [pd.Timestamp(d0, tz="UTC")],
+            "vx_curve_slope": [0.08],
+        }
+    ).to_parquet(vx_path)
+    vx_term_live.clear_vx_term_cache()
+    monkeypatch.setenv("QQQ_BTC_VX_TERM_STRUCTURE", str(vx_path))
+
+    cfg = ReplayConfig(
+        position_frac=0.25,
+        next_day_put_quarantine_loss=-0.02,
+        next_day_put_quarantine_vx_slope_min=0.06,
+        next_day_all_leg_defense_loss=-0.05,
+        next_day_all_leg_defense_position_frac=0.125,
+        next_day_all_leg_defense_vx_slope_min=0.06,
+        entry_quantile=None,
+    )
+    gov = LiveSessionGovernor(cfg)
+    ts0 = datetime(2026, 5, 5, 10, 30, tzinfo=ny).timestamp()
+    # PUT 账户贡献: 0.25 * (-0.10) = -2.5% ≤ -2%；账户: 0.25*(-0.22)= -5.5% ≤ -5%
+    gov.record_trade_close(
+        "QQQ", net_ret=-0.22, curr_ts=ts0, leg="PUT", position_frac=0.25
+    )
+    st = gov._state("QQQ")
+    assert st.day_account_equity < 0.95
+    assert st.day_leg_equity["PUT"] < 0.98
+
+    ts1 = datetime(2026, 5, 6, 10, 0, tzinfo=ny).timestamp()
+    gov.maybe_reset_day("QQQ", ts1)
+    assert gov.all_leg_defense_active("QQQ")
+    assert abs(gov.effective_position_frac("QQQ") - 0.125) < 1e-9
+    assert abs(gov.position_size_mult("QQQ") - 0.5) < 1e-9
+    gated, reason = gov.cross_day_gates("QQQ", session_bar=30, edge_q10=None, leg="PUT")
+    assert gated and reason.startswith("put_quarantine")
+    gated, reason = gov.cross_day_gates("QQQ", session_bar=30, edge_q10=None, leg="CALL")
+    assert not gated
+
+    # 无 VX 阈值不满足时不触发
+    pd.DataFrame(
+        {
+            "date": [pd.Timestamp(d0, tz="UTC")],
+            "vx_curve_slope": [0.01],
+        }
+    ).to_parquet(vx_path)
+    vx_term_live.clear_vx_term_cache()
+    gov2 = LiveSessionGovernor(cfg)
+    gov2.record_trade_close(
+        "QQQ", net_ret=-0.22, curr_ts=ts0, leg="PUT", position_frac=0.25
+    )
+    gov2.maybe_reset_day("QQQ", ts1)
+    assert not gov2.all_leg_defense_active("QQQ")
+    gated, _ = gov2.cross_day_gates("QQQ", session_bar=30, edge_q10=None, leg="PUT")
+    assert not gated
+
+    # 持久化：日切旗标可从 pickle 恢复
+    state_path = tmp_path / "gov.pkl"
+    gov.save_quantile_state(str(state_path))
+    gov3 = LiveSessionGovernor(cfg)
+    gov3.load_quantile_state(str(state_path))
+    assert gov3.all_leg_defense_active("QQQ")
+    assert "PUT" in gov3._state("QQQ").cross_day_quarantined_legs
+    assert abs(gov3.position_size_mult("QQQ") - 0.5) < 1e-9
+
+
+def test_resolve_replay_cfg_all_leg_defense_env(monkeypatch):
+    from qqq_btc.live.session_governor import resolve_replay_cfg
+    import qqq_btc.qqq.config as qcfg
+
+    monkeypatch.delenv("QQQ_BTC_USE_LIVE_REPLAY", raising=False)
+    monkeypatch.setenv("QQQ_BTC_ALL_LEG_DEFENSE_LOSS", "-0.04")
+    monkeypatch.setenv("QQQ_BTC_ALL_LEG_DEFENSE_POSITION_FRAC", "0.10")
+    cfg = resolve_replay_cfg()
+    assert cfg.next_day_all_leg_defense_loss == -0.04
+    assert cfg.next_day_all_leg_defense_position_frac == 0.10
+    assert qcfg.REPLAY.next_day_all_leg_defense_position_frac == 0.125
 
 
 def test_live_cooldown_still_feeds_entry_quantile_edges():

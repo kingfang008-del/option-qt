@@ -224,3 +224,11 @@ production/*.parquet
 *.feather
 *.h5
 *.hdf5
+
+# S3 下载临时目录 / 未完成残留（csv.gz 等大文件）
+data/temp_s3*/
+data/temp_s3_*/
+
+# 根目录误留的 ImageMagick PostScript 导出
+/pd
+/pickle

@@ -1,7 +1,8 @@
 # Mag7 当前统一架构与时钟契约
 
-> 状态日期：2026-07-16  
-> 生产候选：`m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1`
+> 状态日期：2026-07-18  
+> 生产候选：`m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1`  
+> 研究基线 overlay（Watchdog / Hunter，默认 off）：见 [`watchdog_stack_architecture.md`](watchdog_stack_architecture.md)
 
 ## 1. 统一原则
 
@@ -62,6 +63,7 @@ session，不能只凭 1 分钟缓存放行。
 时钟与策略层
   frame 校验 → options 入 book → 股票1s归桶 → completed 1m
   → Rule-A / mf10 / streak / QQQ-VIXY regime / TopK
+  → （可选研究）Watchdog Degrade/Halt + Hunter 短窗
              │
              ▼
 OMS 层
