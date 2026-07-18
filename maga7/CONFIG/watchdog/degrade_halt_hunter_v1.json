@@ -1,0 +1,38 @@
+{
+  "enabled": true,
+  "mode": "rule",
+  "asof": "10:30",
+  "experts_path": "maga7/CONFIG/regime_router/experts_v1.json",
+  "description": "Watchdog v1 + Hunter orb_fractal (arm/TTL/budget). Research only.",
+  "degrade": {
+    "enabled": true,
+    "rule": "reclaim_disp55",
+    "expert": "rebound_trap_dn",
+    "ttl_minutes": null
+  },
+  "halt": {
+    "enabled": true,
+    "rule": "washout_and_reclaim",
+    "expert": "washout_gate_halt",
+    "wash_drop_min": 0.008,
+    "washout_breadth_min": 5,
+    "wash_window_end": "10:00",
+    "ttl_minutes": null
+  },
+  "hunter": {
+    "enabled": true,
+    "detector": "orb_fractal",
+    "ttl_minutes": 15,
+    "max_entries_per_day": 1,
+    "top_k": 1,
+    "mutex_with_baseline": true,
+    "mutex_scope": "symbol",
+    "block_when_degrade": true,
+    "wash_drop_min": 0.005,
+    "wash_window_end": "10:00",
+    "signal_deadline": "10:00",
+    "require_breadth_min": 3,
+    "skip_peer": true,
+    "skip_qqq_align": false
+  }
+}

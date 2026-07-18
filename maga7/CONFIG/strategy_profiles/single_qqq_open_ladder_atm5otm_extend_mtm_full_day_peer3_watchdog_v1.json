@@ -1,10 +1,10 @@
 {
-  "profile": "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1",
-  "profile_id": "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1",
-  "description": "Research baseline (2026-07-18 L0 + P1.1 L1 + P2 L2): extend_mtm T30\u2192T45 + full_day events + peer3 + streak3 + mf_idio + Watchdog L1 Degrade/Halt + Hunter washout_reclaim (T30+extend, same as baseline trade). Feb\u2013Apr lift vs L0. Keep sl_mult=0.40. Sync calendar via tools/sync_event_calendar.py.",
-  "role": "research_baseline",
-  "result_tag": "research_extend_mtm_full_day_peer3_l2_may_jul",
-  "based_on": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1.json",
+  "profile": "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_watchdog_v1",
+  "profile_id": "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_watchdog_v1",
+  "description": "Research: freeze baseline + Watchdog (degrade reclaim_disp55 + halt washout_and_reclaim). Hunter off. Docs: docs/watchdog_architecture.md. Not freeze.",
+  "role": "research",
+  "result_tag": "research_watchdog_degrade_halt",
+  "based_on": "strategy_profiles/single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json",
   "recommended_scheme": "single",
   "baseline_doc": "docs/research_full_day_peer3_baseline.md",
   "frozen_at": "2026-07-18",
@@ -55,7 +55,12 @@
     "window": 15,
     "model_path": null,
     "block_on_missing": false,
-    "channels": ["net$", "ret1", "range_pct", "qqq_ret1"]
+    "channels": [
+      "net$",
+      "ret1",
+      "range_pct",
+      "qqq_ret1"
+    ]
   },
   "lgbm_bouncer": {
     "enabled": false,
@@ -64,61 +69,18 @@
     "scale_when_low": 0.5,
     "model_path": "maga7/results/lgbm_bouncer/lgbm_bouncer_dn_v1.txt",
     "block_on_missing": false,
-    "only_directions": ["DN"]
+    "only_directions": [
+      "DN"
+    ]
   },
   "regime_router": {
     "enabled": false,
     "mode": "rule",
     "rule": "reclaim_disp55",
     "asof": "10:30",
-    "experts_path": "maga7/CONFIG/regime_router/experts_v1.json"
-  },
-  "watchdog": {
-    "enabled": true,
-    "mode": "rule",
-    "asof": "10:30",
     "experts_path": "maga7/CONFIG/regime_router/experts_v1.json",
-    "description": "P2 (2026-07-18): research baseline opens L1 + L2 Hunter washout_reclaim (old exit T30+extend). Gate: Feb\u2013Apr vs L0 lift; 2025H2 noted but not hard veto (Friday-option / regime mismatch).",
-    "degrade": {
-      "enabled": true,
-      "rule": "reclaim_disp55",
-      "expert": "rebound_trap_dn",
-      "ttl_minutes": null
-    },
-    "halt": {
-      "enabled": true,
-      "rule": "washout_and_reclaim",
-      "expert": "washout_gate_halt",
-      "wash_drop_min": 0.008,
-      "washout_breadth_min": 5,
-      "wash_window_end": "10:00",
-      "ttl_minutes": null
-    },
-    "hunter": {
-      "enabled": true,
-      "detector": "washout_reclaim",
-      "wash_drop_min": 0.015,
-      "wash_window_end": "10:00",
-      "signal_deadline": "10:15",
-      "reclaim_level": "open",
-      "hold_confirm_bars": 0,
-      "ttl_minutes": 20,
-      "max_entries_per_day": 1,
-      "top_k": 1,
-      "mutex_with_baseline": true,
-      "block_when_degrade": true,
-      "block_when_halt": true,
-      "require_breadth_min": 0,
-      "skip_peer": true,
-      "skip_qqq_align": true,
-      "only_up": true,
-      "mutex_scope": "symbol_dir",
-      "allow_baseline_opposite": true,
-      "reclaim_buffer_pct": 0.0
-    },
-    "note": "L0+L1+L2 on research_baseline. Hunt uses trade exit (T30+extend). Docs: docs/watchdog_stack_architecture.md"
+    "note": "superseded by watchdog when enabled"
   },
-
   "trade": {
     "tp_mult": 1.6,
     "sl_mult": 0.4,
@@ -221,5 +183,35 @@
       2
     ],
     "otm_rungs": 5
+  },
+  "watchdog": {
+    "enabled": true,
+    "mode": "rule",
+    "asof": "10:30",
+    "experts_path": "maga7/CONFIG/regime_router/experts_v1.json",
+    "description": "Architecture v1: Degrade (reclaim_disp55) + Halt (washout_and_reclaim). Hunter slot empty. Research only — do not enable on freeze until ops sign-off.",
+    "degrade": {
+      "enabled": true,
+      "rule": "reclaim_disp55",
+      "expert": "rebound_trap_dn",
+      "ttl_minutes": null
+    },
+    "halt": {
+      "enabled": true,
+      "rule": "washout_and_reclaim",
+      "expert": "washout_gate_halt",
+      "wash_drop_min": 0.008,
+      "washout_breadth_min": 5,
+      "wash_window_end": "10:00",
+      "ttl_minutes": null
+    },
+    "hunter": {
+      "enabled": false,
+      "ttl_minutes": 15,
+      "max_entries_per_day": 1,
+      "mutex_with_baseline": true,
+      "block_when_degrade": true,
+      "note": "Empty slot — arm detectors (ORB/early_mf) later; never auto-fire without TTL budget."
+    }
   }
 }

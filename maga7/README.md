@@ -1,98 +1,139 @@
 # maga7 — Mag7 Rule-A money-flow Top2 short-DTE scalp
 
-规则策略路径（非 TFT）。布局对齐 `stock_options/`，成交模型复用 `qqq_btc.common.fill_model`。
+规则策略路径（非 TFT）。成交模型复用 `qqq_btc.common.fills_model` /
+`qqq_btc.live.oms_adapter`。
 
-**默认 profile（`CONFIG/mf10_top2_v1.json`）**：`only_reenter_after_win=true` + regime **仅 QQQ `from_prev` 对齐**（VIX/put 闸默认关）。正式 Jan–Jul：`maga7/results/jan_jul_m5c_qqq_onlywin`。
+**临时生产 profile**：
+`CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json`
 
-版本对比与消融见 [`docs/jan_jul_replay_versions.md`](docs/jan_jul_replay_versions.md)；**开盘阶梯 + concurrent + mf_flip 当前结论**见 [`docs/open_ladder_live_package_results.md`](docs/open_ladder_live_package_results.md)。命名 profile 在 [`CONFIG/strategy_profiles/`](CONFIG/strategy_profiles/)（`catalog.json`）。
+- `open_ladder` OTM5 + `only_win` + concurrent p20 + `exit_mode=mf_flip`
+- 股票事实源：`/mnt/s990/data/raw_1s/stocks`
+- 预聚合 1 分钟研究缓存：`~/train_data/spnq_train`（不是独立时钟事实源）
+
+当前统一架构、秒级时钟契约、恢复和 G0–G6 门禁见
+[`docs/current_architecture.md`](docs/current_architecture.md)。
+
+研究基线 + Watchdog/Hunter 三层栈（默认 off、过拟合边界）见
+[`docs/watchdog_stack_architecture.md`](docs/watchdog_stack_architecture.md)；
+完善顺序见 [`docs/watchdog_optimization_roadmap.md`](docs/watchdog_optimization_roadmap.md)。
+
+研究结论见 [`docs/open_ladder_live_package_results.md`](docs/open_ladder_live_package_results.md)；
+版本对比见 [`docs/jan_jul_replay_versions.md`](docs/jan_jul_replay_versions.md)。
 
 ## 策略摘要
 
 - 信号：规则 A（mf10 streak≥8，|from_prev|≥2%，vol_z≥1，10:30–14:00）
 - 选股：当日 Top2（最早触发）
-- 选约：默认 day_lock ATM；研究可用 `open_ladder`（开盘阶梯 OTM5）
-- 出场：TP 1.6x / SL 0.4x / 超时 30m；可选 `exit_mode=mf_flip`（mf10 翻向提前平）
-- 仓位：旧 topk 均分；研究可用 concurrent（独处满袖套，最多 2 腿）
+- 选约：生产候选 `open_ladder`（开盘阶梯 OTM5）；对照可用 day_lock ATM
+- 出场：TP 1.6x / SL 0.4x / 超时 30m；生产候选 `mf_flip`
+- 仓位：concurrent（独处 20%，并发第二腿 10%，最多 2 腿）
 - 成交：点差 frac=0.8（`bid + 0.8*(ask-bid)` 买入）
 
 ## 目录
 
 ```text
 maga7/
-  CONFIG/mf10_top2_v1.json
-  common/   signals, fills, replay, stream_engine, bar_agg, config
-  live/     scanner (1s→1m 或直接 1m)
-  tools/    prepare_jan_jul_data, run_replay_offline, run_stream_parity,
-            run_scanner_shadow, run_scanner_from_1s, run_oms_dry_run,
-            run_oms_live_stub, run_sensitivity_grid, run_regime_ablation
-  live/     scanner, oms_dry, oms_stub
-  common/   signals, fills, replay, stream_engine, bar_agg, regime, config
-  results/  回测与对拍产物
-  docs/
+  CONFIG/strategy_profiles/   命名 profile 与 catalog
+  common/   signals, replay, stream_engine, bar_agg, open_lock, provenance
+  live/     scanner, redis_*, ibkr_connector, broker_oms, live_engine
+  tools/    prepare_*, run_replay_offline, run_stream_parity,
+            run_maga7_redis_sim, run_live_session, OMS dry/stub
+  results/  回测、对拍、Redis S5、live_sessions
+  docs/     架构、对拍、锁约流水线、实时运维
 ```
 
-## 数据准备（2026-01-02 ~ 2026-07-13）
+## 数据与时钟
+
+- 股票权威源是秒级 parquet：`/mnt/s990/data/raw_1s/stocks/{SYM}/{SYM}_{date}.parquet`
+- 秒数据按 `[M, M+1min)` 聚合；分钟完成后再决策
+- 不再用“外部 1 分钟左/右标签”解释因果性
+- `bar_availability_delay_seconds=60` 只用于预聚合 1 分钟缓存适配；
+  原始 1 秒流使用实际 `available_ts`，禁止双重延迟
 
 ```bash
 export MASSIVE_API_KEY=...   # 或 POLYGON_API_KEY
 cd /path/to/option-qt
 export PYTHONPATH=$PWD
 
-# 报告缺口 → 锁约 → 下载/复用 1s quote
+# 日锁对照流水线
 python -m maga7.tools.prepare_jan_jul_data --step all --max-workers 12
+
+# 开盘阶梯锁约 + 1s quote
+python -m maga7.tools.prepare_open_lock_quotes --step all
 ```
 
-说明：`spnq_train` 在约 **2026-03-19 ~ 2026-04-30** 无正股 → 该窗无法算 day_iv/锁约，需另补正股后再跑。
-
-产物：
-
-- 锁约：`~/train_data/locked_targets_map_maga7_mf10_jan_jul.parquet`
-- 1s：`/mnt/s990/data/raw_1s/maga7_mf10_old_lock/{SYM}/`
-
-## Offline replay
+## Offline / Stream / Redis
 
 ```bash
-python -m maga7.tools.run_replay_offline --scheme single
-python -m maga7.tools.run_replay_offline --scheme m5_circuit
+# G1 Offline
+python -m maga7.tools.run_replay_offline \
+  --profile maga7/CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json \
+  --scheme m5_circuit
 
-# 规则敏感性（streak / from_prev / vol_z）
-python -m maga7.tools.run_sensitivity_grid --start-date 2026-01-02 --end-date 2026-07-13
+# G2 Stream parity
+python -m maga7.tools.run_stream_parity \
+  --profile maga7/CONFIG/strategy_profiles/m5c_qqq_onlywin_open_ladder_atm5otm_mf_flip_p20_v1.json \
+  --scheme m5_circuit \
+  --tag parity_open_ladder_otm5_mf_flip_p20_jan_jul
 
-# QQQ/VIXY regime 闸门消融（m5_circuit）
-python -m maga7.tools.run_regime_ablation --scheme m5_circuit
+# G3 Redis S5（股票/期权秒级进总线）
+python -m maga7.tools.run_maga7_redis_sim \
+  --start-date 2026-05-01 --end-date 2026-05-01 \
+  --options --compare-offline
 ```
 
-## 流式对拍
+## Scanner / OMS 仿真
 
 ```bash
-python -m maga7.tools.run_stream_parity --scheme single
-# exit 0 = 逐笔 key/收益一致
-```
-
-流式引擎按时间推进 1m 正股 bar，因果触发 Rule-A / TopK，再用同一套 1s fill 闭合交易，与 offline batch 对拍。
-
-## Dashboard
-
-```bash
-streamlit run qqq_btc/dashboard/qqq_btc_dash.py
-# Sidebar → Board → Mag7
-```
-
-## Scanner shadow（不下单）
-
-```bash
-# S1：历史 1m
-python -m maga7.tools.run_scanner_shadow --start-date 2026-05-06 --end-date 2026-05-10
-
-# S2：正股 1s → 因果聚合 1m（实盘 ingest 对齐；Rule-A 仍按 1m）
+# S2：正股 1s → 因果聚合 1m
 python -m maga7.tools.run_scanner_from_1s --start-date 2026-05-06 --end-date 2026-05-10
 
-# S3：OMS dry-run（fill 0.8 限价 + 1s 闭合，不下真单）
+# S3 / S4
 python -m maga7.tools.run_oms_dry_run --start-date 2026-05-06 --end-date 2026-05-10 --compare-offline
-
-# S4：OMS stub / shadow（小仓 + fill_audit；可选 --redis）
 MAG7_MAX_QTY=1 python -m maga7.tools.run_oms_live_stub \
   --start-date 2026-05-06 --end-date 2026-05-10 --compare-offline
 ```
 
-实盘拓扑见 `docs/scanner_oms_integration.md`（1s 正股 → 1m 信号 → OMS 1s quote，不经 QQQ TFT）。
+## 操作手册
+
+日常顺序（补数据 → Offline → 对拍 → 实盘）见：
+
+[`docs/maga7_operations_guide.md`](docs/maga7_operations_guide.md)
+
+```bash
+cd maga7/SHELL
+./run_day_stream_check.sh 2026-05-28      # 盘前：打一天 → trade_log → 对 offline
+python ../../dash/run.py                  # Download / Offline / Parity / Live
+```
+
+## Live session（G4–G6）
+
+一键脚本在 `maga7/SHELL/`（不要用 `production/SHELL` 旧栈）：
+
+```bash
+cd maga7/SHELL
+./start_maga7_live_session.sh start shadow
+./start_maga7_live_session.sh status
+```
+
+
+或直接：
+
+```bash
+python -m maga7.tools.run_live_session --help
+```
+
+运维、硬锁、恢复和盘后步骤见
+[`docs/live_session_operations.md`](docs/live_session_operations.md)、[`SHELL/menu.md`](SHELL/menu.md)。
+代码存在不等于 Gate 通过；G4/G5/G6 需要真实 session 证据。
+
+## Dashboard
+
+权威全流程监控：
+
+```bash
+python dash/run.py
+```
+
+`qqq_btc/dashboard` 内的 Mag7 board 仅保留为旧 Offline/Parity 面板，不再作为
+G0–G6 / Live session 的权威入口。

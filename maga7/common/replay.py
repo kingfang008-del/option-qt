@@ -6,6 +6,8 @@ Contract modes:
 """
 from __future__ import annotations
 
+import copy
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,6 +52,100 @@ from maga7.common.signals import (
     sync_index,
     tod_mf_z_ok,
 )
+from maga7.common.lgbm_bouncer import load_lgbm_bouncer
+from maga7.common.tcn_gate import load_tcn_gate
+from maga7.common.watchdog import (
+    WATCHDOG_REGIME_KEYS,
+    RegimeWatchdog,
+    WatchdogState,
+    apply_expert_dict,
+    eval_router_rule,
+    restore_regime,
+    snapshot_regime,
+)
+
+# Regime keys that per-day experts may temporarily override.
+_ROUTER_REGIME_KEYS = WATCHDOG_REGIME_KEYS
+
+
+def _load_regime_router(
+    profile: dict[str, Any],
+) -> tuple[bool, dict[str, str], dict[str, dict], str, str]:
+    """Return (enabled, date->day_type, experts, mode, rule_name).
+
+    mode:
+      - ``oracle`` / ``labels``: use labels map (research / upper bound)
+      - ``rule``: evaluate causal morning rule each day (live-feasible)
+    """
+    raw = profile.get("regime_router")
+    if not isinstance(raw, dict) or not bool(raw.get("enabled", False)):
+        return False, {}, {}, "off", ""
+    mode = str(raw.get("mode") or "oracle").strip().lower()
+    if mode in {"labels", "label", "oracle"}:
+        mode = "oracle"
+    elif mode in {"rule", "rules", "causal"}:
+        mode = "rule"
+    else:
+        mode = "oracle"
+    rule_name = str(raw.get("rule") or raw.get("rule_name") or "reclaim_disp55").strip()
+    labels: dict[str, str] = {}
+    lp = raw.get("labels_path") or raw.get("day_type_path")
+    if lp:
+        p = Path(str(lp)).expanduser()
+        if p.is_file():
+            if p.suffix.lower() == ".json":
+                blob = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(blob, dict):
+                    labels = {str(k): str(v) for k, v in blob.items()}
+            else:
+                df = pd.read_csv(p)
+                if "date" in df.columns and "day_type" in df.columns:
+                    for r in df.itertuples(index=False):
+                        labels[str(r.date)] = str(r.day_type)
+    for k, v in (raw.get("labels") or {}).items():
+        labels[str(k)] = str(v)
+    experts: dict[str, dict] = {}
+    ep = raw.get("experts_path")
+    if ep:
+        epth = Path(str(ep)).expanduser()
+        if epth.is_file():
+            experts = json.loads(epth.read_text(encoding="utf-8"))
+    experts.update(raw.get("experts") or {})
+    return True, labels, experts, mode, rule_name
+
+
+def _eval_router_rule(
+    rule_name: str,
+    *,
+    date: str,
+    stock_by: dict[str, pd.DataFrame],
+    qqq_df: pd.DataFrame | None,
+    symbols: list[str],
+    asof_hhmm: str = "10:30",
+    router_cfg: dict[str, Any] | None = None,
+) -> str | None:
+    """Causal morning rule → expert name or None (baseline)."""
+    return eval_router_rule(
+        rule_name,
+        date=date,
+        stock_by=stock_by,
+        qqq_df=qqq_df,
+        symbols=symbols,
+        asof_hhmm=asof_hhmm,
+        router_cfg=router_cfg,
+    )
+
+
+def _router_snapshot_regime(cfg: dict[str, Any]) -> dict[str, Any]:
+    return snapshot_regime(cfg)
+
+
+def _router_restore_regime(cfg: dict[str, Any], snap: dict[str, Any]) -> None:
+    restore_regime(cfg, snap)
+
+
+def _router_apply_expert(cfg: dict[str, Any], expert: dict[str, Any] | None) -> None:
+    apply_expert_dict(cfg, expert)
 
 
 def _trade_flag(trade: dict[str, Any], key: str, default: bool = False) -> bool:
@@ -256,12 +352,138 @@ def _prepare_stock_day(stock_day: pd.DataFrame | None) -> pd.DataFrame | None:
     day = day.sort_values("timestamp")
     day["_ts_ns"] = [int(to_ny(x).value) for x in day["timestamp"].tolist()]
     day["_mf"] = day["mf10"].astype(float)
+    if "mf_fast" in day.columns:
+        day["_mf_fast"] = day["mf_fast"].astype(float)
+    elif "mf_short" in day.columns:
+        day["_mf_fast"] = day["mf_short"].astype(float)
+    elif "net$" in day.columns:
+        day["_mf_fast"] = day["net$"].astype(float).rolling(3, min_periods=3).sum()
+    else:
+        day["_mf_fast"] = np.nan
     day["_su"] = day["streak_up"].astype(int) if "streak_up" in day.columns else 0
     day["_sd"] = day["streak_dn"].astype(int) if "streak_dn" in day.columns else 0
+    if "close" in day.columns:
+        day["_close"] = day["close"].astype(float)
+    if "low" in day.columns:
+        day["_low"] = day["low"].astype(float)
+    if "high" in day.columns:
+        day["_high"] = day["high"].astype(float)
     if "net$" in day.columns:
         day["_net"] = day["net$"].astype(float)
         day["_net_csum"] = day["_net"].cumsum()
     return day
+
+
+def _stock_bar_index(day: pd.DataFrame | None, t: pd.Timestamp) -> int:
+    if day is None or day.empty or "_ts_ns" not in day.columns:
+        return -1
+    return int(np.searchsorted(day["_ts_ns"].to_numpy(), t.value, side="right") - 1)
+
+
+def _session_structure_at(
+    sdf: pd.DataFrame | None,
+    *,
+    date: str,
+    asof_ts: pd.Timestamp,
+) -> dict[str, float | bool | None] | None:
+    """Causal session stats at asof: open, vwap, lod, px, above_open, above_vwap, bounce_from_lod."""
+    if sdf is None or sdf.empty or "close" not in sdf.columns:
+        return None
+    day = sdf[sdf["date"].astype(str) == str(date)]
+    if day.empty:
+        return None
+    day = day.sort_values("timestamp")
+    asof = to_ny(asof_ts)
+    # timestamps may already be tz-aware
+    ts = day["timestamp"].map(to_ny)
+    upto = day.loc[ts <= asof]
+    if upto.empty:
+        return None
+    close = pd.to_numeric(upto["close"], errors="coerce")
+    px = float(close.iloc[-1])
+    if not np.isfinite(px):
+        return None
+    open_col = "open" if "open" in upto.columns else "close"
+    o = pd.to_numeric(upto[open_col], errors="coerce").dropna()
+    if o.empty:
+        return None
+    open0 = float(o.iloc[0])
+    low_col = "low" if "low" in upto.columns else "close"
+    lod = float(pd.to_numeric(upto[low_col], errors="coerce").min())
+    vol = (
+        pd.to_numeric(upto["volume"], errors="coerce").fillna(0.0)
+        if "volume" in upto.columns
+        else pd.Series(0.0, index=upto.index)
+    )
+    if float(vol.sum()) > 0:
+        vwap = float((close * vol).sum() / vol.sum())
+    else:
+        vwap = float(close.expanding().mean().iloc[-1])
+    if not np.isfinite(open0) or open0 <= 0 or not np.isfinite(lod) or lod <= 0 or not np.isfinite(vwap):
+        return None
+    bounce = (px / lod - 1.0) if lod > 0 else None
+    return {
+        "px": px,
+        "open": open0,
+        "vwap": vwap,
+        "lod": lod,
+        "above_open": bool(px > open0),
+        "above_vwap": bool(px > vwap),
+        "bounce_from_lod": float(bounce) if bounce is not None else None,
+    }
+
+
+def _above_session_open(
+    sdf: pd.DataFrame | None,
+    *,
+    date: str,
+    asof_ts: pd.Timestamp,
+) -> bool | None:
+    """True if last close at/before asof is strictly above that day's first open."""
+    st = _session_structure_at(sdf, date=date, asof_ts=asof_ts)
+    if st is None:
+        return None
+    return bool(st["above_open"])
+
+
+def _structure_gate_blocks(
+    sdf: pd.DataFrame | None,
+    *,
+    date: str,
+    asof_ts: pd.Timestamp,
+    direction: str,
+    block_dn_if_above_open: bool = False,
+    vwap_dir_lock: bool = False,
+    block_dn_if_vwap_lod: bool = False,
+    lod_bounce_min: float = 0.02,
+) -> str | None:
+    """Return block reason or None if allowed."""
+    st = _session_structure_at(sdf, date=date, asof_ts=asof_ts)
+    if st is None:
+        return None
+    d = str(direction).upper()
+    if block_dn_if_above_open and d == "DN" and st["above_open"] is True:
+        return "dn_above_open"
+    if vwap_dir_lock:
+        if d == "UP" and st["above_vwap"] is False:
+            return "vwap_lock_up"
+        if d == "DN" and st["above_vwap"] is True:
+            return "vwap_lock_dn"
+    if block_dn_if_vwap_lod and d == "DN":
+        bounce = st.get("bounce_from_lod")
+        if (
+            st["above_vwap"] is True
+            and bounce is not None
+            and float(bounce) >= float(lod_bounce_min)
+        ):
+            return "dn_vwap_lod_bounce"
+    return None
+
+
+def _fav_mf(raw: float | None, direction: str) -> float | None:
+    if raw is None or not np.isfinite(raw):
+        return None
+    return float(raw) if direction == "UP" else -float(raw)
 
 
 def _cum_fav_flow(
@@ -311,6 +533,18 @@ def simulate_trade(
     hold_extend_require_mf: bool = True,
     force_exit_ts=None,
     early_exit_mode: str | None = None,
+    mae_cut_ret: float | None = None,
+    mae_cut_mfe_bypass: float | None = None,
+    mae_cut_min_hold_minutes: float | None = None,
+    mae_cut_only_dn: bool = False,
+    mae_cut_require_mf_against: bool = False,
+    dyn_max_hold_minutes: int | None = None,
+    dyn_min_hold_minutes: float | None = None,
+    dyn_trail_start_minutes: float | None = None,
+    dyn_slope_lookback: int | None = None,
+    dyn_fast_opp_bars: int | None = None,
+    dyn_fast_pct: float | None = None,
+    dyn_require_price_break: bool = True,
 ) -> SimResult | None:
     """Option path fill with TP/SL/time, optional stock-window or MTM trail exit.
 
@@ -332,9 +566,19 @@ def simulate_trade(
       - ``hold_extend`` / ``extend_hold``: at base ``hold_minutes``, if option MTM
         >= ``hold_extend_mtm_min`` (default 0) and (optional) mf10 still aligned,
         extend deadline to ``hold_extend_minutes`` (default 45). Rails still apply.
+      - ``mae_cut`` / ``toxic_cut``: after min-hold (default 5m), if peak MFE
+        < ``mae_cut_mfe_bypass`` (default 0.20) and MTM ret <= -``mae_cut_ret``
+        (default 0.25), exit ``MAE_CUT``. Cuts toxic reversals before SL (-60%)
+        without clipping winners that already printed MFE. Optional
+        ``mae_cut_only_dn``. Set ``mae_cut_require_mf_against`` to also require
+        stock mf10 against the trade (avoids locking V-recovery troughs).
+      - ``dyn_trail`` / ``mf_dual``: drop static T+hold; trail with fast/slow MF
+        windows (default 3m/10m already on stock bars). Soft exits:
+        FAST_REVERSAL (min-hold), MOM_EXHAUST (trail-start + fast pctile +
+        slow slope), TREND_DEAD (slow fav MF < 0), hard ``dyn_max_hold_minutes``.
 
     Soft cuts may be **stacked** on extend via ``exit_mode="hold_extend+mtm_floor"``
-    (or ``+mf_flip`` / ``+mf_reversal``), or via ``early_exit_mode``.
+    (or ``+mf_flip`` / ``+mf_reversal`` / ``+mae_cut``), or via ``early_exit_mode``.
 
     ``force_exit_ts``: if set, exit at the first quote at/after this time with
     reason ``DISPLACE`` (after TP/SL checks). Used by later-signal displacement.
@@ -375,11 +619,19 @@ def simulate_trade(
         "DN",
     )
     use_extend = ("hold_extend" in blob or "extend_hold" in blob) and direction in ("UP", "DN")
+    use_mae_cut = "mae_cut" in blob or "toxic_cut" in blob
+    if use_mae_cut and bool(mae_cut_only_dn) and str(direction or "").upper() != "DN":
+        use_mae_cut = False
+    use_dyn = ("dyn_trail" in blob or "mf_dual" in blob) and direction in ("UP", "DN")
     require_mtm = "flow_mtm" in blob or "flow_soft" in blob
     act = float(trail_activate) if trail_activate is not None else 0.20
     dd = float(trail_dd) if trail_dd is not None else 0.15
     floor = float(mtm_floor_ret) if mtm_floor_ret is not None else 0.0
     flow_floor = float(flow_cum_floor) if flow_cum_floor is not None else 0.0
+    mae_thr = float(mae_cut_ret) if mae_cut_ret is not None else 0.25
+    mae_bypass = float(mae_cut_mfe_bypass) if mae_cut_mfe_bypass is not None else 0.20
+    mae_thr = max(0.0, mae_thr)
+    mae_bypass = max(0.0, mae_bypass)
     ext_hold = int(hold_extend_minutes) if hold_extend_minutes is not None else 45
     if ext_hold <= base_hold:
         ext_hold = base_hold
@@ -389,19 +641,49 @@ def simulate_trade(
     extended = False
     peak_ret = -np.inf
     trail_armed = False
-    # mf_reversal / mtm_floor: wait ~10m; flow_*: wait ~5m before soft exit.
+    # dyn_trail replaces static T+hold with a hard max clock.
+    dyn_max_m = int(dyn_max_hold_minutes) if dyn_max_hold_minutes is not None else 60
+    dyn_min_m = float(dyn_min_hold_minutes) if dyn_min_hold_minutes is not None else 5.0
+    dyn_start_m = float(dyn_trail_start_minutes) if dyn_trail_start_minutes is not None else 15.0
+    dyn_lb = max(1, int(dyn_slope_lookback) if dyn_slope_lookback is not None else 3)
+    dyn_opp_n = max(1, int(dyn_fast_opp_bars) if dyn_fast_opp_bars is not None else 2)
+    dyn_pct = float(dyn_fast_pct) if dyn_fast_pct is not None else 20.0
+    if use_dyn:
+        end_ts = entry_ts + pd.Timedelta(minutes=dyn_max_m)
+        reason = f"T+{dyn_max_m}"
+    # mf_reversal / mtm_floor: wait ~10m; flow_* / mae_cut: wait ~5m before soft exit.
     min_hold_m = exit_min_hold_minutes
     if min_hold_m is None and ("mf_reversal" in blob or use_floor):
         min_hold_m = 10.0
     if min_hold_m is None and use_flow:
         min_hold_m = 5.0
+    if use_mae_cut:
+        if mae_cut_min_hold_minutes is not None:
+            min_hold_m = float(mae_cut_min_hold_minutes)
+        elif min_hold_m is None:
+            min_hold_m = 5.0
     grace_secs = int(exit_mf_grace_seconds)
     if min_hold_m is not None:
         grace_secs = max(grace_secs, int(float(min_hold_m) * 60))
     grace_until = entry_ts + pd.Timedelta(seconds=grace_secs)
     day = stock_day
-    if (use_mf or use_flow or use_extend) and day is not None and not day.empty:
+    if (
+        use_mf or use_flow or use_extend or use_dyn or (use_mae_cut and mae_cut_require_mf_against)
+    ) and day is not None and not day.empty:
         day = _prepare_stock_day(day)
+    entry_px_low: float | None = None
+    entry_px_high: float | None = None
+    opp_streak = 0
+    last_dyn_bar = -1
+    if use_dyn and day is not None and not day.empty:
+        ei = _stock_bar_index(day, entry_ts)
+        if ei >= 0:
+            if "_low" in day.columns:
+                v = float(day["_low"].iloc[ei])
+                entry_px_low = v if np.isfinite(v) else None
+            if "_high" in day.columns:
+                v = float(day["_high"].iloc[ei])
+                entry_px_high = v if np.isfinite(v) else None
     for i, p in enumerate(sell_px):
         t = ts_list[i]
         if not np.isfinite(p) or p <= 0:
@@ -438,14 +720,31 @@ def simulate_trade(
             reason, exit_px, exit_ts = f"T+{ext_hold if extended else base_hold}", float(p), t
             break
         cur_ret = float(p) / entry - 1.0
-        if use_trail:
+        if use_trail or use_mae_cut:
             if cur_ret > peak_ret:
                 peak_ret = cur_ret
+        if use_trail:
             if (not trail_armed) and peak_ret >= act:
                 trail_armed = True
             if trail_armed and cur_ret <= peak_ret - dd:
                 reason, exit_px, exit_ts = "TRAIL", float(p), t
                 break
+        if use_mae_cut and t >= grace_until:
+            # Toxic path: never printed meaningful MFE, then dug to -mae_thr.
+            if (not np.isfinite(peak_ret) or float(peak_ret) < mae_bypass) and cur_ret <= -mae_thr:
+                mf_ok = True
+                if mae_cut_require_mf_against and direction in ("UP", "DN"):
+                    visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
+                    mf, _, _ = _stock_mf_at(day, visible_at)
+                    if mf is None:
+                        mf_ok = False
+                    elif direction == "UP":
+                        mf_ok = mf < 0
+                    else:
+                        mf_ok = mf > 0
+                if mf_ok:
+                    reason, exit_px, exit_ts = "MAE_CUT", float(p), t
+                    break
         if use_floor and t >= grace_until and cur_ret <= floor:
             reason, exit_px, exit_ts = "MTM_FLOOR", float(p), t
             break
@@ -475,6 +774,57 @@ def simulate_trade(
                 if direction == "DN" and sd == 0 and mf >= 0:
                     reason, exit_px, exit_ts = "STREAK0", float(p), t
                     break
+        if use_dyn and day is not None and not day.empty:
+            visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
+            bi = _stock_bar_index(day, visible_at)
+            if bi < 0 or bi == last_dyn_bar:
+                continue
+            last_dyn_bar = bi
+            held_m = (t - entry_ts).total_seconds() / 60.0
+            mf_slow = float(day["_mf"].iloc[bi])
+            mf_fast = float(day["_mf_fast"].iloc[bi]) if "_mf_fast" in day.columns else float("nan")
+            fav_slow = _fav_mf(mf_slow, str(direction))
+            fav_fast = _fav_mf(mf_fast, str(direction))
+            slow_slope = None
+            if bi >= dyn_lb:
+                prev = float(day["_mf"].iloc[bi - dyn_lb])
+                if np.isfinite(prev) and np.isfinite(mf_slow):
+                    # Favorable slope: UP uses raw Δmf10; DN flips.
+                    raw_slope = mf_slow - prev
+                    slow_slope = raw_slope if direction == "UP" else -raw_slope
+            if fav_fast is not None and fav_fast < 0:
+                opp_streak += 1
+            else:
+                opp_streak = 0
+            # Early reverse cut (situation C / 防线二)
+            if held_m >= dyn_min_m and opp_streak >= dyn_opp_n and slow_slope is not None and slow_slope < 0:
+                px_break = True
+                if dyn_require_price_break and "_close" in day.columns:
+                    px = float(day["_close"].iloc[bi])
+                    if direction == "UP":
+                        px_break = entry_px_low is not None and np.isfinite(px) and px < entry_px_low
+                    else:
+                        px_break = entry_px_high is not None and np.isfinite(px) and px > entry_px_high
+                if px_break:
+                    reason, exit_px, exit_ts = "FAST_REVERSAL", float(p), t
+                    break
+            # Profit / trend soft exits after trail-start (防线一 + trend dead)
+            if held_m >= dyn_start_m and fav_slow is not None:
+                if fav_slow < 0:
+                    reason, exit_px, exit_ts = "TREND_DEAD", float(p), t
+                    break
+                if fav_fast is not None and slow_slope is not None and slow_slope < 0:
+                    hist = day["_mf_fast"].iloc[: bi + 1].astype(float).to_numpy()
+                    if direction == "DN":
+                        hist = -hist
+                    hist = hist[np.isfinite(hist)]
+                    thr = None
+                    if hist.size >= 5:
+                        thr = float(np.nanpercentile(hist, dyn_pct))
+                    weak = fav_fast <= (thr if thr is not None else 0.0)
+                    if weak:
+                        reason, exit_px, exit_ts = "MOM_EXHAUST", float(p), t
+                        break
     return SimResult(
         entry=entry,
         exit=exit_px,
@@ -541,19 +891,28 @@ def run_offline_replay(
     # Only arm the gate after N consecutive losing days (None/0 = always on).
     _als = sig_cfg.get("mf_idio_after_loss_streak")
     mf_idio_after_loss_streak = int(_als) if _als is not None else None
-    # Prior sessions for beta need bars before ``start``.
+    # Prior sessions for beta / TCN window need bars before ``start``.
     load_start = start
-    if mf_idio_on:
-        load_start = (pd.Timestamp(start) - pd.Timedelta(days=max(14, mf_idio_beta_days * 3))).strftime(
-            "%Y-%m-%d"
-        )
+    tcn_cfg_peek = (profile.get("tcn_gate") or (profile.get("signal") or {}).get("tcn_gate") or {})
+    tcn_enabled_peek = bool(tcn_cfg_peek.get("enabled", False))
+    router_peek = profile.get("regime_router") or {}
+    watchdog_peek = profile.get("watchdog") or {}
+    router_rule_peek = bool(router_peek.get("enabled", False)) and str(
+        router_peek.get("mode") or "oracle"
+    ).strip().lower() in {"rule", "rules", "causal"}
+    watchdog_rule_peek = bool(watchdog_peek.get("enabled", False))
+    if mf_idio_on or tcn_enabled_peek or router_rule_peek or watchdog_rule_peek:
+        lookback_days = max(14, mf_idio_beta_days * 3 if mf_idio_on else 14)
+        load_start = (pd.Timestamp(start) - pd.Timedelta(days=lookback_days)).strftime("%Y-%m-%d")
         months = month_list(load_start, end)
 
     if stock_by is None:
         stock_by = {}
         # Load excluded names too if they remain in peer_symbols (breadth only).
         load_syms = list(dict.fromkeys(list(symbols) + list(sig_cfg.get("peer_symbols") or [])))
-        if mf_idio_on and "QQQ" not in {str(s).upper() for s in load_syms}:
+        if (mf_idio_on or tcn_enabled_peek or router_rule_peek or watchdog_rule_peek) and "QQQ" not in {
+            str(s).upper() for s in load_syms
+        }:
             load_syms.append("QQQ")
         for sym in load_syms:
             raw = load_stock_month_files(paths["stock_root"], sym, months)
@@ -580,6 +939,12 @@ def run_offline_replay(
     all_first = build_all_first_rule_a_signals(trade_stock, sig_cfg)
     top2 = build_topk_signals(trade_stock, sig_cfg)
     displace_on = _trade_flag(trade, "displace_on_later", False)
+    # TopK blocked-backfill: walk all first-Rule-A in time order, but only keep up to
+    # top_k *successful fills* per day. Regime/peer/quote blocks do not consume a slot
+    # (unlike raw earliest-TopK, where a later-blocked #2 permanently wastes the seat).
+    topk_backfill = _trade_flag(trade, "topk_backfill_on_block", False) or _trade_flag(
+        sig_cfg, "topk_backfill_on_block", False
+    )
     commit_tod = _parse_commit_tod(
         trade.get("topk_commit_tod", sig_cfg.get("topk_commit_tod"))
     )
@@ -603,6 +968,9 @@ def run_offline_replay(
     if _trade_flag(trade, "late_signal_universe_all_first", False):
         event_sigs = all_first
         displace_universe = "all_first"
+    if topk_backfill and commit_tod is None:
+        event_sigs = all_first
+        displace_universe = "all_first_backfill"
     contract_mode = str(trade.get("contract_mode", "day_lock")).lower()
     quote_source = str(trade.get("quote_source", "1s")).lower()  # 1s | day_iv | auto
     half_spread = float(trade.get("day_iv_half_spread_frac", 0.01))
@@ -638,6 +1006,32 @@ def run_offline_replay(
 
     if regime_gate is None:
         regime_gate = Mag7RegimeGate.from_profile(profile, months=months)
+    # Watchdog is the architecture layer; legacy regime_router bridges into it.
+    watchdog = RegimeWatchdog.from_profile(profile)
+    router_on, router_labels, router_experts, router_mode, router_rule = _load_regime_router(
+        profile
+    )
+    # If watchdog synthesized from regime_router, prefer watchdog path only.
+    if watchdog is not None:
+        router_on = False
+    router_regime_snap = (
+        _router_snapshot_regime(regime_gate.cfg)
+        if (watchdog is not None or router_on) and regime_gate is not None
+        else {}
+    )
+    router_asof = str(
+        (profile.get("watchdog") or {}).get("asof")
+        or (profile.get("regime_router") or {}).get("asof")
+        or "10:30"
+    )
+    n_router_expert_days = 0
+    router_day_counts: dict[str, int] = {}
+    watchdog_state_counts: dict[str, int] = {}
+    n_watchdog_days = 0
+    n_hunt_signals = 0
+    n_hunt_trades = 0
+    n_hunt_budget_skip = 0
+    n_hunt_mutex_skip = 0
     n_regime_block = 0
     n_regime_scale = 0
     n_peer_block = 0
@@ -646,12 +1040,54 @@ def run_offline_replay(
     n_si_block = 0
     n_pe_block = 0
     n_tod_z_block = 0
+    n_dn_above_open_block = 0
+    n_vwap_lock_block = 0
+    n_dn_vwap_lod_block = 0
+    block_dn_if_above_open = bool(sig_cfg.get("block_dn_if_above_open", False)) or bool(
+        trade.get("block_dn_if_above_open", False)
+    )
+    vwap_dir_lock = bool(sig_cfg.get("vwap_dir_lock", False)) or bool(
+        trade.get("vwap_dir_lock", False)
+    )
+    block_dn_if_vwap_lod = bool(sig_cfg.get("block_dn_if_vwap_lod", False)) or bool(
+        trade.get("block_dn_if_vwap_lod", False)
+    )
+    lod_bounce_min = float(
+        sig_cfg.get("lod_bounce_min", trade.get("lod_bounce_min", 0.02)) or 0.02
+    )
     peer_align_min = sig_cfg.get("peer_align_min")
     peer_align_min_i = int(peer_align_min) if peer_align_min is not None else None
     peer_align_mode = str(sig_cfg.get("peer_align_mode", "mf10")).strip().lower()
     peer_symbols = list(sig_cfg.get("peer_symbols") or profile.get("symbols") or [])
     qqq_frame = stock_by.get("QQQ")
     mf_idio_beta_cache: dict[tuple[str, str], float | None] = {}
+    tcn_gate = load_tcn_gate(profile)
+    tcn_on = bool(getattr(tcn_gate, "cfg", None) and tcn_gate.cfg.enabled)
+    n_tcn_block = 0
+    n_tcn_scale = 0
+    n_tcn_skip_regime = 0
+    lgbm_bouncer = load_lgbm_bouncer(profile)
+    lgbm_on = bool(getattr(lgbm_bouncer, "cfg", None) and lgbm_bouncer.cfg.enabled)
+    n_lgbm_block = 0
+    n_lgbm_scale = 0
+    # Ensure QQQ frame exists for tcn/lgbm/router-rule channels.
+    need_qqq = tcn_on or lgbm_on or (router_on and router_mode == "rule") or (watchdog is not None)
+    if need_qqq and qqq_frame is None and stock_by.get("QQQ") is None:
+        try:
+            raw_q = load_stock_month_files(paths["stock_root"], "QQQ", months)
+            if not raw_q.empty:
+                raw_q = raw_q[(raw_q["date"] >= load_start) & (raw_q["date"] <= end)]
+                stock_by["QQQ"] = attach_mf_features(
+                    raw_q,
+                    mf_window=int(sig_cfg.get("mf_window", 10)),
+                    vol_ma_window=int(sig_cfg.get("vol_ma_window", 20)),
+                    mf_fast_window=resolve_mf_fast_window(sig_cfg),
+                )
+                qqq_frame = stock_by["QQQ"]
+        except Exception:
+            qqq_frame = None
+    elif need_qqq and qqq_frame is None and stock_by.get("QQQ") is not None:
+        qqq_frame = stock_by["QQQ"]
 
     def _mf_idio_armed(loss_streak_n: int) -> bool:
         if not mf_idio_on:
@@ -727,6 +1163,113 @@ def run_offline_replay(
             n_mf_idio_scale += 1
             return float(mf_idio_scale)
         return 1.0
+
+    def _tcn_regime_kwargs(dec_reg: Any | None) -> dict[str, float | None]:
+        if dec_reg is None:
+            return {"regime_vixy_z": None, "regime_qqq_fp": None}
+        vz = getattr(dec_reg, "vixy_z", None)
+        qfp = getattr(dec_reg, "qqq_from_prev", None)
+        return {
+            "regime_vixy_z": float(vz) if vz is not None and np.isfinite(vz) else None,
+            "regime_qqq_fp": float(qfp) if qfp is not None and np.isfinite(qfp) else None,
+        }
+
+    def _tcn_allows_entry(
+        sym: str,
+        direction: str,
+        feature_ts: pd.Timestamp,
+        dec_reg: Any | None = None,
+    ) -> bool:
+        nonlocal n_tcn_block, n_tcn_skip_regime
+        if not tcn_on or tcn_gate.cfg.action != "block":
+            return True
+        dec_t = tcn_gate.decide(
+            symbol=str(sym),
+            direction=str(direction),
+            asof_ts=feature_ts,
+            stock_df=stock_by.get(sym),
+            qqq_df=qqq_frame,
+            **_tcn_regime_kwargs(dec_reg),
+        )
+        if dec_t.reason == "tcn_skip_regime":
+            n_tcn_skip_regime += 1
+            return True
+        if not dec_t.allow:
+            n_tcn_block += 1
+            return False
+        return True
+
+    def _tcn_size_mult(
+        sym: str,
+        direction: str,
+        feature_ts: pd.Timestamp,
+        dec_reg: Any | None = None,
+    ) -> tuple[float, float | None, str]:
+        nonlocal n_tcn_scale, n_tcn_skip_regime
+        if not tcn_on:
+            return 1.0, None, "off"
+        dec_t = tcn_gate.decide(
+            symbol=str(sym),
+            direction=str(direction),
+            asof_ts=feature_ts,
+            stock_df=stock_by.get(sym),
+            qqq_df=qqq_frame,
+            **_tcn_regime_kwargs(dec_reg),
+        )
+        if dec_t.reason == "tcn_skip_regime":
+            n_tcn_skip_regime += 1
+            return 1.0, dec_t.p, dec_t.reason
+        if tcn_gate.cfg.action == "block":
+            return (1.0 if dec_t.allow else 0.0), dec_t.p, dec_t.reason
+        scale = float(dec_t.size_scale)
+        if scale < 1.0 - 1e-12:
+            n_tcn_scale += 1
+        return scale, dec_t.p, dec_t.reason
+
+    def _lgbm_allows_entry(
+        sym: str,
+        direction: str,
+        feature_ts: pd.Timestamp,
+    ) -> bool:
+        nonlocal n_lgbm_block
+        if not lgbm_on or lgbm_bouncer.cfg.action != "block":
+            return True
+        dec_l = lgbm_bouncer.decide(
+            symbol=str(sym),
+            direction=str(direction),
+            asof_ts=feature_ts,
+            stock_df=stock_by.get(sym),
+            qqq_df=qqq_frame,
+        )
+        if not dec_l.allow:
+            n_lgbm_block += 1
+            return False
+        return True
+
+    def _lgbm_size_mult(
+        sym: str,
+        direction: str,
+        feature_ts: pd.Timestamp,
+    ) -> tuple[float, float | None, str]:
+        nonlocal n_lgbm_scale, n_lgbm_block
+        if not lgbm_on:
+            return 1.0, None, "off"
+        dec_l = lgbm_bouncer.decide(
+            symbol=str(sym),
+            direction=str(direction),
+            asof_ts=feature_ts,
+            stock_df=stock_by.get(sym),
+            qqq_df=qqq_frame,
+        )
+        if lgbm_bouncer.cfg.action == "block":
+            if not dec_l.allow:
+                n_lgbm_block += 1
+                return 0.0, dec_l.p, dec_l.reason
+            return 1.0, dec_l.p, dec_l.reason
+        scale = float(dec_l.size_scale)
+        if scale < 1.0 - 1e-12:
+            n_lgbm_scale += 1
+        return scale, dec_l.p, dec_l.reason
 
     si_min = sig_cfg.get("si_min")
     si_min_f = float(si_min) if si_min is not None else None
@@ -845,6 +1388,12 @@ def run_offline_replay(
     n_commit_pool = 0
     n_commit_selected = 0
     n_commit_post_fill = 0
+    n_topk_backfill = 0
+    n_topk_backfill_cap = 0
+    top2_keys = {
+        (str(r.date), str(r.symbol).upper(), str(r.dir).upper())
+        for r in top2.itertuples(index=False)
+    } if topk_backfill and len(top2) else set()
 
     trades: list[dict[str, Any]] = []
     eq = 100.0
@@ -876,9 +1425,71 @@ def run_offline_replay(
         hold_extend_mtm_min=trade.get("hold_extend_mtm_min"),
         hold_extend_require_mf=bool(trade.get("hold_extend_require_mf", True)),
         early_exit_mode=trade.get("early_exit_mode"),
+        mae_cut_ret=trade.get("mae_cut_ret"),
+        mae_cut_mfe_bypass=trade.get("mae_cut_mfe_bypass"),
+        mae_cut_min_hold_minutes=trade.get("mae_cut_min_hold_minutes"),
+        mae_cut_only_dn=bool(trade.get("mae_cut_only_dn", False)),
+        mae_cut_require_mf_against=bool(trade.get("mae_cut_require_mf_against", False)),
+        dyn_max_hold_minutes=trade.get("dyn_max_hold_minutes"),
+        dyn_min_hold_minutes=trade.get("dyn_min_hold_minutes"),
+        dyn_trail_start_minutes=trade.get("dyn_trail_start_minutes"),
+        dyn_slope_lookback=trade.get("dyn_slope_lookback"),
+        dyn_fast_opp_bars=trade.get("dyn_fast_opp_bars"),
+        dyn_fast_pct=trade.get("dyn_fast_pct"),
+        dyn_require_price_break=bool(trade.get("dyn_require_price_break", True)),
     )
 
     for date, day_sigs in event_sigs.groupby("date", sort=True):
+        # Watchdog / legacy router: restore baseline then apply day's overlay.
+        day_route = "baseline"
+        day_watchdog_state = WatchdogState.NORMAL.value
+        day_watchdog_reason = "off"
+        if watchdog is not None and regime_gate is not None:
+            wd_dec = watchdog.begin_day(
+                str(date),
+                stock_by=stock_by,
+                qqq_df=qqq_frame if qqq_frame is not None else stock_by.get("QQQ"),
+                symbols=symbols,
+            )
+            watchdog.apply_to_regime(regime_gate.cfg, router_regime_snap)
+            day_watchdog_state = wd_dec.state.value
+            day_watchdog_reason = wd_dec.reason
+            day_route = wd_dec.overlay.route_tag or "baseline"
+            if wd_dec.state != WatchdogState.NORMAL:
+                n_watchdog_days += 1
+                n_router_expert_days += 1
+                watchdog_state_counts[day_watchdog_state] = int(
+                    watchdog_state_counts.get(day_watchdog_state, 0)
+                ) + 1
+                if wd_dec.expert:
+                    router_day_counts[str(wd_dec.expert)] = int(
+                        router_day_counts.get(str(wd_dec.expert), 0)
+                    ) + 1
+        elif router_on and regime_gate is not None:
+            _router_restore_regime(regime_gate.cfg, router_regime_snap)
+            if router_mode == "rule":
+                hit = _eval_router_rule(
+                    router_rule,
+                    date=str(date),
+                    stock_by=stock_by,
+                    qqq_df=qqq_frame if qqq_frame is not None else stock_by.get("QQQ"),
+                    symbols=symbols,
+                    asof_hhmm=router_asof,
+                    router_cfg=profile.get("regime_router")
+                    if isinstance(profile.get("regime_router"), dict)
+                    else {},
+                )
+                day_route = str(hit or "baseline")
+            else:
+                day_route = str(router_labels.get(str(date), "baseline"))
+            if day_route not in {"", "baseline", "ok", "other_loss", "wide_chop"} and day_route in router_experts:
+                _router_apply_expert(regime_gate.cfg, router_experts.get(day_route))
+                n_router_expert_days += 1
+                router_day_counts[day_route] = int(router_day_counts.get(day_route, 0)) + 1
+                day_watchdog_state = WatchdogState.DEGRADE.value
+                day_watchdog_reason = f"legacy_router:{day_route}"
+            else:
+                day_route = "baseline"
         syms = list(day_sigs.sort_values("sig_ts")["symbol"].unique())
         # Keep concurrent cap tied to configured top_k even when universe expands.
         n_sym = max(int(sig_cfg.get("top_k", 2)), 1)
@@ -929,13 +1540,42 @@ def run_offline_replay(
         if skip_day:
             events = []
 
+        # Normalize baseline events to 6-tuple: + source
+        events = [
+            (e[0], e[1], e[2], e[3], e[4], "baseline") if len(e) == 5 else e for e in events
+        ]
+
+        # Watchdog Hunter: inject short-window armed candidates (before Rule-A chronologically).
+        day_hunt_symbols: set[str] = set()
+        day_hunt_dirs: set[tuple[str, str]] = set()
+        day_hunt_n = 0
+        if watchdog is not None and watchdog.hunt_armed and not skip_day:
+            for hc in watchdog.hunt_candidates:
+                n_hunt_signals += 1
+                entry_ts = to_ny(hc.sig_ts) + bar_delay
+                # Drop if entry would fall outside arm TTL (after delay).
+                if entry_ts > to_ny(hc.armed_until):
+                    continue
+                events.append(
+                    (entry_ts, to_ny(hc.sig_ts), hc.symbol, hc.direction, None, "hunt")
+                )
+                if hc.symbol not in syms:
+                    syms.append(hc.symbol)
+            events.sort(key=lambda x: (x[0], str(x[5]), str(x[2])))
+
         # Deferred TopK commit: collect pre-commit fires → rank → enter at commit clock.
         if commit_tod is not None and events and not use_reentry:
             commit_ts = pd.Timestamp(f"{date} {commit_tod}", tz=NY)
             commit_entry = commit_ts + bar_delay
             pre: list[dict[str, Any]] = []
             post: list[tuple] = []
-            for ts, feature_ts, sym, direction, sig_from_prev in events:
+            for ev in events:
+                ts, feature_ts, sym, direction, sig_from_prev = ev[0], ev[1], ev[2], ev[3], ev[4]
+                src0 = ev[5] if len(ev) > 5 else "baseline"
+                if src0 == "hunt":
+                    # Hunt entries are immediate (not deferred TopK auction).
+                    post.append((ts, feature_ts, sym, direction, sig_from_prev, "hunt"))
+                    continue
                 if block_same_dir and (str(sym).upper(), str(direction).upper()) in prev_big_win_dirs:
                     n_same_dir_win_block += 1
                     continue
@@ -944,6 +1584,25 @@ def run_offline_replay(
                     if not dec0.allow:
                         n_regime_block += 1
                         continue
+                reason0 = _structure_gate_blocks(
+                    stock_by.get(sym),
+                    date=str(date),
+                    asof_ts=feature_ts,
+                    direction=str(direction),
+                    block_dn_if_above_open=block_dn_if_above_open,
+                    vwap_dir_lock=vwap_dir_lock,
+                    block_dn_if_vwap_lod=block_dn_if_vwap_lod,
+                    lod_bounce_min=lod_bounce_min,
+                )
+                if reason0 == "dn_above_open":
+                    n_dn_above_open_block += 1
+                    continue
+                if reason0 in {"vwap_lock_up", "vwap_lock_dn"}:
+                    n_vwap_lock_block += 1
+                    continue
+                if reason0 == "dn_vwap_lod_bounce":
+                    n_dn_vwap_lod_block += 1
+                    continue
                 peer_n0 = None
                 if peer_align_min_i is not None and peer_align_min_i > 0:
                     peer_n0 = count_peer_align(
@@ -962,6 +1621,10 @@ def run_offline_replay(
                     sym, direction, feature_ts, str(date), loss_streak_n=loss_streak
                 ):
                     continue
+                if not _tcn_allows_entry(sym, direction, feature_ts, dec0 if regime_gate is not None else None):
+                    continue
+                if not _lgbm_allows_entry(sym, direction, feature_ts):
+                    continue
                 score = _topk_rank_score(
                     commit_rank, from_prev=sig_from_prev, peer_n=peer_n0
                 )
@@ -973,11 +1636,12 @@ def run_offline_replay(
                     "sig_from_prev": sig_from_prev,
                     "peer_n": peer_n0,
                     "score": score,
+                    "source": "baseline",
                 }
                 if feature_ts <= commit_ts:
                     pre.append(item)
                 else:
-                    post.append((ts, feature_ts, sym, direction, sig_from_prev))
+                    post.append((ts, feature_ts, sym, direction, sig_from_prev, "baseline"))
             pre.sort(
                 key=lambda c: (-float(c["score"]), to_ny(c["feature_ts"]), str(c["sym"]))
             )
@@ -995,6 +1659,7 @@ def run_offline_replay(
                         c["sym"],
                         c["direction"],
                         c["sig_from_prev"],
+                        "baseline",
                     )
                 )
             if post_commit_fill:
@@ -1011,13 +1676,45 @@ def run_offline_replay(
         n_done = {s: 0 for s in syms}
         open_until = {s: None for s in syms}
         day_big_win_dirs: set[tuple[str, str]] = set()
+        # Slots = filtered TopK seats (regime/peer cleared). Blocks do not consume;
+        # quote/sim failure still consumes so we do not cascade into late noise.
+        day_slots = 0
+        day_slot_cap = int(n_sym) if topk_backfill and not use_reentry else None
 
-        for ts, feature_ts, sym, direction, sig_from_prev in events:
+        for ev in events:
+            ts, feature_ts, sym, direction, sig_from_prev = ev[0], ev[1], ev[2], ev[3], ev[4]
+            event_source = ev[5] if len(ev) > 5 else "baseline"
+            is_hunt = event_source == "hunt"
             if halt:
                 break
+            if day_slot_cap is not None and day_slots >= day_slot_cap and not is_hunt:
+                n_topk_backfill_cap += 1
+                continue
+            if is_hunt and watchdog is not None and watchdog.hunt_budget_remaining() <= 0:
+                n_hunt_budget_skip += 1
+                continue
+            # Mutex vs prior hunt: default same-symbol; research may use symbol_dir.
+            if (
+                (not is_hunt)
+                and watchdog is not None
+                and watchdog.cfg.hunter_mutex_with_baseline
+            ):
+                scope = str(getattr(watchdog.cfg, "hunter_mutex_scope", "symbol") or "symbol").lower()
+                if scope in {"symbol_dir", "dir", "same_dir"}:
+                    mutex_hit = (str(sym), str(direction).upper()) in day_hunt_dirs
+                else:
+                    mutex_hit = str(sym) in day_hunt_symbols
+                if mutex_hit:
+                    n_hunt_mutex_skip += 1
+                    continue
             if block_same_dir and (str(sym).upper(), str(direction).upper()) in prev_big_win_dirs:
                 n_same_dir_win_block += 1
                 continue
+            if sym not in n_done:
+                n_done[sym] = 0
+                last_exit[sym] = None
+                last_win[sym] = True
+                open_until[sym] = None
             if use_reentry:
                 if n_done[sym] >= max_n:
                     continue
@@ -1029,9 +1726,20 @@ def run_offline_replay(
                     continue
             else:
                 if n_done[sym] >= 1:
-                    continue
+                    allow_opp = (
+                        (not is_hunt)
+                        and watchdog is not None
+                        and bool(getattr(watchdog.cfg, "hunter_allow_baseline_opposite", False))
+                        and str(sym) in day_hunt_symbols
+                        and (str(sym), str(direction).upper()) not in day_hunt_dirs
+                        and any(s == str(sym) and d != str(direction).upper() for s, d in day_hunt_dirs)
+                    )
+                    if not allow_opp:
+                        continue
 
-            if regime_gate is not None:
+            if regime_gate is not None and not (
+                is_hunt and watchdog is not None and watchdog.cfg.hunter_skip_qqq_align
+            ):
                 dec = regime_gate.check(direction, feature_ts)
                 if not dec.allow:
                     n_regime_block += 1
@@ -1039,11 +1747,34 @@ def run_offline_replay(
             else:
                 dec = None
 
+            reason_s = _structure_gate_blocks(
+                stock_by.get(sym),
+                date=str(date),
+                asof_ts=feature_ts,
+                direction=str(direction),
+                block_dn_if_above_open=block_dn_if_above_open,
+                vwap_dir_lock=vwap_dir_lock,
+                block_dn_if_vwap_lod=block_dn_if_vwap_lod,
+                lod_bounce_min=lod_bounce_min,
+            )
+            if reason_s == "dn_above_open":
+                n_dn_above_open_block += 1
+                continue
+            if reason_s in {"vwap_lock_up", "vwap_lock_dn"}:
+                n_vwap_lock_block += 1
+                continue
+            if reason_s == "dn_vwap_lod_bounce":
+                n_dn_vwap_lod_block += 1
+                continue
+
             peer_n = None
             si_val = None
             pe_val = None
             pe_ma_val = None
-            if peer_align_min_i is not None and peer_align_min_i > 0:
+            skip_peer = bool(
+                is_hunt and watchdog is not None and watchdog.cfg.hunter_skip_peer
+            )
+            if (not skip_peer) and peer_align_min_i is not None and peer_align_min_i > 0:
                 peer_n = count_peer_align(
                     stock_by,
                     date=str(date),
@@ -1057,9 +1788,13 @@ def run_offline_replay(
                     n_peer_block += 1
                     continue
 
-            if not _mf_idio_allows_entry(
+            if not is_hunt and not _mf_idio_allows_entry(
                 sym, direction, feature_ts, str(date), loss_streak_n=loss_streak
             ):
+                continue
+            if not is_hunt and not _tcn_allows_entry(sym, direction, feature_ts, dec):
+                continue
+            if not is_hunt and not _lgbm_allows_entry(sym, direction, feature_ts):
                 continue
 
             if si_min_f is not None:
@@ -1123,6 +1858,10 @@ def run_offline_replay(
                     continue
                 # Shift fill clock to confirm bar + availability delay.
                 ts = to_ny(confirm_ft) + bar_delay
+
+            # Reserve filtered-TopK seat after gates; quote/sim miss still consumes.
+            if day_slot_cap is not None:
+                day_slots += 1
 
             buckets = lock_idx.get((sym, date)) if lock_idx is not None else None
             day_ticker = None
@@ -1233,13 +1972,23 @@ def run_offline_replay(
             if sdf is not None and not sdf.empty:
                 stock_day = sdf[sdf["date"] == date]
             exit_mode = str(trade.get("exit_mode") or trade.get("stock_exit") or "none")
+            sim_kw = dict(sim_kwargs_common)
+            hunt_pos_frac = None
+            if is_hunt and watchdog is not None:
+                from maga7.common.watchdog import hunt_trade_overrides
+
+                hov = hunt_trade_overrides(watchdog.cfg)
+                hunt_pos_frac = hov.pop("position_frac", None)
+                if "exit_mode" in hov:
+                    exit_mode = str(hov.pop("exit_mode"))
+                sim_kw.update(hov)
             sim = simulate_trade(
                 path,
                 ts,
                 direction=direction,
                 stock_day=stock_day,
                 exit_mode=exit_mode,
-                **sim_kwargs_common,
+                **sim_kw,
             )
             if sim is None:
                 continue
@@ -1250,6 +1999,9 @@ def run_offline_replay(
                 symbol=sym,
                 entry_ts=sim.entry_ts,
             )
+            if hunt_pos_frac is not None and float(hunt_pos_frac) > 0:
+                size_frac = float(hunt_pos_frac)
+                size_reason = f"{size_reason}+hunt_frac:{float(hunt_pos_frac):.2f}"
             if not allow and displace_on:
                 # Kick oldest still-open position if later signal clears score gate.
                 open_syms = [
@@ -1351,6 +2103,19 @@ def run_offline_replay(
             if idio_mult < 1.0 - 1e-12:
                 size_frac = float(size_frac) * float(idio_mult)
                 size_reason = f"{size_reason}+mf_idio_scale:{idio_mult:.2f}"
+            tcn_mult, tcn_p, tcn_reason = _tcn_size_mult(sym, direction, feature_ts, dec)
+            if tcn_mult <= 0.0:
+                n_tcn_block += 1
+                continue
+            if tcn_mult < 1.0 - 1e-12:
+                size_frac = float(size_frac) * float(tcn_mult)
+                size_reason = f"{size_reason}+tcn_scale:{tcn_mult:.2f}"
+            lgbm_mult, lgbm_p, lgbm_reason = _lgbm_size_mult(sym, direction, feature_ts)
+            if lgbm_mult <= 0.0:
+                continue
+            if lgbm_mult < 1.0 - 1e-12:
+                size_frac = float(size_frac) * float(lgbm_mult)
+                size_reason = f"{size_reason}+lgbm_scale:{lgbm_mult:.2f}"
             sym_scale = float(symbol_size_scale.get(str(sym).upper(), 1.0))
             if sym_scale <= 0.0:
                 continue
@@ -1449,7 +2214,28 @@ def run_offline_replay(
                 "n_concurrent": n_conc,
                 "position_sizing": sizing_mode,
                 "size_reason": size_reason,
+                "tcn_p": tcn_p,
+                "tcn_reason": tcn_reason,
+                "route": day_route,
+                "watchdog_state": day_watchdog_state,
+                "watchdog_reason": day_watchdog_reason,
+                "event_source": event_source,
             }
+            if is_hunt:
+                row["route"] = "hunt"
+                row["watchdog_state"] = WatchdogState.HUNT.value
+                hunt_det = (
+                    str(watchdog.cfg.hunter_detector)
+                    if watchdog is not None
+                    else "hunt"
+                )
+                row["watchdog_reason"] = f"hunt:{hunt_det}"
+                if watchdog is not None:
+                    watchdog.note_hunt_entry()
+                day_hunt_symbols.add(str(sym))
+                day_hunt_dirs.add((str(sym), str(direction).upper()))
+                day_hunt_n += 1
+                n_hunt_trades += 1
             if dec is not None:
                 row["regime_qqq_fp"] = dec.qqq_from_prev
                 row["regime_vix_rev"] = dec.vix_reversal
@@ -1478,6 +2264,12 @@ def run_offline_replay(
                 if purity_parts is not None:
                     for pk, pv in purity_parts.items():
                         row[f"purity_{pk}"] = float(pv)
+            if topk_backfill:
+                key = (str(date), str(sym).upper(), str(direction).upper())
+                is_backfill = key not in top2_keys
+                row["topk_backfill"] = bool(is_backfill)
+                if is_backfill:
+                    n_topk_backfill += 1
             trades.append(row)
             if block_same_dir and is_symbol_dir_big_win(
                 ret=float(sim.ret), reason=sim.reason, trade=trade
@@ -1496,6 +2288,11 @@ def run_offline_replay(
                 "day_ret": day_ret,
                 "n": sum(n_done.values()),
                 "day_halt": bool(skip_day or halt),
+                "route": day_route if (watchdog is not None or router_on) else None,
+                "watchdog_state": day_watchdog_state if watchdog is not None or router_on else None,
+                "watchdog_reason": day_watchdog_reason if watchdog is not None or router_on else None,
+                "hunt_armed": bool(watchdog.hunt_armed) if watchdog is not None else False,
+                "n_hunt": int(day_hunt_n),
             }
         )
         if day_ret < 0:
@@ -1530,8 +2327,22 @@ def run_offline_replay(
         "start_equity": 100.0,
         "end_equity": float(eq),
         "n_signals_topk": int(len(top2)),
+        "topk_backfill_on_block": bool(topk_backfill),
+        "n_topk_backfill": int(n_topk_backfill),
+        "n_topk_backfill_cap_skip": int(n_topk_backfill_cap),
+        "displace_universe": displace_universe,
         "n_regime_block": int(n_regime_block),
         "n_regime_scale": int(n_regime_scale),
+        "n_dn_above_open_block": int(n_dn_above_open_block),
+        "n_vwap_lock_block": int(n_vwap_lock_block),
+        "n_dn_vwap_lod_block": int(n_dn_vwap_lod_block),
+        "block_dn_if_above_open": bool(block_dn_if_above_open),
+        "vwap_dir_lock": bool(vwap_dir_lock),
+        "block_dn_if_vwap_lod": bool(block_dn_if_vwap_lod),
+        "lod_bounce_min": float(lod_bounce_min) if block_dn_if_vwap_lod else None,
+        "block_dn_if_qqq_above_open": bool(
+            (profile.get("regime") or {}).get("block_dn_if_qqq_above_open", False)
+        ),
         "n_event_block": int(n_event_block),
         "event_blackout_dates": sorted(event_blackout),
         "n_peer_block": int(n_peer_block),
@@ -1541,6 +2352,31 @@ def run_offline_replay(
         "mf_idio_action": mf_idio_action if mf_idio_on else None,
         "mf_idio_scale": mf_idio_scale if mf_idio_on and mf_idio_action == "scale" else None,
         "mf_idio_after_loss_streak": mf_idio_after_loss_streak if mf_idio_on else None,
+        "tcn_gate_enabled": bool(tcn_on),
+        "tcn_gate_action": tcn_gate.cfg.action if tcn_on else None,
+        "tcn_gate_p_min": tcn_gate.cfg.p_min if tcn_on else None,
+        "n_tcn_block": int(n_tcn_block),
+        "n_tcn_scale": int(n_tcn_scale),
+        "n_tcn_skip_regime": int(n_tcn_skip_regime),
+        "lgbm_bouncer_enabled": bool(lgbm_on),
+        "lgbm_bouncer_action": lgbm_bouncer.cfg.action if lgbm_on else None,
+        "lgbm_bouncer_p_min": lgbm_bouncer.cfg.p_min if lgbm_on else None,
+        "n_lgbm_block": int(n_lgbm_block),
+        "n_lgbm_scale": int(n_lgbm_scale),
+        "regime_router_enabled": bool(router_on),
+        "regime_router_mode": router_mode if router_on else None,
+        "regime_router_rule": router_rule if router_on and router_mode == "rule" else None,
+        "n_router_expert_days": int(n_router_expert_days),
+        "router_day_counts": dict(router_day_counts),
+        "watchdog_enabled": bool(watchdog is not None),
+        "watchdog_mode": watchdog.cfg.mode if watchdog is not None else None,
+        "n_watchdog_days": int(n_watchdog_days),
+        "watchdog_state_counts": dict(watchdog_state_counts),
+        "hunter_enabled": bool(watchdog.cfg.hunter_enabled) if watchdog is not None else False,
+        "n_hunt_signals": int(n_hunt_signals),
+        "n_hunt_trades": int(n_hunt_trades),
+        "n_hunt_budget_skip": int(n_hunt_budget_skip),
+        "n_hunt_mutex_skip": int(n_hunt_mutex_skip),
         "mf_idio_min_frac": mf_idio_min_frac if mf_idio_on and mf_idio_mode in {"frac", "min_frac", "fraction"} else None,
         "mf_idio_beta_days": mf_idio_beta_days if mf_idio_on else None,
         "mf_idio_beta_on": mf_idio_beta_on if mf_idio_on else None,
@@ -1600,5 +2436,16 @@ def run_offline_replay(
         "n_commit_selected": int(n_commit_selected),
         "n_commit_post_fill_events": int(n_commit_post_fill),
         "exit_mode": str(trade.get("exit_mode") or trade.get("stock_exit") or "none"),
+        "early_exit_mode": trade.get("early_exit_mode"),
+        "mae_cut_ret": trade.get("mae_cut_ret")
+        if str(trade.get("early_exit_mode") or "").lower() in {"mae_cut", "toxic_cut"}
+        or "mae_cut" in str(trade.get("exit_mode") or "").lower()
+        else None,
+        "mae_cut_only_dn": bool(trade.get("mae_cut_only_dn", False))
+        if trade.get("early_exit_mode") or "mae_cut" in str(trade.get("exit_mode") or "").lower()
+        else None,
+        "n_mae_cut": int((trades_df["reason"] == "MAE_CUT").sum())
+        if len(trades_df) and "reason" in trades_df.columns
+        else 0,
     }
     return {"summary": summary, "trades": trades_df, "daily": daily_df, "topk": top2}

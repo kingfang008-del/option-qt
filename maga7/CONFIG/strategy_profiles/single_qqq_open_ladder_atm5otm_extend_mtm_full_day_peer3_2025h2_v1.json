@@ -1,0 +1,141 @@
+{
+  "profile": "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_2025h2_v1",
+  "profile_id": "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_2025h2_v1",
+  "description": "full_day research baseline on 2025 H2 (Jul\u2013Dec) OOS window; dedicated open_locked_map.",
+  "role": "research_candidate",
+  "result_tag": "research_extend_mtm_full_day_peer3_2025h2",
+  "based_on": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1.json",
+  "recommended_scheme": "single",
+  "baseline_doc": "docs/event_calendar_full_day.md",
+  "frozen_at": null,
+  "symbols": [
+    "NVDA",
+    "TSLA",
+    "AAPL",
+    "AMZN",
+    "META",
+    "MSFT",
+    "AMD",
+    "GOOGL"
+  ],
+  "signal": {
+    "window_start": "10:30",
+    "window_end": "14:00",
+    "mf_window": 10,
+    "streak_min": 8,
+    "from_prev_abs": 0.02,
+    "vol_z_min": 1.0,
+    "vol_ma_window": 20,
+    "top_k": 2,
+    "rank_by": "earliest",
+    "peer_align_min": 3,
+    "peer_align_mode": "mf10",
+    "peer_symbols": [
+      "NVDA",
+      "TSLA",
+      "AAPL",
+      "AMZN",
+      "META",
+      "MSFT",
+      "AMD"
+    ]
+  },
+  "trade": {
+    "tp_mult": 1.6,
+    "sl_mult": 0.4,
+    "hold_minutes": 30,
+    "position_frac": 0.2,
+    "position_sizing": "concurrent",
+    "max_concurrent_positions": 2,
+    "cooldown_minutes": 5,
+    "max_entries_per_symbol": 1,
+    "day_circuit": null,
+    "reentry_mode": "cooldown_only",
+    "only_reenter_after_win": false,
+    "exit_mode": "hold_extend",
+    "exit_mf_grace_seconds": 60,
+    "bar_availability_delay_seconds": 60,
+    "moneyness": "ATM",
+    "contract_mode": "open_ladder",
+    "ladder_otm_rungs": 5,
+    "quote_source": "1s",
+    "day_iv_half_spread_frac": 0.01,
+    "clear_otm_ban_0dte_pct": 0.01,
+    "risk": {
+      "max_stock_staleness_sec": 2.0,
+      "max_option_staleness_sec": 5.0,
+      "max_spread_pct": 0.25,
+      "max_entry_mid_jump_pct": 0.15,
+      "max_exit_mid_jump_pct": 0.2,
+      "max_gap_hold_ticks": 3,
+      "max_fill_spread_frac": 0.95,
+      "max_exit_chase": 3,
+      "day_circuit_force_flatten": true,
+      "halt_entries_on_gap": true,
+      "requote": {
+        "enabled": true,
+        "entry_timeout_sec": 3.0,
+        "exit_timeout_sec": 2.0,
+        "max_entry_requotes": 3,
+        "max_exit_requotes": 3,
+        "entry_frac_step": 0.05,
+        "entry_max_slippage_pct": 0.08,
+        "entry_step_cap_pct": 0.03,
+        "exit_step": 0.01,
+        "cancel_settle_sec": 0.5
+      }
+    },
+    "hold_extend_minutes": 45,
+    "hold_extend_mtm_min": 0.0,
+    "hold_extend_require_mf": false
+  },
+  "regime": {
+    "enabled": true,
+    "qqq_align": true,
+    "qqq_from_prev_eps": 0.0,
+    "vix_reversal_max": null,
+    "put_vixy_z_min": null,
+    "qqq_mf10_align": false,
+    "day_loss_streak_halt": null,
+    "block_on_missing": false,
+    "event_calendar_block": true,
+    "event_calendar": "default",
+    "event_blackout_sessions": 0,
+    "event_calendar_path": "maga7/CONFIG/event_calendar_live.json"
+  },
+  "fill": {
+    "model": "spread_frac",
+    "entry_frac": 0.8,
+    "exit_frac": 0.8
+  },
+  "buckets": {
+    "UP_ATM": 2,
+    "UP_OTM": 3,
+    "DN_ATM": 0,
+    "DN_OTM": 1
+  },
+  "paths": {
+    "stock_root": "~/train_data/spnq_train",
+    "option_1m_root": "/mnt/s990/new_option_data_s3",
+    "day_iv_root": "~/train_data/nq_options_day_iv",
+    "locked_map": "~/train_data/locked_targets_map_maga7_mf10_jan_jul.parquet",
+    "open_locked_map": "~/train_data/locked_targets_map_maga7_googl_open_ladder_atm5otm_2025h2.parquet",
+    "quote_1s_root": "/mnt/s990/data/raw_1s/maga7_mf10_open_ladder_otm5",
+    "stock_1s_root": "/mnt/s990/data/raw_1s/stocks",
+    "results_dir": "maga7/results"
+  },
+  "date_range": {
+    "start": "2025-07-01",
+    "end": "2025-12-31"
+  },
+  "lock": {
+    "dte_mode": "trading",
+    "prefer_dte": 0,
+    "allowed_dte": [
+      0,
+      1,
+      2
+    ],
+    "otm_rungs": 5
+  }
+}

@@ -207,6 +207,9 @@ qqq_btc/results/
 stock_options/results/
 maga7/results/
 
+# 回测/扫描 CSV 产物与临时表（不入库）
+*.csv
+
 # production 本地数据 dump
 production/*.parquet
 

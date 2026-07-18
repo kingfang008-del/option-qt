@@ -1,0 +1,45 @@
+{
+  "rebound_trap_dn": {
+    "description": "QQQ rebound trap: scale DN when QQQ>open (soft)",
+    "regime": {
+      "scale_dn_if_qqq_above_open": 0.5,
+      "block_dn_if_qqq_above_open": false
+    }
+  },
+  "dn_toxic": {
+    "description": "DN-dominated toxic days: always half DN size",
+    "regime": {
+      "direction_size_scale": {"DN": 0.5}
+    }
+  },
+  "up_toxic": {
+    "description": "UP-dominated toxic days: always half UP size",
+    "regime": {
+      "direction_size_scale": {"UP": 0.5}
+    }
+  },
+  "washout_gate_dn": {
+    "description": "Open washout breadth: soft half DN (do not open full size into chop)",
+    "regime": {
+      "direction_size_scale": {"DN": 0.5}
+    }
+  },
+  "washout_gate_both": {
+    "description": "Open washout breadth: half both directions",
+    "regime": {
+      "direction_size_scale": {"DN": 0.5, "UP": 0.5}
+    }
+  },
+  "washout_gate_halt": {
+    "description": "Open washout breadth: hard skip all Rule-A entries that day",
+    "regime": {
+      "block_directions": ["UP", "DN"]
+    }
+  },
+  "washout_gate_block_dn": {
+    "description": "Open washout breadth: hard block DN only",
+    "regime": {
+      "block_directions": ["DN"]
+    }
+  }
+}

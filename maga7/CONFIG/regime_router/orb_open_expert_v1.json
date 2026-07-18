@@ -1,0 +1,27 @@
+{
+  "enabled": false,
+  "description": "Opening washout + fractal-high ORB UP expert (09:30–10:00). Research only; not wired into freeze. Docs: docs/orb_open_expert_research.md",
+  "signal_window": {
+    "start": "09:30",
+    "end": "10:00"
+  },
+  "orb": {
+    "wash_drop_min": 0.003,
+    "wash_window_end": "10:00",
+    "selloff_min_bars": 3,
+    "confirm_close_above": true,
+    "hold_confirm_bars": 0,
+    "signal_deadline": "10:00",
+    "only_up": true
+  },
+  "trade_overlay": {
+    "note": "Reuse freeze open_ladder + extend_mtm when scanning; do not change Rule-A window.",
+    "max_entries_per_day": 2,
+    "direction": "UP"
+  },
+  "ofi_tick": {
+    "enabled": false,
+    "status": "deferred",
+    "reason": "No stable aggressor tape / L2 OFI feed in current stack."
+  }
+}

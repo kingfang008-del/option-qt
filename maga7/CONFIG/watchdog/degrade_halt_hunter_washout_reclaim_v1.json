@@ -1,0 +1,44 @@
+{
+  "enabled": true,
+  "mode": "rule",
+  "asof": "10:30",
+  "experts_path": "maga7/CONFIG/regime_router/experts_v1.json",
+  "description": "Watchdog Degrade/Halt + Hunter washout→reclaim-open (research). Per-symbol deep wash then close>open. Default off on freeze.",
+  "degrade": {
+    "enabled": true,
+    "rule": "reclaim_disp55",
+    "expert": "rebound_trap_dn",
+    "ttl_minutes": null
+  },
+  "halt": {
+    "enabled": true,
+    "rule": "washout_and_reclaim",
+    "expert": "washout_gate_halt",
+    "wash_drop_min": 0.008,
+    "washout_breadth_min": 5,
+    "wash_window_end": "10:00",
+    "ttl_minutes": null
+  },
+  "hunter": {
+    "enabled": true,
+    "detector": "washout_reclaim",
+    "wash_drop_min": 0.015,
+    "wash_window_end": "10:00",
+    "signal_deadline": "10:15",
+    "reclaim_level": "open",
+    "hold_confirm_bars": 0,
+    "ttl_minutes": 20,
+    "max_entries_per_day": 1,
+    "top_k": 1,
+    "mutex_with_baseline": true,
+    "mutex_scope": "symbol_dir",
+    "allow_baseline_opposite": true,
+    "reclaim_buffer_pct": 0.0,
+    "block_when_degrade": true,
+    "block_when_halt": true,
+    "require_breadth_min": 0,
+    "skip_peer": true,
+    "skip_qqq_align": true,
+    "only_up": true
+  }
+}

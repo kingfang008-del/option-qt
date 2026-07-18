@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "mode": "rule",
+  "rule": "washout_and_reclaim",
+  "asof": "10:30",
+  "wash_window_end": "10:00",
+  "wash_drop_min": 0.008,
+  "washout_breadth_min": 5,
+  "washout_expert": "washout_gate_halt",
+  "experts_path": "maga7/CONFIG/regime_router/experts_v1.json",
+  "description": "Narrow gate: >=5 names washout >=0.8% by 10:00 AND QQQ low-open reclaim (bounce>=0.8%, Mag7 frac_above<=0.55) → hard skip Rule-A that day. Research candidate; do not enable on freeze until ops sign-off. Scoreboard: May–Jul ~108% baseline (07-17 flat), Feb–Apr ~100%."
+}

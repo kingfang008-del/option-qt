@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "mode": "rule",
+  "rule": "reclaim_disp55",
+  "asof": "10:30",
+  "experts_path": "maga7/CONFIG/regime_router/experts_v1.json",
+  "description": "Causal: QQQ low-open reclaim + bounce>=0.8% + Mag7 frac_above_open<=0.55 → rebound_trap_dn expert (DN scale 0.5 when QQQ>open). Default research switch; do not enable on freeze until dual-window recheck."
+}

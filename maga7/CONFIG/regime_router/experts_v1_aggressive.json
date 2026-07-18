@@ -1,0 +1,20 @@
+{
+  "rebound_trap_dn": {
+    "description": "Rebound trap: hard-block DN when QQQ>open",
+    "regime": {
+      "block_dn_if_qqq_above_open": true
+    }
+  },
+  "dn_toxic": {
+    "description": "DN toxic: block all DN entries that day",
+    "regime": {
+      "block_directions": ["DN"]
+    }
+  },
+  "up_toxic": {
+    "description": "UP toxic: block all UP entries that day",
+    "regime": {
+      "block_directions": ["UP"]
+    }
+  }
+}

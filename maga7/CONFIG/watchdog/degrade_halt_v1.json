@@ -1,0 +1,38 @@
+{
+  "enabled": true,
+  "mode": "rule",
+  "asof": "10:30",
+  "experts_path": "maga7/CONFIG/regime_router/experts_v1.json",
+  "description": "Architecture v1: Degrade (reclaim_disp55) + Halt (washout_and_reclaim). Hunter slot empty. Research only — do not enable on freeze until ops sign-off.",
+  "degrade": {
+    "enabled": true,
+    "rule": "reclaim_disp55",
+    "expert": "rebound_trap_dn",
+    "ttl_minutes": null
+  },
+  "halt": {
+    "enabled": true,
+    "rule": "washout_and_reclaim",
+    "expert": "washout_gate_halt",
+    "wash_drop_min": 0.008,
+    "washout_breadth_min": 5,
+    "wash_window_end": "10:00",
+    "ttl_minutes": null
+  },
+  "hunter": {
+    "enabled": false,
+    "detector": "orb_fractal",
+    "ttl_minutes": 15,
+    "max_entries_per_day": 1,
+    "top_k": 1,
+    "mutex_with_baseline": true,
+    "block_when_degrade": true,
+    "wash_drop_min": 0.005,
+    "wash_window_end": "10:00",
+    "signal_deadline": "10:00",
+    "require_breadth_min": 0,
+    "skip_peer": true,
+    "skip_qqq_align": false,
+    "note": "Default off. Enable in …_watchdog_hunter_v1.json for arm→TTL→budget ORB hunt."
+  }
+}

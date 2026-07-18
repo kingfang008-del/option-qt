@@ -80,6 +80,25 @@ class StreamEngine:
     n_peer_block: int = 0
     n_skip0_clear_otm: int = 0
     stock_by: dict[str, Any] = field(default_factory=dict)
+    # Full frames for Watchdog breadth / QQQ (may include refs beyond profile.symbols)
+    stock_by_full: dict[str, Any] = field(default_factory=dict)
+    watchdog: Any = None
+    regime_snap: dict[str, Any] | None = None
+    day_watchdog_state: str = "off"
+    day_watchdog_reason: str = "off"
+    n_watchdog_days: int = 0
+    watchdog_state_counts: dict = field(default_factory=dict)
+    loss_streak: int = 0
+    n_mf_idio_block: int = 0
+    n_mf_idio_scale: int = 0
+    mf_idio_beta_cache: dict = field(default_factory=dict)
+    pending_hunts: list = field(default_factory=list)
+    day_hunt_symbols: set = field(default_factory=set)
+    day_hunt_dirs: set = field(default_factory=set)
+    n_hunt_signals: int = 0
+    n_hunt_trades: int = 0
+    n_hunt_budget_skip: int = 0
+    n_hunt_mutex_skip: int = 0
 
     @classmethod
     def from_profile(cls, profile: dict[str, Any], *, scheme: str = "single") -> "StreamEngine":
@@ -111,12 +130,88 @@ class StreamEngine:
             regime_gate=regime_gate,
         )
 
+    def _mf_idio_cfg(self) -> dict[str, Any]:
+        sig = self.profile.get("signal") or {}
+        mode = str(sig.get("mf_idio_mode") or "off").strip().lower()
+        on = mode not in {"", "off", "none", "false", "0"}
+        action = str(sig.get("mf_idio_action") or "block").strip().lower()
+        if action not in {"block", "scale", "size", "half"}:
+            action = "block"
+        if action in {"size", "half"}:
+            action = "scale"
+        scale = max(0.0, min(float(sig.get("mf_idio_scale", 0.5) or 0.5), 1.0))
+        als = sig.get("mf_idio_after_loss_streak")
+        return {
+            "on": on,
+            "mode": mode,
+            "action": action,
+            "scale": scale,
+            "min_frac": float(sig.get("mf_idio_min_frac", 0.0) or 0.0),
+            "beta_days": int(sig.get("mf_idio_beta_days", 5) or 5),
+            "beta_on": str(sig.get("mf_idio_beta_on") or "ret").strip().lower(),
+            "block_missing": bool(sig.get("mf_idio_block_missing", False)),
+            "after_loss_streak": int(als) if als is not None else None,
+        }
+
+    def _mf_idio_armed(self, cfg: dict[str, Any]) -> bool:
+        if not cfg["on"]:
+            return False
+        als = cfg["after_loss_streak"]
+        if als is None or int(als) <= 0:
+            return True
+        return int(self.loss_streak) >= int(als)
+
+    def _mf_idio_fail(
+        self,
+        sym: str,
+        direction: str,
+        feature_ts: pd.Timestamp,
+        date: str,
+        cfg: dict[str, Any],
+    ) -> bool:
+        if not self._mf_idio_armed(cfg):
+            return False
+        from maga7.common.signals import mf_idio_ok, rolling_idio_beta
+
+        full = self.stock_by_full or self.stock_by
+        key = (str(sym).upper(), str(date))
+        if key not in self.mf_idio_beta_cache and cfg["mode"] not in {
+            "diff_pos",
+            "diff",
+            "mf_diff",
+        }:
+            self.mf_idio_beta_cache[key] = rolling_idio_beta(
+                full.get(sym),
+                full.get("QQQ"),
+                asof_date=str(date),
+                n_days=cfg["beta_days"],
+                on=cfg["beta_on"],
+            )
+        ok, _meta = mf_idio_ok(
+            full.get(sym),
+            full.get("QQQ"),
+            date=str(date),
+            asof_ts=feature_ts,
+            direction=str(direction),
+            mode=cfg["mode"],
+            min_frac=cfg["min_frac"],
+            beta_days=cfg["beta_days"],
+            beta_on=cfg["beta_on"],
+            beta=self.mf_idio_beta_cache.get(key),
+            block_missing=cfg["block_missing"],
+        )
+        return not ok
+
     def _roll_day(self, date: str) -> None:
         if self.current_date == date:
             return
         trade = self.profile.get("trade") or {}
         if self.current_date is not None and self.day_start_equity > 0:
             self.prev_day_ret = self.equity / self.day_start_equity - 1.0
+            if self.prev_day_ret < 0:
+                self.loss_streak += 1
+            else:
+                self.loss_streak = 0
             thr = trade.get("post_win_cooldown_day_ret", 0.10)
             mode = str(trade.get("post_win_cooldown_mode") or "off").lower()
             if (
@@ -150,6 +245,98 @@ class StreamEngine:
         self.n_done = {s: 0 for s in self.profile["symbols"]}
         self.last_exit = {s: None for s in self.profile["symbols"]}
         self.last_win = {s: True for s in self.profile["symbols"]}
+        self.pending_hunts = []
+        self.day_hunt_symbols = set()
+        self.day_hunt_dirs = set()
+        # Watchdog Degrade/Halt + schedule Hunt candidates (mirror offline)
+        self.day_watchdog_state = "off"
+        self.day_watchdog_reason = "off"
+        if self.watchdog is not None and self.regime_gate is not None and self.regime_snap is not None:
+            full = self.stock_by_full or self.stock_by
+            wd_dec = self.watchdog.begin_day(
+                str(date),
+                stock_by=full,
+                qqq_df=full.get("QQQ"),
+                symbols=list(self.profile.get("symbols") or []),
+            )
+            self.watchdog.apply_to_regime(self.regime_gate.cfg, self.regime_snap)
+            self.day_watchdog_state = wd_dec.state.value
+            self.day_watchdog_reason = wd_dec.reason
+            if wd_dec.state.value != "normal":
+                self.n_watchdog_days += 1
+                st = self.day_watchdog_state
+                self.watchdog_state_counts[st] = int(self.watchdog_state_counts.get(st, 0)) + 1
+            self._schedule_hunts(str(date))
+
+    def _schedule_hunts(self, date: str) -> None:
+        """Queue Hunt fires at feature_ts + bar_delay (same clock as offline)."""
+        if self.day_halt or self.watchdog is None:
+            return
+        if not bool(getattr(self.watchdog, "hunt_armed", False)):
+            return
+        trade = self.profile.get("trade") or {}
+        bar_delay = int(trade.get("bar_availability_delay_seconds", 0) or 0)
+        for hc in list(getattr(self.watchdog, "hunt_candidates", None) or []):
+            self.n_hunt_signals += 1
+            feature_ts = to_ny(hc.sig_ts)
+            entry_ts = feature_ts + pd.Timedelta(seconds=bar_delay)
+            if entry_ts > to_ny(hc.armed_until):
+                continue
+            self.pending_hunts.append(
+                {
+                    "entry_ts": entry_ts,
+                    "feature_ts": feature_ts,
+                    "symbol": str(hc.symbol),
+                    "dir": str(hc.direction),
+                    "date": date,
+                    "event_source": "hunt",
+                    "detector": str(getattr(hc, "detector", "") or ""),
+                }
+            )
+        self.pending_hunts.sort(key=lambda x: (x["entry_ts"], x["symbol"]))
+
+    def _spot_at(self, sym: str, date: str, feature_ts: pd.Timestamp) -> float | None:
+        full = self.stock_by_full or self.stock_by
+        sdf = full.get(sym)
+        if sdf is None or getattr(sdf, "empty", True):
+            return None
+        day = sdf[sdf["date"].astype(str) == str(date)]
+        if day.empty:
+            return None
+        ts = pd.to_datetime(day["timestamp"])
+        if getattr(ts.dt, "tz", None) is None:
+            ts = ts.dt.tz_localize("America/New_York")
+        else:
+            ts = ts.dt.tz_convert("America/New_York")
+        day = day.copy()
+        day["_ts"] = ts
+        upto = day[day["_ts"] <= feature_ts]
+        if upto.empty:
+            return None
+        try:
+            return float(upto.iloc[-1]["close"])
+        except Exception:
+            return None
+
+    def _drain_hunts(self, ts: pd.Timestamp) -> None:
+        if not self.pending_hunts or self.day_halt:
+            return
+        due = [h for h in self.pending_hunts if h["entry_ts"] <= ts]
+        if not due:
+            return
+        self.pending_hunts = [h for h in self.pending_hunts if h["entry_ts"] > ts]
+        for h in due:
+            fire = {
+                "symbol": h["symbol"],
+                "dir": h["dir"],
+                "date": h["date"],
+                "sig_ts": h["feature_ts"],
+                "spot": self._spot_at(h["symbol"], h["date"], h["feature_ts"]),
+                "event_source": "hunt",
+                "route": "hunt",
+            }
+            self.events.append({"type": "HUNT_SIGNAL", **fire, "entry_ts": h["entry_ts"]})
+            self._try_enter(fire)
 
     def _build_event_blackout(self) -> set:
         from maga7.common.event_calendar import resolve_event_blackout
@@ -212,6 +399,31 @@ class StreamEngine:
         sym = fire["symbol"]
         direction = fire["dir"]
         date = fire["date"]
+        is_hunt = str(fire.get("event_source") or fire.get("route") or "baseline") == "hunt"
+        wd = self.watchdog
+        wd_cfg = getattr(wd, "cfg", None) if wd is not None else None
+
+        if is_hunt and wd is not None and wd.hunt_budget_remaining() <= 0:
+            self.n_hunt_budget_skip += 1
+            self.events.append({"type": "HUNT_BUDGET_SKIP", **fire})
+            return
+
+        # Mutex: prior Hunt blocks same-symbol (or same dir) baseline unless opp allowed.
+        if (
+            (not is_hunt)
+            and wd_cfg is not None
+            and bool(getattr(wd_cfg, "hunter_mutex_with_baseline", False))
+        ):
+            scope = str(getattr(wd_cfg, "hunter_mutex_scope", "symbol") or "symbol").lower()
+            if scope in {"symbol_dir", "dir", "same_dir"}:
+                mutex_hit = (str(sym), str(direction).upper()) in self.day_hunt_dirs
+            else:
+                mutex_hit = str(sym) in self.day_hunt_symbols
+            if mutex_hit:
+                self.n_hunt_mutex_skip += 1
+                self.events.append({"type": "HUNT_MUTEX_SKIP", **fire})
+                return
+
         if block_same_dir_after_win_enabled(trade) and (
             str(sym).upper(),
             str(direction).upper(),
@@ -237,7 +449,16 @@ class StreamEngine:
         only_win = resolve_only_win_reenter(trade)
 
         if self.n_done.get(sym, 0) >= max_n:
-            return
+            allow_opp = (
+                (not is_hunt)
+                and wd_cfg is not None
+                and bool(getattr(wd_cfg, "hunter_allow_baseline_opposite", False))
+                and str(sym) in self.day_hunt_symbols
+                and (str(sym), str(direction).upper()) not in self.day_hunt_dirs
+                and any(s == str(sym) and d != str(direction).upper() for s, d in self.day_hunt_dirs)
+            )
+            if not allow_opp:
+                return
         if sym in self.positions:
             return
         if self.last_exit.get(sym) is not None and ts < self.last_exit[sym] + pd.Timedelta(minutes=cooldown):
@@ -246,7 +467,10 @@ class StreamEngine:
             return
 
         regime_scale = 1.0
-        if self.regime_gate is not None:
+        skip_qqq = bool(
+            is_hunt and wd_cfg is not None and getattr(wd_cfg, "hunter_skip_qqq_align", False)
+        )
+        if self.regime_gate is not None and not skip_qqq:
             dec = self.regime_gate.check(direction, feature_ts)
             if not dec.allow:
                 self.n_regime_block += 1
@@ -256,7 +480,10 @@ class StreamEngine:
 
         sig_cfg = self.profile.get("signal") or {}
         peer_min = sig_cfg.get("peer_align_min")
-        if peer_min is not None and int(peer_min) > 0 and self.stock_by:
+        skip_peer = bool(
+            is_hunt and wd_cfg is not None and getattr(wd_cfg, "hunter_skip_peer", False)
+        )
+        if (not skip_peer) and peer_min is not None and int(peer_min) > 0 and self.stock_by:
             from maga7.common.signals import count_peer_align
 
             peers = list(sig_cfg.get("peer_symbols") or self.profile.get("symbols") or [])
@@ -274,6 +501,14 @@ class StreamEngine:
                 self.events.append(
                     {"type": "PEER_BLOCK", **fire, "peer_align_n": peer_n, "peer_align_min": int(peer_min)}
                 )
+                return
+
+        idio_cfg = self._mf_idio_cfg()
+        # Hunt skips mf_idio entry block (same as offline); scale still applies below.
+        if (not is_hunt) and idio_cfg["on"] and idio_cfg["action"] == "block":
+            if self._mf_idio_fail(sym, direction, feature_ts, str(date), idio_cfg):
+                self.n_mf_idio_block += 1
+                self.events.append({"type": "MF_IDIO_BLOCK", **fire})
                 return
 
         spot = float(fire["spot"]) if fire.get("spot") is not None else None
@@ -298,27 +533,49 @@ class StreamEngine:
         if sdf is not None and not getattr(sdf, "empty", True):
             stock_day = sdf[sdf["date"] == date]
         exit_mode = str(trade.get("exit_mode") or trade.get("stock_exit") or "none")
+        sim_kw: dict[str, Any] = {
+            "fill": self.fill,
+            "tp_mult": float(trade.get("tp_mult", 1.6)),
+            "sl_mult": float(trade.get("sl_mult", 0.4)),
+            "hold_minutes": int(trade.get("hold_minutes", 30)),
+            "exit_mf_grace_seconds": int(trade.get("exit_mf_grace_seconds", 60)),
+            "exit_min_hold_minutes": trade.get("exit_min_hold_minutes"),
+            "mtm_floor_ret": trade.get("mtm_floor_ret"),
+            "flow_cum_floor": trade.get("flow_cum_floor"),
+            "stock_bar_delay_seconds": bar_delay_seconds,
+            "trail_activate": trade.get("trail_activate"),
+            "trail_dd": trade.get("trail_dd"),
+            "hold_extend_minutes": trade.get("hold_extend_minutes"),
+            "hold_extend_mtm_min": trade.get("hold_extend_mtm_min"),
+            "hold_extend_require_mf": bool(trade.get("hold_extend_require_mf", True)),
+            "early_exit_mode": trade.get("early_exit_mode"),
+            "mae_cut_ret": trade.get("mae_cut_ret"),
+            "mae_cut_mfe_bypass": trade.get("mae_cut_mfe_bypass"),
+            "mae_cut_min_hold_minutes": trade.get("mae_cut_min_hold_minutes"),
+            "dyn_max_hold_minutes": trade.get("dyn_max_hold_minutes"),
+            "dyn_min_hold_minutes": trade.get("dyn_min_hold_minutes"),
+            "dyn_trail_start_minutes": trade.get("dyn_trail_start_minutes"),
+            "dyn_slope_lookback": trade.get("dyn_slope_lookback"),
+            "dyn_fast_opp_bars": trade.get("dyn_fast_opp_bars"),
+            "dyn_fast_pct": trade.get("dyn_fast_pct"),
+            "dyn_require_price_break": bool(trade.get("dyn_require_price_break", True)),
+        }
+        hunt_pos_frac = None
+        if is_hunt and wd is not None:
+            from maga7.common.watchdog import hunt_trade_overrides
+
+            hov = hunt_trade_overrides(wd.cfg)
+            hunt_pos_frac = hov.pop("position_frac", None)
+            if "exit_mode" in hov:
+                exit_mode = str(hov.pop("exit_mode"))
+            sim_kw.update(hov)
         sim = simulate_trade(
             path,
             ts,
-            fill=self.fill,
-            tp_mult=float(trade.get("tp_mult", 1.6)),
-            sl_mult=float(trade.get("sl_mult", 0.4)),
-            hold_minutes=int(trade.get("hold_minutes", 30)),
             direction=direction,
             stock_day=stock_day,
             exit_mode=exit_mode,
-            exit_mf_grace_seconds=int(trade.get("exit_mf_grace_seconds", 60)),
-            exit_min_hold_minutes=trade.get("exit_min_hold_minutes"),
-            mtm_floor_ret=trade.get("mtm_floor_ret"),
-            flow_cum_floor=trade.get("flow_cum_floor"),
-            stock_bar_delay_seconds=bar_delay_seconds,
-            trail_activate=trade.get("trail_activate"),
-            trail_dd=trade.get("trail_dd"),
-            hold_extend_minutes=trade.get("hold_extend_minutes"),
-            hold_extend_mtm_min=trade.get("hold_extend_mtm_min"),
-            hold_extend_require_mf=bool(trade.get("hold_extend_require_mf", True)),
-            early_exit_mode=trade.get("early_exit_mode"),
+            **sim_kw,
         )
         if sim is None:
             return
@@ -331,6 +588,9 @@ class StreamEngine:
             symbol=sym,
             entry_ts=sim.entry_ts,
         )
+        if hunt_pos_frac is not None and float(hunt_pos_frac) > 0:
+            size_frac = float(hunt_pos_frac)
+            size_reason = f"{size_reason}+hunt_frac:{float(hunt_pos_frac):.2f}"
         if not allow:
             self.events.append(
                 {
@@ -348,12 +608,23 @@ class StreamEngine:
             size_frac = float(size_frac) * float(regime_scale)
             size_reason = f"{size_reason}+regime_scale"
             self.n_regime_scale += 1
+        if idio_cfg["on"] and idio_cfg["action"] == "scale":
+            if self._mf_idio_fail(sym, direction, feature_ts, str(date), idio_cfg):
+                idio_mult = float(idio_cfg["scale"])
+                size_frac = float(size_frac) * idio_mult
+                size_reason = f"{size_reason}+mf_idio_scale:{idio_mult:.2f}"
+                self.n_mf_idio_scale += 1
         self.equity *= 1.0 + size_frac * sim.ret
         self.peak = max(self.peak, self.equity)
         self.maxdd = min(self.maxdd, self.equity / self.peak - 1.0)
         self.n_done[sym] = self.n_done.get(sym, 0) + 1
         self.last_exit[sym] = sim.exit_ts
         self.last_win[sym] = sim.ret > 0
+        if is_hunt and wd is not None:
+            wd.note_hunt_entry()
+            self.day_hunt_symbols.add(str(sym))
+            self.day_hunt_dirs.add((str(sym), str(direction).upper()))
+            self.n_hunt_trades += 1
         row = {
             "date": date,
             "symbol": sym,
@@ -378,6 +649,10 @@ class StreamEngine:
             "position_sizing": sizing_mode,
             "size_reason": size_reason,
             "source": "stream",
+            "route": "hunt" if is_hunt else "baseline",
+            "event_source": "hunt" if is_hunt else "baseline",
+            "watchdog_state": self.day_watchdog_state,
+            "watchdog_reason": self.day_watchdog_reason,
         }
         self.trades.append(row)
         self.events.append({"type": "TRADE", **row})
@@ -394,12 +669,15 @@ class StreamEngine:
         ts = to_ny(bar["timestamp"])
         date = ts.strftime("%Y-%m-%d")
         self._roll_day(date)
+        # Hunt fires are time-driven (not TopK); drain before Rule-A at this clock.
+        self._drain_hunts(ts)
         st = self.states.get(symbol)
         if st is None:
             return
         fire = st.on_bar(bar)
         if fire is None:
             return
+        fire = {**fire, "event_source": "baseline", "route": "baseline"}
         self.events.append({"type": "SIGNAL", **fire})
         accepted_syms = {f["symbol"] for f in self.day_fires}
         if fire["symbol"] in accepted_syms:
@@ -429,6 +707,15 @@ class StreamEngine:
             "n_regime_scale": int(self.n_regime_scale),
             "n_event_block": int(self.n_event_block),
             "n_skip0_clear_otm": int(self.n_skip0_clear_otm),
+            "n_mf_idio_block": int(self.n_mf_idio_block),
+            "n_mf_idio_scale": int(self.n_mf_idio_scale),
+            "watchdog_enabled": bool(self.watchdog is not None),
+            "n_watchdog_days": int(self.n_watchdog_days),
+            "watchdog_state_counts": dict(self.watchdog_state_counts),
+            "n_hunt_signals": int(self.n_hunt_signals),
+            "n_hunt_trades": int(self.n_hunt_trades),
+            "n_hunt_budget_skip": int(self.n_hunt_budget_skip),
+            "n_hunt_mutex_skip": int(self.n_hunt_mutex_skip),
         }
 
 
@@ -485,6 +772,17 @@ def run_stream_replay(
         keep = [c for c in ("symbol", "timestamp", "open", "high", "low", "close", "volume", "date") if c in f.columns]
         frames.append(f[keep])
     eng.stock_by = {s: stock_by[s] for s in profile["symbols"] if s in stock_by}
+    eng.stock_by_full = dict(stock_by)
+    # Watchdog: Degrade/Halt overlay + Hunt schedule (drained on bar clock).
+    try:
+        from maga7.common.watchdog import RegimeWatchdog, snapshot_regime
+
+        eng.watchdog = RegimeWatchdog.from_profile(profile)
+        if eng.watchdog is not None and eng.regime_gate is not None:
+            eng.regime_snap = snapshot_regime(eng.regime_gate.cfg)
+    except Exception:
+        eng.watchdog = None
+        eng.regime_snap = None
     if not frames:
         return {"summary": eng.summary(), "trades": pd.DataFrame(), "events": eng.events}
     all_bars = pd.concat(frames, ignore_index=True).sort_values(["timestamp", "symbol"])
@@ -500,6 +798,10 @@ def run_stream_replay(
                 "volume": r.volume,
             },
         )
+    # Flush any Hunt still pending after last bar (should be rare).
+    if eng.pending_hunts:
+        last_ts = to_ny(all_bars["timestamp"].iloc[-1])
+        eng._drain_hunts(last_ts + pd.Timedelta(days=1))
     return {
         "summary": eng.summary(),
         "trades": pd.DataFrame(eng.trades),

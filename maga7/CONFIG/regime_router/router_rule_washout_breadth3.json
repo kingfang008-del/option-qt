@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "mode": "rule",
+  "rule": "washout_breadth3",
+  "asof": "10:30",
+  "wash_window_end": "10:00",
+  "wash_drop_min": 0.003,
+  "washout_breadth_min": 3,
+  "washout_expert": "washout_gate_dn",
+  "experts_path": "maga7/CONFIG/regime_router/experts_v1.json",
+  "description": "Causal: >=3 Mag7/GOOGL names print open_washout by 10:00 → washout_gate_dn (DN size 0.5). Research only; freeze regime_router stays disabled."
+}

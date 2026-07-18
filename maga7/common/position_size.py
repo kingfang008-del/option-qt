@@ -1,7 +1,105 @@
 """Position sizing helpers (shared by offline / stream / OMS)."""
 from __future__ import annotations
 
+import math
 from typing import Any
+
+
+def coerce_size_scale(raw: Any, default: float = 1.0) -> float:
+    """Clamp a multiplicative size scale into ``[0, 1]``."""
+    if raw is None:
+        return float(default)
+    try:
+        s = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(s):
+        return float(default)
+    return max(0.0, min(float(s), 1.0))
+
+
+def apply_size_scale(size_frac: float, scale: Any = 1.0) -> float:
+    """Apply regime/watchdog (or other) scale on top of concurrent sleeve."""
+    return float(size_frac) * coerce_size_scale(scale, default=1.0)
+
+
+def regime_scale_from_meta(meta: dict[str, Any] | None) -> float:
+    meta = meta or {}
+    return coerce_size_scale(meta.get("regime_size_scale", 1.0), default=1.0)
+
+
+def post_win_cooldown_action(
+    trade: dict[str, Any] | None,
+    *,
+    prev_day_ret: float | None = None,
+    cooldown_left: int = 0,
+) -> tuple[str, float]:
+    """After a large winning session, cool down following session(s).
+
+    ``trade.post_win_cooldown_mode``:
+      - ``off`` / missing: no-op → ``("", 1.0)``
+      - ``skip``: skip all entries → ``("skip", 0.0)``
+      - ``scale``: multiply size by ``post_win_cooldown_scale`` → ``("scale", scale)``
+
+    Active when ``cooldown_left > 0`` (preferred), or when
+    ``prev_day_ret >= post_win_cooldown_day_ret`` (default 0.10) for a
+    one-shot next-day cool-down.
+    """
+    trade = trade or {}
+    mode = str(trade.get("post_win_cooldown_mode") or "off").strip().lower()
+    if mode in {"", "off", "none", "false", "0"}:
+        return "", 1.0
+    active = int(cooldown_left or 0) > 0
+    if not active:
+        thr = trade.get("post_win_cooldown_day_ret", 0.10)
+        if thr is None or prev_day_ret is None:
+            return "", 1.0
+        if float(prev_day_ret) < float(thr):
+            return "", 1.0
+    if mode == "skip":
+        return "skip", 0.0
+    if mode in {"scale", "half", "reduce"}:
+        scale = float(trade.get("post_win_cooldown_scale", 0.5))
+        scale = max(0.0, min(scale, 1.0))
+        return "scale", scale
+    return "", 1.0
+
+
+def post_win_cooldown_sessions(trade: dict[str, Any] | None) -> int:
+    trade = trade or {}
+    return max(1, int(trade.get("post_win_cooldown_sessions", 1) or 1))
+
+
+def block_same_dir_after_win_enabled(trade: dict[str, Any] | None) -> bool:
+    """Per-symbol same-direction block the session after a big win.
+
+    Unlike account-level ``post_win_cooldown_*``, this does not change global
+    sizing — only suppresses repeating yesterday's winning symbol+direction
+    (e.g. TSLA UP TP yesterday → no TSLA UP today).
+    """
+    trade = trade or {}
+    raw = trade.get("block_same_dir_after_win", False)
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(raw)
+
+
+def is_symbol_dir_big_win(
+    *,
+    ret: float,
+    reason: str | None,
+    trade: dict[str, Any] | None,
+) -> bool:
+    trade = trade or {}
+    if str(reason or "").upper() == "TP":
+        return True
+    thr = trade.get("block_same_dir_after_win_ret", 0.50)
+    if thr is None:
+        return False
+    try:
+        return float(ret) >= float(thr)
+    except (TypeError, ValueError):
+        return False
 
 
 def count_others_open(
