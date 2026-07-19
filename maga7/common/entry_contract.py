@@ -47,6 +47,7 @@ class ContractBooks:
     prefer_dte: int = 0
     allowed_dte: list[int] | None = None
     clear_otm_thresh: float | None = None
+    max_entry_abs_otm: float | None = None
     ladder: bool = False
     otm_rungs: int = 1
 
@@ -57,6 +58,8 @@ class ContractBooks:
         prefer, allowed = lock_policy_from_profile(profile)
         clear = trade.get("clear_otm_ban_0dte_pct")
         clear_otm = float(clear) if clear is not None else None
+        max_otm_raw = trade.get("max_entry_abs_otm_pct")
+        max_otm = float(max_otm_raw) if max_otm_raw is not None else None
         paths = profile.get("_paths") or {}
         ladder = mode in ("open_ladder", "open_lock_ladder")
         from maga7.common.open_lock import resolve_otm_rungs
@@ -89,9 +92,38 @@ class ContractBooks:
             prefer_dte=prefer,
             allowed_dte=list(allowed),
             clear_otm_thresh=clear_otm,
+            max_entry_abs_otm=max_otm,
             ladder=ladder or bool(trade.get("open_ladder")),
             otm_rungs=otm_rungs,
         )
+
+
+def _apply_max_entry_otm(
+    books: ContractBooks,
+    *,
+    direction: str,
+    spot: float | None,
+    ticker: str | None,
+    dte: int | None,
+    source: str,
+    bid: int,
+    strike: float | None,
+) -> EntryContract:
+    if (
+        books.max_entry_abs_otm is not None
+        and ticker is not None
+        and spot is not None
+        and strike is not None
+        and np.isfinite(float(strike))
+        and is_clearly_otm(
+            direction,
+            float(spot),
+            float(strike),
+            thresh=float(books.max_entry_abs_otm),
+        )
+    ):
+        return EntryContract(None, dte, "skip_max_entry_otm", bid, strike)
+    return EntryContract(ticker=ticker, dte=dte, source=source, bucket_id=bid, strike=strike)
 
 
 def resolve_entry_contract(
@@ -121,7 +153,16 @@ def resolve_entry_contract(
             otm_rungs=books.otm_rungs,
         )
         strike = strike_from_occ(ticker) if ticker else None
-        return EntryContract(ticker=ticker, dte=dte, source=source, bucket_id=bid, strike=strike)
+        return _apply_max_entry_otm(
+            books,
+            direction=direction,
+            spot=spot,
+            ticker=ticker,
+            dte=dte,
+            source=source,
+            bid=bid,
+            strike=strike,
+        )
 
     day_ticker = None
     if books.flat_idx:
@@ -167,14 +208,31 @@ def resolve_entry_contract(
                 fallback_day_lock=False,
             )
             if pick2 is not None:
-                return EntryContract(
-                    pick2.ticker,
-                    pick2.dte if pick2.dte >= 0 else None,
-                    "signal_atm_skip0_clear_otm",
-                    bid,
-                    pick2.strike if np.isfinite(pick2.strike) else strike_from_occ(pick2.ticker),
+                k2 = (
+                    pick2.strike
+                    if np.isfinite(pick2.strike)
+                    else strike_from_occ(pick2.ticker)
                 )
-        return EntryContract(ticker, dte, source, bid, strike)
+                return _apply_max_entry_otm(
+                    books,
+                    direction=direction,
+                    spot=spot,
+                    ticker=pick2.ticker,
+                    dte=pick2.dte if pick2.dte >= 0 else None,
+                    source="signal_atm_skip0_clear_otm",
+                    bid=bid,
+                    strike=k2,
+                )
+        return _apply_max_entry_otm(
+            books,
+            direction=direction,
+            spot=spot,
+            ticker=ticker,
+            dte=dte,
+            source=source,
+            bid=bid,
+            strike=strike,
+        )
 
     # day_lock
     if not day_ticker:
@@ -194,4 +252,13 @@ def resolve_entry_contract(
         and is_clearly_otm(direction, float(spot), strike, thresh=books.clear_otm_thresh)
     ):
         return EntryContract(None, dte, "day_lock_skip0_clear_otm", bid, strike)
-    return EntryContract(day_ticker, dte, "day_lock", bid, strike)
+    return _apply_max_entry_otm(
+        books,
+        direction=direction,
+        spot=spot,
+        ticker=day_ticker,
+        dte=dte,
+        source="day_lock",
+        bid=bid,
+        strike=strike,
+    )

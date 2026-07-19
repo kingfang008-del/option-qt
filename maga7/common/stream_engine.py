@@ -79,6 +79,8 @@ class StreamEngine:
     event_blackout: set = field(default_factory=set)
     n_peer_block: int = 0
     n_skip0_clear_otm: int = 0
+    n_skip_max_entry_otm: int = 0
+    n_confirm_block: int = 0
     stock_by: dict[str, Any] = field(default_factory=dict)
     # Full frames for Watchdog breadth / QQQ (may include refs beyond profile.symbols)
     stock_by_full: dict[str, Any] = field(default_factory=dict)
@@ -511,6 +513,52 @@ class StreamEngine:
                 self.events.append({"type": "MF_IDIO_BLOCK", **fire})
                 return
 
+        # Entry confirm (optional; may be weekday-gated — parity with offline replay).
+        confirm_bars_raw = trade.get("entry_confirm_bars") or (self.profile.get("signal") or {}).get(
+            "entry_confirm_bars"
+        )
+        confirm_bars_n = int(confirm_bars_raw) if confirm_bars_raw is not None else 0
+        confirm_mode = str(
+            trade.get("entry_confirm_mode")
+            or (self.profile.get("signal") or {}).get("entry_confirm_mode")
+            or "mf"
+        ).strip().lower()
+        confirm_wd_raw = trade.get("entry_confirm_weekdays") or (self.profile.get("signal") or {}).get(
+            "entry_confirm_weekdays"
+        )
+        use_confirm = confirm_bars_n > 0
+        if use_confirm and confirm_wd_raw is not None:
+            if isinstance(confirm_wd_raw, str):
+                confirm_wds = {
+                    int(x.strip()) for x in confirm_wd_raw.split(",") if str(x).strip() != ""
+                }
+            else:
+                confirm_wds = {int(x) for x in confirm_wd_raw}
+            try:
+                wd0 = int(pd.Timestamp(str(date)).weekday())
+            except Exception:
+                wd0 = -1
+            use_confirm = wd0 in confirm_wds
+        if use_confirm:
+            from maga7.common.replay import entry_confirm_ok
+
+            sdf_c = self.stock_by.get(sym)
+            stock_day_c = None
+            if sdf_c is not None and not getattr(sdf_c, "empty", True):
+                stock_day_c = sdf_c[sdf_c["date"] == date]
+            ok_c, confirm_ft, _, _, _ = entry_confirm_ok(
+                stock_day_c,
+                direction=str(direction),
+                feature_ts=feature_ts,
+                confirm_bars=confirm_bars_n,
+                mode=confirm_mode,
+            )
+            if not ok_c:
+                self.n_confirm_block += 1
+                self.events.append({"type": "ENTRY_CONFIRM_BLOCK", **fire})
+                return
+            ts = to_ny(confirm_ft) + pd.Timedelta(seconds=bar_delay_seconds)
+
         spot = float(fire["spot"]) if fire.get("spot") is not None else None
         pick = resolve_entry_contract(
             self.books,
@@ -522,7 +570,11 @@ class StreamEngine:
             spot=spot,
         )
         if pick.ticker is None:
-            self.events.append({"type": "NO_CONTRACT", **fire, "source": pick.source})
+            if pick.source == "skip_max_entry_otm":
+                self.n_skip_max_entry_otm += 1
+                self.events.append({"type": "MAX_OTM_SKIP", **fire, "source": pick.source})
+            else:
+                self.events.append({"type": "NO_CONTRACT", **fire, "source": pick.source})
             return
         if "skip0_clear_otm" in pick.source:
             self.n_skip0_clear_otm += 1
@@ -625,6 +677,9 @@ class StreamEngine:
             self.day_hunt_symbols.add(str(sym))
             self.day_hunt_dirs.add((str(sym), str(direction).upper()))
             self.n_hunt_trades += 1
+            h_circ = getattr(wd.cfg, "hunter_day_circuit_ret", None)
+            if h_circ is not None and float(sim.ret) <= float(h_circ):
+                self.day_halt = True
         row = {
             "date": date,
             "symbol": sym,
@@ -707,6 +762,8 @@ class StreamEngine:
             "n_regime_scale": int(self.n_regime_scale),
             "n_event_block": int(self.n_event_block),
             "n_skip0_clear_otm": int(self.n_skip0_clear_otm),
+            "n_skip_max_entry_otm": int(self.n_skip_max_entry_otm),
+            "n_confirm_block": int(self.n_confirm_block),
             "n_mf_idio_block": int(self.n_mf_idio_block),
             "n_mf_idio_scale": int(self.n_mf_idio_scale),
             "watchdog_enabled": bool(self.watchdog is not None),

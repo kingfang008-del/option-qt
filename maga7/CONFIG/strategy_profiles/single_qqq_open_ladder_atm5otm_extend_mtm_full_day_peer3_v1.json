@@ -1,13 +1,13 @@
 {
   "profile": "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1",
   "profile_id": "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1",
-  "description": "Research baseline (2026-07-18 L0 + P1.1 L1 + P2 L2): extend_mtm T30\u2192T45 + full_day events + peer3 + streak3 + mf_idio + Watchdog L1 Degrade/Halt + Hunter washout_reclaim (T30+extend, same as baseline trade). Feb\u2013Apr lift vs L0. Keep sl_mult=0.40. Sync calendar via tools/sync_event_calendar.py.",
+  "description": "Research baseline: extend_mtm T30\u2192T45 + full_day events + peer3 + streak3 + mf_idio + Watchdog L1 + Hunter washout_reclaim. Ladder OTM3. TT1 uplift 05 (2026-07-19): max_entry_abs_otm_pct=0.005 + entry_confirm 2 bars mf on Tue/Thu only. Keep sl_mult=0.40. Sync calendar via tools/sync_event_calendar.py.",
   "role": "research_baseline",
-  "result_tag": "research_extend_mtm_full_day_peer3_l2_may_jul",
+  "result_tag": "research_extend_mtm_full_day_peer3_l2_tt1_05_may_jul",
   "based_on": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1.json",
   "recommended_scheme": "single",
   "baseline_doc": "docs/research_full_day_peer3_baseline.md",
-  "frozen_at": "2026-07-18",
+  "frozen_at": "2026-07-19",
   "symbols": [
     "NVDA",
     "TSLA",
@@ -136,10 +136,14 @@
     "bar_availability_delay_seconds": 60,
     "moneyness": "ATM",
     "contract_mode": "open_ladder",
-    "ladder_otm_rungs": 5,
+    "ladder_otm_rungs": 3,
     "quote_source": "1s",
     "day_iv_half_spread_frac": 0.01,
     "clear_otm_ban_0dte_pct": 0.01,
+    "max_entry_abs_otm_pct": 0.005,
+    "entry_confirm_bars": 2,
+    "entry_confirm_mode": "mf",
+    "entry_confirm_weekdays": [1, 3],
     "risk": {
       "max_stock_staleness_sec": 2.0,
       "max_option_staleness_sec": 5.0,
@@ -163,6 +167,14 @@
         "exit_step": 0.01,
         "cancel_settle_sec": 0.5
       }
+    },
+    "iceberg": {
+      "enabled": true,
+      "ask_size_frac": 0.5,
+      "min_chunk_qty": 1,
+      "max_chunks": 5,
+      "fallback_notional": 8000,
+      "max_total_sec": 15
     },
     "hold_extend_minutes": 45,
     "hold_extend_mtm_min": 0.0,
@@ -189,8 +201,8 @@
   },
   "fill": {
     "model": "spread_frac",
-    "entry_frac": 0.8,
-    "exit_frac": 0.8
+    "entry_frac": 0.75,
+    "exit_frac": 0.75
   },
   "buckets": {
     "UP_ATM": 2,
@@ -220,6 +232,6 @@
       1,
       2
     ],
-    "otm_rungs": 5
+    "otm_rungs": 3
   }
 }

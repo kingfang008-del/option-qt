@@ -968,7 +968,24 @@ def run_offline_replay(
     if _trade_flag(trade, "late_signal_universe_all_first", False):
         event_sigs = all_first
         displace_universe = "all_first"
-    if topk_backfill and commit_tod is None:
+    topk_mf_backfill = _trade_flag(trade, "topk_mf_backfill_on_block", False) or _trade_flag(
+        sig_cfg, "topk_mf_backfill_on_block", False
+    )
+    if topk_mf_backfill and commit_tod is None:
+        # Stricter than time-all_first backfill: try earliest TopK first; only then
+        # remaining first-Rule-A ordered by multi-factor score (research).
+        from maga7.common.multifactor_rank import MultiFactorConfig, order_events_topk_then_mf
+
+        topk_backfill = True
+        event_sigs = order_events_topk_then_mf(
+            top2,
+            all_first,
+            stock_by,
+            symbols=list(symbols),
+            cfg=MultiFactorConfig(),
+        )
+        displace_universe = "topk_mf_backfill"
+    elif topk_backfill and commit_tod is None:
         event_sigs = all_first
         displace_universe = "all_first_backfill"
     contract_mode = str(trade.get("contract_mode", "day_lock")).lower()
@@ -977,6 +994,10 @@ def run_offline_replay(
     prefer_dte, allowed_dte = lock_policy_from_profile(profile)
     clear_otm = trade.get("clear_otm_ban_0dte_pct", None)
     clear_otm_thresh = float(clear_otm) if clear_otm is not None else None
+    max_entry_otm_raw = trade.get("max_entry_abs_otm_pct", None)
+    max_entry_abs_otm = (
+        float(max_entry_otm_raw) if max_entry_otm_raw is not None else None
+    )
 
     # open_lock / open_ladder use multi-DTE map; day_lock / signal_atm use flat 4-bucket map
     lock_path = paths.get("open_locked_map") if contract_mode in ("open_lock", "open", "open_ladder", "open_lock_ladder") else None
@@ -999,6 +1020,7 @@ def run_offline_replay(
     n_signal_atm = 0
     n_day_lock_fb = 0
     n_skip0_clear_otm = 0
+    n_skip_max_entry_otm = 0
     n_quote_1s = 0
     n_quote_day_iv = 0
 
@@ -1032,6 +1054,7 @@ def run_offline_replay(
     n_hunt_trades = 0
     n_hunt_budget_skip = 0
     n_hunt_mutex_skip = 0
+    n_hunt_day_circuit = 0
     n_regime_block = 0
     n_regime_scale = 0
     n_peer_block = 0
@@ -1285,6 +1308,16 @@ def run_offline_replay(
     confirm_mode = str(
         trade.get("entry_confirm_mode") or sig_cfg.get("entry_confirm_mode") or "mf"
     ).strip().lower()
+    # Optional: only apply confirm on given weekdays (0=Mon..4=Fri).
+    confirm_wd_raw = trade.get("entry_confirm_weekdays", sig_cfg.get("entry_confirm_weekdays"))
+    confirm_weekdays: set[int] | None = None
+    if confirm_wd_raw is not None:
+        if isinstance(confirm_wd_raw, str):
+            confirm_weekdays = {
+                int(x.strip()) for x in confirm_wd_raw.split(",") if str(x).strip() != ""
+            }
+        else:
+            confirm_weekdays = {int(x) for x in confirm_wd_raw}
     n_confirm_block = 0
     purity_on = _trade_flag(trade, "trend_purity_sizing", False)
     purity_fp_ref = float(trade.get("trend_purity_fp_ref", 0.025) or 0.025)
@@ -1439,7 +1472,38 @@ def run_offline_replay(
         dyn_require_price_break=bool(trade.get("dyn_require_price_break", True)),
     )
 
-    for date, day_sigs in event_sigs.groupby("date", sort=True):
+    # Day loop keys: Rule-A dates ∪ (optional) Hunt calendar dates.
+    # Without the Hunt pad, single-name sleeves miss washout_reclaim days that
+    # have no Rule-A fire (groupby never yields empty days). Mag7 May–Jul had
+    # zero such days; QQQ-only does.
+    _sig_cols = list(event_sigs.columns) if len(event_sigs) else [
+        "date",
+        "symbol",
+        "dir",
+        "sig_ts",
+        "spot",
+        "rank",
+    ]
+    _by_date: dict[str, pd.DataFrame] = {}
+    if len(event_sigs):
+        for _d, _g in event_sigs.groupby("date", sort=True):
+            _by_date[str(_d)] = _g
+    _loop_dates = sorted(_by_date.keys())
+    if watchdog is not None and bool(getattr(watchdog.cfg, "hunter_enabled", False)):
+        _cal: set[str] = set()
+        for _s in symbols:
+            _sdf = trade_stock.get(_s)
+            if _sdf is None or getattr(_sdf, "empty", True):
+                continue
+            for _dd in _sdf["date"].astype(str).unique():
+                _ds = str(_dd)
+                if start <= _ds <= end:
+                    _cal.add(_ds)
+        _loop_dates = sorted(set(_loop_dates) | _cal)
+    _empty_day = pd.DataFrame(columns=_sig_cols)
+
+    for date in _loop_dates:
+        day_sigs = _by_date.get(str(date), _empty_day)
         # Watchdog / legacy router: restore baseline then apply day's overlay.
         day_route = "baseline"
         day_watchdog_state = WatchdogState.NORMAL.value
@@ -1841,7 +1905,14 @@ def run_offline_replay(
             # Entry confirm: wait N bars after Rule-A; keep peer/regime at fire time.
             confirm_ft = None
             confirm_mf = None
-            if confirm_bars_n > 0:
+            use_confirm = confirm_bars_n > 0
+            if use_confirm and confirm_weekdays is not None:
+                try:
+                    wd0 = int(pd.Timestamp(str(date)).weekday())
+                except Exception:
+                    wd0 = -1
+                use_confirm = wd0 in confirm_weekdays
+            if use_confirm:
                 sdf_c = stock_by.get(sym)
                 stock_day_c = None
                 if sdf_c is not None and not sdf_c.empty:
@@ -1961,6 +2032,19 @@ def run_offline_replay(
                             n_skip0_clear_otm += 1
                             continue
                         pick_dte = dte0
+
+            if max_entry_abs_otm is not None and spot is not None and ticker:
+                from maga7.common.open_lock import is_clearly_otm, strike_from_occ
+
+                k_ent = strike_from_occ(str(ticker))
+                if np.isfinite(k_ent) and is_clearly_otm(
+                    direction,
+                    float(spot),
+                    float(k_ent),
+                    thresh=float(max_entry_abs_otm),
+                ):
+                    n_skip_max_entry_otm += 1
+                    continue
 
             path, qsrc = get_path(sym, date, ticker)
             if qsrc == "1s":
@@ -2236,6 +2320,12 @@ def run_offline_replay(
                 day_hunt_dirs.add((str(sym), str(direction).upper()))
                 day_hunt_n += 1
                 n_hunt_trades += 1
+                h_circ = getattr(watchdog.cfg, "hunter_day_circuit_ret", None) if watchdog else None
+                if h_circ is not None and float(sim.ret) <= float(h_circ):
+                    if not halt:
+                        n_hunt_day_circuit += 1
+                    halt = True
+                    row["hunt_day_circuit"] = True
             if dec is not None:
                 row["regime_qqq_fp"] = dec.qqq_from_prev
                 row["regime_vix_rev"] = dec.vix_reversal
@@ -2375,6 +2465,7 @@ def run_offline_replay(
         "hunter_enabled": bool(watchdog.cfg.hunter_enabled) if watchdog is not None else False,
         "n_hunt_signals": int(n_hunt_signals),
         "n_hunt_trades": int(n_hunt_trades),
+        "n_hunt_day_circuit": int(n_hunt_day_circuit),
         "n_hunt_budget_skip": int(n_hunt_budget_skip),
         "n_hunt_mutex_skip": int(n_hunt_mutex_skip),
         "mf_idio_min_frac": mf_idio_min_frac if mf_idio_on and mf_idio_mode in {"frac", "min_frac", "fraction"} else None,
@@ -2411,6 +2502,8 @@ def run_offline_replay(
         "n_signal_atm": int(n_signal_atm),
         "n_day_lock_fallback": int(n_day_lock_fb),
         "n_skip0_clear_otm": int(n_skip0_clear_otm),
+        "n_skip_max_entry_otm": int(n_skip_max_entry_otm),
+        "max_entry_abs_otm_pct": max_entry_abs_otm,
         "n_quote_1s": int(n_quote_1s),
         "n_quote_day_iv": int(n_quote_day_iv),
         "clear_otm_ban_0dte_pct": clear_otm_thresh,

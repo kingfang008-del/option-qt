@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
 import json
 import logging
@@ -19,6 +20,12 @@ import pandas as pd
 from maga7.common.fills import FillSpec
 from maga7.common.position_size import apply_size_scale, regime_scale_from_meta, resolve_size_frac
 from maga7.common.replay import to_ny
+from maga7.live.iceberg import (
+    decode_chunk_queue,
+    encode_chunk_queue,
+    iceberg_config_from_trade,
+    plan_entry_chunks,
+)
 from maga7.live.requote import (
     entry_requote_limit,
     exit_requote_limit,
@@ -31,6 +38,7 @@ from maga7.live.risk_guards import (
     is_fresh,
     observe_exit_mid,
     quote_mid,
+    quote_spread_fields,
     risk_config_from_trade,
 )
 from maga7.live.scanner import Mag7Scanner, ScannerSignal
@@ -102,6 +110,13 @@ class PendingIntent:
     ref_price: float = 0.0
     replaced_by: str = ""
     parent_intent_id: str = ""
+    # Entry iceberg: remaining clips as "3,2"; empty = not an iceberg / done.
+    iceberg_queue: str = ""
+    iceberg_chunk_idx: int = 0
+    iceberg_chunks: int = 1
+    iceberg_total_qty: int = 0
+    iceberg_qty_frac: float = 0.0
+    iceberg_started_at: float = 0.0
 
 
 def profile_digest(profile: dict[str, Any]) -> str:
@@ -208,6 +223,7 @@ class Mag7BrokerOms:
             getattr(connector, "config", None),
         )
         self.requote_cfg = requote_config_from_trade(self.trade_cfg)
+        self.iceberg_cfg = iceberg_config_from_trade(self.trade_cfg)
         self.profile_hash = str(
             profile.get("_live_fingerprint") or profile_digest(profile)
         )
@@ -241,6 +257,11 @@ class Mag7BrokerOms:
         return self.session_dir / "order_events.jsonl"
 
     @property
+    def trade_spreads_path(self) -> Path:
+        """One row per OPEN/CLOSE fill with bid/ask/spread for Dash."""
+        return self.session_dir / "trade_spreads.csv"
+
+    @property
     def positions_key(self) -> str:
         return f"oms:live_positions:maga7:{self.session_id}"
 
@@ -272,6 +293,68 @@ class Mag7BrokerOms:
                 maxlen=20_000,
                 approximate=True,
             )
+
+    def _record_trade_spread(
+        self,
+        *,
+        action: str,
+        symbol: str,
+        contract: str,
+        side: str,
+        fill_px: float,
+        qty: int,
+        bid: float,
+        ask: float,
+        reason: str = "",
+        ret: float | None = None,
+    ) -> dict[str, Any]:
+        """Persist OPEN/CLOSE quote spread for Dash (csv + event payload fields)."""
+        fields = quote_spread_fields(bid, ask, fill_px=fill_px, side=side)
+        row = {
+            "ts": time.time(),
+            "session_id": self.session_id,
+            "mode": self.mode,
+            "action": str(action).upper(),
+            "symbol": str(symbol).upper(),
+            "contract": contract,
+            "side": str(side).upper(),
+            "qty": int(qty),
+            "fill_px": float(fill_px),
+            "bid": fields.get("bid"),
+            "ask": fields.get("ask"),
+            "spread": fields.get("spread"),
+            "spread_pct": fields.get("spread_pct"),
+            "fill_spread_frac": fields.get("fill_spread_frac"),
+            "reason": reason or "",
+            "ret": ret,
+        }
+        path = self.trade_spreads_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cols = [
+            "ts",
+            "session_id",
+            "mode",
+            "action",
+            "symbol",
+            "contract",
+            "side",
+            "qty",
+            "fill_px",
+            "bid",
+            "ask",
+            "spread",
+            "spread_pct",
+            "fill_spread_frac",
+            "reason",
+            "ret",
+        ]
+        write_header = not path.is_file() or path.stat().st_size == 0
+        with path.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=cols, extrasaction="ignore")
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+        return row
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -576,10 +659,21 @@ class Mag7BrokerOms:
         )
         self.publish_state()
 
+    def _has_active_buy(self, symbol: str) -> bool:
+        terminal = TERMINAL_STATUSES | {"FILLED"}
+        for intent in self.intents.values():
+            if (
+                intent.action == "BUY"
+                and intent.symbol == str(symbol).upper()
+                and str(intent.status).upper() not in terminal
+            ):
+                return True
+        return False
+
     def process_signal(self, signal: ScannerSignal) -> bool:
         symbol = signal.symbol.upper()
         contract = str(signal.contract or "").replace("O:", "")
-        if not contract or self.has_position(symbol):
+        if not contract or self.has_position(symbol) or self._has_active_buy(symbol):
             return False
         if self.day_halted:
             reason = "day_halted"
@@ -651,36 +745,227 @@ class Mag7BrokerOms:
                 },
             )
             return False
+        mid = quote_mid(float(quote["bid"]), float(quote["ask"])) or float(limit_price)
+        ask_size = quote.get("ask_size")
+        try:
+            ask_size_f = float(ask_size) if ask_size is not None else None
+        except (TypeError, ValueError):
+            ask_size_f = None
+        chunks = plan_entry_chunks(
+            qty,
+            mid=float(mid),
+            ask_size=ask_size_f,
+            cfg=self.iceberg_cfg,
+        )
+        if not chunks:
+            self._event("ENTRY_REJECT", {"symbol": symbol, "reason": "iceberg_empty"})
+            return False
+        if len(chunks) > 1:
+            self._event(
+                "ICEBERG_PLAN",
+                {
+                    "symbol": symbol,
+                    "contract": contract,
+                    "total_qty": qty,
+                    "chunks": chunks,
+                    "ask_size": ask_size_f,
+                    "mid": mid,
+                    "fallback_notional": self.iceberg_cfg.fallback_notional,
+                },
+            )
+        started = time.time()
+        if self.mode == "shadow":
+            # Shadow: walk clips immediately (same quote snapshot; still records per-clip spreads).
+            for idx, clip_qty in enumerate(chunks):
+                ok = self._submit_entry_chunk(
+                    signal=signal,
+                    symbol=symbol,
+                    contract=contract,
+                    con_id=lock.con_id,
+                    clip_qty=int(clip_qty),
+                    limit_price=float(limit_price),
+                    qty_frac=float(qty_frac),
+                    quote=quote,
+                    mid=float(mid),
+                    chunk_idx=idx,
+                    chunks_total=len(chunks),
+                    total_qty=qty,
+                    queue=chunks[idx + 1 :],
+                    started_at=started,
+                    parent_intent_id="",
+                )
+                if not ok:
+                    break
+        else:
+            self._submit_entry_chunk(
+                signal=signal,
+                symbol=symbol,
+                contract=contract,
+                con_id=lock.con_id,
+                clip_qty=int(chunks[0]),
+                limit_price=float(limit_price),
+                qty_frac=float(qty_frac),
+                quote=quote,
+                mid=float(mid),
+                chunk_idx=0,
+                chunks_total=len(chunks),
+                total_qty=qty,
+                queue=chunks[1:],
+                started_at=started,
+                parent_intent_id="",
+            )
+        self.publish_state()
+        return True
+
+    def _submit_entry_chunk(
+        self,
+        *,
+        signal: ScannerSignal,
+        symbol: str,
+        contract: str,
+        con_id: int,
+        clip_qty: int,
+        limit_price: float,
+        qty_frac: float,
+        quote: dict[str, float],
+        mid: float,
+        chunk_idx: int,
+        chunks_total: int,
+        total_qty: int,
+        queue: list[int],
+        started_at: float,
+        parent_intent_id: str,
+    ) -> bool:
         intent_id = self._intent_id(
             "BUY",
             symbol,
             contract,
-            str(int(to_ny(signal.sig_ts).timestamp() * 1000)),
+            f"{int(to_ny(signal.sig_ts).timestamp() * 1000)}:ibg{chunk_idx}:{time.time():.3f}",
         )
         if intent_id in self.intents:
             return False
-        mid = quote_mid(float(quote["bid"]), float(quote["ask"])) or float(limit_price)
         intent = PendingIntent(
             intent_id=intent_id,
             action="BUY",
             symbol=symbol,
             contract=contract,
-            con_id=lock.con_id,
-            qty=qty,
-            limit_price=limit_price,
-            reason="ENTRY",
+            con_id=con_id,
+            qty=int(clip_qty),
+            limit_price=float(limit_price),
+            reason="ENTRY" if chunks_total <= 1 else f"ICEBERG_{chunk_idx + 1}/{chunks_total}",
             created_at=time.time(),
             signal=signal,
             ref_price=float(mid),
+            parent_intent_id=parent_intent_id,
+            iceberg_queue=encode_chunk_queue(queue),
+            iceberg_chunk_idx=int(chunk_idx),
+            iceberg_chunks=int(chunks_total),
+            iceberg_total_qty=int(total_qty),
+            iceberg_qty_frac=float(qty_frac),
+            iceberg_started_at=float(started_at),
         )
         self.intents[intent.intent_id] = intent
         self._event("ENTRY_INTENT", _intent_dict(intent))
         if self.mode == "shadow":
-            self._apply_open_fill(intent, qty, limit_price, qty_frac, quote)
+            self._apply_open_fill(
+                intent, int(clip_qty), float(limit_price), float(qty_frac), quote
+            )
         else:
             self._place_broker_order(intent)
-        self.publish_state()
         return True
+
+    def _maybe_continue_iceberg(self, intent: PendingIntent) -> None:
+        """After a BUY clip fully fills, place the next clip if any remain."""
+        if self.mode == "shadow":
+            return  # shadow walks all clips synchronously in process_signal
+        if intent.action != "BUY":
+            return
+        if str(intent.status).upper() != "FILLED":
+            return
+        queue = decode_chunk_queue(intent.iceberg_queue)
+        if not queue:
+            return
+        if intent.iceberg_started_at > 0 and (
+            time.time() - float(intent.iceberg_started_at)
+            > float(self.iceberg_cfg.max_total_sec)
+        ):
+            self._event(
+                "ICEBERG_STOP",
+                {
+                    "symbol": intent.symbol,
+                    "reason": "max_total_sec",
+                    "remaining": queue,
+                    "from_intent_id": intent.intent_id,
+                },
+            )
+            return
+        if self.day_halted:
+            self._event(
+                "ICEBERG_STOP",
+                {
+                    "symbol": intent.symbol,
+                    "reason": "day_halted",
+                    "remaining": queue,
+                    "from_intent_id": intent.intent_id,
+                },
+            )
+            return
+        signal = intent.signal
+        if signal is None:
+            return
+        quote = self._quote(intent.symbol, intent.contract)
+        if quote is None:
+            self._event(
+                "ICEBERG_STOP",
+                {
+                    "symbol": intent.symbol,
+                    "reason": "option_stale_or_missing",
+                    "remaining": queue,
+                    "from_intent_id": intent.intent_id,
+                },
+            )
+            return
+        quote_ok, quote_reason, mid = entry_quote_ok(
+            bid=float(quote["bid"]),
+            ask=float(quote["ask"]),
+            prev_mid=self._last_seen_option_mid.get((intent.symbol, intent.contract)),
+            cfg=self.risk_cfg,
+        )
+        if not quote_ok:
+            self._event(
+                "ICEBERG_STOP",
+                {
+                    "symbol": intent.symbol,
+                    "reason": quote_reason,
+                    "remaining": queue,
+                    "from_intent_id": intent.intent_id,
+                },
+            )
+            return
+        mid = mid or quote_mid(float(quote["bid"]), float(quote["ask"])) or float(
+            intent.limit_price
+        )
+        limit_price = limit_price_from_quote(
+            quote["bid"], quote["ask"], "BUY", self.fill_model
+        )
+        next_qty = int(queue[0])
+        self._submit_entry_chunk(
+            signal=signal,
+            symbol=intent.symbol,
+            contract=intent.contract,
+            con_id=intent.con_id,
+            clip_qty=next_qty,
+            limit_price=float(limit_price),
+            qty_frac=float(intent.iceberg_qty_frac or 0.0),
+            quote=quote,
+            mid=float(mid),
+            chunk_idx=int(intent.iceberg_chunk_idx) + 1,
+            chunks_total=int(intent.iceberg_chunks or 1),
+            total_qty=int(intent.iceberg_total_qty or next_qty),
+            queue=queue[1:],
+            started_at=float(intent.iceberg_started_at or time.time()),
+            parent_intent_id=intent.intent_id,
+        )
 
     def retry_pending_signals(self, timeout_sec: float = 15.0) -> None:
         changed = False
@@ -770,7 +1055,11 @@ class Mag7BrokerOms:
                     )
                     self._apply_open_fill(intent, filled, avg_price, qty_frac, quote)
             elif intent.action == "SELL" and intent.symbol in self.positions:
-                self._apply_close_fill(intent, filled, avg_price)
+                close_q = self._quote(intent.symbol, intent.contract) or {
+                    "bid": avg_price,
+                    "ask": avg_price,
+                }
+                self._apply_close_fill(intent, filled, avg_price, close_q)
             self._on_trade_status(intent_id, trade)
         for intent_id, intent in self.intents.items():
             if intent.status.upper() in TERMINAL_STATUSES or intent_id in recovered_ids:
@@ -1070,7 +1359,7 @@ class Mag7BrokerOms:
                             "ask": quote["ask"],
                         },
                     )
-            self._apply_close_fill(intent, qty, price)
+            self._apply_close_fill(intent, qty, price, quote)
         self._event(
             "FILL",
             {
@@ -1159,20 +1448,33 @@ class Mag7BrokerOms:
                 last_good_mid=float(mid),
             )
             self._remember_option_mid(intent.symbol, intent.contract, float(mid))
-        rec = audit_fill(
-            float(quote["bid"]),
-            float(quote["ask"]),
-            float(price),
-            "BUY",
-            self.fill_model,
+        spread_row = self._record_trade_spread(
+            action="OPEN",
+            symbol=intent.symbol,
+            contract=intent.contract,
+            side="BUY",
+            fill_px=float(price),
+            qty=int(qty),
+            bid=float(quote["bid"]),
+            ask=float(quote["ask"]),
+            reason=str(intent.reason or "ENTRY"),
         )
         self._event(
             "POSITION_OPEN",
             {
                 **asdict(self.positions[intent.symbol]),
-                "fill_spread_frac": rec.fill_spread_frac,
+                "fill_px": float(price),
+                "bid": spread_row["bid"],
+                "ask": spread_row["ask"],
+                "spread": spread_row["spread"],
+                "spread_pct": spread_row["spread_pct"],
+                "fill_spread_frac": spread_row["fill_spread_frac"],
+                "iceberg_chunk": intent.iceberg_chunk_idx,
+                "iceberg_chunks": intent.iceberg_chunks,
             },
         )
+        if str(intent.status).upper() == "FILLED":
+            self._maybe_continue_iceberg(intent)
 
     def evaluate_exits(self, asof_ts: float) -> None:
         grace = int(self.trade_cfg.get("exit_mf_grace_seconds", 60))
@@ -1357,15 +1659,27 @@ class Mag7BrokerOms:
             },
         )
         if self.mode == "shadow":
-            self._apply_close_fill(intent, position.qty, limit_price)
+            self._apply_close_fill(intent, position.qty, limit_price, quote)
         else:
             self._place_broker_order(intent)
         self.publish_state()
 
-    def _apply_close_fill(self, intent: PendingIntent, qty: int, price: float) -> None:
+    def _apply_close_fill(
+        self,
+        intent: PendingIntent,
+        qty: int,
+        price: float,
+        quote: dict[str, float] | None = None,
+    ) -> None:
         position = self.positions.get(intent.symbol)
         if position is None:
             return
+        if quote is None:
+            quote = self._quote(intent.symbol, position.contract)
+        if quote is None and position.last_bid > 0 and position.last_ask >= position.last_bid:
+            quote = {"bid": float(position.last_bid), "ask": float(position.last_ask)}
+        if quote is None:
+            quote = {"bid": float(price), "ask": float(price)}
         previous_filled = float(intent.filled)
         total_filled = previous_filled + int(qty)
         intent.avg_fill_price = (
@@ -1382,6 +1696,20 @@ class Mag7BrokerOms:
             if self.day_start_equity > 0
             else 0.0
         )
+        spread_row = self._record_trade_spread(
+            action="CLOSE" if qty >= position.qty else "PARTIAL_CLOSE",
+            symbol=intent.symbol,
+            contract=position.contract,
+            side="SELL",
+            fill_px=float(price),
+            qty=filled_qty,
+            bid=float(quote["bid"]),
+            ask=float(quote["ask"]),
+            reason=intent.reason,
+            ret=None
+            if qty < position.qty
+            else (float(intent.avg_fill_price) / position.entry_price - 1.0),
+        )
         if qty < position.qty:
             position.qty -= qty
             position.status = "EXIT_PENDING"
@@ -1394,6 +1722,11 @@ class Mag7BrokerOms:
                     "fill_pnl": fill_pnl,
                     "remaining_qty": position.qty,
                     "reason": intent.reason,
+                    "bid": spread_row["bid"],
+                    "ask": spread_row["ask"],
+                    "spread": spread_row["spread"],
+                    "spread_pct": spread_row["spread_pct"],
+                    "fill_spread_frac": spread_row["fill_spread_frac"],
                 },
             )
             circuit = self.trade_cfg.get("day_circuit")
@@ -1421,6 +1754,11 @@ class Mag7BrokerOms:
                 "realized_pnl": self.realized_pnl,
                 "day_return": day_ret,
                 "day_halted": self.day_halted,
+                "bid": spread_row["bid"],
+                "ask": spread_row["ask"],
+                "spread": spread_row["spread"],
+                "spread_pct": spread_row["spread_pct"],
+                "fill_spread_frac": spread_row["fill_spread_frac"],
             },
         )
 
