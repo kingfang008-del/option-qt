@@ -193,8 +193,12 @@ class Mag7LiveFrameEngine:
                 gate = getattr(self.scanner, "regime_gate", None)
                 if gate is not None and hasattr(gate, "on_stock_second"):
                     gate.on_stock_second(symbol, tick)
+                # Feed QQQ completed 1m into scanner.stock_by for Watchdog/Hunt.
+                if hasattr(self.scanner, "on_reference_second"):
+                    self.scanner.on_reference_second(symbol, tick)
 
         signals = []
+        n_sig_before = len(getattr(self.scanner, "signals", []) or [])
         for payload in batch:
             item = _stock_tick(payload)
             if item is None:
@@ -213,6 +217,17 @@ class Mag7LiveFrameEngine:
             signal = self.scanner.on_stock_second(symbol, tick)
             if signal is not None:
                 signals.append(signal)
+        # Hunt emits land in scanner.signals; also drain by frame clock.
+        for sig in list(getattr(self.scanner, "signals", []) or [])[n_sig_before:]:
+            if sig not in signals:
+                signals.append(sig)
+        frame_ts_ny = pd.Timestamp(frame_ts, unit="s", tz="UTC").tz_convert(
+            "America/New_York"
+        )
+        if hasattr(self.scanner, "drain_hunts"):
+            for sig in self.scanner.drain_hunts(frame_ts_ny):
+                if sig not in signals:
+                    signals.append(sig)
 
         # Scanner states now include every completed minute in this cross-symbol
         # frame. Resolve exits first, then admit new entries.

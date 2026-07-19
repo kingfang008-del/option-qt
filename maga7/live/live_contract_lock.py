@@ -57,7 +57,7 @@ def select_ladder_contracts(
     trade_date: str,
     spot: float,
     allowed_dte: Iterable[int] = (0, 1, 2),
-    otm_rungs: int = 5,
+    otm_rungs: int = 3,
     lock_ts: float | None = None,
 ) -> list[LockedContract]:
     """Select ATM + strict OTM1..N on both sides for each exact trading DTE."""
@@ -170,7 +170,7 @@ class LiveOpenLadderLockService:
         ib: Any,
         *,
         allowed_dte: Iterable[int] = (0, 1, 2),
-        otm_rungs: int = 5,
+        otm_rungs: int = 3,
         request_concurrency: int = 2,
     ):
         self.ib = ib

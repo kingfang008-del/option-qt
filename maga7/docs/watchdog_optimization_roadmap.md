@@ -158,14 +158,21 @@ v2 已修「占坑挡反向」；残余问题是 **假收回本身仍亏**（如
 
 ---
 
-## 7. 建议执行节奏（4 周示意）
+## 7. 建议执行节奏
+
+### 已完成（2026-07-18）
+
+P0.1–P0.2、P1.0–P1.1、P2 升线闸门、旧 L2 并入 `peer3_v1` — 见 [`l2_hunter_validation_gates.md`](l2_hunter_validation_gates.md)。
+
+### 下一轮（2026-07-19 起，不动 peer3 参数）
+
+详细勾选表：[`l2_next_acceptance_checklist.md`](l2_next_acceptance_checklist.md)
 
 | 周 | 焦点 | 退出标准 |
 |----|------|----------|
-| W1 | P0.1–P0.2 OOS + 邻域 | 表出炉；不过则 L2 降级为「观察」 |
-| W2 | P1.1–P1.2 仅 L1 纸面 | 触发率与损益日志完整 |
-| W3 | P2.1 Hunt 退出消融 + P0 复验 | 强窗不掉到 &lt;120% freeze 或弱 &lt;95% 则弃 |
-| W4 | P3.1–P3.2 Live 接线 | Shadow 周报；决定是否申请 L1 签字 |
+| W1 | **Round A** P3：Scanner/OMS/Dash Hunt 对齐 | 历史 Hunt 日候选一致；meta 可过滤 |
+| W2 | A 周报 + **Round B** P2.3 日熔断消融 | Shadow 不空跑；双窗 ≥95% 现 L2 才议升 |
+| W3 | **Round C** P0.3/P0.4 符号+费用敏感 | `PASS_SENSITIVITY` 或降级观察 |
 
 ---
 
@@ -191,5 +198,5 @@ v2 已修「占坑挡反向」；残余问题是 **假收回本身仍亏**（如
 
 ## 9. 一句话路线
 
-**先用 P0 证明 overlay 不是同窗幻觉 → 纸面只开 L1 护基线 → 再打磨 L2 假 V 与 Live → 最后才谈扩池/新专家。**  
-在此之前，日常默认保持 **仅 L0**。
+**研究基线已是 L0+L1+L2；下一刀是 Live 对齐 → Hunt 日预算 → 敏感度，不拧信号旋钮。**  
+详见 [`l2_next_acceptance_checklist.md`](l2_next_acceptance_checklist.md)。

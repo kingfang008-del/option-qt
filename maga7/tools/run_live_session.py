@@ -83,17 +83,33 @@ def _scanner_from_live_locks(
             else None
         ),
         ladder=True,
-        otm_rungs=resolve_otm_rungs(profile, default=5),
+        otm_rungs=resolve_otm_rungs(profile, default=3),
     )
     regime_gate = None
     if bool((profile.get("regime") or {}).get("enabled")):
         regime_gate = LiveRegimeGate(profile.get("regime") or {})
+    watchdog = None
+    watchdog_snap: dict = {}
+    wd_cfg = profile.get("watchdog") or {}
+    if bool(wd_cfg.get("enabled")):
+        try:
+            from maga7.common.watchdog import RegimeWatchdog, snapshot_regime
+
+            watchdog = RegimeWatchdog.from_profile(profile)
+            if watchdog is not None and regime_gate is not None:
+                watchdog_snap = snapshot_regime(regime_gate.cfg)
+        except Exception:
+            watchdog = None
+            watchdog_snap = {}
     return Mag7Scanner(
         profile=profile,
         states=states,
         books=books,
         minute_agg=MultiSymbolMinuteAgg(profile["symbols"], rth_only=True),
         regime_gate=regime_gate,
+        watchdog=watchdog,
+        _watchdog_snap=watchdog_snap,
+        stock_by={},
         emit_all=emit_all,
     )
 
@@ -214,7 +230,7 @@ async def run(args: argparse.Namespace) -> int:
         preferred_dte=int((profile.get("trade") or {}).get("prefer_dte", 0)),
     )
     _, allowed = lock_policy_from_profile(profile)
-    otm_rungs = resolve_otm_rungs(profile, default=5)
+    otm_rungs = resolve_otm_rungs(profile, default=3)
     connector = Mag7IbkrConnector(
         session_id=session_id,
         symbols=list(profile["symbols"]),
@@ -226,6 +242,8 @@ async def run(args: argparse.Namespace) -> int:
                 and (
                     bool((profile.get("regime") or {}).get("qqq_align", False))
                     or bool((profile.get("regime") or {}).get("qqq_mf10_align", False))
+                    # Watchdog Halt/Hunt needs QQQ morning bars in stock_by
+                    or bool((profile.get("watchdog") or {}).get("enabled", False))
                 )
             )
             or (

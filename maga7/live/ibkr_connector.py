@@ -63,7 +63,7 @@ class Mag7IbkrConnector:
         session_dir: Path,
         config: Mag7IbkrConfig,
         allowed_dte: tuple[int, ...] = (0, 1, 2),
-        otm_rungs: int = 5,
+        otm_rungs: int = 3,
         resume: bool = False,
         ib: Any | None = None,
     ):
@@ -459,11 +459,15 @@ class Mag7IbkrConnector:
                 bid = _finite(getattr(ticker, "bid", None))
                 ask = _finite(getattr(ticker, "ask", None))
                 if ask >= bid > 0:
+                    bid_size = _finite(getattr(ticker, "bidSize", None))
+                    ask_size = _finite(getattr(ticker, "askSize", None))
                     quote = {
                         "ts": now,
                         "bid": bid,
                         "ask": ask,
                         "mid": (bid + ask) / 2.0,
+                        "bid_size": bid_size if bid_size > 0 else 0.0,
+                        "ask_size": ask_size if ask_size > 0 else 0.0,
                         "strike": lock.strike,
                         "bucket_id": lock.bucket_id,
                     }

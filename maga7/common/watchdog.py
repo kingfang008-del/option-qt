@@ -318,6 +318,9 @@ class WatchdogConfig:
     hunter_mae_cut_mfe_bypass: float | None = None
     hunter_mae_cut_min_hold_minutes: float | None = None
     hunter_position_frac: float | None = None
+    # After a Hunt fill with ret <= this, halt remaining entries that day.
+    # None / unset = off (default). Research only; not in peer3 freeze.
+    hunter_day_circuit_ret: float | None = None
     # legacy oracle labels
     mode: str = "rule"  # rule | oracle
     labels: dict[str, str] = field(default_factory=dict)
@@ -504,6 +507,11 @@ class WatchdogConfig:
             ),
             hunter_position_frac=(
                 float(hunt["position_frac"]) if hunt.get("position_frac") is not None else None
+            ),
+            hunter_day_circuit_ret=(
+                float(hunt["day_circuit_ret"])
+                if hunt.get("day_circuit_ret") is not None
+                else None
             ),
             mode=mode,
             labels=labels,
@@ -830,8 +838,11 @@ class RegimeWatchdog:
         Also arms hunt candidates when the hunter lane is enabled and not blocked
         by HALT / DEGRADE policy. Baseline overlay is unchanged by hunt arming.
         """
+        # Live may re-call begin_day as morning bars accumulate; only reset
+        # Hunt budget on a true day change (offline calls once per date).
+        if self._current_date != str(date):
+            self._hunt_entries_today = 0
         self._current_date = str(date)
-        self._hunt_entries_today = 0
         self.hunt_candidates = []
         self.hunt_armed = False
         if self.cfg.mode == "oracle":

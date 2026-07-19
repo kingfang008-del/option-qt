@@ -109,7 +109,7 @@ class Mag7RedisScannerLoop:
             self.n_option_prints += 1
 
     def _ingest_stock(self, payload: dict[str, Any]) -> ScannerSignal | None:
-        sym = str(payload.get("symbol") or "")
+        sym = str(payload.get("symbol") or "").upper()
         if not sym:
             return None
         stock = payload.get("stock") or {}
@@ -129,7 +129,14 @@ class Mag7RedisScannerLoop:
             "low": float(stock.get("low") or close),
             "close": close,
             "volume": float(stock.get("volume") or 0.0),
+            "previous_close": float(stock.get("previous_close") or 0.0),
         }
+        # Reference names (QQQ): feed stock_by for Watchdog, no Rule-A state.
+        if sym not in self.scanner.states:
+            if hasattr(self.scanner, "on_reference_second"):
+                self.scanner.on_reference_second(sym, tick)
+            self.n_ticks += 1
+            return None
         sig = self.scanner.on_stock_second(sym, tick)
         self.n_ticks += 1
         return sig
@@ -187,12 +194,22 @@ class Mag7RedisScannerLoop:
             self.stub.try_resolve_pending(asof_ts=ts_val)
 
         # Phase 3: update all stock states without callback side effects.
+        n_sig_before = len(self.scanner.signals)
         signals: list[ScannerSignal] = []
         for payload in batch:
             if not isinstance(payload, dict):
                 continue
             sig = self._ingest_stock(payload)
             if sig is not None:
+                signals.append(sig)
+        # Hunt may also have been drained into scanner.signals (not always returned).
+        for sig in self.scanner.signals[n_sig_before:]:
+            if sig not in signals:
+                signals.append(sig)
+        # Frame-clock Hunt drain (covers due entry_ts even if no 1m bar completed).
+        frame_ts = pd.Timestamp(datetime.fromtimestamp(ts_val, tz=NY))
+        for sig in self.scanner.drain_hunts(frame_ts):
+            if sig not in signals:
                 signals.append(sig)
 
         # Phase 4: commit entries after the complete cross-symbol frame.
