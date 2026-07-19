@@ -48,21 +48,21 @@ AGGREGATE_TRADES_TO_1S = os.environ.get("S3_AGG_1S", "1").strip() not in {"0", "
 # quotes → 每合约每秒最后一档盘口
 AGGREGATE_QUOTES_TO_1S = os.environ.get("S3_QUOTE_AGG_1S", "1").strip() not in {"0", "false", "False"}
 
-START_DATE = datetime.date(2026, 3, 10)
-END_DATE = datetime.date(2026, 7, 14)  # 先下 Jul1 烟雾；需要多天再改 END_DATE
+START_DATE = datetime.date(2026, 7, 17)
+END_DATE = datetime.date(2026, 7, 18)  # 先下 Jul1 烟雾；需要多天再改 END_DATE
 
 # [路径]
 # RAW_DIR: 临时存放 S3 原始大文件的目录 (处理完会删除)
 RAW_DIR = f"./data/temp_s3_raw_{DATA_KIND}"
 # PROCESSED_DIR: 最终存放清洗后数据（按 kind 分目录，避免覆盖分钟 parquet）
-_PROCESSED_ROOT = "/home/kingfang007/data/new_option_data_s3"
+_PROCESSED_ROOT = "/mnt/s990/new_option_data_s3"
 PROCESSED_DIR = (
     _PROCESSED_ROOT if DATA_KIND == "minute" else f"{_PROCESSED_ROOT}_{DATA_KIND}"
 )
 #from config import TARGET_SYMBOLS
 # [目标股票列表] (Tier 1 ~ Tier 5 + Macro)
-#TARGET_SYMBOLS =   ['QQQ','NVDA', 'TSLA', 'AMD', 'INTC', 'MSFT', 'AMZN', 'GOOG', 'META', 'AAPL' ]
-TARGET_SYMBOLS =   ['GOOGL']
+TARGET_SYMBOLS =   ['QQQ','NVDA', 'TSLA', 'AMD', 'INTC', 'MSFT', 'AMZN', 'GOOGL', 'META', 'AAPL' ,'MU','AVGO']
+#TARGET_SYMBOLS =   ['GOOGL']
 # [Polygon API Token] 用于预检合约
 API_KEY = "JXuIcG_dpoRiCE6jP7c73nVWweEVSpUp"
 
