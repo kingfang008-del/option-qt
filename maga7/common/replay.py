@@ -23,12 +23,28 @@ from maga7.common.contract_select import (
 )
 from maga7.common.open_lock import load_multidte_lock_index, resolve_open_lock_contract
 from maga7.common.fills import FillSpec
+from maga7.common.hold_watchdog import HoldWatchdogConfig, hold_watchdog_from_trade, qqq_adverse_from_entry
 from maga7.common.position_size import (
     block_same_dir_after_win_enabled,
     is_symbol_dir_big_win,
     post_win_cooldown_action,
     post_win_cooldown_sessions,
     resolve_size_frac,
+)
+from maga7.common.option_trades import (
+    TradeToxicConfig,
+    load_option_trades,
+    path_for_ticker_trades,
+    prepare_trade_mark_arrays,
+    trade_mtm_asof,
+    trade_peak_mfe_asof,
+    trade_toxic_from_trade,
+)
+from maga7.common.scale_in import (
+    ScaleInConfig,
+    blend_scale_in_ret,
+    confirm_scale_in,
+    scale_in_from_trade,
 )
 from maga7.common.event_calendar import resolve_event_blackout
 from maga7.common.reentry import resolve_only_win_reenter
@@ -315,6 +331,10 @@ class SimResult:
     reason: str
     entry_ts: pd.Timestamp
     exit_ts: pd.Timestamp
+    scale_in_added: bool = False
+    scale_in_entry2: float | None = None
+    scale_in_ts: pd.Timestamp | None = None
+    scale_in_deployed_frac: float = 1.0
 
 
 def _stock_mf_at(stock_day: pd.DataFrame | None, t: pd.Timestamp) -> tuple[float | None, int, int]:
@@ -378,6 +398,15 @@ def _stock_bar_index(day: pd.DataFrame | None, t: pd.Timestamp) -> int:
     if day is None or day.empty or "_ts_ns" not in day.columns:
         return -1
     return int(np.searchsorted(day["_ts_ns"].to_numpy(), t.value, side="right") - 1)
+
+
+def _stock_close_at(day: pd.DataFrame | None, t: pd.Timestamp) -> float | None:
+    """Latest causal stock close at/before ``t`` (requires ``_prepare_stock_day``)."""
+    i = _stock_bar_index(day, t)
+    if i < 0 or day is None or "_close" not in day.columns:
+        return None
+    px = float(day["_close"].iloc[i])
+    return px if np.isfinite(px) and px > 0 else None
 
 
 def _session_structure_at(
@@ -545,8 +574,24 @@ def simulate_trade(
     dyn_fast_opp_bars: int | None = None,
     dyn_fast_pct: float | None = None,
     dyn_require_price_break: bool = True,
+    qqq_day: pd.DataFrame | None = None,
+    hold_watchdog: dict[str, Any] | HoldWatchdogConfig | None = None,
+    scale_in: dict[str, Any] | ScaleInConfig | None = None,
+    trade_path: pd.DataFrame | None = None,
+    trade_toxic: dict[str, Any] | TradeToxicConfig | None = None,
 ) -> SimResult | None:
     """Option path fill with TP/SL/time, optional stock-window or MTM trail exit.
+
+    ``hold_watchdog``: optional mid-hold flatten when QQQ moves hard against the
+    trade (see ``maga7.common.hold_watchdog``). Exit reason ``HOLD_SHOCK``.
+
+    ``scale_in``: optional split entry — first tranche at signal fill; on option
+    MTM pullback + secondary factor confirm, add second tranche (see
+    ``maga7.common.scale_in``). Blended ``ret`` keeps ``size_frac * ret`` valid.
+
+    ``trade_path`` / ``trade_toxic``: mark toxic path on trade last prints
+    (MFE bypass + cut); exit fill still uses quote ``sell_px`` → reason
+    ``TRADE_TOX``. See ``maga7.common.option_trades``.
 
     ``exit_mode``:
       - ``None`` / ``none`` / ``rails``: TP/SL/T+hold only (default)
@@ -622,6 +667,18 @@ def simulate_trade(
     use_mae_cut = "mae_cut" in blob or "toxic_cut" in blob
     if use_mae_cut and bool(mae_cut_only_dn) and str(direction or "").upper() != "DN":
         use_mae_cut = False
+    if isinstance(trade_toxic, TradeToxicConfig):
+        ttox = trade_toxic
+    elif isinstance(trade_toxic, dict):
+        ttox = trade_toxic_from_trade({"trade_toxic": trade_toxic})
+    else:
+        ttox = TradeToxicConfig(enabled=False)
+    use_trade_toxic = (
+        bool(ttox.enabled)
+        or "trade_toxic" in blob
+        or "trade_mae" in blob
+        or "toxic_trade" in blob
+    )
     use_dyn = ("dyn_trail" in blob or "mf_dual" in blob) and direction in ("UP", "DN")
     require_mtm = "flow_mtm" in blob or "flow_soft" in blob
     act = float(trail_activate) if trail_activate is not None else 0.20
@@ -651,6 +708,53 @@ def simulate_trade(
     if use_dyn:
         end_ts = entry_ts + pd.Timedelta(minutes=dyn_max_m)
         reason = f"T+{dyn_max_m}"
+    if isinstance(hold_watchdog, HoldWatchdogConfig):
+        hwd = hold_watchdog
+    elif isinstance(hold_watchdog, dict):
+        hwd = hold_watchdog_from_trade({"hold_watchdog": hold_watchdog})
+    else:
+        hwd = HoldWatchdogConfig(enabled=False)
+    use_hold_wd = bool(hwd.enabled) and direction in ("UP", "DN") and qqq_day is not None
+    hold_wd_until = entry_ts + pd.Timedelta(seconds=int(hwd.min_hold_seconds))
+    if isinstance(scale_in, ScaleInConfig):
+        sic = scale_in
+    elif isinstance(scale_in, dict):
+        sic = scale_in_from_trade({"scale_in": scale_in})
+    else:
+        sic = ScaleInConfig(enabled=False)
+    use_scale_in = bool(sic.enabled) and direction in ("UP", "DN")
+    scale_grace = entry_ts + pd.Timedelta(seconds=int(sic.min_hold_seconds))
+    scale_deadline = (
+        entry_ts + pd.Timedelta(seconds=int(sic.max_wait_seconds))
+        if use_scale_in and sic.max_wait_seconds is not None
+        else None
+    )
+    entry2: float | None = None
+    entry2_ts: pd.Timestamp | None = None
+    # Anchor trade marks at the *quote fill* clock (first usable quote bar), not
+    # signal ts. entry_confirm / quote gaps can leave 10m+ between sig and fill;
+    # pre-fill prints at stale highs create phantom TRADE_TOX (e.g. AMD 05-15).
+    fill_ts = ts_list[0]
+    trade_mark = None
+    trade_peak_mfe = -np.inf
+    trade_cut_until = fill_ts + pd.Timedelta(seconds=int(ttox.min_hold_seconds))
+    trade_dig_since: pd.Timestamp | None = None
+    trade_cut_deadline = (
+        fill_ts + pd.Timedelta(seconds=int(ttox.max_cut_seconds))
+        if use_trade_toxic and ttox.max_cut_seconds is not None and int(ttox.max_cut_seconds) > 0
+        else None
+    )
+    use_div_mfe = (
+        use_trade_toxic
+        and ttox.div_mfe_bypass is not None
+        and ttox.div_stock_adverse_max is not None
+        and direction in ("UP", "DN")
+    )
+    if use_trade_toxic:
+        trade_mark = prepare_trade_mark_arrays(trade_path, fill_ts)
+        if trade_mark is None:
+            use_trade_toxic = False
+            use_div_mfe = False
     # mf_reversal / mtm_floor: wait ~10m; flow_* / mae_cut: wait ~5m before soft exit.
     min_hold_m = exit_min_hold_minutes
     if min_hold_m is None and ("mf_reversal" in blob or use_floor):
@@ -667,10 +771,20 @@ def simulate_trade(
         grace_secs = max(grace_secs, int(float(min_hold_m) * 60))
     grace_until = entry_ts + pd.Timedelta(seconds=grace_secs)
     day = stock_day
-    if (
-        use_mf or use_flow or use_extend or use_dyn or (use_mae_cut and mae_cut_require_mf_against)
-    ) and day is not None and not day.empty:
+    need_stock_day = (
+        use_mf
+        or use_flow
+        or use_extend
+        or use_dyn
+        or (use_mae_cut and mae_cut_require_mf_against)
+        or (use_scale_in and sic.confirm_mode not in {"always", "any", "never", "off", "none", "half_only"})
+        or use_div_mfe
+    )
+    if need_stock_day and day is not None and not day.empty:
         day = _prepare_stock_day(day)
+    stock_entry_px = _stock_close_at(day, fill_ts) if use_div_mfe else None
+    if use_div_mfe and stock_entry_px is None:
+        use_div_mfe = False
     entry_px_low: float | None = None
     entry_px_high: float | None = None
     opp_streak = 0
@@ -697,6 +811,44 @@ def simulate_trade(
         if force_ts is not None and t >= force_ts:
             reason, exit_px, exit_ts = "DISPLACE", float(p), t
             break
+        if (
+            use_scale_in
+            and entry2 is None
+            and t >= scale_grace
+            and (scale_deadline is None or t <= scale_deadline)
+        ):
+            mtm_mark = float(p) / entry - 1.0
+            if mtm_mark <= -float(sic.pullback_ret):
+                mf_v, su_v, sd_v = None, 0, 0
+                if sic.confirm_mode not in {"always", "any", "never", "off", "none", "half_only"}:
+                    visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
+                    mf_v, su_v, sd_v = _stock_mf_at(day, visible_at)
+                if confirm_scale_in(
+                    mode=sic.confirm_mode,
+                    direction=str(direction),
+                    mf=mf_v,
+                    streak_up=su_v,
+                    streak_dn=sd_v,
+                ):
+                    e2 = fill.buy(float(bids[i]), float(asks[i]))
+                    if np.isfinite(e2) and e2 > 0:
+                        entry2 = float(e2)
+                        entry2_ts = t
+        if use_hold_wd and t >= hold_wd_until:
+            fired, _signed = qqq_adverse_from_entry(
+                qqq_day,
+                entry_ts=entry_ts,
+                now_ts=t,
+                direction=str(direction),
+                thresh=float(hwd.qqq_adverse_from_entry),
+                bar_delay_seconds=int(stock_bar_delay_seconds),
+            )
+            if fired:
+                cur_ret_h = float(p) / entry - 1.0
+                mtm_gate = hwd.require_option_mtm_max
+                if mtm_gate is None or cur_ret_h <= float(mtm_gate):
+                    reason, exit_px, exit_ts = "HOLD_SHOCK", float(p), t
+                    break
         if t >= end_ts:
             if use_extend and (not extended) and end_ts == base_end and ext_hold > base_hold:
                 cur_ret = float(p) / entry - 1.0
@@ -745,6 +897,43 @@ def simulate_trade(
                 if mf_ok:
                     reason, exit_px, exit_ts = "MAE_CUT", float(p), t
                     break
+        if use_trade_toxic and trade_mark is not None:
+            ts_ns, tpx, t_entry = trade_mark
+            t_mtm = trade_mtm_asof(ts_ns, tpx, t_entry, t)
+            t_peak = trade_peak_mfe_asof(ts_ns, tpx, t_entry, t)
+            if t_peak is not None and t_peak > trade_peak_mfe:
+                trade_peak_mfe = float(t_peak)
+            in_cut_window = t >= trade_cut_until and (
+                trade_cut_deadline is None or t <= trade_cut_deadline
+            )
+            mfe_lim = float(ttox.mfe_bypass)
+            if use_div_mfe and stock_entry_px is not None and day is not None:
+                visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
+                s_px = _stock_close_at(day, visible_at)
+                if s_px is not None and stock_entry_px > 0:
+                    s_ret = s_px / stock_entry_px - 1.0
+                    # Positive when underlying moves against the option trade.
+                    adverse = (-s_ret) if str(direction).upper() == "UP" else s_ret
+                    if adverse < float(ttox.div_stock_adverse_max):
+                        mfe_lim = max(mfe_lim, float(ttox.div_mfe_bypass))
+            dig = (
+                t_mtm is not None
+                and float(trade_peak_mfe) < mfe_lim
+                and float(t_mtm) <= -float(ttox.cut_ret)
+            )
+            if dig and in_cut_window:
+                if trade_dig_since is None:
+                    trade_dig_since = t
+                persist_ok = (t - trade_dig_since).total_seconds() >= float(
+                    ttox.persist_seconds or 0
+                )
+                qconf = ttox.quote_confirm_ret
+                quote_ok = True if qconf is None else (float(p) / float(entry) - 1.0) <= -float(qconf)
+                if persist_ok and quote_ok:
+                    reason, exit_px, exit_ts = "TRADE_TOX", float(p), t
+                    break
+            else:
+                trade_dig_since = None
         if use_floor and t >= grace_until and cur_ret <= floor:
             reason, exit_px, exit_ts = "MTM_FLOOR", float(p), t
             break
@@ -825,13 +1014,28 @@ def simulate_trade(
                     if weak:
                         reason, exit_px, exit_ts = "MOM_EXHAUST", float(p), t
                         break
+    ret = float(exit_px) / entry - 1.0
+    scale_added = False
+    deployed = 1.0
+    if use_scale_in:
+        ret, deployed, scale_added = blend_scale_in_ret(
+            entry1=entry,
+            entry2=entry2,
+            exit_px=float(exit_px),
+            first_frac=float(sic.first_frac),
+            add_frac=float(sic.add_frac),
+        )
     return SimResult(
         entry=entry,
         exit=exit_px,
-        ret=exit_px / entry - 1.0,
+        ret=ret,
         reason=reason,
         entry_ts=ts_list[0],
         exit_ts=exit_ts,
+        scale_in_added=bool(scale_added),
+        scale_in_entry2=entry2 if scale_added else None,
+        scale_in_ts=entry2_ts if scale_added else None,
+        scale_in_deployed_frac=float(deployed),
     )
 
 
@@ -1015,6 +1219,12 @@ def run_offline_replay(
 
     quote_root = paths["quote_1s_root"]
     quote_cache: dict[tuple[str, str], pd.DataFrame | None] = {}
+    trades_root = paths.get("option_trades_root")
+    trade_cache: dict[tuple[str, str], pd.DataFrame | None] = {}
+    ttox_cfg = trade_toxic_from_trade(trade)
+    use_trade_toxic_global = bool(ttox_cfg.enabled) or str(
+        trade.get("early_exit_mode") or ""
+    ).strip().lower() in {"trade_toxic", "trade_mae", "toxic_trade"}
     day_iv_root = paths.get("day_iv_root")
     chain_cache = DayIvChainCache(day_iv_root) if day_iv_root else None
     n_signal_atm = 0
@@ -1023,6 +1233,8 @@ def run_offline_replay(
     n_skip_max_entry_otm = 0
     n_quote_1s = 0
     n_quote_day_iv = 0
+    n_trade_path = 0
+    n_trade_path_miss = 0
 
     from maga7.common.regime import Mag7RegimeGate
 
@@ -1094,7 +1306,13 @@ def run_offline_replay(
     n_lgbm_block = 0
     n_lgbm_scale = 0
     # Ensure QQQ frame exists for tcn/lgbm/router-rule channels.
-    need_qqq = tcn_on or lgbm_on or (router_on and router_mode == "rule") or (watchdog is not None)
+    need_qqq = (
+        tcn_on
+        or lgbm_on
+        or (router_on and router_mode == "rule")
+        or (watchdog is not None)
+        or bool(hold_watchdog_from_trade(trade).enabled)
+    )
     if need_qqq and qqq_frame is None and stock_by.get("QQQ") is None:
         try:
             raw_q = load_stock_month_files(paths["stock_root"], "QQQ", months)
@@ -1318,7 +1536,23 @@ def run_offline_replay(
             }
         else:
             confirm_weekdays = {int(x) for x in confirm_wd_raw}
+    confirm_dir_raw = trade.get(
+        "entry_confirm_directions", sig_cfg.get("entry_confirm_directions")
+    )
+    confirm_directions: set[str] | None = None
+    if confirm_dir_raw is not None:
+        if isinstance(confirm_dir_raw, str):
+            confirm_directions = {
+                x.strip().upper()
+                for x in confirm_dir_raw.split(",")
+                if str(x).strip() != ""
+            }
+        else:
+            confirm_directions = {str(x).upper() for x in confirm_dir_raw}
+    max_fp_raw = trade.get("max_from_prev_abs", sig_cfg.get("max_from_prev_abs"))
+    max_from_prev_abs = float(max_fp_raw) if max_fp_raw is not None else None
     n_confirm_block = 0
+    n_max_fp_block = 0
     purity_on = _trade_flag(trade, "trend_purity_sizing", False)
     purity_fp_ref = float(trade.get("trend_purity_fp_ref", 0.025) or 0.025)
     purity_features = str(
@@ -1348,6 +1582,14 @@ def run_offline_replay(
             if path is not None and not path.empty:
                 return path, "day_iv"
         return None, "none"
+
+    def get_trade_path(sym: str, date: str, ticker: str) -> pd.DataFrame | None:
+        if not use_trade_toxic_global or trades_root is None:
+            return None
+        k = (sym, date)
+        if k not in trade_cache:
+            trade_cache[k] = load_option_trades(trades_root, sym, date)
+        return path_for_ticker_trades(trade_cache[k], ticker)
 
     def spot_at(sym: str, date: str, ts) -> float | None:
         sdf = stock_by.get(sym)
@@ -1470,7 +1712,11 @@ def run_offline_replay(
         dyn_fast_opp_bars=trade.get("dyn_fast_opp_bars"),
         dyn_fast_pct=trade.get("dyn_fast_pct"),
         dyn_require_price_break=bool(trade.get("dyn_require_price_break", True)),
+        hold_watchdog=hold_watchdog_from_trade(trade),
+        scale_in=scale_in_from_trade(trade),
+        trade_toxic=ttox_cfg,
     )
+    hwd_cfg = sim_kwargs_common["hold_watchdog"]
 
     # Day loop keys: Rule-A dates ∪ (optional) Hunt calendar dates.
     # Without the Hunt pad, single-name sleeves miss washout_reclaim days that
@@ -1902,6 +2148,15 @@ def run_offline_replay(
                     n_tod_z_block += 1
                     continue
 
+            # Chase cap: skip Rule-A already extended beyond max |from_prev|.
+            if max_from_prev_abs is not None and sig_from_prev is not None:
+                try:
+                    if abs(float(sig_from_prev)) > float(max_from_prev_abs) + 1e-12:
+                        n_max_fp_block += 1
+                        continue
+                except (TypeError, ValueError):
+                    pass
+
             # Entry confirm: wait N bars after Rule-A; keep peer/regime at fire time.
             confirm_ft = None
             confirm_mf = None
@@ -1912,6 +2167,8 @@ def run_offline_replay(
                 except Exception:
                     wd0 = -1
                 use_confirm = wd0 in confirm_weekdays
+            if use_confirm and confirm_directions is not None:
+                use_confirm = str(direction).upper() in confirm_directions
             if use_confirm:
                 sdf_c = stock_by.get(sym)
                 stock_day_c = None
@@ -2055,6 +2312,11 @@ def run_offline_replay(
             stock_day = None
             if sdf is not None and not sdf.empty:
                 stock_day = sdf[sdf["date"] == date]
+            qqq_day = None
+            if bool(getattr(hwd_cfg, "enabled", False)):
+                qdf = stock_by.get("QQQ")
+                if qdf is not None and not getattr(qdf, "empty", True):
+                    qqq_day = qdf[qdf["date"].astype(str) == str(date)]
             exit_mode = str(trade.get("exit_mode") or trade.get("stock_exit") or "none")
             sim_kw = dict(sim_kwargs_common)
             hunt_pos_frac = None
@@ -2066,12 +2328,20 @@ def run_offline_replay(
                 if "exit_mode" in hov:
                     exit_mode = str(hov.pop("exit_mode"))
                 sim_kw.update(hov)
+            tpath = get_trade_path(sym, date, ticker)
+            if use_trade_toxic_global:
+                if tpath is not None and not tpath.empty:
+                    n_trade_path += 1
+                else:
+                    n_trade_path_miss += 1
+            sim_kw["trade_path"] = tpath
             sim = simulate_trade(
                 path,
                 ts,
                 direction=direction,
                 stock_day=stock_day,
                 exit_mode=exit_mode,
+                qqq_day=qqq_day,
                 **sim_kw,
             )
             if sim is None:
@@ -2127,6 +2397,10 @@ def run_offline_replay(
                         stock_day_v = None
                         if sdf_v is not None and not sdf_v.empty:
                             stock_day_v = sdf_v[sdf_v["date"] == date]
+                        sim_v_kw = dict(sim_kwargs_common)
+                        sim_v_kw["trade_path"] = get_trade_path(
+                            vic_sym, date, str(old_row["ticker"])
+                        )
                         sim_v = simulate_trade(
                             vic_path,
                             old_row["entry_ts"],
@@ -2134,7 +2408,7 @@ def run_offline_replay(
                             stock_day=stock_day_v,
                             exit_mode=exit_mode,
                             force_exit_ts=sim.entry_ts,
-                            **sim_kwargs_common,
+                            **sim_v_kw,
                         )
                         if sim_v is not None and str(sim_v.reason) == "DISPLACE":
                             old_sf = float(old_row["size_frac"])
@@ -2298,6 +2572,10 @@ def run_offline_replay(
                 "n_concurrent": n_conc,
                 "position_sizing": sizing_mode,
                 "size_reason": size_reason,
+                "scale_in_added": bool(getattr(sim, "scale_in_added", False)),
+                "scale_in_entry2": getattr(sim, "scale_in_entry2", None),
+                "scale_in_ts": getattr(sim, "scale_in_ts", None),
+                "scale_in_deployed_frac": float(getattr(sim, "scale_in_deployed_frac", 1.0) or 1.0),
                 "tcn_p": tcn_p,
                 "tcn_reason": tcn_reason,
                 "route": day_route,
@@ -2475,6 +2753,8 @@ def run_offline_replay(
         "n_pe_block": int(n_pe_block),
         "n_tod_z_block": int(n_tod_z_block),
         "n_confirm_block": int(n_confirm_block),
+        "max_from_prev_abs": max_from_prev_abs,
+        "n_max_fp_block": int(n_max_fp_block),
         "entry_confirm_bars": int(confirm_bars_n) if confirm_bars_n > 0 else None,
         "entry_confirm_mode": confirm_mode if confirm_bars_n > 0 else None,
         "trend_purity_sizing": bool(purity_on),
@@ -2538,6 +2818,18 @@ def run_offline_replay(
         if trade.get("early_exit_mode") or "mae_cut" in str(trade.get("exit_mode") or "").lower()
         else None,
         "n_mae_cut": int((trades_df["reason"] == "MAE_CUT").sum())
+        if len(trades_df) and "reason" in trades_df.columns
+        else 0,
+        "scale_in_enabled": bool(scale_in_from_trade(trade).enabled),
+        "n_scale_in_added": int(trades_df["scale_in_added"].sum())
+        if len(trades_df) and "scale_in_added" in trades_df.columns
+        else 0,
+        "trade_toxic_enabled": bool(use_trade_toxic_global),
+        "trade_toxic_cut_ret": float(ttox_cfg.cut_ret) if use_trade_toxic_global else None,
+        "trade_toxic_mfe_bypass": float(ttox_cfg.mfe_bypass) if use_trade_toxic_global else None,
+        "n_trade_path": int(n_trade_path),
+        "n_trade_path_miss": int(n_trade_path_miss),
+        "n_trade_tox": int((trades_df["reason"] == "TRADE_TOX").sum())
         if len(trades_df) and "reason" in trades_df.columns
         else 0,
     }

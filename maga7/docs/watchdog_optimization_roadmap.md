@@ -24,6 +24,8 @@ P0  防拟合闸门（OOS / 邻域 / 冻结纪律）     ← PASS_P0（1 月空�
 P1  L1 升线准备（流式对拍 → 研究开 L1）   ← 流式对拍已过
 P2  L2 质量（假 V、占坑残余、退出）
 P3  Live 接线（Hunt 注入 + 观测）
+P3.5 持仓 Watchdog（QQQ 冲击中途平仓）——见 [`hold_watchdog_research.md`](hold_watchdog_research.md)；默认 off
+P3.6 成交价毒性早切 trade_toxic——**已升** research_baseline；见 [`trade_mark_toxic_path_research.md`](trade_mark_toxic_path_research.md)
 P4  新专家 / 扩池（MU 等）——仅 P0–P2 过后再开
 ```
 

@@ -97,8 +97,16 @@ class QuoteSimSession:
         return None, "none"
 
     def simulate_on_path(self, sig: ScannerSignal, path: pd.DataFrame):
+        from maga7.common.hold_watchdog import hold_watchdog_from_trade
+
         sdf = self.stock_by.get(sig.symbol)
         stock_day = None if sdf is None or sdf.empty else sdf[sdf["date"] == sig.date]
+        hwd = hold_watchdog_from_trade(self.trade)
+        qqq_day = None
+        if hwd.enabled:
+            qdf = self.stock_by.get("QQQ")
+            if qdf is not None and not getattr(qdf, "empty", True):
+                qqq_day = qdf[qdf["date"].astype(str) == str(sig.date)]
         return simulate_trade(
             path,
             sig.sig_ts,
@@ -121,6 +129,8 @@ class QuoteSimSession:
             hold_extend_minutes=self.trade.get("hold_extend_minutes"),
             hold_extend_mtm_min=self.trade.get("hold_extend_mtm_min"),
             hold_extend_require_mf=bool(self.trade.get("hold_extend_require_mf", True)),
+            hold_watchdog=hwd,
+            qqq_day=qqq_day,
         )
 
     def simulate_signal(self, sig: ScannerSignal):

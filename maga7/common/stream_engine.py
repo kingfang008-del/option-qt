@@ -612,6 +612,15 @@ class StreamEngine:
             "dyn_fast_pct": trade.get("dyn_fast_pct"),
             "dyn_require_price_break": bool(trade.get("dyn_require_price_break", True)),
         }
+        from maga7.common.hold_watchdog import hold_watchdog_from_trade
+
+        hwd = hold_watchdog_from_trade(trade)
+        sim_kw["hold_watchdog"] = hwd
+        qqq_day = None
+        if hwd.enabled:
+            qdf = self.stock_by.get("QQQ") or self.stock_by_full.get("QQQ")
+            if qdf is not None and not getattr(qdf, "empty", True):
+                qqq_day = qdf[qdf["date"].astype(str) == str(date)]
         hunt_pos_frac = None
         if is_hunt and wd is not None:
             from maga7.common.watchdog import hunt_trade_overrides
@@ -627,6 +636,7 @@ class StreamEngine:
             direction=direction,
             stock_day=stock_day,
             exit_mode=exit_mode,
+            qqq_day=qqq_day,
             **sim_kw,
         )
         if sim is None:
