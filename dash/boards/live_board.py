@@ -16,6 +16,7 @@ from sources import (
     process_snapshot,
     redis_snapshot,
     resolve_live_trace_bundle,
+    trade_spreads_from_events,
 )
 
 try:
@@ -194,6 +195,7 @@ def _render_positions(host: str, port: int, db: int, profile: dict) -> None:
 
     session_dir = bundle.get("session_dir")
     if session_dir:
+        _render_trade_spreads(Path(session_dir))
         events_path = Path(session_dir) / "order_events.jsonl"
         if events_path.is_file():
             rows = []
@@ -248,10 +250,20 @@ def _render_sessions(sessions) -> None:
     options = {session.name: session for session in sessions}
     selected = options[st.selectbox("Live session", list(options), key="live_session")]
     frames = live_session_frames(selected)
-    a, b = st.tabs(["Order / fill events", "Open ladder locks"])
+    a, b, c = st.tabs(["交易点差（开/平仓）", "Order / fill events", "Open ladder locks"])
     with a:
-        st.dataframe(frames["events"], use_container_width=True, hide_index=True)
+        spreads = frames.get("trade_spreads")
+        if spreads is None or spreads.empty:
+            st.info("尚无 OPEN/CLOSE 点差记录（成交后写入 trade_spreads.csv）")
+        else:
+            st.dataframe(
+                _format_spread_df(spreads),
+                use_container_width=True,
+                hide_index=True,
+            )
     with b:
+        st.dataframe(frames["events"], use_container_width=True, hide_index=True)
+    with c:
         st.dataframe(frames["locks"], use_container_width=True, hide_index=True)
     with st.expander("Session manifest"):
         st.json(selected.manifest)
@@ -280,6 +292,68 @@ def _render_redis(host: str, port: int, db: int) -> None:
             use_container_width=True,
             hide_index=True,
         )
+
+
+def _format_spread_df(df: pd.DataFrame) -> pd.DataFrame:
+    show = df.copy()
+    if "spread_pct" in show.columns:
+        show["spread_pct"] = show["spread_pct"].map(
+            lambda x: f"{float(x):.2%}" if pd.notna(x) and x != "" else ""
+        )
+    if "fill_spread_frac" in show.columns:
+        show["fill_spread_frac"] = show["fill_spread_frac"].map(
+            lambda x: f"{float(x):.2f}" if pd.notna(x) and x != "" else ""
+        )
+    prefer = [
+        "ts",
+        "action",
+        "symbol",
+        "contract",
+        "side",
+        "fill_px",
+        "bid",
+        "ask",
+        "spread",
+        "spread_pct",
+        "fill_spread_frac",
+        "reason",
+        "ret",
+        "mode",
+    ]
+    cols = [c for c in prefer if c in show.columns] + [
+        c for c in show.columns if c not in prefer
+    ]
+    return show[cols]
+
+
+def _render_trade_spreads(session_dir: Path) -> None:
+    csv_path = session_dir / "trade_spreads.csv"
+    spreads = None
+    if csv_path.is_file():
+        try:
+            spreads = pd.read_csv(csv_path)
+        except Exception:
+            spreads = None
+    if spreads is None or spreads.empty:
+        events_path = session_dir / "order_events.jsonl"
+        rows = []
+        if events_path.is_file():
+            try:
+                with events_path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            rows.append(json.loads(line))
+                        except Exception:
+                            continue
+            except OSError:
+                rows = []
+        spreads = trade_spreads_from_events(rows)
+    st.markdown("**交易点差（开仓 / 平仓）**")
+    st.caption("每笔 OPEN/CLOSE 记录当时 bid/ask、绝对点差、spread_pct、成交落在点差的位置 fill_spread_frac。")
+    if spreads is None or spreads.empty:
+        st.info("尚无成交点差记录")
+        return
+    st.dataframe(_format_spread_df(spreads), use_container_width=True, hide_index=True)
 
 
 def _render_ops(profile: dict) -> None:

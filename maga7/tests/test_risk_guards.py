@@ -10,6 +10,7 @@ from maga7.live.risk_guards import (
     fill_adverse,
     is_fresh,
     observe_exit_mid,
+    quote_spread_fields,
     risk_config_from_trade,
 )
 
@@ -54,6 +55,15 @@ def test_exit_gap_hold_then_force():
         last_good_mid=good, mid=1.5, gap_hold_count=hold, cfg=cfg
     )
     assert status == "gap_force" and hold == 3
+
+
+def test_quote_spread_fields_open_close():
+    open_f = quote_spread_fields(1.0, 1.2, fill_px=1.16, side="BUY")
+    assert abs(float(open_f["spread"]) - 0.2) < 1e-9
+    assert abs(float(open_f["spread_pct"]) - (0.2 / 1.1)) < 1e-9
+    assert abs(float(open_f["fill_spread_frac"]) - 0.8) < 1e-9
+    close_f = quote_spread_fields(1.0, 1.2, fill_px=1.04, side="SELL")
+    assert abs(float(close_f["fill_spread_frac"]) - 0.8) < 1e-9
 
 
 def test_adverse_fill_buy_through_ask():

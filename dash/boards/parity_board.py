@@ -8,6 +8,32 @@ from boards.common import render_contract_banner, run_options
 from sources import REPO, latest_by_stage, run_frames
 
 
+def _show_trade_log(df: pd.DataFrame) -> pd.DataFrame:
+    show = df.copy()
+    if "spread_pct" in show.columns:
+        show["spread_pct"] = show["spread_pct"].map(
+            lambda x: f"{float(x):.2%}" if pd.notna(x) and str(x) != "" else ""
+        )
+    prefer = [
+        "action",
+        "ts",
+        "symbol",
+        "dir",
+        "contract",
+        "px",
+        "bid",
+        "ask",
+        "spread",
+        "spread_pct",
+        "reason",
+        "ret",
+    ]
+    cols = [c for c in prefer if c in show.columns] + [
+        c for c in show.columns if c not in prefer
+    ]
+    return show[cols]
+
+
 def render_parity_board(runs, profile: dict) -> None:
     st.markdown("### ③ Stream Parity / 一天流式对拍")
     st.caption(
@@ -91,20 +117,25 @@ python -m maga7.tools.run_maga7_redis_sim \\
             else:
                 st.dataframe(df, use_container_width=True, hide_index=True)
 
-    # trade_log if present (day stream check)
+    # trade_log if present (day stream check) — OPEN/CLOSE 含 bid/ask/spread_pct
     tl = run.path / "trade_log.csv"
     tl_off = run.path / "trade_log_offline.csv"
     if tl.is_file() or tl_off.is_file():
-        st.markdown("**trade_log（OPEN/CLOSE）**")
+        st.markdown("**trade_log（OPEN/CLOSE + 点差）**")
+        st.caption("每行开仓/平仓各自记录 bid / ask / spread / spread_pct。")
         t1, t2 = st.columns(2)
         with t1:
             if tl.is_file():
                 st.caption("stream")
-                st.dataframe(pd.read_csv(tl), use_container_width=True, hide_index=True)
+                st.dataframe(_show_trade_log(pd.read_csv(tl)), use_container_width=True, hide_index=True)
         with t2:
             if tl_off.is_file():
                 st.caption("offline")
-                st.dataframe(pd.read_csv(tl_off), use_container_width=True, hide_index=True)
+                st.dataframe(
+                    _show_trade_log(pd.read_csv(tl_off)),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
     st.success(
         "对拍通过后 → Live 页开 Shadow；不要在 Live 改一套不同的出场/选约逻辑。"

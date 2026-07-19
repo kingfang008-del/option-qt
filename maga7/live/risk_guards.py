@@ -65,6 +65,42 @@ def spread_pct(bid: float, ask: float) -> float | None:
     return (ask - bid) / mid
 
 
+def quote_spread_fields(
+    bid: float,
+    ask: float,
+    *,
+    fill_px: float | None = None,
+    side: str | None = None,
+) -> dict[str, float | None]:
+    """Snapshot bid/ask/spread for OPEN/CLOSE trade records (Dash / audits)."""
+    bid_f = float(bid) if bid is not None else 0.0
+    ask_f = float(ask) if ask is not None else 0.0
+    mid = quote_mid(bid_f, ask_f)
+    abs_spread = (ask_f - bid_f) if mid is not None else None
+    pct = spread_pct(bid_f, ask_f)
+    fill_frac: float | None = None
+    if (
+        fill_px is not None
+        and side is not None
+        and mid is not None
+        and abs_spread is not None
+        and abs_spread > 0
+    ):
+        px = float(fill_px)
+        side_u = str(side).upper()
+        if side_u == "BUY":
+            fill_frac = (px - bid_f) / abs_spread
+        elif side_u == "SELL":
+            fill_frac = (ask_f - px) / abs_spread
+    return {
+        "bid": bid_f if mid is not None else None,
+        "ask": ask_f if mid is not None else None,
+        "spread": abs_spread,
+        "spread_pct": pct,
+        "fill_spread_frac": fill_frac,
+    }
+
+
 def spread_ok(bid: float, ask: float, *, max_spread_pct: float) -> tuple[bool, str]:
     pct = spread_pct(bid, ask)
     if pct is None:

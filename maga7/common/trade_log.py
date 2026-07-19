@@ -2,6 +2,9 @@
 
 Mirrors the spirit of ``production`` ``_emit_trade_log`` / ``replay_trades_*.csv``:
 one row per open, one row per close, easy to diff entry/exit clocks.
+
+Each OPEN/CLOSE row records the option quote spread at that fill:
+``bid``, ``ask``, ``spread``, ``spread_pct``.
 """
 from __future__ import annotations
 
@@ -9,6 +12,24 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
+
+
+def _spread_fields(bid: Any, ask: Any) -> dict[str, Any]:
+    try:
+        bid_f = float(bid) if bid is not None and bid != "" else float("nan")
+        ask_f = float(ask) if ask is not None and ask != "" else float("nan")
+    except (TypeError, ValueError):
+        return {"bid": None, "ask": None, "spread": None, "spread_pct": None}
+    if not (bid_f == bid_f and ask_f == ask_f and ask_f >= bid_f > 0):
+        return {"bid": None, "ask": None, "spread": None, "spread_pct": None}
+    mid = (bid_f + ask_f) / 2.0
+    spread = ask_f - bid_f
+    return {
+        "bid": bid_f,
+        "ask": ask_f,
+        "spread": spread,
+        "spread_pct": (spread / mid) if mid > 0 else None,
+    }
 
 
 def trades_to_trade_log(trades: Iterable[Any]) -> pd.DataFrame:
@@ -32,6 +53,10 @@ def trades_to_trade_log(trades: Iterable[Any]) -> pd.DataFrame:
                 "exit_ts": getattr(t, "exit_ts", None),
                 "qty_frac": getattr(t, "qty_frac", None) or getattr(t, "size_frac", None),
                 "pnl_equity": getattr(t, "pnl_equity", None),
+                "entry_bid": getattr(t, "entry_bid", None),
+                "entry_ask": getattr(t, "entry_ask", None),
+                "exit_bid": getattr(t, "exit_bid", None),
+                "exit_ask": getattr(t, "exit_ask", None),
             }
         trade_id = f"{d.get('date')}|{d.get('symbol')}|{d.get('entry_ts')}|{i}"
         common = {
@@ -43,6 +68,8 @@ def trades_to_trade_log(trades: Iterable[Any]) -> pd.DataFrame:
             "rank": d.get("rank"),
             "qty_frac": d.get("qty_frac"),
         }
+        open_sp = _spread_fields(d.get("entry_bid"), d.get("entry_ask"))
+        close_sp = _spread_fields(d.get("exit_bid"), d.get("exit_ask"))
         rows.append(
             {
                 **common,
@@ -52,6 +79,7 @@ def trades_to_trade_log(trades: Iterable[Any]) -> pd.DataFrame:
                 "ret": None,
                 "reason": "ENTRY",
                 "pnl_equity": None,
+                **open_sp,
             }
         )
         rows.append(
@@ -63,6 +91,7 @@ def trades_to_trade_log(trades: Iterable[Any]) -> pd.DataFrame:
                 "ret": d.get("ret"),
                 "reason": d.get("reason"),
                 "pnl_equity": d.get("pnl_equity"),
+                **close_sp,
             }
         )
     if not rows:
@@ -81,6 +110,10 @@ def trades_to_trade_log(trades: Iterable[Any]) -> pd.DataFrame:
                 "ret",
                 "reason",
                 "pnl_equity",
+                "bid",
+                "ask",
+                "spread",
+                "spread_pct",
             ]
         )
     return pd.DataFrame(rows)
@@ -115,6 +148,10 @@ def offline_trades_to_trade_log(trades_df: pd.DataFrame) -> pd.DataFrame:
                 "exit_ts": getattr(r, "exit_ts", None),
                 "qty_frac": getattr(r, "size_frac", None) or getattr(r, "qty_frac", None),
                 "pnl_equity": getattr(r, "pnl_equity", None),
+                "entry_bid": getattr(r, "entry_bid", None),
+                "entry_ask": getattr(r, "entry_ask", None),
+                "exit_bid": getattr(r, "exit_bid", None),
+                "exit_ask": getattr(r, "exit_ask", None),
             }
         )
     return trades_to_trade_log(rows)

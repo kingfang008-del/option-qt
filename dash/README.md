@@ -7,7 +7,7 @@
 | **Download** | 补数据：可配起止日期 / 标的 → 扫缺数 → 一键日历同步与股票 1s 下载 → 页面看执行日志 |
 | **Offline Replay** | 离线金标结果与复跑 |
 | **Stream Parity** | 流式 / Redis S5 / day `trade_log` 对拍 |
-| **Live** | Shadow/Paper/Live：同时持仓、滑动窗口、session 证据 |
+| **Live** | Shadow/Paper/Live：同时持仓、滑动窗口、session 证据；每笔开/平仓点差（`trade_spreads.csv`） |
 
 ## 一致性契约
 

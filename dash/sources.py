@@ -605,11 +605,55 @@ def live_session_frames(session: LiveSessionArtifact) -> dict[str, pd.DataFrame]
                         events.append(row)
         except OSError:
             pass
+    spreads = load_csv(session.path / "trade_spreads.csv")
+    if spreads is None or spreads.empty:
+        spreads = trade_spreads_from_events(events)
     return {
         "locks": pd.DataFrame(lock_rows),
         "events": pd.DataFrame(events[-2000:]),
         "signals": load_csv(session.path / "signals.csv"),
+        "trade_spreads": spreads,
     }
+
+
+def trade_spreads_from_events(events: list[dict]) -> pd.DataFrame:
+    """Fallback: derive OPEN/CLOSE spread rows from order_events.jsonl."""
+    kind_map = {
+        "POSITION_OPEN": "OPEN",
+        "POSITION_CLOSE": "CLOSE",
+        "POSITION_PARTIAL_CLOSE": "PARTIAL_CLOSE",
+    }
+    rows = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        action = kind_map.get(str(ev.get("kind") or ""))
+        if not action:
+            continue
+        bid = ev.get("bid", ev.get("entry_bid") if action == "OPEN" else ev.get("last_bid"))
+        ask = ev.get("ask", ev.get("entry_ask") if action == "OPEN" else ev.get("last_ask"))
+        fill_px = ev.get("fill_px", ev.get("exit_price", ev.get("entry_price")))
+        rows.append(
+            {
+                "ts": ev.get("ts"),
+                "session_id": ev.get("session_id"),
+                "mode": ev.get("mode"),
+                "action": action,
+                "symbol": ev.get("symbol"),
+                "contract": ev.get("contract"),
+                "side": "BUY" if action == "OPEN" else "SELL",
+                "qty": ev.get("qty") or ev.get("filled_qty"),
+                "fill_px": fill_px,
+                "bid": bid,
+                "ask": ask,
+                "spread": ev.get("spread"),
+                "spread_pct": ev.get("spread_pct"),
+                "fill_spread_frac": ev.get("fill_spread_frac"),
+                "reason": ev.get("reason") or ("ENTRY" if action == "OPEN" else ""),
+                "ret": ev.get("ret"),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _decode_jsonish(raw: Any) -> Any:
