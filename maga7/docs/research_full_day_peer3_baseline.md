@@ -42,29 +42,46 @@
 | L2+05+sl55+tt600 | 上 + cut25 + max_cut=600s | +1829% | ~226% | 对照 |
 | **L2+05+sl55+tt600d** | 上 + **div_mfe6%/stock&lt;0.5%** | **+1856%** | **~229%** | **是（默认）** |
 
-升线门槛（Hunt）：**Feb–Apr vs L0 有提升**（L2 ~**+152%** ≈ **108% of L0**）。  
-sl55：Feb–Apr **+150.6%**；+tt600d：**+164%**；见 [`trade_mark_toxic_path_research.md`](trade_mark_toxic_path_research.md)。
+### 验收窗重划（2026-07-19）
+
+旧「弱窗 Feb–Apr」把 **4 月牛市** 和 1–3 月波动市混在一起，会高估弱窗、低估强窗 MaxDD 来源。
+
+| 窗 | 区间 | 市场叙事 | tt600d total_ret | MaxDD | n |
+|----|------|----------|-----------------:|------:|--:|
+| **强窗（新）** | **Apr–Jul（→07-16）** | QQQ 总量拉升 / 趋势市 | **+3987%** | **−24.4%** | 86 |
+| 其中 May–Jul | 05-01→07-16 | 同上 | +1856% | **−5.4%** | 57 |
+| 其中 Apr only | 04-01→04-30 | 牛市起步 | +109% | −24.4% | 29 |
+| **弱窗（新）** | **Jan–Mar** | 波动市、无 QQQ 总量拉升 | **+37%** | −21.7% | 66 |
+| 其中 Feb–Mar | 02-01→03-31 | 同上 | +35% | −21.7% | 50 |
+| ~~旧弱窗~~ | Feb–Apr（废弃作弱窗） | 混入 4 月牛 | +164% | −24.4% | 77 |
+
+要点：
+- **4 月不应再算弱窗**（单月 +109%、胜率 59%）。
+- Apr–Jul 复利很高，但 MaxDD **−24.4% 主要来自 4 月硬 SL**（如 04-08/04-22 AAPL）；May–Jul 单独 MaxDD 仅 −5.4%。
+- 弱窗 Jan–Mar 仍为正（+37%），比「旧 Feb–Apr +164%」更诚实。
+
+产物：`results/research_windows_apr_jul_vs_jan_mar_tt600d/`  
+升线门槛（Hunt 历史）：曾用 Feb–Apr vs L0；**此后双窗验收默认用 Apr–Jul + Jan–Mar**。  
+trade_toxic 细则：[`trade_mark_toxic_path_research.md`](trade_mark_toxic_path_research.md)。
 
 - L1 产物：`results/research_extend_mtm_full_day_peer3_l1_may_jul/`  
 - L2 产物：`results/watchdog/hunter_washout_reclaim_v2_opp/`  
 - L2+05（sl60）产物：`results/research_extend_mtm_full_day_peer3_l2_tt1_05_may_jul/`  
 - sl55 对照：`results/research_extend_mtm_full_day_peer3_l2_tt1_05_sl55_may_jul/`  
-- **当前基线产物**：`results/trade_toxic_div_ablation_dual_window/strong_may_jul__04_div06_adv05/`  
+- May–Jul tt600d：`results/trade_toxic_div_ablation_dual_window/strong_may_jul__04_div06_adv05/`  
+- **新窗产物**：`results/research_windows_apr_jul_vs_jan_mar_tt600d/`  
 - P2.1 `hold20_noext`（~+840%）仅为备选退出研究，**未**进基线。
 
 | Window | total_ret | MaxDD | notes |
 |--------|----------:|------:|-------|
-| May–Jul (→07-16) **L2+05+sl55+tt600d** | **+1856%** | **−5.4%** | **当前基线** |
-| May–Jul (→07-16) tt600 对照 | +1829% | −6.6% | 无股价背离软 MFE |
-| May–Jul (→07-16) tt 无 max_cut 对照 | +1721% | −6.6% | |
-| May–Jul (→07-16) L2+05+sl55 对照 | +1555% | −11.1% | 关 trade_toxic |
-| May–Jul (→07-17) L2+05 sl60 对照 | +1528% | −12.2% | 旧硬轨 |
-| May–Jul (→07-17) L2 对照 | ~+1282% | −12.2% | 无 TT1 05 |
-| May–Jul (→07-17) L1 对照 | +874.7% | −13.2% | Hunter off |
-| May–Jul (→07-17) L0 对照 | +810.4% | −13.2% | 无 Watchdog |
-| Feb–Apr **L2+05+sl55+tt600d** | **+164%** | −24.4% | vs sl55 +151% |
-| Feb–Apr L2+05+sl55 | +150.6% | −26.0% | 关 trade_toxic |
-| Feb–Apr L0 | ~+140% | −28.9% | weaker tape |
+| **Apr–Jul (→07-16) tt600d** | **+3987%** | **−24.4%** | **新强窗**（DD 含 4 月） |
+| May–Jul (→07-16) **tt600d** | **+1856%** | **−5.4%** | 趋势市干净段 |
+| Apr only tt600d | +109% | −24.4% | 牛市；勿算弱窗 |
+| **Jan–Mar tt600d** | **+37%** | −21.7% | **新弱窗** |
+| Feb–Mar tt600d | +35% | −21.7% | 弱窗子集 |
+| Feb–Apr tt600d（旧标签） | +164% | −24.4% | 已废弃作弱窗 |
+| May–Jul L2+05+sl55（关 tox） | +1555% | −11.1% | 对照 |
+| May–Jul L0 | +810% | −13.2% | 无 Watchdog |
 
 ### 工程闸门（防忘）
 
