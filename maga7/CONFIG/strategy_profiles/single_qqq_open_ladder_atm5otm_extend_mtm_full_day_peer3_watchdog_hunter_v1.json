@@ -98,7 +98,7 @@
     "bar_availability_delay_seconds": 60,
     "moneyness": "ATM",
     "contract_mode": "open_ladder",
-    "ladder_otm_rungs": 5,
+    "ladder_otm_rungs": 3,
     "quote_source": "1s",
     "day_iv_half_spread_frac": 0.01,
     "clear_otm_ban_0dte_pct": 0.01,
@@ -151,8 +151,8 @@
   },
   "fill": {
     "model": "spread_frac",
-    "entry_frac": 0.8,
-    "exit_frac": 0.8
+    "entry_frac": 0.75,
+    "exit_frac": 0.75
   },
   "buckets": {
     "UP_ATM": 2,
@@ -182,7 +182,7 @@
       1,
       2
     ],
-    "otm_rungs": 5
+    "otm_rungs": 3
   },
   "watchdog": {
     "enabled": true,

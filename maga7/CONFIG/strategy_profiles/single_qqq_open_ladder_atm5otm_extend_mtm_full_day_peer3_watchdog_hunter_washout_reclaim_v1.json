@@ -141,7 +141,7 @@
     "bar_availability_delay_seconds": 60,
     "moneyness": "ATM",
     "contract_mode": "open_ladder",
-    "ladder_otm_rungs": 5,
+    "ladder_otm_rungs": 3,
     "quote_source": "1s",
     "day_iv_half_spread_frac": 0.01,
     "clear_otm_ban_0dte_pct": 0.01,
@@ -169,6 +169,14 @@
         "cancel_settle_sec": 0.5
       }
     },
+    "iceberg": {
+      "enabled": true,
+      "ask_size_frac": 0.5,
+      "min_chunk_qty": 1,
+      "max_chunks": 5,
+      "fallback_notional": 8000,
+      "max_total_sec": 15
+    },
     "hold_extend_minutes": 45,
     "hold_extend_mtm_min": 0.0,
     "hold_extend_require_mf": false,
@@ -194,8 +202,8 @@
   },
   "fill": {
     "model": "spread_frac",
-    "entry_frac": 0.8,
-    "exit_frac": 0.8
+    "entry_frac": 0.75,
+    "exit_frac": 0.75
   },
   "buckets": {
     "UP_ATM": 2,
@@ -225,6 +233,6 @@
       1,
       2
     ],
-    "otm_rungs": 5
+    "otm_rungs": 3
   }
 }
