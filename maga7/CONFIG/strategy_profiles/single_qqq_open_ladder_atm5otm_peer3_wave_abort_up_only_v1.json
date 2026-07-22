@@ -1,13 +1,12 @@
 {
-  "profile": "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1",
-  "profile_id": "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1",
-  "description": "Research baseline: extend_mtm T30\u2192T45 + event_calendar=feb_jul_aapl_ceo + peer3 + streak3 + mf_idio + Watchdog L1 + Hunter + TT1 05 + sl55 + trade_toxic + S1 soft stock_path_confirm (timeout allow; delay_on_pos=false; tod 10:30\u201314:00). Ladder OTM3. NOT production freeze / WA_UP not default. Sync calendar via tools/sync_event_calendar.py.",
-  "role": "research_baseline",
-  "result_tag": "research_extend_mtm_full_day_peer3_l2_tt1_05_sl55_tt600d_feb_jul_aapl_ceo_cal_s1",
-  "research_revision": "2026-07-23_s1_path_soft",
-  "based_on": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1.json",
+  "profile": "single_qqq_open_ladder_atm5otm_peer3_wave_abort_up_only_v1",
+  "profile_id": "single_qqq_open_ladder_atm5otm_peer3_wave_abort_up_only_v1",
+  "description": "Research: peer3 + WAVE_ABORT only_directions=UP (July narrow ablation PASS). Saves Jul21 AMD UP toxic; keeps Jul02 AMD DN TP. NOT freeze.",
+  "role": "research_wave_abort_up_only",
+  "result_tag": "july_wave_abort_narrow_v1_WA_UP_ONLY",
+  "based_on": "strategy_profiles/single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json",
   "recommended_scheme": "single",
-  "baseline_doc": "docs/research_full_day_peer3_baseline.md",
+  "baseline_doc": "docs/wave_confirm_spec.md",
   "frozen_at": "2026-07-20",
   "symbols": [
     "NVDA",
@@ -56,7 +55,12 @@
     "window": 15,
     "model_path": null,
     "block_on_missing": false,
-    "channels": ["net$", "ret1", "range_pct", "qqq_ret1"]
+    "channels": [
+      "net$",
+      "ret1",
+      "range_pct",
+      "qqq_ret1"
+    ]
   },
   "lgbm_bouncer": {
     "enabled": false,
@@ -65,7 +69,9 @@
     "scale_when_low": 0.5,
     "model_path": "maga7/results/lgbm_bouncer/lgbm_bouncer_dn_v1.txt",
     "block_on_missing": false,
-    "only_directions": ["DN"]
+    "only_directions": [
+      "DN"
+    ]
   },
   "regime_router": {
     "enabled": false,
@@ -79,7 +85,7 @@
     "mode": "rule",
     "asof": "10:30",
     "experts_path": "maga7/CONFIG/regime_router/experts_v1.json",
-    "description": "P2 (2026-07-18): research baseline opens L1 + L2 Hunter washout_reclaim (old exit T30+extend). Gate: Feb\u2013Apr vs L0 lift; 2025H2 noted but not hard veto (Friday-option / regime mismatch).",
+    "description": "P2 (2026-07-18): research baseline opens L1 + L2 Hunter washout_reclaim (old exit T30+extend). Gate: Feb–Apr vs L0 lift; 2025H2 noted but not hard veto (Friday-option / regime mismatch).",
     "degrade": {
       "enabled": true,
       "rule": "reclaim_disp55",
@@ -105,7 +111,7 @@
       "washout_breadth_min": 3,
       "wash_window_end": "10:00",
       "frac_above_min": 0.35,
-      "frac_above_max": 0.70,
+      "frac_above_max": 0.7,
       "ttl_minutes": null,
       "note": "OFF after dual-window FAIL (2026-07-20): breadth≥3 fires 22/15 days and cuts strong to 34–54% of prev-off. Retune before re-enable. See docs/predictive_prevention_scoreboard.md."
     },
@@ -133,7 +139,6 @@
     },
     "note": "L0+L1+L2 on research_baseline. Hunt uses trade exit (T30+extend). Docs: docs/watchdog_stack_architecture.md"
   },
-
   "trade": {
     "tp_mult": 1.6,
     "sl_mult": 0.45,
@@ -158,7 +163,10 @@
     "max_entry_abs_otm_pct": 0.005,
     "entry_confirm_bars": 2,
     "entry_confirm_mode": "mf",
-    "entry_confirm_weekdays": [1, 3],
+    "entry_confirm_weekdays": [
+      1,
+      3
+    ],
     "hold_watchdog": {
       "enabled": false,
       "qqq_adverse_from_entry": 0.008,
@@ -218,16 +226,17 @@
     "mae_cut_mfe_bypass": 0.2,
     "mae_cut_min_hold_minutes": 5,
     "mae_cut_only_dn": false,
-    "stock_path_confirm": {
+    "wave_abort": {
       "enabled": true,
       "thr_pos": 0.0015,
       "thr_neg": -0.003,
       "max_wait_seconds": 300,
+      "revoke_seconds": 1800,
       "on_timeout": "allow",
-      "delay_on_pos": false,
-      "tod_start": "10:30",
-      "tod_end": "14:00",
-      "note": "S1 soft path 2026-07-23 research_baseline: adverse-first veto only; timeout allow. Dual-window flow_state / s1_wa_up. Live needs asof pending (scanner). WA_UP stays overlay-only."
+      "only_directions": [
+        "UP"
+      ],
+      "note": "July narrow ablation: WA_UP_ONLY keep=1.07, 7/21 -5.2%→-2.1%, AMD DN 7/02 kept TP"
     }
   },
   "regime": {
@@ -271,8 +280,8 @@
     "live_sessions_dir": "/mnt/s990/data/maga7/live_sessions"
   },
   "date_range": {
-    "start": "2026-05-01",
-    "end": "2026-07-17"
+    "start": "2026-07-01",
+    "end": "2026-07-21"
   },
   "lock": {
     "dte_mode": "trading",

@@ -81,6 +81,24 @@ Profile：`…_peer3_watchdog_v1`（Hunter off），`--stock-source stock_1s`。
 
 升线总闸见 [`l2_hunter_validation_gates.md`](l2_hunter_validation_gates.md)（对拍过 ≠ 进基线）。  
 
+### S1 research_baseline 对拍（2026-07-23）
+
+Profile：`…_extend_mtm_full_day_peer3_v1`（含 soft `stock_path_confirm`）。  
+指纹：`057410a6…c997df` · revision `2026-07-23_s1_path_soft`。
+
+| tag | period | n | ok | note |
+|-----|--------|--:|:--:|------|
+| `parity_s1_research_baseline_jan_mar_stock1s` | 01-02..03-31 | 54 | true | offline↔stream |
+| `parity_s1_research_baseline_apr_jul_stock1s` | 04-01..07-21 | 79 | true | offline↔stream |
+| `parity_s1_fix_tox_hunt_20260701_21` | 07-01..07-21 | 15 | true | offline↔stream；+ scanner 三路 |
+
+工程修复（同日）：
+- `stream_engine`：接线 `trade_toxic` + `trade_path`（否则 7/01 TSLA 退出对不齐）
+- `scanner`：Hunt 排程按**当日** `hunt_budget_remaining`（勿用累计 `n_hunt_emitted`）
+- `stock_path_confirm_ok(..., asof_ts=)` + scanner `pending_path`（实盘因果等待）
+
+双窗收益验收（cache offline PRE vs S1）：`KEEP_S1_RESEARCH_BASELINE` — 见 [`research_full_day_peer3_baseline.md`](research_full_day_peer3_baseline.md) · 汇总包 `results/s1_research_baseline_offline_pack_20260723/`。
+
 Scanner 对拍时挂 `scanner.stock_by`，`peer_align` 与 offline 同用 `feature_ts` asof；纯 IBKR live 无 stock_by 时退回各标的 live mf（秒级完成时刻可能差 1–2s）。
 
 **注意**：G2 是进程内 offline ↔ stream / scanner 规则对拍（股票 1s 聚合 + 期权 1s quote），

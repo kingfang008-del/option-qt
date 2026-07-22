@@ -17,7 +17,18 @@ from maga7.common.position_size import (
     resolve_size_frac,
 )
 from maga7.common.reentry import resolve_only_win_reenter
-from maga7.common.replay import load_quotes, path_for_ticker, simulate_trade, to_ny
+from maga7.common.option_trades import (
+    load_option_trades,
+    path_for_ticker_trades,
+    trade_toxic_from_trade,
+)
+from maga7.common.replay import (
+    load_quotes,
+    path_for_ticker,
+    simulate_trade,
+    stock_path_confirm_ok,
+    to_ny,
+)
 from maga7.common.signals import StreamSignalState
 
 
@@ -77,10 +88,13 @@ class StreamEngine:
     n_regime_scale: int = 0
     n_event_block: int = 0
     event_blackout: set = field(default_factory=set)
+    event_symbol_blackout: dict = field(default_factory=dict)
     n_peer_block: int = 0
     n_skip0_clear_otm: int = 0
     n_skip_max_entry_otm: int = 0
     n_confirm_block: int = 0
+    n_stock_path_confirm_block: int = 0
+    n_stock_path_confirm_ok: int = 0
     stock_by: dict[str, Any] = field(default_factory=dict)
     # Full frames for Watchdog breadth / QQQ (may include refs beyond profile.symbols)
     stock_by_full: dict[str, Any] = field(default_factory=dict)
@@ -101,6 +115,10 @@ class StreamEngine:
     n_hunt_trades: int = 0
     n_hunt_budget_skip: int = 0
     n_hunt_mutex_skip: int = 0
+    trade_cache: dict = field(default_factory=dict)
+    n_trade_path: int = 0
+    n_trade_path_miss: int = 0
+    n_trade_toxic: int = 0
 
     @classmethod
     def from_profile(cls, profile: dict[str, Any], *, scheme: str = "single") -> "StreamEngine":
@@ -239,8 +257,10 @@ class StreamEngine:
         )
         if self.post_win_mode == "skip":
             self.day_halt = True
-        if not self.event_blackout:
-            self.event_blackout = self._build_event_blackout()
+        if not self.event_blackout and not self.event_symbol_blackout:
+            full, sym = self._build_event_blackout_plan()
+            self.event_blackout = full
+            self.event_symbol_blackout = sym
         if date in self.event_blackout:
             self.day_halt = True
             self.n_event_block += 1
@@ -279,6 +299,11 @@ class StreamEngine:
         trade = self.profile.get("trade") or {}
         bar_delay = int(trade.get("bar_availability_delay_seconds", 0) or 0)
         for hc in list(getattr(self.watchdog, "hunt_candidates", None) or []):
+            if str(hc.symbol).upper() in (
+                self.event_symbol_blackout.get(str(date)) or set()
+            ):
+                self.n_event_block += 1
+                continue
             self.n_hunt_signals += 1
             feature_ts = to_ny(hc.sig_ts)
             entry_ts = feature_ts + pd.Timedelta(seconds=bar_delay)
@@ -340,18 +365,21 @@ class StreamEngine:
             self.events.append({"type": "HUNT_SIGNAL", **fire, "entry_ts": h["entry_ts"]})
             self._try_enter(fire)
 
-    def _build_event_blackout(self) -> set:
-        from maga7.common.event_calendar import resolve_event_blackout
+    def _build_event_blackout_plan(self) -> tuple[set, dict]:
+        from maga7.common.event_calendar import resolve_event_blackout_plan
 
         trade = self.profile.get("trade") or {}
         reg = self.profile.get("regime") or {}
+        keys = (
+            "event_calendar_block",
+            "event_calendar",
+            "event_dates",
+            "event_blackout_sessions",
+            "event_symbol_blackout",
+        )
         cfg = {
-            **{k: reg[k] for k in (
-                "event_calendar_block", "event_calendar", "event_dates", "event_blackout_sessions",
-            ) if k in reg},
-            **{k: trade[k] for k in (
-                "event_calendar_block", "event_calendar", "event_dates", "event_blackout_sessions",
-            ) if k in trade},
+            **{k: reg[k] for k in keys if k in reg},
+            **{k: trade[k] for k in keys if k in trade},
         }
         sessions: list[str] = []
         for sdf in self.stock_by.values():
@@ -365,7 +393,15 @@ class StreamEngine:
                     d.strftime("%Y-%m-%d")
                     for d in pd.bdate_range(start, end)
                 ]
-        return resolve_event_blackout(cfg, session_dates=sessions)
+        plan = resolve_event_blackout_plan(cfg, session_dates=sessions)
+        return set(plan.full_days), {
+            d: set(syms) for d, syms in plan.symbol_days.items()
+        }
+
+    def _build_event_blackout(self) -> set:
+        full, sym = self._build_event_blackout_plan()
+        self.event_symbol_blackout = sym
+        return full
 
     def _get_q(self, sym: str, date: str):
         k = (sym, date)
@@ -391,6 +427,25 @@ class StreamEngine:
                 return path, "day_iv"
         return None, "none"
 
+    def _get_trade_path(self, sym: str, date: str, ticker: str):
+        """Option trade prints for TRADE_TOX (parity with offline / OMS)."""
+        trade = self.profile.get("trade") or {}
+        ttox = trade_toxic_from_trade(trade)
+        use = bool(ttox.enabled) or str(trade.get("early_exit_mode") or "").strip().lower() in {
+            "trade_toxic",
+            "trade_mae",
+            "toxic_trade",
+        }
+        if not use:
+            return None
+        trades_root = (self.profile.get("_paths") or {}).get("option_trades_root")
+        if trades_root is None:
+            return None
+        k = (sym, date)
+        if k not in self.trade_cache:
+            self.trade_cache[k] = load_option_trades(trades_root, sym, date)
+        return path_for_ticker_trades(self.trade_cache[k], ticker)
+
     def _topk(self) -> int:
         return int(self.profile["signal"].get("top_k", 2))
 
@@ -401,6 +456,12 @@ class StreamEngine:
         sym = fire["symbol"]
         direction = fire["dir"]
         date = fire["date"]
+        if str(sym).upper() in (self.event_symbol_blackout.get(str(date)) or set()):
+            self.n_event_block += 1
+            self.events.append(
+                {"type": "EVENT_SYMBOL_BLACKOUT", "symbol": sym, "date": date}
+            )
+            return
         is_hunt = str(fire.get("event_source") or fire.get("route") or "baseline") == "hunt"
         wd = self.watchdog
         wd_cfg = getattr(wd, "cfg", None) if wd is not None else None
@@ -559,6 +620,67 @@ class StreamEngine:
                 return
             ts = to_ny(confirm_ft) + pd.Timedelta(seconds=bar_delay_seconds)
 
+        # Soft stock path confirm (S1) — batch semantics match offline (full day).
+        spc_raw = trade.get("stock_path_confirm") or {}
+        if isinstance(spc_raw, dict) and bool(spc_raw.get("enabled", False)):
+            use_spc = True
+            wd_raw = spc_raw.get("weekdays")
+            if wd_raw is not None:
+                if isinstance(wd_raw, str):
+                    spc_wds = {
+                        int(x.strip()) for x in wd_raw.split(",") if str(x).strip() != ""
+                    }
+                else:
+                    spc_wds = {int(x) for x in wd_raw}
+                try:
+                    wd_s = int(pd.Timestamp(str(date)).weekday())
+                except Exception:
+                    wd_s = -1
+                use_spc = wd_s in spc_wds
+            tod_start = spc_raw.get("tod_start")
+            tod_end = spc_raw.get("tod_end")
+            if use_spc and tod_start is not None and tod_end is not None:
+                try:
+                    sh, sm = str(tod_start).split(":", 1)
+                    eh, em = str(tod_end).split(":", 1)
+                    t0 = int(sh) * 60 + int(sm)
+                    t1 = int(eh) * 60 + int(em)
+                    hm = int(to_ny(ts).hour) * 60 + int(to_ny(ts).minute)
+                    use_spc = t0 <= hm <= t1
+                except Exception:
+                    pass
+            if use_spc:
+                sdf_p = self.stock_by.get(sym)
+                stock_day_p = None
+                if sdf_p is not None and not getattr(sdf_p, "empty", True):
+                    stock_day_p = sdf_p[sdf_p["date"] == date]
+                ok_p, path_confirm_ts, path_reason = stock_path_confirm_ok(
+                    stock_day_p,
+                    direction=str(direction),
+                    entry_ts=ts,
+                    thr_pos=float(spc_raw.get("thr_pos", 0.0015) or 0.0015),
+                    thr_neg=float(spc_raw.get("thr_neg", -0.003) or -0.003),
+                    max_wait_seconds=int(spc_raw.get("max_wait_seconds", 300) or 300),
+                    on_timeout=str(spc_raw.get("on_timeout", "block") or "block"),
+                )
+                if not ok_p:
+                    self.n_stock_path_confirm_block += 1
+                    self.events.append(
+                        {
+                            "type": "STOCK_PATH_CONFIRM_BLOCK",
+                            **fire,
+                            "path_confirm_reason": path_reason,
+                        }
+                    )
+                    return
+                self.n_stock_path_confirm_ok += 1
+                if (
+                    bool(spc_raw.get("delay_on_pos", True))
+                    and path_confirm_ts is not None
+                    and path_reason == "pos"
+                ):
+                    ts = to_ny(path_confirm_ts) + pd.Timedelta(seconds=bar_delay_seconds)
+
         spot = float(fire["spot"]) if fire.get("spot") is not None else None
         pick = resolve_entry_contract(
             self.books,
@@ -616,6 +738,22 @@ class StreamEngine:
 
         hwd = hold_watchdog_from_trade(trade)
         sim_kw["hold_watchdog"] = hwd
+        from maga7.common.ladder_active import ladder_active_from_trade
+
+        sim_kw["ladder_active"] = ladder_active_from_trade(trade)
+        ttox = trade_toxic_from_trade(trade)
+        sim_kw["trade_toxic"] = ttox
+        tpath = self._get_trade_path(sym, date, pick.ticker)
+        if bool(ttox.enabled) or str(trade.get("early_exit_mode") or "").strip().lower() in {
+            "trade_toxic",
+            "trade_mae",
+            "toxic_trade",
+        }:
+            if tpath is not None and not getattr(tpath, "empty", True):
+                self.n_trade_path += 1
+            else:
+                self.n_trade_path_miss += 1
+        sim_kw["trade_path"] = tpath
         qqq_day = None
         if hwd.enabled:
             qdf = self.stock_by.get("QQQ") or self.stock_by_full.get("QQQ")
@@ -641,6 +779,8 @@ class StreamEngine:
         )
         if sim is None:
             return
+        if str(sim.reason).upper() == "TRADE_TOX":
+            self.n_trade_toxic += 1
 
         open_until = {s: t for s, t in self.last_exit.items() if t is not None}
         size_frac, sizing_mode, n_conc, allow, size_reason = resolve_size_frac(
@@ -774,6 +914,8 @@ class StreamEngine:
             "n_skip0_clear_otm": int(self.n_skip0_clear_otm),
             "n_skip_max_entry_otm": int(self.n_skip_max_entry_otm),
             "n_confirm_block": int(self.n_confirm_block),
+            "n_stock_path_confirm_block": int(self.n_stock_path_confirm_block),
+            "n_stock_path_confirm_ok": int(self.n_stock_path_confirm_ok),
             "n_mf_idio_block": int(self.n_mf_idio_block),
             "n_mf_idio_scale": int(self.n_mf_idio_scale),
             "watchdog_enabled": bool(self.watchdog is not None),
@@ -783,6 +925,10 @@ class StreamEngine:
             "n_hunt_trades": int(self.n_hunt_trades),
             "n_hunt_budget_skip": int(self.n_hunt_budget_skip),
             "n_hunt_mutex_skip": int(self.n_hunt_mutex_skip),
+            "n_trade_path": int(self.n_trade_path),
+            "n_trade_path_miss": int(self.n_trade_path_miss),
+            "n_trade_toxic": int(self.n_trade_toxic),
+            "trade_toxic_enabled": bool(trade_toxic_from_trade(self.profile.get("trade")).enabled),
         }
 
 

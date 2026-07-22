@@ -46,7 +46,44 @@ from maga7.common.scale_in import (
     confirm_scale_in,
     scale_in_from_trade,
 )
-from maga7.common.event_calendar import resolve_event_blackout
+from maga7.common.event_calendar import resolve_event_blackout_plan
+from maga7.common.corr_rewire import corr_rewire_asof, corr_rewire_from_trade
+from maga7.common.adverse_vol_share import (
+    AdverseVolShareConfig,
+    EntryAdvVolConfig,
+    adverse_vol_share_asof,
+    adverse_vol_share_from_trade,
+    entry_adv_vol_from_trade,
+    prepare_stock_1s_arrays,
+)
+from maga7.common.delta_time_stop import (
+    AdverseSoftConfig,
+    DeltaTimeStopConfig,
+    RoiTimeStopConfig,
+    StockRevExitConfig,
+    adverse_soft_from_trade,
+    delta_time_stop_from_trade,
+    morning_r5_scale_from_trade,
+    roi_time_stop_from_trade,
+    stock_rev_day_should_arm,
+    stock_rev_exit_from_trade,
+)
+from maga7.common.wave_confirm import (
+    WaveAbortConfig,
+    WaveAbortState,
+    wave_abort_from_trade,
+    wave_abort_on_tick,
+)
+from maga7.common.path_fast_pack import (
+    apply_path_fast_pack_overrides,
+    path_fast_pack_day_should_arm,
+    path_fast_pack_from_trade,
+)
+from maga7.common.ladder_active import (
+    LadderActiveConfig,
+    ladder_active_from_trade,
+    ladder_day_should_arm,
+)
 from maga7.common.reentry import resolve_only_win_reenter
 from maga7.common.trend_purity import (
     path_efficiency_features,
@@ -69,6 +106,7 @@ from maga7.common.signals import (
     tod_mf_z_ok,
 )
 from maga7.common.lgbm_bouncer import load_lgbm_bouncer
+from maga7.common.state_gate import load_state_gate
 from maga7.common.tcn_gate import load_tcn_gate
 from maga7.common.watchdog import (
     WATCHDOG_REGIME_KEYS,
@@ -270,6 +308,88 @@ def entry_confirm_ok(
         ok = mf_ok
     return ok, confirm_ft, mf, su, sd
 
+
+def _hhmm_to_minutes(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return int(raw)
+    s = str(raw).strip()
+    if not s:
+        return None
+    if ":" in s:
+        hh, mm = s.split(":", 1)
+        return int(hh) * 60 + int(mm)
+    return int(float(s))
+
+
+def stock_path_confirm_ok(
+    stock_day: pd.DataFrame | None,
+    *,
+    direction: str,
+    entry_ts,
+    thr_pos: float = 0.0015,
+    thr_neg: float = -0.003,
+    max_wait_seconds: int = 300,
+    on_timeout: str = "block",
+    asof_ts=None,
+) -> tuple[bool, pd.Timestamp | None, str]:
+    """Causal first-touch path confirm after the fill clock starts.
+
+    From the latest close at/before ``entry_ts``, walk later 1m bars up to
+    ``max_wait_seconds``. Keep if signed move reaches ``thr_pos`` before
+    ``thr_neg``; cancel on adverse-first.
+
+    ``on_timeout``:
+      - ``block`` (default): no +thr_pos within wait → cancel
+      - ``allow``: only cancel on adverse-first; timeout keeps original ``entry_ts``
+
+    ``asof_ts`` (live / streaming): only bars at/before ``asof_ts`` are visible.
+    If no decision yet and ``asof_ts < deadline``, returns
+    ``(False, None, "pending")`` so the caller can wait. Offline batch leaves
+    ``asof_ts=None`` and resolves timeout immediately from the full day.
+
+    Returns ``(ok, confirm_bar_ts, reason)``. On ``allow`` timeout,
+    ``confirm_bar_ts`` is None (caller keeps original fill clock).
+    """
+    day = _prepare_stock_day(stock_day)
+    if day is None or day.empty or "_close" not in day.columns:
+        return False, None, "no_stock"
+    et = to_ny(entry_ts)
+    i0 = _stock_bar_index(day, et)
+    if i0 < 0:
+        return False, None, "no_anchor"
+    c0 = float(day["_close"].iloc[i0])
+    if not np.isfinite(c0) or c0 <= 0:
+        return False, None, "bad_anchor"
+    dir_u = str(direction).upper()
+    if dir_u not in {"UP", "DN"}:
+        return False, None, "bad_dir"
+    deadline = et + pd.Timedelta(seconds=int(max_wait_seconds))
+    asof = to_ny(asof_ts) if asof_ts is not None else None
+    thr_p = float(thr_pos)
+    thr_n = float(thr_neg)
+    for i in range(i0 + 1, len(day)):
+        ts_i = to_ny(day["timestamp"].iloc[i])
+        if ts_i > deadline:
+            break
+        if asof is not None and ts_i > asof:
+            break
+        px = float(day["_close"].iloc[i])
+        if not np.isfinite(px) or px <= 0:
+            continue
+        signed = (px / c0 - 1.0) if dir_u == "UP" else (1.0 - px / c0)
+        if signed >= thr_p:
+            return True, ts_i, "pos"
+        if signed <= thr_n:
+            return False, ts_i, "neg"
+    if asof is not None and asof < deadline:
+        return False, None, "pending"
+    mode = str(on_timeout or "block").strip().lower()
+    if mode in {"allow", "pass", "keep"}:
+        return True, None, "timeout_allow"
+    return False, None, "timeout"
+
 NY = "America/New_York"
 BUCKET_MAP = {
     ("UP", "ATM"): 2,
@@ -335,6 +455,8 @@ class SimResult:
     scale_in_entry2: float | None = None
     scale_in_ts: pd.Timestamp | None = None
     scale_in_deployed_frac: float = 1.0
+    adverse_soft_armed: bool = False
+    adv_vol_armed: bool = False
 
 
 def _stock_mf_at(stock_day: pd.DataFrame | None, t: pd.Timestamp) -> tuple[float | None, int, int]:
@@ -371,6 +493,14 @@ def _prepare_stock_day(stock_day: pd.DataFrame | None) -> pd.DataFrame | None:
     day["timestamp"] = [to_ny(x) for x in day["timestamp"].tolist()]
     day = day.sort_values("timestamp")
     day["_ts_ns"] = [int(to_ny(x).value) for x in day["timestamp"].tolist()]
+    if "mf10" not in day.columns and {"open", "high", "low", "close", "volume", "date"}.issubset(
+        set(day.columns)
+    ):
+        from maga7.common.signals import attach_mf_features
+
+        day = attach_mf_features(day)
+    if "mf10" not in day.columns:
+        day["mf10"] = np.nan
     day["_mf"] = day["mf10"].astype(float)
     if "mf_fast" in day.columns:
         day["_mf_fast"] = day["mf_fast"].astype(float)
@@ -560,6 +690,13 @@ def simulate_trade(
     hold_extend_minutes: int | None = None,
     hold_extend_mtm_min: float | None = None,
     hold_extend_require_mf: bool = True,
+    hold_extend_require_stock: bool = False,
+    hold_extend_stock_min: float = 0.0,
+    hold_extend_min_peak_mfe: float | None = None,
+    hold_extend_max_qqq_adverse: float | None = None,
+    stale_cut_minutes: float | None = None,
+    stale_cut_mtm_max: float = 0.0,
+    stale_cut_stock_max: float = 0.0,
     force_exit_ts=None,
     early_exit_mode: str | None = None,
     mae_cut_ret: float | None = None,
@@ -579,11 +716,38 @@ def simulate_trade(
     scale_in: dict[str, Any] | ScaleInConfig | None = None,
     trade_path: pd.DataFrame | None = None,
     trade_toxic: dict[str, Any] | TradeToxicConfig | None = None,
+    delta_time_stop: dict[str, Any] | DeltaTimeStopConfig | None = None,
+    roi_time_stop: dict[str, Any] | RoiTimeStopConfig | None = None,
+    adverse_soft: dict[str, Any] | AdverseSoftConfig | None = None,
+    adverse_vol_share: dict[str, Any] | AdverseVolShareConfig | None = None,
+    stock_rev_exit: dict[str, Any] | StockRevExitConfig | None = None,
+    wave_abort: dict[str, Any] | WaveAbortConfig | None = None,
+    stock_1s: pd.DataFrame | None = None,
+    ladder_active: dict[str, Any] | LadderActiveConfig | None = None,
 ) -> SimResult | None:
     """Option path fill with TP/SL/time, optional stock-window or MTM trail exit.
 
     ``hold_watchdog``: optional mid-hold flatten when QQQ moves hard against the
     trade (see ``maga7.common.hold_watchdog``). Exit reason ``HOLD_SHOCK``.
+
+    ``delta_time_stop``: if underlying signed move stays below threshold after
+    ``check_seconds`` while option MTM is non-positive, exit ``DELTA_STOP``.
+
+    ``stock_rev_exit``: after ``min_hold_minutes``, if signed stock from fill
+    ``<= stock_max`` and option MTM ``<= opt_mtm_max``, exit ``STOCK_REV``.
+
+    ``wave_abort``: post-fill revocable wave confirm → exit ``WAVE_ABORT``
+    (see ``maga7.common.wave_confirm`` / ``docs/wave_confirm_spec.md``).
+
+    ``adverse_soft``: after ``check_seconds``, if signed stock MAE is deep adverse
+    and option MTM is non-positive, either tighten trade_toxic (``tox_tighten``)
+    or flatten ``ADVERSE_SOFT``. Default OFF — softer than hard DELTA_STOP.
+
+    ``adverse_vol_share`` + ``stock_1s``: short-window share of volume on
+    adverse ticks; ``tox_tighten`` or flatten ``ADV_VOL``. Default OFF.
+
+    ``roi_time_stop``: V0-style option ROI progress rails — at each ``mins``,
+    if MTM ``< min_roi`` exit ``ROI_TIME{mins}``.
 
     ``scale_in``: optional split entry — first tranche at signal fill; on option
     MTM pullback + secondary factor confirm, add second tranche (see
@@ -611,6 +775,11 @@ def simulate_trade(
       - ``hold_extend`` / ``extend_hold``: at base ``hold_minutes``, if option MTM
         >= ``hold_extend_mtm_min`` (default 0) and (optional) mf10 still aligned,
         extend deadline to ``hold_extend_minutes`` (default 45). Rails still apply.
+        Optional feature gates (default off): ``hold_extend_require_stock`` /
+        ``hold_extend_stock_min``, ``hold_extend_min_peak_mfe``,
+        ``hold_extend_max_qqq_adverse``. Mid-hold ``stale_cut_minutes`` can flatten
+        losers early (MTM≤``stale_cut_mtm_max`` and stock≤``stale_cut_stock_max``)
+        without abolishing the T30 clock for healthy trades.
       - ``mae_cut`` / ``toxic_cut``: after min-hold (default 5m), if peak MFE
         < ``mae_cut_mfe_bypass`` (default 0.20) and MTM ret <= -``mae_cut_ret``
         (default 0.25), exit ``MAE_CUT``. Cuts toxic reversals before SL (-60%)
@@ -621,6 +790,10 @@ def simulate_trade(
         windows (default 3m/10m already on stock bars). Soft exits:
         FAST_REVERSAL (min-hold), MOM_EXHAUST (trail-start + fast pctile +
         slow slope), TREND_DEAD (slow fav MF < 0), hard ``dyn_max_hold_minutes``.
+      - ``ladder_active`` / ``sec_active`` / ``hft_ladder``: second-level active
+        management — hard ``max_hold_seconds``, stepped TP/SL rails, profit-stall,
+        optional short-grace mf flip. Never passive T+30. See
+        ``maga7.common.ladder_active`` / ``docs/sec_ladder_active_research.md``.
 
     Soft cuts may be **stacked** on extend via ``exit_mode="hold_extend+mtm_floor"``
     (or ``+mf_flip`` / ``+mf_reversal`` / ``+mae_cut``), or via ``early_exit_mode``.
@@ -679,10 +852,85 @@ def simulate_trade(
         or "trade_mae" in blob
         or "toxic_trade" in blob
     )
+    if isinstance(delta_time_stop, DeltaTimeStopConfig):
+        dts = delta_time_stop
+    elif isinstance(delta_time_stop, dict):
+        dts = delta_time_stop_from_trade({"delta_time_stop": delta_time_stop})
+    else:
+        dts = DeltaTimeStopConfig(enabled=False)
+    use_delta_stop = bool(dts.enabled) and direction in ("UP", "DN")
+    delta_check_until = None
+    delta_check_deadline = None
+    if isinstance(roi_time_stop, RoiTimeStopConfig):
+        rts = roi_time_stop
+    elif isinstance(roi_time_stop, dict):
+        rts = roi_time_stop_from_trade({"roi_time_stop": roi_time_stop})
+    else:
+        rts = RoiTimeStopConfig(enabled=False)
+    use_roi_time = bool(rts.enabled) and bool(rts.rails)
+    roi_fired: set[float] = set()
+    if isinstance(adverse_soft, AdverseSoftConfig):
+        adv = adverse_soft
+    elif isinstance(adverse_soft, dict):
+        adv = adverse_soft_from_trade({"adverse_soft": adverse_soft})
+    else:
+        adv = AdverseSoftConfig(enabled=False)
+    use_adv_soft = bool(adv.enabled) and direction in ("UP", "DN")
+    if isinstance(stock_rev_exit, StockRevExitConfig):
+        srev = stock_rev_exit
+    elif isinstance(stock_rev_exit, dict):
+        srev = stock_rev_exit_from_trade({"stock_rev_exit": stock_rev_exit})
+    else:
+        srev = StockRevExitConfig(enabled=False)
+    use_stock_rev = bool(srev.enabled) and direction in ("UP", "DN")
+    stock_rev_until = None
+    if isinstance(wave_abort, WaveAbortConfig):
+        wabort = wave_abort
+    elif isinstance(wave_abort, dict):
+        wabort = wave_abort_from_trade({"wave_abort": wave_abort})
+    else:
+        wabort = WaveAbortConfig(enabled=False)
+    _wa_dirs = getattr(wabort, "only_directions", None) or ("UP", "DN")
+    use_wave_abort = bool(wabort.enabled) and direction in _wa_dirs
+    wave_state = WaveAbortState()
+    adv_check_until = None
+    adv_armed = False
+    stock_mae = 0.0
+    stock_signed_now = 0.0
+    opt_quote_peak = -np.inf
+    if isinstance(adverse_vol_share, AdverseVolShareConfig):
+        avs = adverse_vol_share
+    elif isinstance(adverse_vol_share, dict):
+        avs = adverse_vol_share_from_trade({"adverse_vol_share": adverse_vol_share})
+    else:
+        avs = AdverseVolShareConfig(enabled=False)
+    use_adv_vol = bool(avs.enabled) and direction in ("UP", "DN")
+    adv_vol_check_until = None
+    adv_vol_armed = False
+    stock_1s_arr = prepare_stock_1s_arrays(stock_1s) if use_adv_vol else None
+    if use_adv_vol and stock_1s_arr is None:
+        use_adv_vol = False
     use_dyn = ("dyn_trail" in blob or "mf_dual" in blob) and direction in ("UP", "DN")
+    if isinstance(ladder_active, LadderActiveConfig):
+        lac = ladder_active
+    elif isinstance(ladder_active, dict):
+        lac = ladder_active_from_trade({"ladder_active": ladder_active, "exit_mode": mode})
+    else:
+        lac = ladder_active_from_trade({"exit_mode": mode})
+    use_ladder = bool(lac.enabled)
+    if use_ladder and lac.mf_flip and direction in ("UP", "DN"):
+        use_mf_flip = True
+        use_mf = True
+    # Ladder owns its own trail rails; don't double-arm classic mtm_trail / extend.
+    if use_ladder:
+        use_trail = False
+        use_extend = False
     require_mtm = "flow_mtm" in blob or "flow_soft" in blob
     act = float(trail_activate) if trail_activate is not None else 0.20
     dd = float(trail_dd) if trail_dd is not None else 0.15
+    ladder_trail_dd = 0.05
+    ladder_trail_armed = False
+    peak_ts: pd.Timestamp | None = None
     floor = float(mtm_floor_ret) if mtm_floor_ret is not None else 0.0
     flow_floor = float(flow_cum_floor) if flow_cum_floor is not None else 0.0
     mae_thr = float(mae_cut_ret) if mae_cut_ret is not None else 0.25
@@ -695,6 +943,28 @@ def simulate_trade(
     ext_end = entry_ts + pd.Timedelta(minutes=ext_hold)
     ext_mtm_min = float(hold_extend_mtm_min) if hold_extend_mtm_min is not None else 0.0
     require_mf_align = bool(hold_extend_require_mf)
+    require_stock_align = bool(hold_extend_require_stock)
+    ext_stock_min = float(hold_extend_stock_min)
+    ext_min_peak = (
+        float(hold_extend_min_peak_mfe) if hold_extend_min_peak_mfe is not None else None
+    )
+    ext_max_qqq_adv = (
+        float(hold_extend_max_qqq_adverse)
+        if hold_extend_max_qqq_adverse is not None
+        else None
+    )
+    use_stale_cut = (
+        stale_cut_minutes is not None
+        and float(stale_cut_minutes) > 0
+        and direction in ("UP", "DN")
+    )
+    stale_until = (
+        entry_ts + pd.Timedelta(minutes=float(stale_cut_minutes))
+        if use_stale_cut
+        else None
+    )
+    stale_mtm_max = float(stale_cut_mtm_max)
+    stale_stock_max = float(stale_cut_stock_max)
     extended = False
     peak_ret = -np.inf
     trail_armed = False
@@ -735,6 +1005,14 @@ def simulate_trade(
     # signal ts. entry_confirm / quote gaps can leave 10m+ between sig and fill;
     # pre-fill prints at stale highs create phantom TRADE_TOX (e.g. AMD 05-15).
     fill_ts = ts_list[0]
+    if use_ladder:
+        ladder_end = fill_ts + pd.Timedelta(seconds=int(lac.max_hold_seconds))
+        end_ts = ladder_end
+        base_end = ladder_end
+        reason = "SEC_MAX"
+        if not lac.keep_outer_rails:
+            tp_lvl = float("inf")
+            sl_lvl = 0.0
     trade_mark = None
     trade_peak_mfe = -np.inf
     trade_cut_until = fill_ts + pd.Timedelta(seconds=int(ttox.min_hold_seconds))
@@ -769,22 +1047,67 @@ def simulate_trade(
     grace_secs = int(exit_mf_grace_seconds)
     if min_hold_m is not None:
         grace_secs = max(grace_secs, int(float(min_hold_m) * 60))
-    grace_until = entry_ts + pd.Timedelta(seconds=grace_secs)
+    # Ladder: never inherit mf_reversal's ~10m grace on a seconds-scale book.
+    if use_ladder and lac.mf_flip:
+        grace_secs = int(lac.mf_grace_seconds)
+    grace_until = (fill_ts if use_ladder else entry_ts) + pd.Timedelta(seconds=grace_secs)
     day = stock_day
     need_stock_day = (
         use_mf
         or use_flow
         or use_extend
         or use_dyn
+        or use_ladder
         or (use_mae_cut and mae_cut_require_mf_against)
         or (use_scale_in and sic.confirm_mode not in {"always", "any", "never", "off", "none", "half_only"})
         or use_div_mfe
+        or use_delta_stop
+        or use_adv_soft
+        or (use_adv_vol and bool(avs.require_stock_adverse))
+        or use_stale_cut
+        or require_stock_align
+        or use_stock_rev
+        or use_wave_abort
     )
     if need_stock_day and day is not None and not day.empty:
         day = _prepare_stock_day(day)
-    stock_entry_px = _stock_close_at(day, fill_ts) if use_div_mfe else None
+    stock_entry_px = (
+        _stock_close_at(day, fill_ts)
+        if (
+            use_div_mfe
+            or use_delta_stop
+            or use_adv_soft
+            or (use_adv_vol and bool(avs.require_stock_adverse))
+            or use_stale_cut
+            or require_stock_align
+            or use_stock_rev
+            or use_wave_abort
+        )
+        else None
+    )
     if use_div_mfe and stock_entry_px is None:
         use_div_mfe = False
+    if use_delta_stop:
+        if stock_entry_px is None:
+            use_delta_stop = False
+        else:
+            delta_check_until = fill_ts + pd.Timedelta(seconds=int(dts.check_seconds))
+            if dts.max_seconds is not None and int(dts.max_seconds) > 0:
+                delta_check_deadline = fill_ts + pd.Timedelta(seconds=int(dts.max_seconds))
+    if use_adv_soft:
+        if stock_entry_px is None:
+            use_adv_soft = False
+        else:
+            adv_check_until = fill_ts + pd.Timedelta(seconds=int(adv.check_seconds))
+    if use_stock_rev:
+        if stock_entry_px is None:
+            use_stock_rev = False
+        else:
+            stock_rev_until = fill_ts + pd.Timedelta(minutes=float(srev.min_hold_minutes))
+    if use_wave_abort and stock_entry_px is None:
+        use_wave_abort = False
+    if use_adv_vol:
+        adv_vol_check_until = fill_ts + pd.Timedelta(seconds=int(avs.check_seconds))
     entry_px_low: float | None = None
     entry_px_high: float | None = None
     opp_streak = 0
@@ -849,9 +1172,74 @@ def simulate_trade(
                 if mtm_gate is None or cur_ret_h <= float(mtm_gate):
                     reason, exit_px, exit_ts = "HOLD_SHOCK", float(p), t
                     break
+        # Ladder rails before time hard-cap so quote gaps past end_ts still honor SL/TP.
+        cur_ret = float(p) / entry - 1.0
+        if use_trail or use_mae_cut or use_ladder or use_extend or use_stale_cut:
+            if cur_ret > peak_ret:
+                peak_ret = cur_ret
+                if use_ladder:
+                    peak_ts = t
+        if (
+            use_stale_cut
+            and stale_until is not None
+            and t >= stale_until
+            and (not extended)
+            and cur_ret <= stale_mtm_max
+        ):
+            stock_signed = None
+            if stock_entry_px is not None and day is not None and stock_entry_px > 0:
+                visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
+                s_px = _stock_close_at(day, visible_at)
+                if s_px is not None:
+                    s_ret = s_px / stock_entry_px - 1.0
+                    stock_signed = s_ret if str(direction).upper() == "UP" else -s_ret
+            if stock_signed is not None and float(stock_signed) <= stale_stock_max:
+                reason, exit_px, exit_ts = "STALE_CUT", float(p), t
+                break
+        if use_ladder:
+            ladder_hit = False
+            # SL rails: tightest (closest to 0) first.
+            for rail in sorted(lac.sl_rails, key=lambda r: float(r.ret), reverse=True):
+                if cur_ret <= float(rail.ret):
+                    pct = int(round(abs(float(rail.ret)) * 100))
+                    reason, exit_px, exit_ts = f"SL_LADDER{pct}", float(p), t
+                    ladder_hit = True
+                    break
+            if not ladder_hit:
+                for rail in lac.tp_rails:
+                    if cur_ret < float(rail.ret):
+                        continue
+                    if rail.action == "exit":
+                        pct = int(round(float(rail.ret) * 100))
+                        reason, exit_px, exit_ts = f"TP_LADDER{pct}", float(p), t
+                        ladder_hit = True
+                        break
+                    ladder_trail_armed = True
+                    ladder_trail_dd = float(rail.trail_dd)
+            if (
+                not ladder_hit
+                and ladder_trail_armed
+                and np.isfinite(peak_ret)
+                and cur_ret <= float(peak_ret) - ladder_trail_dd
+            ):
+                reason, exit_px, exit_ts = "TRAIL_LADDER", float(p), t
+                ladder_hit = True
+            if (
+                not ladder_hit
+                and np.isfinite(peak_ret)
+                and float(peak_ret) >= float(lac.stall_min_peak)
+                and peak_ts is not None
+                and (t - peak_ts).total_seconds() >= float(lac.stall_seconds)
+            ):
+                reason, exit_px, exit_ts = "PROFIT_STALL", float(p), t
+                ladder_hit = True
+            if ladder_hit:
+                break
         if t >= end_ts:
+            if use_ladder:
+                reason, exit_px, exit_ts = "SEC_MAX", float(p), t
+                break
             if use_extend and (not extended) and end_ts == base_end and ext_hold > base_hold:
-                cur_ret = float(p) / entry - 1.0
                 mtm_ok = cur_ret >= ext_mtm_min
                 mf_ok = True
                 if require_mf_align:
@@ -863,7 +1251,31 @@ def simulate_trade(
                         mf_ok = mf > 0
                     else:
                         mf_ok = mf < 0
-                if mtm_ok and mf_ok:
+                stock_ok = True
+                if require_stock_align:
+                    stock_ok = False
+                    if stock_entry_px is not None and day is not None and stock_entry_px > 0:
+                        visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
+                        s_px = _stock_close_at(day, visible_at)
+                        if s_px is not None:
+                            s_ret = s_px / stock_entry_px - 1.0
+                            signed = s_ret if str(direction).upper() == "UP" else -s_ret
+                            stock_ok = float(signed) >= ext_stock_min
+                peak_ok = True
+                if ext_min_peak is not None:
+                    peak_ok = bool(np.isfinite(peak_ret) and float(peak_ret) >= ext_min_peak)
+                qqq_ok = True
+                if ext_max_qqq_adv is not None and qqq_day is not None:
+                    fired, _signed = qqq_adverse_from_entry(
+                        qqq_day,
+                        entry_ts=entry_ts,
+                        now_ts=t,
+                        direction=str(direction),
+                        thresh=float(ext_max_qqq_adv),
+                        bar_delay_seconds=int(stock_bar_delay_seconds),
+                    )
+                    qqq_ok = not bool(fired)
+                if mtm_ok and mf_ok and stock_ok and peak_ok and qqq_ok:
                     extended = True
                     end_ts = ext_end
                     continue
@@ -871,10 +1283,6 @@ def simulate_trade(
                 break
             reason, exit_px, exit_ts = f"T+{ext_hold if extended else base_hold}", float(p), t
             break
-        cur_ret = float(p) / entry - 1.0
-        if use_trail or use_mae_cut:
-            if cur_ret > peak_ret:
-                peak_ret = cur_ret
         if use_trail:
             if (not trail_armed) and peak_ret >= act:
                 trail_armed = True
@@ -897,6 +1305,70 @@ def simulate_trade(
                 if mf_ok:
                     reason, exit_px, exit_ts = "MAE_CUT", float(p), t
                     break
+        if use_adv_soft and stock_entry_px is not None and day is not None:
+            if cur_ret > opt_quote_peak:
+                opt_quote_peak = float(cur_ret)
+            visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
+            s_px = _stock_close_at(day, visible_at)
+            if s_px is not None and stock_entry_px > 0:
+                s_ret = s_px / stock_entry_px - 1.0
+                signed = s_ret if str(direction).upper() == "UP" else -s_ret
+                stock_signed_now = float(signed)
+                if signed < stock_mae:
+                    stock_mae = float(signed)
+            mfe_ok = True
+            if adv.max_opt_mfe is not None:
+                mfe_ok = (not np.isfinite(opt_quote_peak)) or (
+                    float(opt_quote_peak) < float(adv.max_opt_mfe)
+                )
+            still_ok = True
+            if bool(adv.require_still_adverse):
+                still_ok = stock_signed_now <= float(adv.still_adverse_max)
+            if (
+                adv_check_until is not None
+                and t >= adv_check_until
+                and stock_mae <= -float(adv.adverse_mae)
+                and cur_ret <= float(adv.opt_mtm_max)
+                and mfe_ok
+                and still_ok
+            ):
+                if adv.mode == "soft_exit":
+                    reason, exit_px, exit_ts = "ADVERSE_SOFT", float(p), t
+                    break
+                if not adv_armed:
+                    adv_armed = True
+                    if bool(adv.extend_max_cut):
+                        trade_cut_deadline = None
+        if use_adv_vol and stock_1s_arr is not None and adv_vol_check_until is not None:
+            if t >= adv_vol_check_until and cur_ret <= float(avs.opt_mtm_max):
+                stock_ok = True
+                if bool(avs.require_stock_adverse):
+                    if stock_entry_px is None or day is None:
+                        stock_ok = False
+                    else:
+                        visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
+                        s_px = _stock_close_at(day, visible_at)
+                        if s_px is None or stock_entry_px <= 0:
+                            stock_ok = False
+                        else:
+                            s_ret = s_px / stock_entry_px - 1.0
+                            signed = s_ret if str(direction).upper() == "UP" else -s_ret
+                            stock_ok = float(signed) <= float(avs.stock_adverse_max)
+                if stock_ok:
+                    share = adverse_vol_share_asof(
+                        stock_1s_arr,
+                        now_ts=t,
+                        window_seconds=int(avs.window_seconds),
+                        direction=str(direction),
+                    )
+                    if share is not None and float(share) >= float(avs.min_share):
+                        if avs.mode == "soft_exit":
+                            reason, exit_px, exit_ts = "ADV_VOL", float(p), t
+                            break
+                        if not adv_vol_armed:
+                            adv_vol_armed = True
+                            if bool(avs.extend_max_cut):
+                                trade_cut_deadline = None
         if use_trade_toxic and trade_mark is not None:
             ts_ns, tpx, t_entry = trade_mark
             t_mtm = trade_mtm_asof(ts_ns, tpx, t_entry, t)
@@ -906,7 +1378,14 @@ def simulate_trade(
             in_cut_window = t >= trade_cut_until and (
                 trade_cut_deadline is None or t <= trade_cut_deadline
             )
+            cut_lim = float(ttox.cut_ret)
             mfe_lim = float(ttox.mfe_bypass)
+            if adv_armed:
+                cut_lim = min(cut_lim, float(adv.tight_cut_ret))
+                mfe_lim = min(mfe_lim, float(adv.tight_mfe_bypass))
+            if adv_vol_armed:
+                cut_lim = min(cut_lim, float(avs.tight_cut_ret))
+                mfe_lim = min(mfe_lim, float(avs.tight_mfe_bypass))
             if use_div_mfe and stock_entry_px is not None and day is not None:
                 visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
                 s_px = _stock_close_at(day, visible_at)
@@ -919,7 +1398,7 @@ def simulate_trade(
             dig = (
                 t_mtm is not None
                 and float(trade_peak_mfe) < mfe_lim
-                and float(t_mtm) <= -float(ttox.cut_ret)
+                and float(t_mtm) <= -float(cut_lim)
             )
             if dig and in_cut_window:
                 if trade_dig_since is None:
@@ -934,6 +1413,73 @@ def simulate_trade(
                     break
             else:
                 trade_dig_since = None
+        if use_delta_stop and stock_entry_px is not None and day is not None:
+            in_delta_win = t >= delta_check_until and (
+                delta_check_deadline is None or t <= delta_check_deadline
+            )
+            if in_delta_win and cur_ret <= float(dts.opt_mtm_max):
+                visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
+                s_px = _stock_close_at(day, visible_at)
+                if s_px is not None and stock_entry_px > 0:
+                    s_ret = s_px / stock_entry_px - 1.0
+                    signed = s_ret if str(direction).upper() == "UP" else -s_ret
+                    if signed < float(dts.min_stock_move):
+                        reason, exit_px, exit_ts = "DELTA_STOP", float(p), t
+                        break
+        if (
+            use_stock_rev
+            and stock_rev_until is not None
+            and t >= stock_rev_until
+            and stock_entry_px is not None
+            and day is not None
+            and cur_ret <= float(srev.opt_mtm_max)
+        ):
+            visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
+            s_px = _stock_close_at(day, visible_at)
+            if s_px is not None and stock_entry_px > 0:
+                s_ret = s_px / stock_entry_px - 1.0
+                signed = s_ret if str(direction).upper() == "UP" else -s_ret
+                if float(signed) <= float(srev.stock_max):
+                    reason, exit_px, exit_ts = "STOCK_REV", float(p), t
+                    break
+        if (
+            use_wave_abort
+            and stock_entry_px is not None
+            and day is not None
+            and not wave_state.done
+        ):
+            visible_at = t - pd.Timedelta(seconds=int(stock_bar_delay_seconds))
+            s_px = _stock_close_at(day, visible_at)
+            if s_px is not None and stock_entry_px > 0:
+                s_ret = s_px / stock_entry_px - 1.0
+                signed = s_ret if str(direction).upper() == "UP" else -s_ret
+                held_s = (t - fill_ts).total_seconds()
+                do_abort, wreason, wave_state = wave_abort_on_tick(
+                    wave_state,
+                    cfg=wabort,
+                    held_seconds=float(held_s),
+                    stock_signed=float(signed),
+                    opt_mtm=float(cur_ret),
+                )
+                if do_abort:
+                    reason, exit_px, exit_ts = "WAVE_ABORT", float(p), t
+                    break
+        if use_roi_time:
+            held_m = (t - fill_ts).total_seconds() / 60.0
+            hit_roi = False
+            for mins, min_roi in rts.rails:
+                key = float(mins)
+                if key in roi_fired:
+                    continue
+                if held_m + 1e-9 < key:
+                    break
+                roi_fired.add(key)
+                if cur_ret < float(min_roi):
+                    reason, exit_px, exit_ts = f"ROI_TIME{int(mins)}", float(p), t
+                    hit_roi = True
+                    break
+            if hit_roi:
+                break
         if use_floor and t >= grace_until and cur_ret <= floor:
             reason, exit_px, exit_ts = "MTM_FLOOR", float(p), t
             break
@@ -1036,6 +1582,8 @@ def simulate_trade(
         scale_in_entry2=entry2 if scale_added else None,
         scale_in_ts=entry2_ts if scale_added else None,
         scale_in_deployed_frac=float(deployed),
+        adverse_soft_armed=bool(adv_armed),
+        adv_vol_armed=bool(adv_vol_armed),
     )
 
 
@@ -1114,7 +1662,9 @@ def run_offline_replay(
         stock_by = {}
         # Load excluded names too if they remain in peer_symbols (breadth only).
         load_syms = list(dict.fromkeys(list(symbols) + list(sig_cfg.get("peer_symbols") or [])))
-        if (mf_idio_on or tcn_enabled_peek or router_rule_peek or watchdog_rule_peek) and "QQQ" not in {
+        # corr_rewire needs QQQ + Mag7 1m history (parsed later; peek trade flag).
+        _cr_peek = bool((trade.get("corr_rewire") or {}).get("enabled")) if isinstance(trade.get("corr_rewire"), dict) else False
+        if (mf_idio_on or tcn_enabled_peek or router_rule_peek or watchdog_rule_peek or _cr_peek) and "QQQ" not in {
             str(s).upper() for s in load_syms
         }:
             load_syms.append("QQQ")
@@ -1221,6 +1771,13 @@ def run_offline_replay(
     quote_cache: dict[tuple[str, str], pd.DataFrame | None] = {}
     trades_root = paths.get("option_trades_root")
     trade_cache: dict[tuple[str, str], pd.DataFrame | None] = {}
+    stock_1s_root = paths.get("stock_1s_root")
+    stock_1s_cache: dict[tuple[str, str], pd.DataFrame] = {}
+    avs_cfg_early = adverse_vol_share_from_trade(trade)
+    entry_avs_cfg = entry_adv_vol_from_trade(trade)
+    use_adv_vol_global = bool(avs_cfg_early.enabled) or bool(entry_avs_cfg.enabled)
+    n_entry_adv_vol_block = 0
+    n_entry_adv_vol_scale = 0
     ttox_cfg = trade_toxic_from_trade(trade)
     use_trade_toxic_global = bool(ttox_cfg.enabled) or str(
         trade.get("early_exit_mode") or ""
@@ -1301,6 +1858,11 @@ def run_offline_replay(
     n_tcn_block = 0
     n_tcn_scale = 0
     n_tcn_skip_regime = 0
+    state_gate = load_state_gate(profile)
+    state_gate_on = bool(getattr(state_gate, "cfg", None) and state_gate.cfg.enabled)
+    n_state_gate_block = 0
+    n_state_gate_scale = 0
+    state_gate_day_counts: dict[str, int] = {}
     lgbm_bouncer = load_lgbm_bouncer(profile)
     lgbm_on = bool(getattr(lgbm_bouncer, "cfg", None) and lgbm_bouncer.cfg.enabled)
     n_lgbm_block = 0
@@ -1553,6 +2115,34 @@ def run_offline_replay(
     max_from_prev_abs = float(max_fp_raw) if max_fp_raw is not None else None
     n_confirm_block = 0
     n_max_fp_block = 0
+    spc_raw = trade.get("stock_path_confirm") or {}
+    if not isinstance(spc_raw, dict):
+        spc_raw = {}
+    spc_on = bool(spc_raw.get("enabled", False))
+    spc_thr_pos = float(spc_raw.get("thr_pos", 0.0015) or 0.0015)
+    spc_thr_neg = float(spc_raw.get("thr_neg", -0.003) or -0.003)
+    spc_max_wait = int(spc_raw.get("max_wait_seconds", 300) or 300)
+    spc_on_timeout = str(spc_raw.get("on_timeout", "block") or "block").strip().lower()
+    # When False, path confirm is a veto only (no fill delay on +thr_pos).
+    spc_delay_on_pos = bool(spc_raw.get("delay_on_pos", True))
+    spc_tod_start = _hhmm_to_minutes(spc_raw.get("tod_start", "10:31"))
+    spc_tod_end = _hhmm_to_minutes(spc_raw.get("tod_end", "11:00"))
+    spc_wd_raw = spc_raw.get("weekdays")
+    spc_weekdays: set[int] | None = None
+    if spc_wd_raw is not None:
+        if isinstance(spc_wd_raw, str):
+            spc_weekdays = {
+                int(x.strip()) for x in spc_wd_raw.split(",") if str(x).strip() != ""
+            }
+        else:
+            spc_weekdays = {int(x) for x in spc_wd_raw}
+    n_stock_path_confirm_block = 0
+    n_stock_path_confirm_ok = 0
+    cr_cfg = corr_rewire_from_trade(trade)
+    cr_on = cr_cfg is not None
+    n_corr_rewire_scale = 0
+    n_corr_rewire_block = 0
+    n_corr_rewire_days = 0
     purity_on = _trade_flag(trade, "trend_purity_sizing", False)
     purity_fp_ref = float(trade.get("trend_purity_fp_ref", 0.025) or 0.025)
     purity_features = str(
@@ -1590,6 +2180,17 @@ def run_offline_replay(
         if k not in trade_cache:
             trade_cache[k] = load_option_trades(trades_root, sym, date)
         return path_for_ticker_trades(trade_cache[k], ticker)
+
+    def get_stock_1s(sym: str, date: str) -> pd.DataFrame | None:
+        if not use_adv_vol_global or stock_1s_root is None:
+            return None
+        from maga7.common.bar_agg import load_stock_1s_day
+
+        k = (sym, date)
+        if k not in stock_1s_cache:
+            stock_1s_cache[k] = load_stock_1s_day(stock_1s_root, sym, date)
+        df = stock_1s_cache[k]
+        return df if df is not None and not df.empty else None
 
     def spot_at(sym: str, date: str, ts) -> float | None:
         sdf = stock_by.get(sym)
@@ -1641,12 +2242,14 @@ def run_offline_replay(
             "event_calendar",
             "event_dates",
             "event_blackout_sessions",
+            "event_symbol_blackout",
         ) if k in reg_cfg},
         **{k: trade[k] for k in (
             "event_calendar_block",
             "event_calendar",
             "event_dates",
             "event_blackout_sessions",
+            "event_symbol_blackout",
         ) if k in trade},
     }
     session_dates = sorted(str(d) for d in event_sigs["date"].unique()) if len(event_sigs) else []
@@ -1655,8 +2258,10 @@ def run_offline_replay(
         if sdf is not None and not getattr(sdf, "empty", True) and "date" in sdf.columns:
             session_dates.extend(str(x) for x in sdf["date"].unique())
     session_dates = sorted(d for d in set(session_dates) if start <= d <= end)
-    event_blackout = resolve_event_blackout(event_cfg, session_dates=session_dates)
+    event_plan = resolve_event_blackout_plan(event_cfg, session_dates=session_dates)
+    event_blackout = set(event_plan.full_days)
     n_event_block = 0
+    n_event_symbol_block = 0
     n_displace = 0
     n_displace_skip_score = 0
     n_commit_days = 0
@@ -1699,6 +2304,13 @@ def run_offline_replay(
         hold_extend_minutes=trade.get("hold_extend_minutes"),
         hold_extend_mtm_min=trade.get("hold_extend_mtm_min"),
         hold_extend_require_mf=bool(trade.get("hold_extend_require_mf", True)),
+        hold_extend_require_stock=bool(trade.get("hold_extend_require_stock", False)),
+        hold_extend_stock_min=float(trade.get("hold_extend_stock_min", 0.0) or 0.0),
+        hold_extend_min_peak_mfe=trade.get("hold_extend_min_peak_mfe"),
+        hold_extend_max_qqq_adverse=trade.get("hold_extend_max_qqq_adverse"),
+        stale_cut_minutes=trade.get("stale_cut_minutes"),
+        stale_cut_mtm_max=float(trade.get("stale_cut_mtm_max", 0.0) or 0.0),
+        stale_cut_stock_max=float(trade.get("stale_cut_stock_max", 0.0) or 0.0),
         early_exit_mode=trade.get("early_exit_mode"),
         mae_cut_ret=trade.get("mae_cut_ret"),
         mae_cut_mfe_bypass=trade.get("mae_cut_mfe_bypass"),
@@ -1715,8 +2327,38 @@ def run_offline_replay(
         hold_watchdog=hold_watchdog_from_trade(trade),
         scale_in=scale_in_from_trade(trade),
         trade_toxic=ttox_cfg,
+        delta_time_stop=delta_time_stop_from_trade(trade),
+        roi_time_stop=roi_time_stop_from_trade(trade),
+        adverse_soft=adverse_soft_from_trade(trade),
+        adverse_vol_share=adverse_vol_share_from_trade(trade),
+        stock_rev_exit=stock_rev_exit_from_trade(trade),
+        wave_abort=wave_abort_from_trade(trade),
+        ladder_active=ladder_active_from_trade(trade),
     )
     hwd_cfg = sim_kwargs_common["hold_watchdog"]
+    dts_cfg = sim_kwargs_common["delta_time_stop"]
+    rts_cfg = sim_kwargs_common["roi_time_stop"]
+    adv_cfg = sim_kwargs_common["adverse_soft"]
+    avs_cfg = sim_kwargs_common["adverse_vol_share"]
+    lac_cfg_global = sim_kwargs_common["ladder_active"]
+    ladder_fallback_exit = str(
+        trade.get("ladder_fallback_exit_mode") or "hold_extend"
+    ).strip() or "hold_extend"
+    n_ladder_days = 0
+    n_ladder_fallback_days = 0
+    n_stock_rev_days = 0
+    n_stock_rev_off_days = 0
+    fast_pack_cfg = path_fast_pack_from_trade(trade)
+    n_fast_pack_days = 0
+    n_fast_pack_off_days = 0
+    n_delta_stop = 0
+    n_roi_time_stop = 0
+    n_adverse_soft = 0
+    n_adverse_soft_armed = 0
+    n_adv_vol = 0
+    n_adv_vol_armed = 0
+    morn_r5_cfg = morning_r5_scale_from_trade(trade)
+    n_morn_r5_scale = 0
 
     # Day loop keys: Rule-A dates ∪ (optional) Hunt calendar dates.
     # Without the Hunt pad, single-name sleeves miss washout_reclaim days that
@@ -1754,6 +2396,11 @@ def run_offline_replay(
         day_route = "baseline"
         day_watchdog_state = WatchdogState.NORMAL.value
         day_watchdog_reason = "off"
+        day_ladder_on = bool(getattr(lac_cfg_global, "enabled", False))
+        srev_cfg_global = sim_kwargs_common.get("stock_rev_exit")
+        day_stock_rev_on = bool(getattr(srev_cfg_global, "enabled", False))
+        day_fast_pack_on = False
+        day_exit_mode_base = str(trade.get("exit_mode") or trade.get("stock_exit") or "none")
         if watchdog is not None and regime_gate is not None:
             wd_dec = watchdog.begin_day(
                 str(date),
@@ -1800,12 +2447,148 @@ def run_offline_replay(
                 day_watchdog_reason = f"legacy_router:{day_route}"
             else:
                 day_route = "baseline"
+        # Conditional ladder: arm only on mixed_wash_up / prevention days.
+        if bool(getattr(lac_cfg_global, "enabled", False)):
+            prev_cfg = {}
+            if isinstance(profile.get("watchdog"), dict):
+                prev_cfg = (profile["watchdog"].get("prevention") or {}) if isinstance(
+                    profile["watchdog"].get("prevention"), dict
+                ) else {}
+            day_ladder_on = ladder_day_should_arm(
+                lac_cfg_global,
+                date=str(date),
+                stock_by=stock_by,
+                qqq_df=qqq_frame if qqq_frame is not None else stock_by.get("QQQ"),
+                symbols=list(symbols),
+                asof=str(prev_cfg.get("asof") or (profile.get("watchdog") or {}).get("asof") or "10:30"),
+                washout_breadth_min=int(prev_cfg.get("washout_breadth_min", 3) or 3),
+                wash_drop_min=float(prev_cfg.get("wash_drop_min", 0.008) or 0.008),
+                frac_above_min=float(prev_cfg.get("frac_above_min", 0.35) or 0.35),
+                frac_above_max=float(prev_cfg.get("frac_above_max", 0.70) or 0.70),
+            )
+            if day_ladder_on:
+                n_ladder_days += 1
+            else:
+                n_ladder_fallback_days += 1
+        # Conditional STOCK_REV: arm only on mixed_wash_up days when when≠always.
+        if bool(getattr(srev_cfg_global, "enabled", False)):
+            prev_cfg = {}
+            if isinstance(profile.get("watchdog"), dict):
+                prev_cfg = (profile["watchdog"].get("prevention") or {}) if isinstance(
+                    profile["watchdog"].get("prevention"), dict
+                ) else {}
+            day_stock_rev_on = stock_rev_day_should_arm(
+                srev_cfg_global,
+                date=str(date),
+                stock_by=stock_by,
+                qqq_df=qqq_frame if qqq_frame is not None else stock_by.get("QQQ"),
+                symbols=list(symbols),
+                asof=str(prev_cfg.get("asof") or (profile.get("watchdog") or {}).get("asof") or "10:30"),
+                washout_breadth_min=int(prev_cfg.get("washout_breadth_min", 3) or 3),
+                wash_drop_min=float(prev_cfg.get("wash_drop_min", 0.008) or 0.008),
+                frac_above_min=float(prev_cfg.get("frac_above_min", 0.35) or 0.35),
+                frac_above_max=float(prev_cfg.get("frac_above_max", 0.70) or 0.70),
+            )
+            if day_stock_rev_on:
+                n_stock_rev_days += 1
+            else:
+                n_stock_rev_off_days += 1
+        if bool(getattr(fast_pack_cfg, "enabled", False)):
+            prev_cfg = {}
+            if isinstance(profile.get("watchdog"), dict):
+                prev_cfg = (profile["watchdog"].get("prevention") or {}) if isinstance(
+                    profile["watchdog"].get("prevention"), dict
+                ) else {}
+            day_fast_pack_on = path_fast_pack_day_should_arm(
+                fast_pack_cfg,
+                date=str(date),
+                stock_by=stock_by,
+                qqq_df=qqq_frame if qqq_frame is not None else stock_by.get("QQQ"),
+                symbols=list(symbols),
+                asof=str(
+                    fast_pack_cfg.asof
+                    or prev_cfg.get("asof")
+                    or (profile.get("watchdog") or {}).get("asof")
+                    or "10:30"
+                ),
+                washout_breadth_min=int(
+                    fast_pack_cfg.washout_breadth_min
+                    if fast_pack_cfg.washout_breadth_min is not None
+                    else prev_cfg.get("washout_breadth_min", 3)
+                    or 3
+                ),
+                wash_drop_min=float(prev_cfg.get("wash_drop_min", 0.008) or 0.008),
+                frac_above_min=float(prev_cfg.get("frac_above_min", 0.35) or 0.35),
+                frac_above_max=float(prev_cfg.get("frac_above_max", 0.70) or 0.70),
+            )
+            if day_fast_pack_on:
+                n_fast_pack_days += 1
+            else:
+                n_fast_pack_off_days += 1
+        day_state_dec = None
+        if state_gate_on:
+            day_state_dec = state_gate.begin_day(
+                str(date),
+                stock_by=stock_by,
+                qqq_df=qqq_frame if qqq_frame is not None else stock_by.get("QQQ"),
+                symbols=list(symbols),
+            )
+            st_name = str(day_state_dec.state or "unknown")
+            state_gate_day_counts[st_name] = int(state_gate_day_counts.get(st_name, 0)) + 1
         syms = list(day_sigs.sort_values("sig_ts")["symbol"].unique())
         # Keep concurrent cap tied to configured top_k even when universe expands.
         n_sym = max(int(sig_cfg.get("top_k", 2)), 1)
         day_start = eq
         halt = False
+        # Day-level Mag7–QQQ corr rewire (causal asof 10:30); default OFF.
+        day_cr = None
+        day_cr_scale = 1.0
+        if cr_on and cr_cfg is not None:
+            asof_hhmm = str(cr_cfg.get("asof", "10:30") or "10:30")
+            try:
+                hh, mm = asof_hhmm.split(":")
+                asof_cr = pd.Timestamp(f"{date} {int(hh):02d}:{int(mm):02d}:00", tz=NY)
+            except Exception:
+                asof_cr = pd.Timestamp(f"{date} 10:30:00", tz=NY)
+            cr_syms = cr_cfg.get("symbols") or symbols
+            day_cr = corr_rewire_asof(
+                stock_by,
+                asof_ts=asof_cr,
+                symbols=list(cr_syms),
+                event_bars=int(cr_cfg.get("event_bars", 60) or 60),
+                calm_bars=int(cr_cfg.get("calm_bars", 180) or 180),
+                min_bars=int(cr_cfg.get("min_bars", 30) or 30),
+                edge_threshold=float(cr_cfg.get("edge_threshold", 0.5) or 0.5),
+                rewire_min=(
+                    float(cr_cfg["rewire_min"])
+                    if cr_cfg.get("rewire_min") is not None
+                    else None
+                ),
+                rho_event_min=(
+                    float(cr_cfg["rho_event_min"])
+                    if cr_cfg.get("rho_event_min") is not None
+                    else None
+                ),
+                rho_event_max=(
+                    float(cr_cfg["rho_event_max"])
+                    if cr_cfg.get("rho_event_max") is not None
+                    else None
+                ),
+                edge_density_min=(
+                    float(cr_cfg["edge_density_min"])
+                    if cr_cfg.get("edge_density_min") is not None
+                    else None
+                ),
+                action=str(cr_cfg.get("action", "scale") or "scale"),
+                scale=float(cr_cfg.get("scale", 0.5) or 0.5),
+            )
+            day_cr_scale = float(day_cr.size_scale)
+            if day_cr.trigger:
+                n_corr_rewire_days += 1
         skip_day = bool(day_loss_halt_n is not None and loss_streak >= day_loss_halt_n)
+        if cr_on and day_cr is not None and day_cr.trigger and day_cr_scale <= 0.0:
+            skip_day = True
+            n_corr_rewire_block += 1
         post_win_mode, post_win_scale = post_win_cooldown_action(
             trade, prev_day_ret=prev_day_ret, cooldown_left=post_win_left
         )
@@ -1815,12 +2598,16 @@ def run_offline_replay(
         if str(date) in event_blackout:
             skip_day = True
             n_event_block += 1
+        day_sym_block = event_plan.symbols_blocked_on(str(date))
         if skip_day:
             n_day_halt += 1
 
         if not use_reentry:
             events = []
             for r in day_sigs.itertuples(index=False):
+                if str(r.symbol).upper() in day_sym_block:
+                    n_event_symbol_block += 1
+                    continue
                 fp = getattr(r, "from_prev", None)
                 try:
                     fp_f = float(fp) if fp is not None and pd.notna(fp) else None
@@ -1833,6 +2620,9 @@ def run_offline_replay(
             events = []
             rule_kw = _rule_a_kwargs_from_cfg(sig_cfg)
             for r in day_sigs.itertuples(index=False):
+                if str(r.symbol).upper() in day_sym_block:
+                    n_event_symbol_block += 1
+                    continue
                 fp = getattr(r, "from_prev", None)
                 try:
                     fp_f = float(fp) if fp is not None and pd.notna(fp) else None
@@ -1861,6 +2651,9 @@ def run_offline_replay(
         day_hunt_n = 0
         if watchdog is not None and watchdog.hunt_armed and not skip_day:
             for hc in watchdog.hunt_candidates:
+                if str(hc.symbol).upper() in day_sym_block:
+                    n_event_symbol_block += 1
+                    continue
                 n_hunt_signals += 1
                 entry_ts = to_ny(hc.sig_ts) + bar_delay
                 # Drop if entry would fall outside arm TTL (after delay).
@@ -2057,6 +2850,17 @@ def run_offline_replay(
             else:
                 dec = None
 
+            # State gate: day-regime veto / scale (never predicts Call/Put).
+            state_entry_scale = 1.0
+            state_entry_tag = None
+            if state_gate_on:
+                sg_dec = state_gate.decide_entry(str(direction))
+                state_entry_tag = f"{sg_dec.state}:{sg_dec.reason}"
+                if not sg_dec.allow:
+                    n_state_gate_block += 1
+                    continue
+                state_entry_scale = float(sg_dec.size_scale)
+
             reason_s = _structure_gate_blocks(
                 stock_by.get(sym),
                 date=str(date),
@@ -2186,6 +2990,77 @@ def run_offline_replay(
                     continue
                 # Shift fill clock to confirm bar + availability delay.
                 ts = to_ny(confirm_ft) + bar_delay
+
+            # Stock path confirm: wait for +thr_pos before -thr_neg (causal delay).
+            path_confirm_ts = None
+            path_confirm_reason = None
+            if spc_on:
+                use_spc = True
+                if spc_weekdays is not None:
+                    try:
+                        wd_s = int(pd.Timestamp(str(date)).weekday())
+                    except Exception:
+                        wd_s = -1
+                    use_spc = wd_s in spc_weekdays
+                if use_spc and spc_tod_start is not None and spc_tod_end is not None:
+                    hm = int(to_ny(ts).hour) * 60 + int(to_ny(ts).minute)
+                    use_spc = spc_tod_start <= hm <= spc_tod_end
+                if use_spc:
+                    sdf_p = stock_by.get(sym)
+                    stock_day_p = None
+                    if sdf_p is not None and not sdf_p.empty:
+                        stock_day_p = sdf_p[sdf_p["date"] == date]
+                    ok_p, path_confirm_ts, path_confirm_reason = stock_path_confirm_ok(
+                        stock_day_p,
+                        direction=str(direction),
+                        entry_ts=ts,
+                        thr_pos=spc_thr_pos,
+                        thr_neg=spc_thr_neg,
+                        max_wait_seconds=spc_max_wait,
+                        on_timeout=spc_on_timeout,
+                    )
+                    if not ok_p:
+                        n_stock_path_confirm_block += 1
+                        continue
+                    n_stock_path_confirm_ok += 1
+                    if (
+                        spc_delay_on_pos
+                        and path_confirm_ts is not None
+                        and path_confirm_reason == "pos"
+                    ):
+                        ts = to_ny(path_confirm_ts) + bar_delay
+
+            # Entry-side adverse volume share (1s): block or scale before fill.
+            entry_adv_share = None
+            entry_adv_scale_pending = 1.0
+            if bool(entry_avs_cfg.enabled):
+                use_eavs = True
+                if entry_avs_cfg.tod_start and entry_avs_cfg.tod_end:
+                    tod0 = _hhmm_to_minutes(entry_avs_cfg.tod_start)
+                    tod1 = _hhmm_to_minutes(entry_avs_cfg.tod_end)
+                    hm = int(to_ny(ts).hour) * 60 + int(to_ny(ts).minute)
+                    if tod0 is not None and tod1 is not None:
+                        use_eavs = tod0 <= hm <= tod1
+                if use_eavs:
+                    arr = prepare_stock_1s_arrays(get_stock_1s(sym, date))
+                    share = adverse_vol_share_asof(
+                        arr,
+                        now_ts=ts,
+                        window_seconds=int(entry_avs_cfg.window_seconds),
+                        direction=str(direction),
+                    )
+                    entry_adv_share = share
+                    hot = share is not None and float(share) >= float(entry_avs_cfg.max_share)
+                    missing = share is None
+                    if missing and entry_avs_cfg.on_missing == "block":
+                        n_entry_adv_vol_block += 1
+                        continue
+                    if hot:
+                        if entry_avs_cfg.action == "block":
+                            n_entry_adv_vol_block += 1
+                            continue
+                        if float(entry_avs_cfg.scale) < 1.0 - 1e-12:
+                            entry_adv_scale_pending = float(entry_avs_cfg.scale)
 
             # Reserve filtered-TopK seat after gates; quote/sim miss still consumes.
             if day_slot_cap is not None:
@@ -2317,8 +3192,29 @@ def run_offline_replay(
                 qdf = stock_by.get("QQQ")
                 if qdf is not None and not getattr(qdf, "empty", True):
                     qqq_day = qdf[qdf["date"].astype(str) == str(date)]
-            exit_mode = str(trade.get("exit_mode") or trade.get("stock_exit") or "none")
+            exit_mode = day_exit_mode_base
             sim_kw = dict(sim_kwargs_common)
+            if bool(getattr(lac_cfg_global, "enabled", False)) and not day_ladder_on:
+                # Non-toxic day: fall back to extend rails (never unmanaged).
+                exit_mode = ladder_fallback_exit
+                sim_kw["ladder_active"] = LadderActiveConfig(enabled=False)
+            elif bool(getattr(lac_cfg_global, "enabled", False)) and day_ladder_on:
+                exit_mode = "ladder_active"
+                sim_kw["ladder_active"] = lac_cfg_global
+            if bool(getattr(srev_cfg_global, "enabled", False)) and not day_stock_rev_on:
+                sim_kw["stock_rev_exit"] = StockRevExitConfig(enabled=False)
+            elif bool(getattr(srev_cfg_global, "enabled", False)) and day_stock_rev_on:
+                sim_kw["stock_rev_exit"] = srev_cfg_global
+            if day_fast_pack_on:
+                sim_kw.update(
+                    apply_path_fast_pack_overrides(
+                        hold_minutes=int(sim_kw.get("hold_minutes") or 30),
+                        trail_activate=sim_kw.get("trail_activate"),
+                        trail_dd=sim_kw.get("trail_dd"),
+                        stock_rev=sim_kw.get("stock_rev_exit"),
+                        pack=fast_pack_cfg,
+                    )
+                )
             hunt_pos_frac = None
             if is_hunt and watchdog is not None:
                 from maga7.common.watchdog import hunt_trade_overrides
@@ -2335,6 +3231,8 @@ def run_offline_replay(
                 else:
                     n_trade_path_miss += 1
             sim_kw["trade_path"] = tpath
+            if use_adv_vol_global:
+                sim_kw["stock_1s"] = get_stock_1s(sym, date)
             sim = simulate_trade(
                 path,
                 ts,
@@ -2346,6 +3244,18 @@ def run_offline_replay(
             )
             if sim is None:
                 continue
+            if str(sim.reason).upper() == "DELTA_STOP":
+                n_delta_stop += 1
+            if str(sim.reason).upper().startswith("ROI_TIME"):
+                n_roi_time_stop += 1
+            if str(sim.reason).upper() == "ADVERSE_SOFT":
+                n_adverse_soft += 1
+            if bool(getattr(sim, "adverse_soft_armed", False)):
+                n_adverse_soft_armed += 1
+            if str(sim.reason).upper() == "ADV_VOL":
+                n_adv_vol += 1
+            if bool(getattr(sim, "adv_vol_armed", False)):
+                n_adv_vol_armed += 1
             size_frac, sizing_mode, n_conc, allow, size_reason = resolve_size_frac(
                 trade,
                 top_k=n_sym,
@@ -2401,6 +3311,22 @@ def run_offline_replay(
                         sim_v_kw["trade_path"] = get_trade_path(
                             vic_sym, date, str(old_row["ticker"])
                         )
+                        if use_adv_vol_global:
+                            sim_v_kw["stock_1s"] = get_stock_1s(vic_sym, date)
+                        if bool(getattr(srev_cfg_global, "enabled", False)) and not day_stock_rev_on:
+                            sim_v_kw["stock_rev_exit"] = StockRevExitConfig(enabled=False)
+                        elif bool(getattr(srev_cfg_global, "enabled", False)) and day_stock_rev_on:
+                            sim_v_kw["stock_rev_exit"] = srev_cfg_global
+                        if day_fast_pack_on:
+                            sim_v_kw.update(
+                                apply_path_fast_pack_overrides(
+                                    hold_minutes=int(sim_v_kw.get("hold_minutes") or 30),
+                                    trail_activate=sim_v_kw.get("trail_activate"),
+                                    trail_dd=sim_v_kw.get("trail_dd"),
+                                    stock_rev=sim_v_kw.get("stock_rev_exit"),
+                                    pack=fast_pack_cfg,
+                                )
+                            )
                         sim_v = simulate_trade(
                             vic_path,
                             old_row["entry_ts"],
@@ -2455,6 +3381,45 @@ def run_offline_replay(
                 size_frac = float(size_frac) * float(dec.size_scale)
                 size_reason = f"{size_reason}+regime_scale"
                 n_regime_scale += 1
+            if state_gate_on and float(state_entry_scale) < 1.0 - 1e-12:
+                size_frac = float(size_frac) * float(state_entry_scale)
+                size_reason = f"{size_reason}+state_gate:{state_entry_scale:.2f}"
+                n_state_gate_scale += 1
+            if cr_on and day_cr_scale < 1.0 - 1e-12:
+                size_frac = float(size_frac) * float(day_cr_scale)
+                size_reason = f"{size_reason}+corr_rewire:{day_cr_scale:.2f}"
+                n_corr_rewire_scale += 1
+            if morn_r5_cfg is not None:
+                et = to_ny(sim.entry_ts)
+                hm = int(et.hour) * 60 + int(et.minute)
+                tod0 = _hhmm_to_minutes(morn_r5_cfg.get("tod_start", "10:31"))
+                tod1 = _hhmm_to_minutes(morn_r5_cfg.get("tod_end", "11:00"))
+                if tod0 is not None and tod1 is not None and tod0 <= hm <= tod1:
+                    lb = max(1, int(morn_r5_cfg.get("lookback_bars", 5) or 5))
+                    min_s = float(morn_r5_cfg.get("min_signed_ret", 0.0005) or 0.0005)
+                    sc = float(morn_r5_cfg.get("scale", 0.5) or 0.5)
+                    sc = max(0.0, min(sc, 1.0))
+                    sdf_r = stock_by.get(sym)
+                    g_r = None
+                    if sdf_r is not None and not sdf_r.empty:
+                        g_r = _prepare_stock_day(sdf_r[sdf_r["date"] == date])
+                    if g_r is not None and "_close" in g_r.columns:
+                        i1 = _stock_bar_index(g_r, et)
+                        i0 = max(0, i1 - lb)
+                        if i1 > i0:
+                            c0 = float(g_r["_close"].iloc[i0])
+                            c1 = float(g_r["_close"].iloc[i1])
+                            if np.isfinite(c0) and c0 > 0 and np.isfinite(c1):
+                                raw = c1 / c0 - 1.0
+                                signed = raw if str(direction).upper() == "UP" else -raw
+                                if signed < min_s and sc < 1.0 - 1e-12:
+                                    size_frac = float(size_frac) * sc
+                                    size_reason = f"{size_reason}+morn_r5:{sc:.2f}"
+                                    n_morn_r5_scale += 1
+            if float(entry_adv_scale_pending) < 1.0 - 1e-12:
+                size_frac = float(size_frac) * float(entry_adv_scale_pending)
+                size_reason = f"{size_reason}+entry_adv_vol:{float(entry_adv_scale_pending):.2f}"
+                n_entry_adv_vol_scale += 1
             idio_mult = _mf_idio_size_mult(
                 sym, direction, feature_ts, str(date), loss_streak_n=loss_streak
             )
@@ -2576,6 +3541,9 @@ def run_offline_replay(
                 "scale_in_entry2": getattr(sim, "scale_in_entry2", None),
                 "scale_in_ts": getattr(sim, "scale_in_ts", None),
                 "scale_in_deployed_frac": float(getattr(sim, "scale_in_deployed_frac", 1.0) or 1.0),
+                "adverse_soft_armed": bool(getattr(sim, "adverse_soft_armed", False)),
+                "adv_vol_armed": bool(getattr(sim, "adv_vol_armed", False)),
+                "entry_adv_vol_share": float(entry_adv_share) if entry_adv_share is not None else None,
                 "tcn_p": tcn_p,
                 "tcn_reason": tcn_reason,
                 "route": day_route,
@@ -2625,6 +3593,16 @@ def run_offline_replay(
                 row["entry_confirm_bars"] = int(confirm_bars_n)
                 if confirm_mf is not None:
                     row["confirm_mf"] = float(confirm_mf)
+            if path_confirm_ts is not None:
+                row["stock_path_confirm_ts"] = path_confirm_ts
+                row["stock_path_confirm_reason"] = path_confirm_reason
+            if day_cr is not None:
+                row["corr_rewire"] = day_cr.rewire
+                row["corr_rho_event"] = day_cr.rho_event
+                row["corr_rho_calm"] = day_cr.rho_calm
+                row["corr_edge_density"] = day_cr.edge_density
+                row["corr_rewire_reason"] = day_cr.reason
+                row["corr_rewire_scale"] = float(day_cr_scale)
             if purity_score is not None:
                 row["trend_purity"] = float(purity_score)
                 if purity_scale is not None:
@@ -2712,7 +3690,11 @@ def run_offline_replay(
             (profile.get("regime") or {}).get("block_dn_if_qqq_above_open", False)
         ),
         "n_event_block": int(n_event_block),
+        "n_event_symbol_block": int(n_event_symbol_block),
         "event_blackout_dates": sorted(event_blackout),
+        "event_symbol_blackout": {
+            d: sorted(s) for d, s in sorted(event_plan.symbol_days.items())
+        },
         "n_peer_block": int(n_peer_block),
         "n_mf_idio_block": int(n_mf_idio_block),
         "n_mf_idio_scale": int(n_mf_idio_scale),
@@ -2757,6 +3739,20 @@ def run_offline_replay(
         "n_max_fp_block": int(n_max_fp_block),
         "entry_confirm_bars": int(confirm_bars_n) if confirm_bars_n > 0 else None,
         "entry_confirm_mode": confirm_mode if confirm_bars_n > 0 else None,
+        "stock_path_confirm_enabled": bool(spc_on),
+        "stock_path_confirm_thr_pos": spc_thr_pos if spc_on else None,
+        "stock_path_confirm_thr_neg": spc_thr_neg if spc_on else None,
+        "stock_path_confirm_max_wait_seconds": spc_max_wait if spc_on else None,
+        "n_stock_path_confirm_block": int(n_stock_path_confirm_block),
+        "n_stock_path_confirm_ok": int(n_stock_path_confirm_ok),
+        "state_gate_enabled": bool(state_gate_on),
+        "n_state_gate_block": int(n_state_gate_block),
+        "n_state_gate_scale": int(n_state_gate_scale),
+        "state_gate_day_counts": dict(state_gate_day_counts),
+        "corr_rewire_enabled": bool(cr_on),
+        "n_corr_rewire_days": int(n_corr_rewire_days),
+        "n_corr_rewire_scale": int(n_corr_rewire_scale),
+        "n_corr_rewire_block": int(n_corr_rewire_block),
         "trend_purity_sizing": bool(purity_on),
         "trend_purity_features": purity_features if purity_on else None,
         "n_purity_skip": int(n_purity_skip),
@@ -2827,6 +3823,39 @@ def run_offline_replay(
         "trade_toxic_enabled": bool(use_trade_toxic_global),
         "trade_toxic_cut_ret": float(ttox_cfg.cut_ret) if use_trade_toxic_global else None,
         "trade_toxic_mfe_bypass": float(ttox_cfg.mfe_bypass) if use_trade_toxic_global else None,
+        "delta_time_stop_enabled": bool(getattr(dts_cfg, "enabled", False)),
+        "n_delta_stop": int(n_delta_stop),
+        "roi_time_stop_enabled": bool(getattr(rts_cfg, "enabled", False)),
+        "n_roi_time_stop": int(n_roi_time_stop),
+        "ladder_active_enabled": bool(getattr(lac_cfg_global, "enabled", False)),
+        "ladder_when": str(getattr(lac_cfg_global, "when", "always") or "always")
+        if getattr(lac_cfg_global, "enabled", False)
+        else None,
+        "n_ladder_days": int(n_ladder_days),
+        "n_ladder_fallback_days": int(n_ladder_fallback_days),
+        "n_stock_rev_days": int(n_stock_rev_days),
+        "n_stock_rev_off_days": int(n_stock_rev_off_days),
+        "stock_rev_when": str(
+            getattr(sim_kwargs_common.get("stock_rev_exit"), "when", "off") or "off"
+        ),
+        "path_fast_pack_enabled": bool(getattr(fast_pack_cfg, "enabled", False)),
+        "path_fast_pack_when": str(getattr(fast_pack_cfg, "when", "off") or "off")
+        if getattr(fast_pack_cfg, "enabled", False)
+        else None,
+        "n_fast_pack_days": int(n_fast_pack_days),
+        "n_fast_pack_off_days": int(n_fast_pack_off_days),
+        "morning_r5_scale_enabled": bool(morn_r5_cfg is not None),
+        "n_morn_r5_scale": int(n_morn_r5_scale),
+        "adverse_soft_enabled": bool(getattr(adv_cfg, "enabled", False)),
+        "adverse_soft_mode": str(getattr(adv_cfg, "mode", "")) if getattr(adv_cfg, "enabled", False) else None,
+        "n_adverse_soft": int(n_adverse_soft),
+        "n_adverse_soft_armed": int(n_adverse_soft_armed),
+        "adverse_vol_share_enabled": bool(getattr(avs_cfg, "enabled", False)),
+        "n_adv_vol": int(n_adv_vol),
+        "n_adv_vol_armed": int(n_adv_vol_armed),
+        "entry_adv_vol_enabled": bool(entry_avs_cfg.enabled),
+        "n_entry_adv_vol_block": int(n_entry_adv_vol_block),
+        "n_entry_adv_vol_scale": int(n_entry_adv_vol_scale),
         "n_trade_path": int(n_trade_path),
         "n_trade_path_miss": int(n_trade_path_miss),
         "n_trade_tox": int((trades_df["reason"] == "TRADE_TOX").sum())

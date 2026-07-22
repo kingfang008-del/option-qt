@@ -74,6 +74,8 @@ def _drive_day(
                 "volume": row.volume,
             },
         )
+    # Flush open minute bars + pending Hunt / path-confirm before next session.
+    scanner.flush_seconds()
     return {"ticks": int(len(all_ticks)), "missing_symbols": missing}
 
 
@@ -175,6 +177,7 @@ def main() -> None:
     scanner = Mag7Scanner.from_profile(profile, scheme=args.scheme)
     scanner.regime_gate = regime_gate_from_1s(profile, stock_by)
     scanner.stock_by = stock_by  # peer_align parity with offline feature_ts asof
+    scanner.stock_by_frozen = True  # causal asof path_confirm; do not duplicate bars
     runner.scanner = scanner
     scanner.on_signal = runner.process_one
     scanner.is_symbol_active = lambda sym: (

@@ -1,6 +1,6 @@
 {
   "catalog": "maga7_strategy_profiles",
-  "updated": "2026-07-17",
+  "updated": "2026-07-23",
   "window": {
     "start": "2026-05-01",
     "end": "2026-07-13"
@@ -9,7 +9,116 @@
   "moneyness": "ATM",
   "default_profile": "CONFIG/strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1.json",
   "default_matches": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1.json",
+  "research_baseline": "CONFIG/strategy_profiles/single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json",
   "profiles": [
+    {
+      "id": "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1",
+      "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json",
+      "role": "research_baseline",
+      "scheme": "single",
+      "exit_mode": "hold_extend+trade_toxic+s1_path_soft",
+      "docs": "docs/research_full_day_peer3_baseline.md",
+      "note": "Research baseline 2026-07-23: + S1 soft path. Offline accept Apr–Jul/Jan–Mar KEEP_S1 (results/s1_research_baseline_accept_apr_jul_jan_mar_v1). Stream parity both windows ok. Production default remains googl_peer3_v1; WA_UP overlay only."
+    },
+    {
+      "id": "single_qqq_open_ladder_atm5otm_peer3_s1_wa_up_v1",
+      "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_peer3_s1_wa_up_v1.json",
+      "role": "research_s1_wa_up",
+      "scheme": "single",
+      "exit_mode": "hold_extend+s1+wave_abort_up",
+      "docs": "docs/wave_confirm_spec.md",
+      "note": "Research overlay 2026-07-23: research_baseline S1 + WAVE_ABORT only_directions=UP. July toxic better; weak-window keep weaker — do not promote as global default."
+    },
+    {
+      "id": "single_qqq_open_ladder_atm5otm_peer3_tail_tox20_wash_m3_v1",
+      "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_peer3_tail_tox20_wash_m3_v1.json",
+      "role": "research_tail",
+      "scheme": "single",
+      "exit_mode": "hold_extend+tox20+stock_rev_wash_m3",
+      "docs": "docs/peer3_tail_loss_research.md",
+      "note": "Research 2026-07-22: tail-first shadow — tox cut20 + wash_m3 L3. May–Jul ≤−25% trades 4→1; Jul21 AMD −26%→−16%. Not in peer3_v1 baseline."
+    },
+    {
+      "id": "single_qqq_open_ladder_atm5otm_peer3_l3_wash_m3_v1",
+      "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_peer3_l3_wash_m3_v1.json",
+      "role": "research_l3_causal",
+      "scheme": "single",
+      "exit_mode": "hold_extend+stock_rev_l3",
+      "docs": "docs/peer3_l3_causal_exit_research.md",
+      "note": "Research 2026-07-22: preferred L3 causal exit on peer3 (wash∧m3∧uw). May–Jul retain~0.91; Jul20 −3.5%. Shadow only — not in peer3_v1 baseline."
+    },
+    {
+      "id": "single_qqq_open_ladder_atm5otm_peer3_l3_uw_m3_h15_v1",
+      "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_peer3_l3_uw_m3_h15_v1.json",
+      "role": "research_l3_causal_alt",
+      "scheme": "single",
+      "exit_mode": "hold_extend+stock_rev_l3",
+      "docs": "docs/peer3_l3_causal_exit_research.md",
+      "note": "Research 2026-07-22: alt L3 always-on uw_m3@15m. Clock 28%; Jul20 −4.1%. Shadow only — not in peer3_v1 baseline."
+    },
+    {
+      "id": "single_qqq_open_ladder_atm5otm_path_hold_lit_opt_chop_v1",
+      "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_path_hold_lit_opt_chop_v1.json",
+      "role": "research_path_hold_lit_opt_chop",
+      "scheme": "single",
+      "exit_mode": "lit_rails+wash_fast_pack",
+      "docs": "docs/option_surface_hold_research.md",
+      "note": "Research 2026-07-21: wash + wash_refine (chop/med/pcr/iv_mom). FA 8→1, keeps Jul20. See fast_pack_arm_diagnosis_v1."
+    },
+    {
+      "id": "single_qqq_open_ladder_atm5otm_path_hold_lit_wash_fast_v1",
+      "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_path_hold_lit_wash_fast_v1.json",
+      "role": "research_path_hold_lit_wash_fast",
+      "scheme": "single",
+      "exit_mode": "lit_rails+wash_fast_pack",
+      "docs": "docs/path_adaptive_hold_research.md",
+      "note": "Research 2026-07-21: lit default + mixed_wash_up → trail15/8 + REV@5 + T20. Prefer over always-scalp. Not freeze."
+    },
+    {
+      "id": "single_qqq_open_ladder_atm5otm_path_hold_lit_v1",
+      "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_path_hold_lit_v1.json",
+      "role": "research_path_hold_lit",
+      "scheme": "single",
+      "exit_mode": "mtm_trail+stock_rev_always+t45_safety",
+      "docs": "docs/path_adaptive_hold_research.md",
+      "note": "Research 2026-07-21 literature rails: TRAIL@+20/−12 + STOCK_REV@10m + T45 undeveloped only (no hold_extend). Ablation path_hold_lit_v1. Not freeze."
+    },
+    {
+      "id": "single_qqq_open_ladder_atm5otm_path_hold_cond_rev_v1",
+      "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_path_hold_cond_rev_v1.json",
+      "role": "research_path_hold",
+      "scheme": "single",
+      "exit_mode": "hold_extend+stock_rev_always",
+      "docs": "docs/path_adaptive_hold_research.md",
+      "note": "Prior risk-first: always STOCK_REV@10m still on hold_extend scaffold. Prefer path_hold_lit_v1 for full three-rail. Not freeze."
+    },
+    {
+      "id": "single_qqq_open_ladder_atm5otm_cond_ladder_loose_wash_v1",
+      "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_cond_ladder_loose_wash_v1.json",
+      "role": "research_cond_ladder",
+      "scheme": "single",
+      "exit_mode": "hold_extend+ladder_when_mixed_wash",
+      "docs": "docs/sec_ladder_active_research.md",
+      "note": "Research 2026-07-20: conditional loose ladder on mixed_wash_up; May–Jul +515% DD-6.2%. Not freeze."
+    },
+    {
+      "id": "single_qqq_open_ladder_atm5otm_sec_ladder_active_v1",
+      "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_sec_ladder_active_v1.json",
+      "role": "research_sec_ladder",
+      "scheme": "single",
+      "reentry_mode": "cooldown_only",
+      "position_sizing": "concurrent",
+      "position_frac": 0.2,
+      "exit_mode": "ladder_active",
+      "hold_minutes": 5,
+      "max_hold_seconds": 300,
+      "contract_mode": "open_ladder",
+      "ladder_otm_rungs": 3,
+      "peer_align_min": 3,
+      "peer_align_mode": "mf10",
+      "docs": "docs/sec_ladder_active_research.md",
+      "note": "Research 2026-07-20: seconds-scale active ladder (TP/SL/stall/mf). Does NOT replace peer3 freeze."
+    },
     {
       "id": "single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1",
       "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1.json",

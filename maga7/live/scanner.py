@@ -4,7 +4,12 @@ Does NOT use QQQ TFT/FCS as the primary signal path. Optional regime filter
 can be added later (QQQ state only gates Mag7 entries).
 
 Hunt: mirrors ``stream_engine`` — ``begin_day`` arms candidates, then
-``_drain_hunts`` emits at feature_ts + bar_delay (does not consume TopK slots).
+``drain_hunts`` emits at confirm_ft + bar_delay (entry_confirm when gated;
+does not consume TopK slots).
+
+Stock path confirm (S1): after fill clock, wait for +thr_pos before -thr_neg
+using ``stock_path_confirm_ok(..., asof_ts=)``; pending candidates sit in
+``pending_path`` until pos / neg / timeout.
 """
 from __future__ import annotations
 
@@ -20,8 +25,13 @@ from maga7.common.bar_agg import MultiSymbolMinuteAgg
 from maga7.common.config import load_profile
 from maga7.common.entry_contract import ContractBooks, resolve_entry_contract
 from maga7.common.reentry import resolve_only_win_reenter
-from maga7.common.replay import to_ny
-from maga7.common.signals import StreamSignalState, count_peer_align
+from maga7.common.replay import stock_path_confirm_ok, to_ny
+from maga7.common.signals import (
+    StreamSignalState,
+    attach_mf_features,
+    count_peer_align,
+    resolve_mf_fast_window,
+)
 
 logger = logging.getLogger("maga7.live.scanner")
 
@@ -157,6 +167,7 @@ class Mag7Scanner:
     n_hunt_mutex_skip: int = 0
     n_halt_skip: int = 0
     event_blackout: set = field(default_factory=set)
+    event_symbol_blackout: dict = field(default_factory=dict)  # date -> {SYM}
     event_blackout_meta: dict[str, Any] = field(default_factory=dict)
     # Optional feature frames for peer_align parity with offline/stream.
     # When set (stock-1s replay), peer uses count_peer_align(asof=feature_ts).
@@ -164,8 +175,16 @@ class Mag7Scanner:
     # Also required for Watchdog Hunt arming (washout_reclaim needs day bars).
     stock_by: dict[str, Any] | None = None
     pending_hunts: list = field(default_factory=list)
+    # Path-confirm wait queue (baseline TopK + Hunt) — live asof pending.
+    pending_path: list = field(default_factory=list)
     day_hunt_symbols: set = field(default_factory=set)
     day_hunt_dirs: set = field(default_factory=set)
+    # Earliest-TopK seats reserved at first Rule-A (before confirm/regime/peer).
+    day_topk_syms: set = field(default_factory=set)
+    # When True, stock_by is research-preloaded (lookback+features); do not mutate.
+    stock_by_frozen: bool = False
+    n_stock_path_confirm_block: int = 0
+    n_stock_path_confirm_ok: int = 0
 
     @classmethod
     def from_profile(cls, profile: dict[str, Any] | None = None, **kwargs) -> "Mag7Scanner":
@@ -255,14 +274,23 @@ class Mag7Scanner:
     def _roll_day(self, date: str) -> None:
         if self.current_date == date:
             return
+        prev = self.current_date
+        if prev is not None:
+            # Resolve pending Hunt / path-confirm before dropping day state.
+            # Otherwise cross-day rolls silently drop S1 waits (missed Hunt emits).
+            eod = pd.Timestamp(f"{prev} 20:00:00", tz="America/New_York")
+            self.drain_hunts(eod)
+            self.drain_path_confirms(eod)
         self.current_date = date
         self.day_fires = []
         self.n_done = {s: 0 for s in self.profile["symbols"]}
         self.last_exit = {s: None for s in self.profile["symbols"]}
         self.last_win = {s: True for s in self.profile["symbols"]}
         self.pending_hunts = []
+        self.pending_path = []
         self.day_hunt_symbols = set()
         self.day_hunt_dirs = set()
+        self.day_topk_syms = set()
         self._day_halt = False
         self._watchdog_closed = False
         self._watchdog_last_eval_tod = None
@@ -293,6 +321,8 @@ class Mag7Scanner:
 
     def _append_stock_bar(self, symbol: str, bar: dict[str, Any]) -> None:
         """Accumulate completed 1m OHLCV into stock_by for Watchdog/Hunt."""
+        if self.stock_by_frozen:
+            return
         if self.stock_by is None:
             self.stock_by = {}
         ts = to_ny(bar["timestamp"])
@@ -341,6 +371,20 @@ class Mag7Scanner:
         if pc is None or not (pc > 0):
             pc = float(df.iloc[0]["open"])
         df = df.copy()
+        df["prev_close"] = float(pc)
+        df["from_prev"] = df["close"].astype(float) / float(pc) - 1.0
+        # entry_confirm / peer_align need mf10+streak on stock_by (same as offline bars)
+        sig = self.profile.get("signal") or {}
+        mf_w = int(sig.get("mf_window", 10) or 10)
+        vol_w = int(sig.get("vol_ma_window", 20) or 20)
+        fast_w = resolve_mf_fast_window(sig)
+        df = attach_mf_features(
+            df,
+            mf_window=mf_w,
+            vol_ma_window=vol_w,
+            mf_fast_window=fast_w,
+        )
+        # Keep overnight prev_close if StreamSignalState provided one
         df["prev_close"] = float(pc)
         df["from_prev"] = df["close"].astype(float) / float(pc) - 1.0
         self.stock_by[symbol] = df
@@ -426,11 +470,16 @@ class Mag7Scanner:
             self._watchdog_reason = dec.reason
             self._watchdog_route = dec.overlay.route_tag or "baseline"
             self._day_halt = str(self._watchdog_state) == "halt"
-            # Reschedule Hunt only if we have not already filled today's Hunt budget.
-            if self.n_hunt_emitted == 0 and not self._day_halt:
-                self._schedule_hunts(str(date))
-            elif self._day_halt:
+            # Reschedule Hunt while *today's* budget remains.
+            # Do NOT gate on cumulative ``n_hunt_emitted`` — that blocked Hunt on
+            # later sessions after the first Hunt of a multi-day replay.
+            if self._day_halt:
                 self.pending_hunts = []
+            elif (
+                self.watchdog is None
+                or self.watchdog.hunt_budget_remaining() > 0
+            ):
+                self._schedule_hunts(str(date))
             logger.info(
                 "WATCHDOG %s state=%s reason=%s route=%s hunt_armed=%s n_hunt_cand=%d pending=%d",
                 date,
@@ -441,6 +490,13 @@ class Mag7Scanner:
                 len(getattr(self.watchdog, "hunt_candidates", None) or []),
                 len(self.pending_hunts),
             )
+            if str(dec.reason or "").startswith("prevention:"):
+                logger.info(
+                    "PREVENTION %s expert=%s prefer_risk_off=%s",
+                    date,
+                    dec.expert,
+                    bool((self.watchdog.cfg.prevention_router_cfg or {}).get("prefer_risk_off")),
+                )
         except Exception as exc:
             self._watchdog_state = "normal"
             self._watchdog_reason = f"error:{type(exc).__name__}"
@@ -448,21 +504,247 @@ class Mag7Scanner:
             self._day_halt = False
             logger.warning("WATCHDOG %s evaluate failed: %s", date, exc)
 
+    def _path_confirm_cfg(self) -> dict[str, Any] | None:
+        trade = self.profile.get("trade") or {}
+        raw = trade.get("stock_path_confirm") or {}
+        if not isinstance(raw, dict) or not bool(raw.get("enabled", False)):
+            return None
+        return raw
+
+    def _path_confirm_applies(
+        self, cfg: dict[str, Any], *, date: str, entry_ts: pd.Timestamp
+    ) -> bool:
+        wd_raw = cfg.get("weekdays")
+        if wd_raw is not None:
+            if isinstance(wd_raw, str):
+                wds = {int(x.strip()) for x in wd_raw.split(",") if str(x).strip() != ""}
+            else:
+                wds = {int(x) for x in wd_raw}
+            try:
+                wd = int(pd.Timestamp(str(date)).weekday())
+            except Exception:
+                wd = -1
+            if wd not in wds:
+                return False
+        tod_start = cfg.get("tod_start")
+        tod_end = cfg.get("tod_end")
+        if tod_start is not None and tod_end is not None:
+            try:
+                sh, sm = str(tod_start).split(":", 1)
+                eh, em = str(tod_end).split(":", 1)
+                t0 = int(sh) * 60 + int(sm)
+                t1 = int(eh) * 60 + int(em)
+            except Exception:
+                return True
+            hm = int(to_ny(entry_ts).hour) * 60 + int(to_ny(entry_ts).minute)
+            if not (t0 <= hm <= t1):
+                return False
+        return True
+
+    def _eval_path_confirm(
+        self,
+        *,
+        symbol: str,
+        date: str,
+        direction: str,
+        entry_ts: pd.Timestamp,
+        asof_ts: pd.Timestamp,
+        cfg: dict[str, Any],
+    ) -> tuple[str, pd.Timestamp | None, str]:
+        """Return ``(ok|block|pending, confirm_ts, reason)``."""
+        sdf = (self.stock_by or {}).get(symbol)
+        stock_day = None
+        if sdf is not None and not getattr(sdf, "empty", True):
+            stock_day = sdf[sdf["date"].astype(str) == str(date)]
+        ok_p, path_ts, reason = stock_path_confirm_ok(
+            stock_day,
+            direction=direction,
+            entry_ts=entry_ts,
+            thr_pos=float(cfg.get("thr_pos", 0.0015) or 0.0015),
+            thr_neg=float(cfg.get("thr_neg", -0.003) or -0.003),
+            max_wait_seconds=int(cfg.get("max_wait_seconds", 300) or 300),
+            on_timeout=str(cfg.get("on_timeout", "block") or "block"),
+            asof_ts=asof_ts,
+        )
+        if reason == "pending":
+            return "pending", None, reason
+        if not ok_p:
+            return "block", path_ts, reason
+        return "ok", path_ts, reason
+
+    def _gate_path_confirm(
+        self,
+        *,
+        route: str,
+        symbol: str,
+        date: str,
+        direction: str,
+        feature_ts: pd.Timestamp,
+        entry_ts: pd.Timestamp,
+        asof_ts: pd.Timestamp,
+        stash: dict[str, Any],
+    ) -> tuple[str, pd.Timestamp, str | None]:
+        """Apply S1 path gate. Returns ``(ok|block|pending|skip, entry_ts, reason)``."""
+        cfg = self._path_confirm_cfg()
+        if cfg is None or not self._path_confirm_applies(
+            cfg, date=date, entry_ts=entry_ts
+        ):
+            return "skip", entry_ts, None
+        status, path_ts, reason = self._eval_path_confirm(
+            symbol=symbol,
+            date=date,
+            direction=direction,
+            entry_ts=entry_ts,
+            asof_ts=asof_ts,
+            cfg=cfg,
+        )
+        if status == "pending":
+            self.pending_path.append(
+                {
+                    **stash,
+                    "route": route,
+                    "symbol": symbol,
+                    "date": date,
+                    "direction": direction,
+                    "feature_ts": feature_ts,
+                    "entry_ts": entry_ts,
+                    "path_cfg": cfg,
+                }
+            )
+            return "pending", entry_ts, reason
+        if status == "block":
+            self.n_stock_path_confirm_block += 1
+            logger.info(
+                "PATH_CONFIRM_BLOCK %s %s %s route=%s reason=%s",
+                date,
+                symbol,
+                direction,
+                route,
+                reason,
+            )
+            return "block", entry_ts, reason
+        self.n_stock_path_confirm_ok += 1
+        if (
+            bool(cfg.get("delay_on_pos", True))
+            and path_ts is not None
+            and reason == "pos"
+        ):
+            delay = int(
+                (self.profile.get("trade") or {}).get(
+                    "bar_availability_delay_seconds", 0
+                )
+                or 0
+            )
+            entry_ts = to_ny(path_ts) + pd.Timedelta(seconds=delay)
+        return "ok", entry_ts, reason
+
+    def drain_path_confirms(self, ts: pd.Timestamp) -> list[ScannerSignal]:
+        """Resolve pending path-confirm candidates as of ``ts``."""
+        if not self.pending_path:
+            return []
+        asof = to_ny(ts)
+        out: list[ScannerSignal] = []
+        rest: list[dict[str, Any]] = []
+        for item in self.pending_path:
+            cfg = item.get("path_cfg") or self._path_confirm_cfg() or {}
+            status, path_ts, reason = self._eval_path_confirm(
+                symbol=str(item["symbol"]),
+                date=str(item["date"]),
+                direction=str(item["direction"]),
+                entry_ts=to_ny(item["entry_ts"]),
+                asof_ts=asof,
+                cfg=cfg,
+            )
+            if status == "pending":
+                rest.append(item)
+                continue
+            if status == "block":
+                self.n_stock_path_confirm_block += 1
+                logger.info(
+                    "PATH_CONFIRM_BLOCK %s %s %s route=%s reason=%s",
+                    item["date"],
+                    item["symbol"],
+                    item["direction"],
+                    item.get("route"),
+                    reason,
+                )
+                continue
+            self.n_stock_path_confirm_ok += 1
+            entry_ts = to_ny(item["entry_ts"])
+            if (
+                bool(cfg.get("delay_on_pos", True))
+                and path_ts is not None
+                and reason == "pos"
+            ):
+                delay = int(
+                    (self.profile.get("trade") or {}).get(
+                        "bar_availability_delay_seconds", 0
+                    )
+                    or 0
+                )
+                entry_ts = to_ny(path_ts) + pd.Timedelta(seconds=delay)
+            item = {**item, "entry_ts": entry_ts, "path_confirm_reason": reason}
+            if str(item.get("route") or "") == "hunt":
+                sig = self._emit_hunt_resolved(item)
+            else:
+                sig = self._emit_topk_resolved(item)
+            if sig is not None:
+                out.append(sig)
+        self.pending_path = rest
+        return out
+
+    def _entry_confirm_cfg(self, date: str) -> tuple[bool, int, str]:
+        """Weekday-gated entry_confirm knobs (parity with offline / baseline emit)."""
+        trade = self.profile.get("trade") or {}
+        sig = self.profile.get("signal") or {}
+        confirm_bars_raw = trade.get("entry_confirm_bars") or sig.get("entry_confirm_bars")
+        confirm_bars_n = int(confirm_bars_raw) if confirm_bars_raw is not None else 0
+        confirm_mode = str(
+            trade.get("entry_confirm_mode") or sig.get("entry_confirm_mode") or "mf"
+        ).strip().lower()
+        confirm_wd_raw = trade.get("entry_confirm_weekdays") or sig.get(
+            "entry_confirm_weekdays"
+        )
+        use_confirm = confirm_bars_n > 0
+        if use_confirm and confirm_wd_raw is not None:
+            if isinstance(confirm_wd_raw, str):
+                confirm_wds = {
+                    int(x.strip()) for x in confirm_wd_raw.split(",") if str(x).strip() != ""
+                }
+            else:
+                confirm_wds = {int(x) for x in confirm_wd_raw}
+            try:
+                wd0 = int(pd.Timestamp(str(date)).weekday())
+            except Exception:
+                wd0 = -1
+            use_confirm = wd0 in confirm_wds
+        return use_confirm, confirm_bars_n, confirm_mode
+
     def _schedule_hunts(self, date: str) -> None:
-        """Queue Hunt fires at feature_ts + bar_delay (same clock as stream/offline)."""
+        """Queue Hunt fires at confirm_ft + bar_delay (same clock as stream/offline)."""
         self.pending_hunts = []
         if self._day_halt or self.watchdog is None:
             return
-        if self.is_event_blackout(date):
+        if self.is_event_blackout(date):  # full-day only (no symbol arg)
             return
         if not bool(getattr(self.watchdog, "hunt_armed", False)):
             return
         trade = self.profile.get("trade") or {}
         bar_delay = int(trade.get("bar_availability_delay_seconds", 0) or 0)
+        use_confirm, confirm_bars_n, _ = self._entry_confirm_cfg(date)
         n_new = 0
         for hc in list(getattr(self.watchdog, "hunt_candidates", None) or []):
+            if self.is_event_blackout(date, symbol=str(hc.symbol)):
+                self.n_event_block += 1
+                continue
             feature_ts = to_ny(hc.sig_ts)
-            entry_ts = feature_ts + pd.Timedelta(seconds=bar_delay)
+            # Match offline: fill clock = (feature + confirm_bars) + bar_delay when gated.
+            confirm_ft = (
+                feature_ts + pd.Timedelta(minutes=confirm_bars_n)
+                if use_confirm
+                else feature_ts
+            )
+            entry_ts = confirm_ft + pd.Timedelta(seconds=bar_delay)
             if entry_ts > to_ny(hc.armed_until):
                 continue
             self.pending_hunts.append(
@@ -508,6 +790,26 @@ class Mag7Scanner:
                 return None
         return None
 
+    def _hunt_confirm_ready(self, h: dict[str, Any]) -> bool:
+        """True when stock_by has the confirm bar (avoid early mf-from-prior-bar)."""
+        date = str(h["date"])
+        use_confirm, confirm_bars_n, _ = self._entry_confirm_cfg(date)
+        if not use_confirm:
+            return True
+        confirm_ft = to_ny(h["feature_ts"]) + pd.Timedelta(minutes=confirm_bars_n)
+        sdf = (self.stock_by or {}).get(str(h["symbol"]))
+        if sdf is None or getattr(sdf, "empty", True):
+            return False
+        day = sdf[sdf["date"].astype(str) == date]
+        if day.empty or "timestamp" not in day.columns:
+            return False
+        ts = pd.to_datetime(day["timestamp"])
+        if getattr(ts.dt, "tz", None) is None:
+            ts = ts.dt.tz_localize("America/New_York")
+        else:
+            ts = ts.dt.tz_convert("America/New_York")
+        return bool((ts >= confirm_ft).any())
+
     def drain_hunts(self, ts: pd.Timestamp) -> list[ScannerSignal]:
         """Emit Hunt signals due at/before ``ts``. Safe to call every tick/frame."""
         ts = to_ny(ts)
@@ -520,12 +822,22 @@ class Mag7Scanner:
         due = [h for h in self.pending_hunts if h["entry_ts"] <= ts]
         if not due:
             return []
-        self.pending_hunts = [h for h in self.pending_hunts if h["entry_ts"] > ts]
+        rest = [h for h in self.pending_hunts if h["entry_ts"] > ts]
         out: list[ScannerSignal] = []
         for h in due:
-            sig = self._emit_hunt(h)
+            if self.is_event_blackout(
+                h.get("date") or self.current_date, symbol=h.get("symbol")
+            ):
+                self.n_event_block += 1
+                continue
+            # Wait for confirm minute bar before deciding (causal vs full-day offline).
+            if not self._hunt_confirm_ready(h):
+                rest.append(h)
+                continue
+            sig = self._emit_hunt({**h, "_asof": ts})
             if sig is not None:
                 out.append(sig)
+        self.pending_hunts = sorted(rest, key=lambda x: (x["entry_ts"], x["symbol"]))
         return out
 
     def _emit_hunt(self, h: dict[str, Any]) -> ScannerSignal | None:
@@ -544,6 +856,80 @@ class Mag7Scanner:
             return None
 
         trade = self.profile.get("trade") or {}
+        delay = int(trade.get("bar_availability_delay_seconds", 0) or 0)
+        use_confirm, confirm_bars_n, confirm_mode = self._entry_confirm_cfg(date)
+        if use_confirm:
+            from maga7.common.replay import entry_confirm_ok
+
+            sdf_c = (self.stock_by or {}).get(symbol)
+            stock_day_c = None
+            if sdf_c is not None and not getattr(sdf_c, "empty", True):
+                stock_day_c = sdf_c[sdf_c["date"].astype(str) == str(date)]
+            ok_c, confirm_ft, _, _, _ = entry_confirm_ok(
+                stock_day_c,
+                direction=direction,
+                feature_ts=feature_ts,
+                confirm_bars=confirm_bars_n,
+                mode=confirm_mode,
+            )
+            if not ok_c or confirm_ft is None:
+                logger.info(
+                    "HUNT_CONFIRM_BLOCK %s %s %s bars=%s mode=%s",
+                    date,
+                    symbol,
+                    direction,
+                    confirm_bars_n,
+                    confirm_mode,
+                )
+                return None
+            entry_ts = to_ny(confirm_ft) + pd.Timedelta(seconds=delay)
+
+        asof = to_ny(h.get("_asof") or entry_ts)
+        status, entry_ts, _ = self._gate_path_confirm(
+            route="hunt",
+            symbol=symbol,
+            date=date,
+            direction=direction,
+            feature_ts=feature_ts,
+            entry_ts=entry_ts,
+            asof_ts=asof,
+            stash={**h, "spot": float(spot), "delay": delay},
+        )
+        if status in {"pending", "block"}:
+            return None
+
+        return self._emit_hunt_resolved(
+            {
+                **h,
+                "symbol": symbol,
+                "dir": direction,
+                "date": date,
+                "feature_ts": feature_ts,
+                "entry_ts": entry_ts,
+                "spot": float(spot),
+                "delay": delay,
+            }
+        )
+
+    def _emit_hunt_resolved(self, h: dict[str, Any]) -> ScannerSignal | None:
+        """Emit Hunt after entry_confirm + path confirm have resolved."""
+        if self.watchdog is not None and self.watchdog.hunt_budget_remaining() <= 0:
+            self.n_hunt_budget_skip += 1
+            return None
+        symbol = str(h["symbol"])
+        direction = str(h.get("dir") or h.get("direction") or "").upper()
+        date = str(h["date"])
+        feature_ts = to_ny(h["feature_ts"])
+        entry_ts = to_ny(h["entry_ts"])
+        spot = h.get("spot")
+        if spot is None:
+            spot = self._spot_at(symbol, date, feature_ts)
+        if spot is None or float(spot) <= 0:
+            logger.warning("HUNT skip %s %s %s: no spot", date, symbol, direction)
+            return None
+        trade = self.profile.get("trade") or {}
+        delay = int(h.get("delay") if h.get("delay") is not None else trade.get("bar_availability_delay_seconds", 0) or 0)
+
         money = str(trade.get("moneyness", "ATM"))
         books = self.books or ContractBooks.from_profile(self.profile)
         pick = resolve_entry_contract(
@@ -555,6 +941,15 @@ class Mag7Scanner:
             sig_ts=entry_ts,
             spot=float(spot),
         )
+        if pick.ticker is None:
+            logger.info(
+                "HUNT skip %s %s %s: no contract src=%s",
+                date,
+                symbol,
+                direction,
+                pick.source,
+            )
+            return None
         fill = self.profile.get("fill") or {}
         hold_minutes = int(trade.get("hold_minutes", 30))
         sl_mult = float(trade.get("sl_mult", 0.4))
@@ -570,9 +965,9 @@ class Mag7Scanner:
             if hov.get("tp_mult") is not None:
                 tp_mult = float(hov["tp_mult"])
 
-        delay = int(trade.get("bar_availability_delay_seconds", 0) or 0)
         det = str(h.get("detector") or "")
         wd_reason = f"hunt:{det}" if det else f"hunt:{self._watchdog_reason}"
+        path_reason = h.get("path_confirm_reason")
         sig = ScannerSignal(
             date=date,
             symbol=symbol,
@@ -601,6 +996,7 @@ class Mag7Scanner:
                 "route": "hunt",
                 "event_source": "hunt",
                 "hunt_detector": det,
+                "stock_path_confirm_reason": path_reason,
             },
         )
 
@@ -655,10 +1051,33 @@ class Mag7Scanner:
     ) -> None:
         self.event_blackout = set(blackout or ())
         self.event_blackout_meta = dict(meta or {})
+        plan = (meta or {}).get("event_plan")
+        if plan is not None and hasattr(plan, "symbol_days"):
+            self.event_symbol_blackout = {
+                str(d): {str(s).upper() for s in syms}
+                for d, syms in (plan.symbol_days or {}).items()
+            }
+        else:
+            raw = (meta or {}).get("symbol_blackout") or {}
+            self.event_symbol_blackout = {
+                str(d): {str(s).upper() for s in (syms or [])}
+                for d, syms in raw.items()
+            }
 
-    def is_event_blackout(self, date: str | None = None) -> bool:
+    def is_event_blackout(
+        self, date: str | None = None, *, symbol: str | None = None
+    ) -> bool:
+        """Full-day block, or symbol-scoped when ``symbol`` is set."""
         d = date or self.current_date
-        return bool(d) and str(d) in self.event_blackout
+        if not d:
+            return False
+        if str(d) in self.event_blackout:
+            return True
+        if symbol:
+            return str(symbol).upper() in (
+                self.event_symbol_blackout.get(str(d)) or set()
+            )
+        return False
 
     def on_stock_second(self, symbol: str, tick: dict[str, Any]) -> ScannerSignal | None:
         """Ingest 1s (or trade) print → maybe complete a 1m bar → Rule-A / Hunt."""
@@ -667,8 +1086,9 @@ class Mag7Scanner:
         ts = to_ny(tick["timestamp"])
         date = ts.strftime("%Y-%m-%d")
         self._roll_day(date)
-        # Even without a completed 1m bar, Hunt may become due on this clock.
+        # Even without a completed 1m bar, Hunt / path-confirm may become due.
         self.drain_hunts(ts)
+        self.drain_path_confirms(ts)
         bar = self.minute_agg.on_second(symbol, tick)
         if bar is None:
             return None
@@ -693,6 +1113,17 @@ class Mag7Scanner:
             for hs in self.drain_hunts(last):
                 if hs not in out:
                     out.append(hs)
+        if self.pending_path:
+            lasts = [to_ny(p["entry_ts"]) for p in self.pending_path]
+            # Flush path waits at deadline so timeout_allow/block can resolve.
+            for p in self.pending_path:
+                cfg = p.get("path_cfg") or {}
+                mw = int(cfg.get("max_wait_seconds", 300) or 300)
+                lasts.append(to_ny(p["entry_ts"]) + pd.Timedelta(seconds=mw))
+            last_p = max(lasts)
+            for ps in self.drain_path_confirms(last_p):
+                if ps not in out:
+                    out.append(ps)
         return out
 
     def on_stock_bar(self, symbol: str, bar: dict[str, Any]) -> ScannerSignal | None:
@@ -708,13 +1139,15 @@ class Mag7Scanner:
             bar.get("available_ts")
             or (feature_ts + pd.Timedelta(seconds=delay))
         )
+        clock_ts = ts
         date = feature_ts.strftime("%Y-%m-%d")
         self._roll_day(date)
         # Live/research: keep growing stock_by so Watchdog can arm after wash window.
         self._append_stock_bar(symbol, bar)
         self._maybe_refresh_watchdog(feature_ts)
-        # Hunt first (time-driven); may emit via on_signal / self.signals.
+        # Hunt / path-confirm first (time-driven); may emit via on_signal.
         self.drain_hunts(ts)
+        self.drain_path_confirms(ts)
 
         st = self.states.get(symbol)
         if st is None:
@@ -722,7 +1155,7 @@ class Mag7Scanner:
         fire = st.on_bar(bar)
         if fire is None:
             return None
-        if self.is_event_blackout(date):
+        if self.is_event_blackout(date, symbol=symbol):
             self.n_event_block += 1
             logger.info("EVENT_BLACKOUT %s skip %s %s", date, symbol, fire.get("dir"))
             return None
@@ -752,7 +1185,9 @@ class Mag7Scanner:
                 self.n_hunt_mutex_skip += 1
                 return None
 
-        already = any(f.symbol == symbol for f in self.day_fires)
+        already = str(symbol) in self.day_topk_syms or any(
+            f.symbol == symbol for f in self.day_fires
+        )
         if already and not use_reentry:
             # Hunt may have taken n_done; still allow opposite baseline once.
             allow_opp = (
@@ -768,12 +1203,12 @@ class Mag7Scanner:
             )
             if not allow_opp:
                 return None
-        if not already and len(self.day_fires) >= self._topk() and not use_reentry:
-            return None
-        # TopK admission: first fires of new symbols only until K filled
-        # (match stream/offline: reserve slot BEFORE regime — blocked names still fill K)
-        if not already and len({f.symbol for f in self.day_fires}) >= self._topk():
-            return None
+        # Earliest-TopK: reserve seat at first Rule-A, before confirm/regime/peer
+        # (offline top2 is fixed; confirm fails must not free the seat for later names).
+        if not already and not use_reentry:
+            if len(self.day_topk_syms) >= self._topk():
+                return None
+            self.day_topk_syms.add(str(symbol))
         if use_reentry:
             if self.is_symbol_active is not None and self.is_symbol_active(symbol):
                 return None
@@ -802,31 +1237,7 @@ class Mag7Scanner:
         spot = float(fire["spot"])
 
         # Entry confirm (weekday-gated); parity with offline / stream.
-        confirm_bars_raw = trade.get("entry_confirm_bars") or (
-            self.profile.get("signal") or {}
-        ).get("entry_confirm_bars")
-        confirm_bars_n = int(confirm_bars_raw) if confirm_bars_raw is not None else 0
-        confirm_mode = str(
-            trade.get("entry_confirm_mode")
-            or (self.profile.get("signal") or {}).get("entry_confirm_mode")
-            or "mf"
-        ).strip().lower()
-        confirm_wd_raw = trade.get("entry_confirm_weekdays") or (
-            self.profile.get("signal") or {}
-        ).get("entry_confirm_weekdays")
-        use_confirm = confirm_bars_n > 0
-        if use_confirm and confirm_wd_raw is not None:
-            if isinstance(confirm_wd_raw, str):
-                confirm_wds = {
-                    int(x.strip()) for x in confirm_wd_raw.split(",") if str(x).strip() != ""
-                }
-            else:
-                confirm_wds = {int(x) for x in confirm_wd_raw}
-            try:
-                wd0 = int(pd.Timestamp(str(date)).weekday())
-            except Exception:
-                wd0 = -1
-            use_confirm = wd0 in confirm_wds
+        use_confirm, confirm_bars_n, confirm_mode = self._entry_confirm_cfg(date)
         if use_confirm:
             from maga7.common.replay import entry_confirm_ok
 
@@ -844,6 +1255,63 @@ class Mag7Scanner:
             if not ok_c:
                 return None
             ts = to_ny(confirm_ft) + pd.Timedelta(seconds=delay)
+
+        # Path confirm uses the scan clock (bar available_ts), not the fill clock.
+        status, ts, path_reason = self._gate_path_confirm(
+            route="baseline",
+            symbol=symbol,
+            date=date,
+            direction=direction,
+            feature_ts=feature_ts,
+            entry_ts=ts,
+            asof_ts=clock_ts,
+            stash={
+                "already": already,
+                "use_reentry": use_reentry,
+                "spot": spot,
+                "money": money,
+                "delay": delay,
+                "bar_source": bar.get("bar_source", "1m"),
+            },
+        )
+        if status in {"pending", "block"}:
+            return None
+
+        return self._emit_topk_resolved(
+            {
+                "symbol": symbol,
+                "direction": direction,
+                "date": date,
+                "feature_ts": feature_ts,
+                "entry_ts": ts,
+                "spot": spot,
+                "already": already,
+                "use_reentry": use_reentry,
+                "money": money,
+                "delay": delay,
+                "bar_source": bar.get("bar_source", "1m"),
+                "path_confirm_reason": path_reason,
+            }
+        )
+
+    def _emit_topk_resolved(self, ctx: dict[str, Any]) -> ScannerSignal | None:
+        """Emit TopK after entry_confirm + path confirm have resolved."""
+        symbol = str(ctx["symbol"])
+        direction = str(ctx["direction"]).upper()
+        date = str(ctx["date"])
+        feature_ts = to_ny(ctx["feature_ts"])
+        ts = to_ny(ctx["entry_ts"])
+        spot = float(ctx["spot"])
+        already = bool(ctx.get("already"))
+        use_reentry = bool(ctx.get("use_reentry"))
+        trade = self.profile.get("trade") or {}
+        money = str(ctx.get("money") or trade.get("moneyness", "ATM"))
+        delay = int(
+            ctx["delay"]
+            if ctx.get("delay") is not None
+            else trade.get("bar_availability_delay_seconds", 0) or 0
+        )
+        path_reason = ctx.get("path_confirm_reason")
 
         books = self.books or ContractBooks.from_profile(self.profile)
         pick = resolve_entry_contract(
@@ -874,7 +1342,7 @@ class Mag7Scanner:
                 "tp_mult": float(trade.get("tp_mult", 1.6)),
                 "sl_mult": float(trade.get("sl_mult", 0.4)),
                 "hold_minutes": int(trade.get("hold_minutes", 30)),
-                "bar_source": bar.get("bar_source", "1m"),
+                "bar_source": ctx.get("bar_source", "1m"),
                 "contract_source": pick.source,
                 "sig_dte": pick.dte,
                 "sig_strike": pick.strike,
@@ -886,6 +1354,7 @@ class Mag7Scanner:
                 "watchdog_reason": self._watchdog_reason,
                 "route": self._watchdog_route,
                 "event_source": "baseline",
+                "stock_path_confirm_reason": path_reason,
             },
         )
         if not already:

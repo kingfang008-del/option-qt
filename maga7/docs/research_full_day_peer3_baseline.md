@@ -7,6 +7,25 @@
 （细则：[`tt1_uplift_05.md`](tt1_uplift_05.md)）  
 **Hard SL 55:** 2026-07-19 — `sl_mult=0.45`（≈−55%；见 [`sl55_hard_stop_research.md`](sl55_hard_stop_research.md)）  
 **Trade toxic:** 2026-07-19 — cut25/mfe05 + max_cut=600s + **div_mfe6%/stock&lt;0.5%**（见 [`trade_mark_toxic_path_research.md`](trade_mark_toxic_path_research.md)）  
+**Event calendar feb_jul:** 2026-07-20 — 在 May–Jul 原集上并入 loss-scan：02-05 capex / 02-11 NFP / 02-13 CPI / 03-03 geopol / 04-29 FOMC（见 [`loss_day_event_scan.md`](../results/research_extend_mtm_full_day_peer3_l2_tt1_05_sl55_tt600d_feb_jul/loss_day_event_scan.md)；消融 `research_event_calendar_extend_ablation_*`）  
+**Event calendar +AAPL CEO:** 2026-07-20 — `feb_jul_aapl_ceo` = feb_jul + 04-21/22 Cook→Ternus（见 [`remaining9_stock_news.md`](../results/research_extend_mtm_full_day_peer3_l2_tt1_05_sl55_tt600d_feb_jul/remaining9_stock_news.md)；消融 `research_event_calendar_aapl_ceo_ablation_*`）  
+**Company-news policy:** 2026-07-20 — **不定方向**；live `company_news_mode=hard_risk`（仅 CEO 可自动禁票）；大单/合作只审计+LLM；宏观/财报分层禁入（见 [`event_news_policy.py`](../common/event_news_policy.py)）  
+**L3 causal exit (STOCK_REV):** 2026-07-22 — 细网格已过晋级条，**shadow 候选已落盘**，**未**并入本基线；见 [`peer3_l3_causal_exit_research.md`](peer3_l3_causal_exit_research.md)  
+**Tail-first shadow:** 2026-07-22 — `tox_cut20 + wash_m3`（压单笔 ≤−25%）；见 [`peer3_tail_loss_research.md`](peer3_tail_loss_research.md) · profile `..._peer3_tail_tox20_wash_m3_v1`  
+**S1 soft path_confirm:** 2026-07-23 — `trade.stock_path_confirm` enabled（thr_pos=+15bp / thr_neg=−30bp / max_wait=300s / **on_timeout=allow** / delay_on_pos=false / tod 10:30–14:00）。**已并入本 research_baseline**。生产 / freeze / `default_profile` 仍是 `googl_peer3_v1`。  
+**S1 离线验收（标准双窗，2026-07-23）：** PRE（关 S1）vs S1 — **`KEEP_S1_RESEARCH_BASELINE`**  
+| 窗 | PRE total_ret | S1 total_ret | keep | MaxDD PRE→S1 |
+|----|-------------:|-------------:|-----:|--------------|
+| 强 Apr–Jul（→07-21） | +4205% | **+4504%** | **1.07** | −16.1%→**−14.1%** |
+| 弱 Jan–Mar | +90.6% | **+97.7%** | 1.08 | −15.5%→**−15.3%** |
+| 七月切片 | +95.7% | +95.7% | **1.00** | 同 |
+产物：`results/s1_research_baseline_accept_apr_jul_jan_mar_v1/` · 脚本 `tools/run_s1_research_baseline_accept.py`  
+完整记录：[`s1_research_baseline_offline_pack.md`](s1_research_baseline_offline_pack.md) · 对拍节见 [`replay_stream_parity.md`](replay_stream_parity.md)  
+工程对拍（stock_1s，offline↔stream）：  
+- 弱窗 Jan–Mar：`parity_s1_research_baseline_jan_mar_stock1s` — **ok**（54 笔）  
+- 强窗 Apr–Jul：`parity_s1_research_baseline_apr_jul_stock1s` — **ok**（79 笔）  
+- 七月三路：`parity_s1_fix_tox_hunt_20260701_21` — **ok**（15 笔，含 scanner）  
+**WAVE_ABORT UP-only:** 七月更好，但强窗 keep≈0.82 **未过** 0.85 — 仅 overlay，**未**并入本基线。  
 **Role:** `research_baseline` (research / shadow default; not yet production freeze)
 
 ## Stack
@@ -15,7 +34,7 @@
 |-------|---------|
 | Causal core | Mag7+GOOGL open_ladder **OTM3**, peer_align_min=3, QQQ align, rails delay 60s |
 | Exit | `hold_extend` T30→T45, MTM≥0, `hold_extend_require_mf=false`（Hunt 同此） |
-| Events | `event_calendar_block` + `event_calendar_live.json` |
+| Events | `event_calendar_block` + **`feb_jul_aapl_ceo`** + live **`company_news_mode=hard_risk`**（新闻不定方向；CEO/财报 symbol、宏观 full-day） |
 | Day halt | `day_loss_streak_halt=3` |
 | Size gate | `mf_idio_mode=pos`, `action=scale`, `scale=0.5`, `after_loss_streak=1`, ret β 5d |
 | Watchdog L1 | Degrade `reclaim_disp55` + Halt `washout_and_reclaim` |
@@ -51,16 +70,17 @@
 | **强窗（新）** | **Apr–Jul（→07-16）** | QQQ 总量拉升 / 趋势市 | **+3987%** | **−24.4%** | 86 |
 | 其中 May–Jul | 05-01→07-16 | 同上 | +1856% | **−5.4%** | 57 |
 | 其中 Apr only | 04-01→04-30 | 牛市起步 | +109% | −24.4% | 29 |
-| **弱窗（新）** | **Jan–Mar** | 波动市、无 QQQ 总量拉升 | **+37%** | −21.7% | 66 |
-| 其中 Feb–Mar | 02-01→03-31 | 同上 | +35% | −21.7% | 50 |
+| **弱窗（新）** | **Jan–Mar** | 波动市、无 QQQ 总量拉升 | **+42%** | −23.9% | 69 |
+| 其中 Feb–Mar | 02-01→03-31 | 同上 | +40% | −23.9% | 53 |
 | ~~旧弱窗~~ | Feb–Apr（废弃作弱窗） | 混入 4 月牛 | +164% | −24.4% | 77 |
 
 要点：
 - **4 月不应再算弱窗**（单月 +109%、胜率 59%）。
 - Apr–Jul 复利很高，但 MaxDD **−24.4% 主要来自 4 月硬 SL**（如 04-08/04-22 AAPL）；May–Jul 单独 MaxDD 仅 −5.4%。
-- 弱窗 Jan–Mar 仍为正（+37%），比「旧 Feb–Apr +164%」更诚实。
+- 弱窗 Jan–Mar 仍为正（+42%），比「旧 Feb–Apr +164%」更诚实。  
+- **2026-07-19：** 补齐 GOOGL Feb `open_lock`（quote 本已有）后，弱窗由 +37%/+35% → **+42%/+40%**；见 [`missed_movers_feb_mar.md`](missed_movers_feb_mar.md) §5.1。AMD Mon/Tue 仍为短 DTE 结构性不可交易。
 
-产物：`results/research_windows_apr_jul_vs_jan_mar_tt600d/`  
+产物：`results/research_windows_apr_jul_vs_jan_mar_tt600d/` · 弱窗刷新：`…_tt600d_jan_mar_googl_feb_lock/`  
 升线门槛（Hunt 历史）：曾用 Feb–Apr vs L0；**此后双窗验收默认用 Apr–Jul + Jan–Mar**。  
 trade_toxic 细则：[`trade_mark_toxic_path_research.md`](trade_mark_toxic_path_research.md)。
 
@@ -77,8 +97,8 @@ trade_toxic 细则：[`trade_mark_toxic_path_research.md`](trade_mark_toxic_path
 | **Apr–Jul (→07-16) tt600d** | **+3987%** | **−24.4%** | **新强窗**（DD 含 4 月） |
 | May–Jul (→07-16) **tt600d** | **+1856%** | **−5.4%** | 趋势市干净段 |
 | Apr only tt600d | +109% | −24.4% | 牛市；勿算弱窗 |
-| **Jan–Mar tt600d** | **+37%** | −21.7% | **新弱窗** |
-| Feb–Mar tt600d | +35% | −21.7% | 弱窗子集 |
+| **Jan–Mar tt600d** | **+42%** | −23.9% | **新弱窗**（含 GOOGL Feb lock） |
+| Feb–Mar tt600d | +40% | −23.9% | 弱窗子集 |
 | Feb–Apr tt600d（旧标签） | +164% | −24.4% | 已废弃作弱窗 |
 | May–Jul L2+05+sl55（关 tox） | +1555% | −11.1% | 对照 |
 | May–Jul L0 | +810% | −13.2% | 无 Watchdog |
@@ -110,6 +130,12 @@ trade_toxic 细则：[`trade_mark_toxic_path_research.md`](trade_mark_toxic_path
 
 2. 见 [`l2_next_acceptance_checklist.md`](l2_next_acceptance_checklist.md)：P3 Live/shadow → P2.3 Hunt 日熔断 → P0.3/P0.4 敏感度
 
+3. **L3 STOCK_REV shadow** — 主推 `peer3_l3_wash_m3_v1`（备选 `peer3_l3_uw_m3_h15_v1`）；多日毒性 + OMS 确认后再议 peer3_v2。状态见 [`peer3_l3_causal_exit_research.md`](peer3_l3_causal_exit_research.md)
+
+4. **尾损优先 shadow** — `peer3_tail_tox20_wash_m3_v1`（tox cut20 + wash_m3）；验收见 [`peer3_tail_loss_research.md`](peer3_tail_loss_research.md)
+
+5. **波段确认规格（未实现）** — 生产级前提：fill 后路径确认失败则 `WAVE_ABORT`，禁止未确认拖到 T30；见 [`wave_confirm_spec.md`](wave_confirm_spec.md)
+
 ## Non-goals in this freeze
 
 - Do not bare-enable `mf_flip` / streak early exits (hurts May–Jul)
@@ -120,3 +146,5 @@ trade_toxic 细则：[`trade_mark_toxic_path_research.md`](trade_mark_toxic_path
 - 勿把 `wash_drop_min` 降到 1.2%（弱窗断崖）
 - Hunt 专用 `hold20_noext` **不**进基线（除非另开决策）
 - `scale_in` / 全局 `mae_cut` **不**进基线（`trade_toxic` 已升，勿与 quote `mae_cut` 混淆）
+- **L3 `STOCK_REV` 不写进本 `peer3_v1`**（shadow only；升线见 L3 文档门槛）
+- **尾损栈 `tox20+wash_m3` 不写进本 `peer3_v1`**（`research_tail` shadow；见尾损文档）
