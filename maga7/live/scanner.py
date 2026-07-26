@@ -166,6 +166,23 @@ class Mag7Scanner:
     n_hunt_budget_skip: int = 0
     n_hunt_mutex_skip: int = 0
     n_halt_skip: int = 0
+    # Satellite sleeve: qqq_open_cont (09:45 continuation; not TopK / not Hunt).
+    n_open_cont_signals: int = 0
+    n_open_cont_emitted: int = 0
+    n_open_cont_skip: int = 0
+    _open_cont_done_date: str | None = None
+    _qqq_rth_open: float | None = None
+    _qqq_rth_open_date: str | None = None
+    _qqq_last_px: float | None = None
+    _qqq_last_ts: pd.Timestamp | None = None
+    # Satellite sleeve: am_pulse (Mag7 FO 09:30–10:25; not TopK / not Hunt).
+    n_am_pulse_signals: int = 0
+    n_am_pulse_emitted: int = 0
+    n_am_pulse_skip: int = 0
+    n_am_pulse_shadow: int = 0
+    pending_am_pulse: list = field(default_factory=list)
+    _am_pulse_scout: Any = None
+    _am_pulse_scout_date: str | None = None
     event_blackout: set = field(default_factory=set)
     event_symbol_blackout: dict = field(default_factory=dict)  # date -> {SYM}
     event_blackout_meta: dict[str, Any] = field(default_factory=dict)
@@ -288,6 +305,7 @@ class Mag7Scanner:
         self.last_win = {s: True for s in self.profile["symbols"]}
         self.pending_hunts = []
         self.pending_path = []
+        self.pending_am_pulse = []
         self.day_hunt_symbols = set()
         self.day_hunt_dirs = set()
         self.day_topk_syms = set()
@@ -295,6 +313,15 @@ class Mag7Scanner:
         self._watchdog_closed = False
         self._watchdog_last_eval_tod = None
         self._watchdog_date = None
+        # Open-cont is once/day; clear RTH open tracker on day roll.
+        if self._qqq_rth_open_date != date:
+            self._qqq_rth_open = None
+            self._qqq_rth_open_date = None
+            self._qqq_last_px = None
+            self._qqq_last_ts = None
+        # Am-pulse scout resets each session day.
+        self._am_pulse_scout = None
+        self._am_pulse_scout_date = None
         # Live accumulation starts empty; preloaded research stock_by kept.
         if self.stock_by is None:
             self.stock_by = {}
@@ -403,6 +430,21 @@ class Mag7Scanner:
                     float(tick["timestamp"]), unit="s", tz="UTC"
                 ).tz_convert("America/New_York"),
             }
+        # Track RTH open / last for satellite qqq_open_cont (clock 09:45).
+        try:
+            ts = to_ny(tick.get("timestamp"))
+            px = float(tick.get("close", tick.get("price", tick.get("last")) or 0.0))
+        except Exception:
+            ts, px = None, 0.0
+        if ts is not None and px > 0:
+            d = ts.strftime("%Y-%m-%d")
+            t = ts.time()
+            if t >= pd.Timestamp("09:30").time() and t < pd.Timestamp("16:00").time():
+                if self._qqq_rth_open_date != d or self._qqq_rth_open is None:
+                    self._qqq_rth_open = float(px)
+                    self._qqq_rth_open_date = d
+                self._qqq_last_px = float(px)
+                self._qqq_last_ts = ts
         bar = self.ref_agg.on_second(symbol, tick)
         if bar is None:
             return
@@ -840,6 +882,333 @@ class Mag7Scanner:
         self.pending_hunts = sorted(rest, key=lambda x: (x["entry_ts"], x["symbol"]))
         return out
 
+    def drain_open_cont(self, ts: pd.Timestamp) -> list[ScannerSignal]:
+        """Emit at most one QQQ open_cont satellite signal when clock is due.
+
+        Independent of Rule-A TopK and Hunt. Requires ``profile.qqq_open_cont.enabled``.
+        """
+        from maga7.common.qqq_open_cont import (
+            load_champion,
+            open_cont_enabled,
+            resolve_atm_ticker,
+            signal_at_clock,
+            signal_from_open_spot,
+        )
+
+        ts = to_ny(ts)
+        if not open_cont_enabled(self.profile):
+            return []
+        date = self.current_date or ts.strftime("%Y-%m-%d")
+        if self.current_date is None:
+            self._roll_day(date)
+            date = self.current_date or date
+        if self._open_cont_done_date == date:
+            return []
+        if self.is_event_blackout(date, symbol="QQQ"):
+            self._open_cont_done_date = date
+            self.n_open_cont_skip += 1
+            return []
+        champ = load_champion(self.profile)
+        clock = str(champ.get("clock") or "09:45")
+        clock_ts = pd.Timestamp(f"{date} {clock}", tz="America/New_York")
+        if ts < clock_ts:
+            return []
+        # Mark attempted so we only fire once even on no-signal / no-contract.
+        self._open_cont_done_date = date
+        self.n_open_cont_signals += 1
+
+        oc = None
+        if (
+            self._qqq_rth_open_date == date
+            and self._qqq_rth_open is not None
+            and self._qqq_last_px is not None
+        ):
+            oc = signal_from_open_spot(
+                date=date,
+                open_px=float(self._qqq_rth_open),
+                spot=float(self._qqq_last_px),
+                entry_ts=clock_ts,
+                from_open_min=float(champ.get("from_open_min", 0.002)),
+            )
+        if oc is None:
+            paths = self.profile.get("_paths") or self.profile.get("paths") or {}
+            s1s = paths.get("stock_1s_root")
+            if s1s is not None:
+                try:
+                    oc = signal_at_clock(
+                        Path(s1s),
+                        date,
+                        clock=clock,
+                        from_open_min=float(champ.get("from_open_min", 0.002)),
+                    )
+                except Exception:
+                    oc = None
+        if oc is None:
+            self.n_open_cont_skip += 1
+            logger.info("OPEN_CONT skip %s: no signal (|fo| or no QQQ tape)", date)
+            return []
+
+        quote_root = champ.get("quote_1s_root")
+        if not quote_root:
+            paths = self.profile.get("_paths") or self.profile.get("paths") or {}
+            quote_root = paths.get("quote_1s_root_qqq") or paths.get("quote_1s_root")
+            # Mag7 ladder root is multi-symbol; prefer dedicated QQQ dte0 if present.
+            if quote_root and Path(quote_root).name != "QQQ":
+                qqq_guess = Path("/mnt/s990/data/raw_1s/dte0_options/QQQ")
+                if qqq_guess.is_dir():
+                    quote_root = qqq_guess
+        ticker, strike = resolve_atm_ticker(quote_root, date, oc.direction)
+        books = self.books or ContractBooks.from_profile(self.profile)
+        pick = resolve_entry_contract(
+            books,
+            symbol="QQQ",
+            date=date,
+            direction=oc.direction,
+            moneyness="ATM",
+            sig_ts=oc.entry_ts,
+            spot=float(oc.spot),
+        )
+        contract = pick.ticker or ticker
+        if contract is None:
+            self.n_open_cont_skip += 1
+            logger.info("OPEN_CONT skip %s %s: no QQQ ATM contract", date, oc.direction)
+            return []
+
+        hold_sec = int(champ.get("max_hold_sec", 900) or 900)
+        tp = float(champ.get("tp", 0.10) or 0.10)
+        sl = float(champ.get("sl", 0.25) or 0.25)
+        fill_frac = float(champ.get("entry_frac", 0.75) or 0.75)
+        pos_frac = float(champ.get("position_frac", 0.10) or 0.10)
+        meta = {
+            "fill_frac": fill_frac,
+            # Mag7 OMS uses price multiples: TP at entry*(1+tp), SL at entry*(1-sl).
+            "tp_mult": 1.0 + tp,
+            "sl_mult": 1.0 - sl,
+            "hold_minutes": max(1, int(round(hold_sec / 60.0))),
+            "exit_hold_sec": hold_sec,
+            "exit_tp_mult": 1.0 + tp,
+            "exit_sl_mult": 1.0 - sl,
+            "exit_simple": True,
+            "bar_source": "qqq_open_cont",
+            "contract_source": pick.source if pick.ticker else "qqq_dte0_bucket",
+            "sig_dte": pick.dte if pick.ticker else 0,
+            "sig_strike": pick.strike if pick.strike is not None else strike,
+            "route": "qqq_open_cont",
+            "event_source": "qqq_open_cont",
+            "from_open": float(oc.from_open),
+            "position_frac": pos_frac,
+            "watchdog_state": "satellite",
+            "watchdog_reason": "qqq_open_cont",
+        }
+        sig = ScannerSignal(
+            date=date,
+            symbol="QQQ",
+            direction=oc.direction,
+            sig_ts=oc.entry_ts,
+            spot=float(oc.spot),
+            rank=0,
+            bucket_id=int(pick.bucket_id) if pick.ticker and pick.bucket_id is not None else (
+                2 if oc.direction == "UP" else 0
+            ),
+            contract=str(contract),
+            moneyness="ATM",
+            meta=meta,
+        )
+        self.n_open_cont_emitted += 1
+        self.signals.append(sig)
+        logger.info(
+            "OPEN_CONT signal %s %s fo=%.4f contract=%s",
+            date,
+            oc.direction,
+            oc.from_open,
+            contract,
+        )
+        if self.on_signal:
+            self.on_signal(sig)
+        return [sig]
+
+    def _ensure_am_pulse_scout(self, date: str):
+        from maga7.common.am_pulse_scout import (
+            AmPulseScout,
+            am_pulse_enabled,
+            load_am_pulse_cfg,
+            scout_config_from_live,
+        )
+
+        if not am_pulse_enabled(self.profile):
+            return None
+        if self._am_pulse_scout is not None and self._am_pulse_scout_date == date:
+            return self._am_pulse_scout
+        cfg = scout_config_from_live(load_am_pulse_cfg(self.profile))
+        scout = AmPulseScout(cfg=cfg)
+        scout.begin_day(str(date))
+        self._am_pulse_scout = scout
+        self._am_pulse_scout_date = str(date)
+        return scout
+
+    def _feed_am_pulse_bar(self, symbol: str, bar: dict[str, Any]) -> None:
+        """Push completed Mag7 1m bar into am_pulse detector; queue alerts."""
+        from maga7.common.am_pulse_scout import am_pulse_enabled, load_am_pulse_cfg
+
+        if not am_pulse_enabled(self.profile):
+            return
+        live = load_am_pulse_cfg(self.profile)
+        if str(live.get("execute_mode") or "shadow") == "off":
+            return
+        sym = str(symbol).upper()
+        if sym not in set(self.profile.get("symbols") or []):
+            return
+        ts = to_ny(bar.get("timestamp"))
+        date = ts.strftime("%Y-%m-%d")
+        scout = self._ensure_am_pulse_scout(date)
+        if scout is None:
+            return
+        arm_want = str(live.get("arm") or "FO").upper()
+        alert = scout.on_bar(
+            symbol=sym,
+            ts=ts,
+            open_=float(bar.get("open") or 0.0),
+            high=float(bar.get("high") or 0.0),
+            low=float(bar.get("low") or 0.0),
+            close=float(bar.get("close") or 0.0),
+        )
+        if alert is None:
+            return
+        if arm_want in {"FO", "LB"} and alert.arm != arm_want:
+            return
+        self.n_am_pulse_signals += 1
+        self.pending_am_pulse.append(alert)
+
+    def drain_am_pulse(self, ts: pd.Timestamp) -> list[ScannerSignal]:
+        """Emit queued Mag7 am_pulse sleeve signals (independent of Rule-A / Hunt).
+
+        Requires ``profile.am_pulse.enabled``. Default ``execute_mode=shadow`` —
+        OMS only fills when engine OMS mode is shadow (or execute_mode=live).
+        Signal window ends ``window_end`` (default 10:25); flatten_before 10:30.
+        """
+        from maga7.common.am_pulse_scout import am_pulse_enabled
+
+        ts = to_ny(ts)
+        if not am_pulse_enabled(self.profile):
+            return []
+        date = self.current_date or ts.strftime("%Y-%m-%d")
+        if self.current_date is None:
+            self._roll_day(date)
+        if not self.pending_am_pulse:
+            return []
+        out: list[ScannerSignal] = []
+        rest: list = []
+        for alert in list(self.pending_am_pulse):
+            # Defer if wall clock still before alert bar (shouldn't happen live).
+            alert_ts = to_ny(pd.Timestamp(alert.ts))
+            if ts < alert_ts:
+                rest.append(alert)
+                continue
+            sig = self._emit_am_pulse(alert)
+            if sig is not None:
+                out.append(sig)
+        self.pending_am_pulse = rest
+        return out
+
+    def _emit_am_pulse(self, alert: Any) -> ScannerSignal | None:
+        from maga7.common.am_pulse_scout import EVENT_SOURCE, load_am_pulse_cfg
+
+        live = load_am_pulse_cfg(self.profile)
+        date = str(alert.date)
+        sym = str(alert.symbol).upper()
+        direction = str(alert.dir).upper()
+        if self.is_event_blackout(date, symbol=sym):
+            self.n_am_pulse_skip += 1
+            logger.info("AM_PULSE skip %s %s: event blackout", date, sym)
+            return None
+        arm_ts = to_ny(pd.Timestamp(alert.ts))
+        books = self.books or ContractBooks.from_profile(self.profile)
+        pick = resolve_entry_contract(
+            books,
+            symbol=sym,
+            date=date,
+            direction=direction,
+            moneyness=str(live.get("moneyness") or "ATM"),
+            sig_ts=arm_ts,
+            spot=float(alert.px),
+        )
+        if not pick.ticker:
+            self.n_am_pulse_skip += 1
+            logger.info("AM_PULSE skip %s %s %s: no ATM contract", date, sym, direction)
+            return None
+
+        hold_sec = int(live.get("max_hold_sec", 900) or 900)
+        # Cap hold so position cannot spill into CORE (flatten_before).
+        flat_hhmm = str(live.get("flatten_before") or "10:30")
+        try:
+            flat_ts = pd.Timestamp(f"{date} {flat_hhmm}", tz="America/New_York")
+            max_to_flat = max(1, int((flat_ts - arm_ts).total_seconds()))
+            hold_sec = min(hold_sec, max_to_flat)
+        except Exception:
+            pass
+        tp = float(live.get("tp", 0.15) or 0.15)
+        sl = float(live.get("sl", 0.20) or 0.20)
+        fill_frac = float(live.get("entry_frac", 0.75) or 0.75)
+        pos_frac = float(live.get("position_frac", 0.10) or 0.10)
+        exec_mode = str(live.get("execute_mode") or "shadow")
+        meta = {
+            "fill_frac": fill_frac,
+            "tp_mult": 1.0 + tp,
+            "sl_mult": 1.0 - sl,
+            "hold_minutes": max(1, int(round(hold_sec / 60.0))),
+            "exit_hold_sec": hold_sec,
+            "exit_tp_mult": 1.0 + tp,
+            "exit_sl_mult": 1.0 - sl,
+            "exit_simple": True,
+            "exit_flatten_before": flat_hhmm,
+            "bar_source": "am_pulse",
+            "contract_source": pick.source,
+            "sig_dte": pick.dte,
+            "sig_strike": pick.strike,
+            "route": "am_pulse",
+            "event_source": EVENT_SOURCE,
+            "am_pulse_arm": str(alert.arm),
+            "fav_from_open": float(alert.fav_from_open),
+            "lookback_ret": alert.lookback_ret,
+            "position_frac": pos_frac,
+            "execute_mode": exec_mode,
+            "max_lag_sec": float(live.get("max_lag_sec", 5.0) or 5.0),
+            "max_spread_pct": float(live.get("max_spread_pct", 0.15) or 0.15),
+            "watchdog_state": "satellite",
+            "watchdog_reason": "am_pulse",
+        }
+        sig = ScannerSignal(
+            date=date,
+            symbol=sym,
+            direction=direction,
+            sig_ts=arm_ts,
+            spot=float(alert.px),
+            rank=0,
+            bucket_id=int(pick.bucket_id) if pick.bucket_id is not None else (
+                2 if direction == "UP" else 0
+            ),
+            contract=str(pick.ticker),
+            moneyness=str(live.get("moneyness") or "ATM"),
+            meta=meta,
+        )
+        self.n_am_pulse_emitted += 1
+        if exec_mode == "shadow":
+            self.n_am_pulse_shadow += 1
+        self.signals.append(sig)
+        logger.info(
+            "AM_PULSE signal %s %s %s arm=%s fo=%.4f exec=%s contract=%s",
+            date,
+            sym,
+            direction,
+            alert.arm,
+            float(alert.fav_from_open),
+            exec_mode,
+            pick.ticker,
+        )
+        if self.on_signal:
+            self.on_signal(sig)
+        return sig
+
     def _emit_hunt(self, h: dict[str, Any]) -> ScannerSignal | None:
         """Build + emit one Hunt ScannerSignal (does not consume TopK day_fires)."""
         if self.watchdog is not None and self.watchdog.hunt_budget_remaining() <= 0:
@@ -954,6 +1323,7 @@ class Mag7Scanner:
         hold_minutes = int(trade.get("hold_minutes", 30))
         sl_mult = float(trade.get("sl_mult", 0.4))
         tp_mult = float(trade.get("tp_mult", 1.6))
+        hunt_pos_frac: float | None = None
         if self.watchdog is not None:
             from maga7.common.watchdog import hunt_trade_overrides
 
@@ -964,10 +1334,34 @@ class Mag7Scanner:
                 sl_mult = float(hov["sl_mult"])
             if hov.get("tp_mult") is not None:
                 tp_mult = float(hov["tp_mult"])
+            if hov.get("position_frac") is not None:
+                hunt_pos_frac = float(hov["position_frac"])
 
         det = str(h.get("detector") or "")
         wd_reason = f"hunt:{det}" if det else f"hunt:{self._watchdog_reason}"
         path_reason = h.get("path_confirm_reason")
+        meta = {
+            "fill_frac": float(fill.get("entry_frac", 0.8)),
+            "tp_mult": tp_mult,
+            "sl_mult": sl_mult,
+            "hold_minutes": hold_minutes,
+            "bar_source": "hunt",
+            "contract_source": pick.source,
+            "sig_dte": pick.dte,
+            "sig_strike": pick.strike,
+            "contract_mode": books.mode,
+            "feature_ts": feature_ts.isoformat(),
+            "decision_ts": entry_ts.isoformat(),
+            "bar_availability_delay_seconds": delay,
+            "watchdog_state": "hunt",
+            "watchdog_reason": wd_reason,
+            "route": "hunt",
+            "event_source": "hunt",
+            "hunt_detector": det,
+            "stock_path_confirm_reason": path_reason,
+        }
+        if hunt_pos_frac is not None:
+            meta["position_frac"] = float(hunt_pos_frac)
         sig = ScannerSignal(
             date=date,
             symbol=symbol,
@@ -978,26 +1372,7 @@ class Mag7Scanner:
             bucket_id=pick.bucket_id,
             contract=pick.ticker,
             moneyness=money,
-            meta={
-                "fill_frac": float(fill.get("entry_frac", 0.8)),
-                "tp_mult": tp_mult,
-                "sl_mult": sl_mult,
-                "hold_minutes": hold_minutes,
-                "bar_source": "hunt",
-                "contract_source": pick.source,
-                "sig_dte": pick.dte,
-                "sig_strike": pick.strike,
-                "contract_mode": books.mode,
-                "feature_ts": feature_ts.isoformat(),
-                "decision_ts": entry_ts.isoformat(),
-                "bar_availability_delay_seconds": delay,
-                "watchdog_state": "hunt",
-                "watchdog_reason": wd_reason,
-                "route": "hunt",
-                "event_source": "hunt",
-                "hunt_detector": det,
-                "stock_path_confirm_reason": path_reason,
-            },
+            meta=meta,
         )
 
         # Hunt skips peer / QQQ by hunter flags (mirror stream/offline).
@@ -1148,6 +1523,9 @@ class Mag7Scanner:
         # Hunt / path-confirm first (time-driven); may emit via on_signal.
         self.drain_hunts(ts)
         self.drain_path_confirms(ts)
+        # AM pulse sleeve: feed completed Mag7 1m → queue → drain (pre-CORE).
+        self._feed_am_pulse_bar(symbol, bar)
+        self.drain_am_pulse(ts)
 
         st = self.states.get(symbol)
         if st is None:

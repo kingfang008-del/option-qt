@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -50,6 +51,8 @@ class Mag7LiveFrameEngine:
         self.seen: set[str] = set()
         self._stop = asyncio.Event()
         self._last_disk_snapshot = 0.0
+        self._last_redis_snapshot = 0.0
+        self._snapshot_interval_sec = 5.0
         self._ensure_group()
         self._restore_progress()
 
@@ -89,6 +92,26 @@ class Mag7LiveFrameEngine:
             self.metrics.last_frame_ts = float(frame_ts or 0.0)
         except ValueError:
             self.metrics.last_frame_ts = 0.0
+
+    def _append_signal_audit(self, signal: Any) -> None:
+        """Append one accepted signal so mid-session tape parity can see it."""
+        try:
+            path = Path(self.oms.session_dir) / "signals.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = (
+                signal.to_orch_payload()
+                if hasattr(signal, "to_orch_payload")
+                else {
+                    "sig_ts": getattr(signal, "sig_ts", None),
+                    "symbol": getattr(signal, "symbol", None),
+                    "direction": getattr(signal, "direction", None),
+                    "contract": getattr(signal, "contract", None),
+                }
+            )
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        except Exception as exc:
+            logger.warning("signal audit append failed: %s", exc)
 
     def _publish_health(self, state: str, error: str = "") -> None:
         payload = {
@@ -228,6 +251,14 @@ class Mag7LiveFrameEngine:
             for sig in self.scanner.drain_hunts(frame_ts_ny):
                 if sig not in signals:
                     signals.append(sig)
+        if hasattr(self.scanner, "drain_open_cont"):
+            for sig in self.scanner.drain_open_cont(frame_ts_ny):
+                if sig not in signals:
+                    signals.append(sig)
+        if hasattr(self.scanner, "drain_am_pulse"):
+            for sig in self.scanner.drain_am_pulse(frame_ts_ny):
+                if sig not in signals:
+                    signals.append(sig)
 
         # Scanner states now include every completed minute in this cross-symbol
         # frame. Resolve exits first, then admit new entries.
@@ -235,13 +266,21 @@ class Mag7LiveFrameEngine:
         for signal in signals:
             if self.oms.process_signal(signal):
                 self.metrics.signals += 1
+                self._append_signal_audit(signal)
 
         self.seen.add(frame_id)
         self.metrics.frames += 1
         self.metrics.last_frame_ts = frame_ts
         self.metrics.last_frame_id = frame_id
+        # Keep the IB asyncio loop light: snapshot+msgpack+fsync every N seconds
+        # (not every fused frame). Otherwise pendingTickers stalls for 10–15s.
+        now = time.time()
+        do_snapshot = (
+            hasattr(self.scanner, "day_fires")
+            and (now - self._last_redis_snapshot) >= self._snapshot_interval_sec
+        )
         state_payload = None
-        if hasattr(self.scanner, "day_fires"):
+        if do_snapshot:
             state_payload = {
                 **scanner_snapshot(self.scanner),
                 "session_id": self.session_id,
@@ -256,15 +295,24 @@ class Mag7LiveFrameEngine:
         if state_payload is not None:
             pipe.set(self.scanner_state_key, pack_obj(state_payload))
         pipe.execute()
-        if (
-            state_payload is not None
-            and time.time() - self._last_disk_snapshot >= 5.0
-        ):
+        if state_payload is not None:
             write_scanner_snapshot(
                 self.oms.session_dir / "scanner_state.json",
                 state_payload,
             )
-            self._last_disk_snapshot = time.time()
+            prev = state_payload.get("prevention")
+            if isinstance(prev, dict):
+                try:
+                    path = Path(self.oms.session_dir) / "prevention.json"
+                    path.write_text(
+                        json.dumps(prev, indent=2, ensure_ascii=False, default=str),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    logger.exception("failed to write prevention.json")
+            self._last_disk_snapshot = now
+            self._last_redis_snapshot = now
+        # Health is cheap; still useful every frame for Dash L0.
         self._publish_health("RUNNING")
 
     def _claim_stale(self) -> None:
@@ -317,7 +365,19 @@ class Mag7LiveFrameEngine:
             messages = await asyncio.to_thread(self._read_messages, 1000)
             # Process on the IB asyncio thread; placeOrder/cancelOrder and
             # ib_insync events are not safe from the Redis worker thread.
-            self._process_messages(messages)
+            # Yield between messages so pendingTickers/publish_loop stay live
+            # during catch-up after a stall.
+            for _, entries in messages or []:
+                for message_id, fields in entries:
+                    if self._stop.is_set():
+                        return
+                    try:
+                        self._process_message(message_id, fields)
+                    except Exception as exc:
+                        self.metrics.rejected += 1
+                        self._publish_health("ERROR", error=str(exc))
+                        raise
+                    await asyncio.sleep(0)
 
     def stop(self) -> None:
         self._stop.set()

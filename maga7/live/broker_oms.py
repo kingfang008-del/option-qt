@@ -17,7 +17,22 @@ from typing import Any
 
 import pandas as pd
 
+from maga7.common.exit_arms import build_exit_arms, build_exit_health
 from maga7.common.fills import FillSpec
+from maga7.common.hold_watchdog import hold_watchdog_from_trade, qqq_adverse_from_prices
+from maga7.common.delta_time_stop import StockRevExitConfig, stock_rev_exit_from_trade
+from maga7.common.wave_confirm import WaveAbortState, wave_abort_from_trade, wave_abort_on_tick
+from maga7.common.ladder_active import ladder_active_from_trade
+from maga7.common.path_fast_pack import (
+    apply_path_fast_pack_overrides,
+    path_fast_pack_day_should_arm,
+    path_fast_pack_from_trade,
+)
+from maga7.common.option_trades import (
+    trade_toxic_from_trade,
+    trade_toxic_in_cut_window,
+    trade_toxic_is_dig,
+)
 from maga7.common.position_size import apply_size_scale, regime_scale_from_meta, resolve_size_frac
 from maga7.common.replay import to_ny
 from maga7.live.iceberg import (
@@ -62,6 +77,7 @@ FORCE_EXIT_REASONS = {
     "EXIT_CHASE_CAP",
     "GAP_FLATTEN",
     "ADVERSE_FILL_FLATTEN",
+    "TRADE_TOX_RECONNECT",
 }
 
 
@@ -87,6 +103,27 @@ class LivePosition:
     last_good_mid: float = 0.0
     gap_hold_count: int = 0
     exit_chase_count: int = 0
+    # Quote-proxy MFE for live trade_toxic (offline uses OPRA last prints).
+    peak_mfe: float = 0.0
+    trade_dig_since: float = 0.0
+    entry_stock_px: float = 0.0
+    entry_qqq_px: float = 0.0
+    # Post-fill wave confirm (revocable); see maga7.common.wave_confirm.
+    wave_armed: bool = False
+    wave_done: bool = False
+    # Set on OMS restore; first good quote rechecks toxic with max_cut bypass.
+    toxic_reconnect_pending: bool = False
+    # Second-level ladder_active bookkeeping (research path).
+    ladder_peak_ret: float = float("-inf")
+    ladder_peak_ts: float = 0.0
+    ladder_trail_armed: bool = False
+    ladder_trail_dd: float = 0.05
+    # Satellite sleeve exit overrides (e.g. qqq_open_cont / am_pulse tp/sl).
+    exit_tp_mult: float | None = None
+    exit_sl_mult: float | None = None
+    exit_hold_sec: float | None = None
+    exit_simple: bool = False
+    exit_flatten_before: str | None = None  # HH:MM NY — force exit before CORE
 
 
 @dataclass
@@ -161,6 +198,11 @@ def _intent_dict(intent: PendingIntent) -> dict[str, Any]:
     return payload
 
 
+def _live_position_from_dict(payload: dict[str, Any]) -> LivePosition:
+    allowed = {item.name for item in fields(LivePosition)}
+    return LivePosition(**{k: v for k, v in dict(payload or {}).items() if k in allowed})
+
+
 def _intent_from_dict(payload: dict[str, Any]) -> PendingIntent:
     data = dict(payload)
     signal = data.get("signal")
@@ -224,6 +266,10 @@ class Mag7BrokerOms:
         )
         self.requote_cfg = requote_config_from_trade(self.trade_cfg)
         self.iceberg_cfg = iceberg_config_from_trade(self.trade_cfg)
+        self.trade_toxic = trade_toxic_from_trade(self.trade_cfg)
+        self.hold_watchdog = hold_watchdog_from_trade(self.trade_cfg)
+        self._path_fast_pack = path_fast_pack_from_trade(self.trade_cfg)
+        self._path_fast_armed: bool | None = None
         self.profile_hash = str(
             profile.get("_live_fingerprint") or profile_digest(profile)
         )
@@ -232,12 +278,19 @@ class Mag7BrokerOms:
         self.trades: dict[str, Any] = {}
         self.pending_signals: dict[str, tuple[ScannerSignal, float]] = {}
         self.open_until: dict[str, pd.Timestamp] = {}
+        self.exit_reason_counts: dict[str, int] = {}
         self.seen_fills: set[str] = set()
         self.seen_commissions: set[str] = set()
         self._bound_order_refs: set[str] = set()
         self._last_seen_option_mid: dict[tuple[str, str], float] = {}
         self._flattening_circuit = False
         self.reconcile_ok = self.mode == "shadow"
+        self.last_reconcile: dict[str, Any] = {
+            "ok": self.reconcile_ok,
+            "broker": {},
+            "internal": {},
+            "ts": None,
+        }
         self._lock = threading.RLock()
         self._event_seq = 0
         self.scanner.is_symbol_active = self.has_position
@@ -371,6 +424,7 @@ class Mag7BrokerOms:
             "day_halted": self.day_halted,
             "available_funds": self.available_funds,
             "account_ready": self.account_ready,
+            "last_reconcile": dict(self.last_reconcile or {}),
             "seen_fills": sorted(self.seen_fills),
             "seen_commissions": sorted(self.seen_commissions),
             "positions": {key: asdict(value) for key, value in self.positions.items()},
@@ -383,12 +437,118 @@ class Mag7BrokerOms:
                 for symbol, (signal, created) in self.pending_signals.items()
             },
             "open_until": {key: value.isoformat() for key, value in self.open_until.items()},
+            "exit_reason_counts": dict(self.exit_reason_counts),
+            "exit_arms": self.exit_arms_snapshot(),
+            "exit_health": self.exit_health_snapshot(),
+        }
+
+    def exit_arms_snapshot(self) -> dict[str, Any]:
+        return build_exit_arms(self.trade_cfg, reason_counts=self.exit_reason_counts)
+
+    def exit_health_snapshot(self) -> dict[str, Any]:
+        return build_exit_health(
+            self.exit_reason_counts, arms=self.exit_arms_snapshot()
+        )
+
+    def _seed_exit_reason_counts_from_events(self) -> None:
+        """Backfill day close reasons from order_events after resume."""
+        path = self.event_path
+        if not path.is_file():
+            return
+        counts: dict[str, int] = {}
+        try:
+            with path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if str(row.get("kind") or "") != "POSITION_CLOSE":
+                        continue
+                    reason = str(row.get("reason") or "UNKNOWN")
+                    counts[reason] = int(counts.get(reason, 0)) + 1
+        except Exception:
+            logger.exception("seed exit_reason_counts from events failed")
+            return
+        if counts:
+            self.exit_reason_counts = counts
+
+    def _watchdog_hunt_snapshot(self) -> dict[str, Any]:
+        """Compact Watchdog/Hunt counters for oms_meta / Dash (P3 observability)."""
+        sc = self.scanner
+        wd = getattr(sc, "watchdog", None)
+        pending = list(getattr(sc, "pending_hunts", None) or [])
+        return {
+            "state": getattr(sc, "_watchdog_state", "off"),
+            "reason": getattr(sc, "_watchdog_reason", "off"),
+            "route": getattr(sc, "_watchdog_route", "baseline"),
+            "day_halt": bool(getattr(sc, "_day_halt", False)),
+            "hunt_armed": bool(getattr(wd, "hunt_armed", False)) if wd is not None else False,
+            "n_hunt_candidates": int(len(getattr(wd, "hunt_candidates", None) or [])),
+            "n_hunt_signals": int(getattr(sc, "n_hunt_signals", 0) or 0),
+            "n_hunt_emitted": int(getattr(sc, "n_hunt_emitted", 0) or 0),
+            "n_hunt_budget_skip": int(getattr(sc, "n_hunt_budget_skip", 0) or 0),
+            "n_hunt_mutex_skip": int(getattr(sc, "n_hunt_mutex_skip", 0) or 0),
+            "pending_hunts": int(len(pending)),
+            "day_hunt_symbols": sorted(
+                str(s) for s in (getattr(sc, "day_hunt_symbols", None) or set())
+            ),
+        }
+
+    def _meta_payload(self, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+        snap = snapshot or self.snapshot()
+        return {
+            "schema_version": snap.get("schema_version"),
+            "session_id": snap.get("session_id"),
+            "trade_date": snap.get("trade_date"),
+            "mode": snap.get("mode"),
+            "profile_hash": snap.get("profile_hash"),
+            "updated_at": snap.get("updated_at"),
+            "reconcile_ok": snap.get("reconcile_ok"),
+            "equity": snap.get("equity"),
+            "day_start_equity": snap.get("day_start_equity"),
+            "realized_pnl": snap.get("realized_pnl"),
+            "day_halted": snap.get("day_halted"),
+            "available_funds": snap.get("available_funds"),
+            "account_ready": snap.get("account_ready"),
+            "last_reconcile": snap.get("last_reconcile") or {},
+            "n_positions": len(self.positions),
+            "n_intents": len(
+                [
+                    intent
+                    for intent in self.intents.values()
+                    if intent.status.upper() not in TERMINAL_STATUSES
+                ]
+            ),
+            "exit_arms": snap.get("exit_arms") or self.exit_arms_snapshot(),
+            "exit_health": snap.get("exit_health") or self.exit_health_snapshot(),
+            "exit_reason_counts": snap.get("exit_reason_counts")
+            or dict(self.exit_reason_counts),
+            "watchdog": self._watchdog_hunt_snapshot(),
         }
 
     def publish_state(self) -> None:
         payload = self.snapshot()
         _atomic_json(self.state_path, payload)
+        try:
+            _atomic_json(
+                self.session_dir / "exit_health.json",
+                {
+                    "session_id": self.session_id,
+                    "trade_date": self.trade_date,
+                    "updated_at": payload.get("updated_at"),
+                    "exit_arms": payload.get("exit_arms"),
+                    "exit_health": payload.get("exit_health"),
+                },
+            )
+        except Exception:
+            logger.exception("failed to write exit_health.json")
+        meta_packed = json.dumps(self._meta_payload(payload), ensure_ascii=True, default=str)
         pipe = self.redis.pipeline(transaction=True)
+        pipe.set(f"maga7:oms_meta:{self.session_id}", meta_packed)
         pipe.delete(self.positions_key)
         if self.positions:
             pipe.hset(
@@ -423,7 +583,32 @@ class Mag7BrokerOms:
         except Exception as exc:
             raise RuntimeError(f"cannot restore OMS state: {exc}") from exc
         if raw.get("profile_hash") != self.profile_hash:
-            raise RuntimeError("OMS state profile hash mismatch")
+            # Mid-day live hotfixes change LIVE_FILES hash. Prefer continuing when
+            # this session already has a LOCKED open-lock manifest (even with a
+            # flat or open book); refuse only when lock evidence is missing.
+            locks_ok = False
+            locks_path = self.session_dir / "locks.json"
+            if locks_path.is_file():
+                try:
+                    locks_doc = json.loads(locks_path.read_text(encoding="utf-8"))
+                    locks_ok = (
+                        str(locks_doc.get("status") or "") == "LOCKED"
+                        and str(locks_doc.get("session_id") or "") == self.session_id
+                    )
+                except Exception:
+                    locks_ok = False
+            open_book = bool(raw.get("positions") or {}) or bool(
+                raw.get("intents") or {}
+            ) or bool(raw.get("pending_signals") or {})
+            if not locks_ok:
+                raise RuntimeError("OMS state profile hash mismatch")
+            logger.warning(
+                "OMS resume profile_hash mismatch saved=%s live=%s "
+                "(LOCKED session open_book=%s — continuing after code hotfix)",
+                str(raw.get("profile_hash") or "")[:12],
+                str(self.profile_hash or "")[:12],
+                open_book,
+            )
         if raw.get("trade_date") != self.trade_date:
             raise RuntimeError("OMS state trade date mismatch")
         self.equity = float(raw.get("equity", self.equity))
@@ -435,11 +620,13 @@ class Mag7BrokerOms:
         self.available_funds = float(
             raw.get("available_funds", self.available_funds)
         )
+        if isinstance(raw.get("last_reconcile"), dict):
+            self.last_reconcile = dict(raw["last_reconcile"])
         self.account_ready = bool(raw.get("account_ready", self.account_ready))
         self.seen_fills = set(raw.get("seen_fills") or [])
         self.seen_commissions = set(raw.get("seen_commissions") or [])
         self.positions = {
-            key: LivePosition(**value)
+            key: _live_position_from_dict(value)
             for key, value in (raw.get("positions") or {}).items()
         }
         self.intents = {
@@ -464,7 +651,32 @@ class Mag7BrokerOms:
         self.open_until = {
             key: to_ny(value) for key, value in (raw.get("open_until") or {}).items()
         }
-        self._event("STATE_RESTORED", {"positions": len(self.positions), "intents": len(self.intents)})
+        raw_counts = raw.get("exit_reason_counts") or {}
+        if isinstance(raw_counts, dict):
+            self.exit_reason_counts = {
+                str(k): int(v) for k, v in raw_counts.items() if int(v) > 0
+            }
+        if not self.exit_reason_counts:
+            self._seed_exit_reason_counts_from_events()
+        armed = 0
+        if self.trade_toxic.enabled:
+            for position in self.positions.values():
+                if position.status in {"OPEN", "EXIT_PENDING"}:
+                    position.toxic_reconnect_pending = True
+                    armed += 1
+        self._event(
+            "STATE_RESTORED",
+            {
+                "positions": len(self.positions),
+                "intents": len(self.intents),
+                "toxic_reconnect_armed": armed,
+            },
+        )
+        if armed:
+            self._event(
+                "TOXIC_RECONNECT_ARMED",
+                {"n_positions": armed, "cut_ret": float(self.trade_toxic.cut_ret)},
+            )
 
     def _runtime_armed(self) -> bool:
         raw = self.redis.hget("meta:runtime_trading_controls:maga7", "trading_enabled")
@@ -516,6 +728,133 @@ class Mag7BrokerOms:
         if age > self.risk_cfg.max_option_staleness_sec:
             return None
         return quote
+
+    def _stock_last_close(self, symbol: str) -> float | None:
+        state = getattr(self.scanner, "states", {}).get(str(symbol).upper())
+        bars = getattr(state, "bars", None) or []
+        if not bars:
+            return None
+        try:
+            px = float(bars[-1]["close"])
+        except Exception:
+            return None
+        if not math.isfinite(px) or px <= 0:
+            return None
+        return px
+
+    def _qqq_last_close(self) -> float | None:
+        # Live QQQ feeds scanner.stock_by via on_reference_second (not states).
+        stock_by = getattr(self.scanner, "stock_by", None) or {}
+        sdf = stock_by.get("QQQ")
+        if sdf is not None and not getattr(sdf, "empty", True):
+            try:
+                px = float(sdf.iloc[-1]["close"])
+                if math.isfinite(px) and px > 0:
+                    return px
+            except Exception:
+                pass
+        gate = getattr(self.scanner, "regime_gate", None)
+        for attr in ("qqq_last_close", "last_qqq_close", "qqq_close"):
+            raw = getattr(gate, attr, None)
+            if raw is not None:
+                try:
+                    px = float(raw)
+                    if math.isfinite(px) and px > 0:
+                        return px
+                except Exception:
+                    pass
+        return self._stock_last_close("QQQ")
+
+    def _hold_shock_reason(
+        self,
+        position: LivePosition,
+        *,
+        mtm_ret: float,
+        held: float,
+    ) -> str:
+        cfg = self.hold_watchdog
+        if not cfg.enabled:
+            return ""
+        if held < float(cfg.min_hold_seconds or 0):
+            return ""
+        if position.entry_qqq_px <= 0:
+            q0 = self._qqq_last_close()
+            if q0 is not None:
+                position.entry_qqq_px = float(q0)
+        if position.entry_qqq_px <= 0:
+            return ""
+        now_qqq = self._qqq_last_close()
+        if now_qqq is None:
+            return ""
+        fired, _signed = qqq_adverse_from_prices(
+            entry_px=float(position.entry_qqq_px),
+            now_px=float(now_qqq),
+            direction=str(position.direction),
+            thresh=float(cfg.qqq_adverse_from_entry),
+        )
+        if not fired:
+            return ""
+        mtm_gate = cfg.require_option_mtm_max
+        if mtm_gate is not None and (
+            not math.isfinite(mtm_ret) or float(mtm_ret) > float(mtm_gate)
+        ):
+            return ""
+        return "HOLD_SHOCK"
+
+    def _stock_adverse_from_entry(self, position: LivePosition) -> float | None:
+        entry_px = float(position.entry_stock_px or 0.0)
+        if entry_px <= 0:
+            return None
+        cur = self._stock_last_close(position.symbol)
+        if cur is None:
+            return None
+        ret = cur / entry_px - 1.0
+        if str(position.direction).upper() == "UP":
+            return float(-ret)
+        return float(ret)
+
+    def _trade_toxic_reason(
+        self,
+        position: LivePosition,
+        *,
+        mtm_ret: float,
+        held: float,
+        asof_ts: float,
+    ) -> str:
+        """Return TRADE_TOX / TRADE_TOX_RECONNECT, or empty if no cut."""
+        cfg = self.trade_toxic
+        if not cfg.enabled:
+            position.toxic_reconnect_pending = False
+            return ""
+        if math.isfinite(mtm_ret) and mtm_ret > float(position.peak_mfe):
+            position.peak_mfe = float(mtm_ret)
+        reconnect = bool(position.toxic_reconnect_pending)
+        in_window = trade_toxic_in_cut_window(
+            held, cfg, bypass_max_cut=reconnect
+        )
+        dig = trade_toxic_is_dig(
+            mtm_ret=mtm_ret,
+            peak_mfe=float(position.peak_mfe),
+            cfg=cfg,
+            stock_adverse=self._stock_adverse_from_entry(position),
+        )
+        if dig and in_window:
+            if position.trade_dig_since <= 0:
+                position.trade_dig_since = float(asof_ts)
+            persist_ok = (float(asof_ts) - float(position.trade_dig_since)) >= float(
+                cfg.persist_seconds or 0
+            )
+            qconf = cfg.quote_confirm_ret
+            quote_ok = True if qconf is None else float(mtm_ret) <= -float(qconf)
+            if persist_ok and quote_ok:
+                position.toxic_reconnect_pending = False
+                return "TRADE_TOX_RECONNECT" if reconnect else "TRADE_TOX"
+            # Keep reconnect arm while waiting on persist / quote confirm.
+            return ""
+        position.trade_dig_since = 0.0
+        # Recheck complete: not currently toxic under reconnect rules.
+        position.toxic_reconnect_pending = False
+        return ""
 
     def _stock_fresh(self, symbol: str, *, now: float | None = None) -> tuple[bool, str]:
         now_ts = time.time() if now is None else float(now)
@@ -594,6 +933,7 @@ class Mag7BrokerOms:
         entry_price: float,
         *,
         regime_scale: float = 1.0,
+        position_frac_override: float | None = None,
     ) -> tuple[int, float]:
         top_k = max(int((self.profile.get("signal") or {}).get("top_k", 2)), 1)
         sizing_clock = to_ny(entry_ts)
@@ -608,12 +948,38 @@ class Mag7BrokerOms:
             symbol=symbol,
             entry_ts=sizing_clock,
         )
+        # Hunt may set meta.position_frac (mirror offline hunt_trade_overrides).
+        if position_frac_override is not None and float(position_frac_override) > 0:
+            frac = float(position_frac_override)
         frac = apply_size_scale(frac, regime_scale)
         if (not allow) or frac <= 0.0:
             return 0, float(frac)
         capital = min(self.equity, self.available_funds)
         qty = int((capital * float(frac)) // max(entry_price * 100.0, 0.01))
         return max(1, min(self.max_qty, qty)), float(frac)
+
+    @staticmethod
+    def _signal_source_fields(signal: ScannerSignal | None) -> dict[str, Any]:
+        meta = getattr(signal, "meta", None) or {}
+        return {
+            "event_source": meta.get("event_source", "baseline"),
+            "watchdog_state": meta.get("watchdog_state"),
+            "watchdog_reason": meta.get("watchdog_reason"),
+            "route": meta.get("route"),
+            "hunt_detector": meta.get("hunt_detector"),
+        }
+
+    @staticmethod
+    def _position_frac_override(signal: ScannerSignal | None) -> float | None:
+        meta = getattr(signal, "meta", None) or {}
+        raw = meta.get("position_frac")
+        if raw is None:
+            return None
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return val if val > 0 else None
 
     async def initialize_account(self) -> None:
         if self.mode == "shadow":
@@ -675,6 +1041,33 @@ class Mag7BrokerOms:
         contract = str(signal.contract or "").replace("O:", "")
         if not contract or self.has_position(symbol) or self._has_active_buy(symbol):
             return False
+        # Satellite am_pulse: default execute_mode=shadow — only fill in OMS shadow.
+        meta0 = getattr(signal, "meta", None) or {}
+        if str(meta0.get("event_source") or "") == "am_pulse_sleeve" or str(
+            meta0.get("route") or ""
+        ) == "am_pulse":
+            exec_mode = str(meta0.get("execute_mode") or "shadow").lower()
+            if exec_mode in {"off", "audit", "false", "0"}:
+                self._event(
+                    "ENTRY_SHADOW",
+                    {
+                        "symbol": symbol,
+                        "reason": "am_pulse_execute_off",
+                        **self._signal_source_fields(signal),
+                    },
+                )
+                return False
+            if exec_mode == "shadow" and self.mode != "shadow":
+                self._event(
+                    "ENTRY_REJECT",
+                    {
+                        "symbol": symbol,
+                        "reason": "am_pulse_shadow_only",
+                        "oms_mode": self.mode,
+                        **self._signal_source_fields(signal),
+                    },
+                )
+                return False
         if self.day_halted:
             reason = "day_halted"
             meta = getattr(self.scanner, "event_blackout_meta", None) or {}
@@ -733,7 +1126,11 @@ class Mag7BrokerOms:
         )
         r_scale = regime_scale_from_meta(getattr(signal, "meta", None))
         qty, qty_frac = self._size(
-            symbol, signal.sig_ts, limit_price, regime_scale=r_scale
+            symbol,
+            signal.sig_ts,
+            limit_price,
+            regime_scale=r_scale,
+            position_frac_override=self._position_frac_override(signal),
         )
         if qty <= 0:
             self._event(
@@ -742,6 +1139,7 @@ class Mag7BrokerOms:
                     "symbol": symbol,
                     "reason": "size_gate",
                     "regime_size_scale": r_scale,
+                    **self._signal_source_fields(signal),
                 },
             )
             return False
@@ -1052,6 +1450,7 @@ class Mag7BrokerOms:
                         signal.sig_ts,
                         avg_price,
                         regime_scale=regime_scale_from_meta(getattr(signal, "meta", None)),
+                        position_frac_override=self._position_frac_override(signal),
                     )
                     self._apply_open_fill(intent, filled, avg_price, qty_frac, quote)
             elif intent.action == "SELL" and intent.symbol in self.positions:
@@ -1325,6 +1724,7 @@ class Mag7BrokerOms:
                 regime_scale=regime_scale_from_meta(
                     getattr(signal, "meta", None) if signal is not None else None
                 ),
+                position_frac_override=self._position_frac_override(signal),
             )
             self._apply_open_fill(intent, qty, price, qty_frac, quote)
             if adverse:
@@ -1432,6 +1832,20 @@ class Mag7BrokerOms:
             existing.status = "OPEN"
         else:
             mid = quote_mid(float(quote["bid"]), float(quote["ask"])) or float(price)
+            entry_stock = self._stock_last_close(intent.symbol) or float(
+                getattr(signal, "spot", 0.0) or 0.0
+            )
+            entry_qqq = self._qqq_last_close() or 0.0
+            meta = getattr(signal, "meta", None) or {}
+            def _opt_f(key: str) -> float | None:
+                raw = meta.get(key)
+                if raw is None:
+                    return None
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    return None
+
             self.positions[intent.symbol] = LivePosition(
                 symbol=intent.symbol,
                 contract=intent.contract,
@@ -1446,6 +1860,17 @@ class Mag7BrokerOms:
                 entry_bid=float(quote["bid"]),
                 entry_ask=float(quote["ask"]),
                 last_good_mid=float(mid),
+                entry_stock_px=float(entry_stock or 0.0),
+                entry_qqq_px=float(entry_qqq or 0.0),
+                exit_tp_mult=_opt_f("exit_tp_mult") or _opt_f("tp_mult"),
+                exit_sl_mult=_opt_f("exit_sl_mult") or _opt_f("sl_mult"),
+                exit_hold_sec=_opt_f("exit_hold_sec"),
+                exit_simple=bool(meta.get("exit_simple", False)),
+                exit_flatten_before=(
+                    str(meta["exit_flatten_before"])
+                    if meta.get("exit_flatten_before")
+                    else None
+                ),
             )
             self._remember_option_mid(intent.symbol, intent.contract, float(mid))
         spread_row = self._record_trade_spread(
@@ -1463,6 +1888,7 @@ class Mag7BrokerOms:
             "POSITION_OPEN",
             {
                 **asdict(self.positions[intent.symbol]),
+                **self._signal_source_fields(signal),
                 "fill_px": float(price),
                 "bid": spread_row["bid"],
                 "ask": spread_row["ask"],
@@ -1475,6 +1901,43 @@ class Mag7BrokerOms:
         )
         if str(intent.status).upper() == "FILLED":
             self._maybe_continue_iceberg(intent)
+
+    def _ensure_path_fast_armed(self) -> bool:
+        if self._path_fast_armed is not None:
+            return bool(self._path_fast_armed)
+        pack = self._path_fast_pack
+        if not pack.enabled:
+            self._path_fast_armed = False
+            return False
+        stock_by = getattr(self.scanner, "stock_by", None) or {}
+        if not stock_by:
+            self._path_fast_armed = False
+            return False
+        wd = self.profile.get("watchdog") if isinstance(self.profile.get("watchdog"), dict) else {}
+        prev = wd.get("prevention") if isinstance(wd.get("prevention"), dict) else {}
+        try:
+            self._path_fast_armed = bool(
+                path_fast_pack_day_should_arm(
+                    pack,
+                    date=str(self.trade_date),
+                    stock_by=stock_by,
+                    qqq_df=stock_by.get("QQQ"),
+                    symbols=list(self.profile.get("symbols") or []),
+                    asof=str(pack.asof or prev.get("asof") or wd.get("asof") or "10:30"),
+                    washout_breadth_min=int(
+                        pack.washout_breadth_min
+                        if pack.washout_breadth_min is not None
+                        else prev.get("washout_breadth_min", 3)
+                        or 3
+                    ),
+                    wash_drop_min=float(prev.get("wash_drop_min", 0.008) or 0.008),
+                    frac_above_min=float(prev.get("frac_above_min", 0.35) or 0.35),
+                    frac_above_max=float(prev.get("frac_above_max", 0.70) or 0.70),
+                )
+            )
+        except Exception:
+            self._path_fast_armed = False
+        return bool(self._path_fast_armed)
 
     def evaluate_exits(self, asof_ts: float) -> None:
         grace = int(self.trade_cfg.get("exit_mf_grace_seconds", 60))
@@ -1490,15 +1953,37 @@ class Mag7BrokerOms:
         if early and early not in {"", "none", "off"} and early not in exit_mode:
             exit_mode = f"{exit_mode}+{early}" if exit_mode not in {"", "none"} else early
         blob = exit_mode.replace(",", "+").replace("|", "+")
-        use_extend = "hold_extend" in blob or "extend_hold" in blob
+        lac = ladder_active_from_trade(self.trade_cfg)
+        use_ladder = bool(lac.enabled)
+        use_extend = ("hold_extend" in blob or "extend_hold" in blob) and not use_ladder
+        use_trail = ("mtm_trail" in blob or blob in {"trail"}) and not use_ladder
+        trail_activate = float(self.trade_cfg.get("trail_activate", 0.20) or 0.20)
+        trail_dd = float(self.trade_cfg.get("trail_dd", 0.15) or 0.15)
+        srev_live = stock_rev_exit_from_trade(self.trade_cfg)
+        if self._ensure_path_fast_armed():
+            ov = apply_path_fast_pack_overrides(
+                hold_minutes=int(hold // 60),
+                trail_activate=trail_activate,
+                trail_dd=trail_dd,
+                stock_rev=srev_live,
+                pack=self._path_fast_pack,
+            )
+            hold = int(ov["hold_minutes"]) * 60
+            trail_activate = float(ov["trail_activate"])
+            trail_dd = float(ov["trail_dd"])
+            srev_live = ov["stock_rev_exit"]
+            use_extend = False
+            ext_hold = hold
         use_floor = "mtm_floor" in blob or "mtm_defend" in blob
-        use_mf_flip = "mf_flip" in blob or "mf_reversal" in blob
+        use_mf_flip = "mf_flip" in blob or "mf_reversal" in blob or (use_ladder and lac.mf_flip)
         use_streak = "streak_break" in blob
         min_hold = self.trade_cfg.get("exit_min_hold_minutes")
         if min_hold is None and ("mf_reversal" in blob or use_floor):
             min_hold = 10.0
         if min_hold is not None:
             grace = max(grace, int(float(min_hold) * 60))
+        if use_ladder and lac.mf_flip:
+            grace = int(lac.mf_grace_seconds)
         floor = float(self.trade_cfg.get("mtm_floor_ret", 0.0))
         for symbol, position in list(self.positions.items()):
             if position.status != "OPEN":
@@ -1535,12 +2020,154 @@ class Mag7BrokerOms:
             reason = ""
             held = asof_ts - position.entry_ts
             mtm_ret = sell_price / position.entry_price - 1.0 if position.entry_price > 0 else float("nan")
+            if math.isfinite(mtm_ret) and mtm_ret > float(position.peak_mfe):
+                position.peak_mfe = float(mtm_ret)
+            if position.entry_stock_px <= 0:
+                stock_px = self._stock_last_close(symbol)
+                if stock_px is not None:
+                    position.entry_stock_px = float(stock_px)
+            if position.entry_qqq_px <= 0:
+                qqq_px = self._qqq_last_close()
+                if qqq_px is not None:
+                    position.entry_qqq_px = float(qqq_px)
+            # Per-position rails for satellite sleeves (qqq_open_cont / am_pulse).
+            pos_tp = float(position.exit_tp_mult) if position.exit_tp_mult else tp
+            pos_sl = float(position.exit_sl_mult) if position.exit_sl_mult else sl
+            pos_hold = (
+                float(position.exit_hold_sec)
+                if position.exit_hold_sec is not None and float(position.exit_hold_sec) > 0
+                else float(hold)
+            )
+            simple = bool(position.exit_simple)
+            toxic_reason = None if simple else self._trade_toxic_reason(
+                position, mtm_ret=mtm_ret, held=held, asof_ts=asof_ts
+            )
+            shock_reason = None if simple else self._hold_shock_reason(
+                position, mtm_ret=mtm_ret, held=held
+            )
+            flatten_hit = False
+            if simple and position.exit_flatten_before:
+                try:
+                    ny = pd.Timestamp(float(asof_ts), unit="s", tz="UTC").tz_convert(
+                        "America/New_York"
+                    )
+                    parts = str(position.exit_flatten_before).split(":")
+                    flat_m = int(parts[0]) * 60 + int(parts[1])
+                    flatten_hit = (ny.hour * 60 + ny.minute) >= flat_m
+                except Exception:
+                    flatten_hit = False
             if gap_status == "gap_force":
                 reason = "GAP_FLATTEN"
-            elif sell_price >= position.entry_price * tp:
+            elif flatten_hit:
+                reason = "FLATTEN_BEFORE_CORE"
+            elif sell_price >= position.entry_price * pos_tp and (
+                simple or (not use_ladder or lac.keep_outer_rails)
+            ):
                 reason = "TP"
-            elif sell_price <= position.entry_price * sl:
+            elif toxic_reason:
+                reason = toxic_reason
+            elif shock_reason:
+                reason = shock_reason
+            elif simple and sell_price <= position.entry_price * pos_sl:
                 reason = "SL"
+            elif simple and held >= pos_hold:
+                reason = "MAX_HOLD"
+            elif not simple:
+                # Wave confirm: arm then revocable abort (before STOCK_REV / clock grind).
+                wcfg = wave_abort_from_trade(self.trade_cfg)
+                if (
+                    wcfg.enabled
+                    and not position.wave_done
+                    and position.entry_stock_px > 0
+                    and math.isfinite(mtm_ret)
+                ):
+                    cur_stock = self._stock_last_close(symbol)
+                    if cur_stock is not None and float(cur_stock) > 0:
+                        s_ret = float(cur_stock) / float(position.entry_stock_px) - 1.0
+                        signed = s_ret if position.direction == "UP" else -s_ret
+                        st = WaveAbortState(armed=bool(position.wave_armed), done=bool(position.wave_done))
+                        do_abort, _, st = wave_abort_on_tick(
+                            st,
+                            cfg=wcfg,
+                            held_seconds=float(held),
+                            stock_signed=float(signed),
+                            opt_mtm=float(mtm_ret),
+                        )
+                        position.wave_armed = bool(st.armed)
+                        position.wave_done = bool(st.done)
+                        if do_abort:
+                            reason = "WAVE_ABORT"
+                # Path risk: underlying reversed — cut before grinding to hard SL / clock.
+                srev = srev_live
+                if (
+                    not reason
+                    and srev.enabled
+                    and held >= float(srev.min_hold_minutes) * 60.0
+                    and math.isfinite(mtm_ret)
+                    and mtm_ret <= float(srev.opt_mtm_max)
+                    and position.entry_stock_px > 0
+                ):
+                    cur_stock = self._stock_last_close(symbol)
+                    if cur_stock is not None and float(cur_stock) > 0:
+                        s_ret = float(cur_stock) / float(position.entry_stock_px) - 1.0
+                        signed = s_ret if position.direction == "UP" else -s_ret
+                        if float(signed) <= float(srev.stock_max):
+                            reason = "STOCK_REV"
+            if reason:
+                pass
+            elif simple:
+                pass  # satellite rails already evaluated above
+            elif (
+                use_trail
+                and math.isfinite(mtm_ret)
+                and float(position.peak_mfe) >= float(trail_activate)
+                and mtm_ret <= float(position.peak_mfe) - float(trail_dd)
+            ):
+                reason = "TRAIL"
+            elif sell_price <= position.entry_price * pos_sl and (
+                not use_ladder or lac.keep_outer_rails
+            ):
+                reason = "SL"
+            elif use_ladder and math.isfinite(mtm_ret):
+                if mtm_ret > position.ladder_peak_ret:
+                    position.ladder_peak_ret = float(mtm_ret)
+                    position.ladder_peak_ts = float(asof_ts)
+                for rail in sorted(lac.sl_rails, key=lambda r: float(r.ret), reverse=True):
+                    if mtm_ret <= float(rail.ret):
+                        reason = f"SL_LADDER{int(round(abs(float(rail.ret)) * 100))}"
+                        break
+                if not reason:
+                    for rail in lac.tp_rails:
+                        if mtm_ret < float(rail.ret):
+                            continue
+                        if rail.action == "exit":
+                            reason = f"TP_LADDER{int(round(float(rail.ret) * 100))}"
+                            break
+                        position.ladder_trail_armed = True
+                        position.ladder_trail_dd = float(rail.trail_dd)
+                if (
+                    not reason
+                    and position.ladder_trail_armed
+                    and mtm_ret <= float(position.ladder_peak_ret) - float(position.ladder_trail_dd)
+                ):
+                    reason = "TRAIL_LADDER"
+                if (
+                    not reason
+                    and float(position.ladder_peak_ret) >= float(lac.stall_min_peak)
+                    and position.ladder_peak_ts > 0
+                    and (float(asof_ts) - float(position.ladder_peak_ts)) >= float(lac.stall_seconds)
+                ):
+                    reason = "PROFIT_STALL"
+                if not reason and held >= grace and use_mf_flip:
+                    state = self.scanner.states.get(symbol)
+                    mf10 = float(getattr(state, "mf10", float("nan")))
+                    if math.isfinite(mf10):
+                        if position.direction == "UP" and mf10 < 0:
+                            reason = "MF_FLIP"
+                        elif position.direction == "DN" and mf10 > 0:
+                            reason = "MF_FLIP"
+                if not reason and held >= float(lac.max_hold_seconds):
+                    reason = "SEC_MAX"
             elif (
                 held >= grace
                 and use_floor
@@ -1592,7 +2219,7 @@ class Mag7BrokerOms:
                         position.hold_extended = True
                     else:
                         reason = f"T+{hold // 60}"
-            elif held >= hold:
+            elif (not use_ladder) and held >= hold:
                 reason = f"T+{hold // 60}"
             if reason:
                 # Aggressive limit for force exits; model sell for normal rails.
@@ -1735,6 +2362,10 @@ class Mag7BrokerOms:
             return
         ret = float(intent.avg_fill_price) / position.entry_price - 1.0
         exit_ts = pd.Timestamp.now(tz="America/New_York")
+        reason_key = str(intent.reason or "UNKNOWN")
+        self.exit_reason_counts[reason_key] = int(
+            self.exit_reason_counts.get(reason_key, 0)
+        ) + 1
         self.open_until[intent.symbol] = exit_ts
         self.scanner.record_fill(intent.symbol, exit_ts=exit_ts, won=ret > 0)
         self.connector.release_on_demand_subscription(position.con_id)
@@ -1804,6 +2435,12 @@ class Mag7BrokerOms:
                 broker[local] = qty
         internal = {pos.contract: pos.qty for pos in self.positions.values()}
         self.reconcile_ok = broker == internal
+        self.last_reconcile = {
+            "ok": self.reconcile_ok,
+            "broker": broker,
+            "internal": internal,
+            "ts": time.time(),
+        }
         self._event(
             "RECONCILE",
             {"ok": self.reconcile_ok, "broker": broker, "internal": internal},
@@ -1815,9 +2452,29 @@ class Mag7BrokerOms:
         while True:
             try:
                 await self.reconcile()
+                # Heartbeat even on a flat book so Dash OMS age stays live.
+                if self.mode == "shadow":
+                    self.last_reconcile = {
+                        "ok": True,
+                        "broker": {},
+                        "internal": {},
+                        "ts": time.time(),
+                    }
+                self.publish_state()
             except Exception as exc:
                 self.reconcile_ok = False
+                self.last_reconcile = {
+                    "ok": False,
+                    "broker": (self.last_reconcile or {}).get("broker") or {},
+                    "internal": (self.last_reconcile or {}).get("internal") or {},
+                    "ts": time.time(),
+                    "error": str(exc),
+                }
                 self._event("RECONCILE_ERROR", {"error": str(exc)})
+                try:
+                    self.publish_state()
+                except Exception:
+                    pass
             await asyncio.sleep(interval_sec)
 
     async def order_watchdog_loop(self, interval_sec: float = 1.0) -> None:

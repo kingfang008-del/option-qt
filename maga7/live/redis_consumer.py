@@ -131,8 +131,11 @@ class Mag7RedisScannerLoop:
             "volume": float(stock.get("volume") or 0.0),
             "previous_close": float(stock.get("previous_close") or 0.0),
         }
-        # Reference names (QQQ): feed stock_by for Watchdog, no Rule-A state.
+        # Reference names (QQQ/VIXY): regime gate + stock_by for Watchdog.
         if sym not in self.scanner.states:
+            gate = getattr(self.scanner, "regime_gate", None)
+            if gate is not None and hasattr(gate, "on_stock_second"):
+                gate.on_stock_second(sym, tick)
             if hasattr(self.scanner, "on_reference_second"):
                 self.scanner.on_reference_second(sym, tick)
             self.n_ticks += 1
@@ -211,6 +214,14 @@ class Mag7RedisScannerLoop:
         for sig in self.scanner.drain_hunts(frame_ts):
             if sig not in signals:
                 signals.append(sig)
+        if hasattr(self.scanner, "drain_open_cont"):
+            for sig in self.scanner.drain_open_cont(frame_ts):
+                if sig not in signals:
+                    signals.append(sig)
+        if hasattr(self.scanner, "drain_am_pulse"):
+            for sig in self.scanner.drain_am_pulse(frame_ts):
+                if sig not in signals:
+                    signals.append(sig)
 
         # Phase 4: commit entries after the complete cross-symbol frame.
         if self.stub is not None:

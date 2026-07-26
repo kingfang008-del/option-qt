@@ -35,6 +35,7 @@ from maga7.common.option_trades import (
     TradeToxicConfig,
     load_option_trades,
     path_for_ticker_trades,
+    prepare_quote_mark_arrays,
     prepare_trade_mark_arrays,
     trade_mtm_asof,
     trade_peak_mfe_asof,
@@ -55,6 +56,47 @@ from maga7.common.adverse_vol_share import (
     adverse_vol_share_from_trade,
     entry_adv_vol_from_trade,
     prepare_stock_1s_arrays,
+)
+from maga7.common.dvol_size_scale import parse_dvol_size_scale, resolve_dvol_size_scale
+from maga7.common.vrp_prior import (
+    build_vrp_day_table,
+    parse_vrp_size_scale,
+    resolve_vrp_size_scale,
+)
+from maga7.common.from_open_gate import (
+    parse_from_open_gate,
+    resolve_from_open_gate,
+    session_from_open,
+)
+from maga7.common.overnight_gap_gate import (
+    parse_overnight_gap_gate,
+    resolve_overnight_gap_gate,
+)
+from maga7.common.peer_gap_gate import (
+    parse_peer_gap_gate,
+    resolve_peer_gap_gate,
+)
+from maga7.common.range_stall_gate import (
+    parse_range_stall_gate,
+    resolve_range_stall_gate,
+)
+from maga7.common.dn_gap_stall_gate import (
+    parse_dn_gap_stall_gate,
+    resolve_dn_gap_stall_gate,
+)
+from maga7.common.up_gap_stall_gate import (
+    parse_up_gap_stall_gate,
+    resolve_up_gap_stall_gate,
+)
+from maga7.common.fo_lod_chase_gate import (
+    parse_fo_lod_chase_gate,
+    resolve_fo_lod_chase_gate,
+)
+from maga7.common.seat_score_gate import (
+    candidate_gate_active,
+    day_gate_armed,
+    parse_seat_score_gate,
+    seat_score_ok,
 )
 from maga7.common.delta_time_stop import (
     AdverseSoftConfig,
@@ -107,6 +149,8 @@ from maga7.common.signals import (
 )
 from maga7.common.lgbm_bouncer import load_lgbm_bouncer
 from maga7.common.state_gate import load_state_gate
+from maga7.common.chop_gate import load_chop_gate
+from maga7.common.session_flow_gate import load_session_flow_gate
 from maga7.common.tcn_gate import load_tcn_gate
 from maga7.common.watchdog import (
     WATCHDOG_REGIME_KEYS,
@@ -1014,6 +1058,7 @@ def simulate_trade(
             tp_lvl = float("inf")
             sl_lvl = 0.0
     trade_mark = None
+    trade_mark_source = "none"
     trade_peak_mfe = -np.inf
     trade_cut_until = fill_ts + pd.Timedelta(seconds=int(ttox.min_hold_seconds))
     trade_dig_since: pd.Timestamp | None = None
@@ -1030,9 +1075,18 @@ def simulate_trade(
     )
     if use_trade_toxic:
         trade_mark = prepare_trade_mark_arrays(trade_path, fill_ts)
+        if trade_mark is not None:
+            trade_mark_source = "prints"
+        elif bool(ttox.quote_fallback):
+            trade_mark = prepare_quote_mark_arrays(
+                ts_list, sell_px, entry_px=float(entry), fill_ts=fill_ts
+            )
+            if trade_mark is not None:
+                trade_mark_source = "quote"
         if trade_mark is None:
             use_trade_toxic = False
             use_div_mfe = False
+            trade_mark_source = "none"
     # mf_reversal / mtm_floor: wait ~10m; flow_* / mae_cut: wait ~5m before soft exit.
     min_hold_m = exit_min_hold_minutes
     if min_hold_m is None and ("mf_reversal" in blob or use_floor):
@@ -1379,6 +1433,11 @@ def simulate_trade(
                 trade_cut_deadline is None or t <= trade_cut_deadline
             )
             cut_lim = float(ttox.cut_ret)
+            if (
+                trade_mark_source == "quote"
+                and ttox.quote_fallback_cut_ret is not None
+            ):
+                cut_lim = float(ttox.quote_fallback_cut_ret)
             mfe_lim = float(ttox.mfe_bypass)
             if adv_armed:
                 cut_lim = min(cut_lim, float(adv.tight_cut_ret))
@@ -1624,6 +1683,32 @@ def run_offline_replay(
         str(k).upper(): float(v)
         for k, v in (trade.get("symbol_size_scale") or {}).items()
     }
+    dvol_size_cfg = parse_dvol_size_scale(trade.get("dvol_size_scale"))
+    n_dvol_size_boost = 0
+    vrp_size_cfg = parse_vrp_size_scale(trade.get("vrp_size_scale"))
+    n_vrp_size_scale = 0
+    n_vrp_skip = 0
+    from_open_cfg = parse_from_open_gate(trade.get("from_open_gate"))
+    n_from_open_block = 0
+    n_from_open_scale = 0
+    overnight_gap_cfg = parse_overnight_gap_gate(trade.get("overnight_gap_gate"))
+    n_overnight_gap_block = 0
+    n_overnight_gap_scale = 0
+    peer_gap_cfg = parse_peer_gap_gate(trade.get("peer_gap_gate"))
+    n_peer_gap_block = 0
+    n_peer_gap_scale = 0
+    range_stall_cfg = parse_range_stall_gate(trade.get("range_stall_gate"))
+    n_range_stall_block = 0
+    n_range_stall_scale = 0
+    dn_gap_stall_cfg = parse_dn_gap_stall_gate(trade.get("dn_gap_stall_gate"))
+    n_dn_gap_stall_block = 0
+    n_dn_gap_stall_scale = 0
+    up_gap_stall_cfg = parse_up_gap_stall_gate(trade.get("up_gap_stall_gate"))
+    n_up_gap_stall_block = 0
+    n_up_gap_stall_scale = 0
+    fo_lod_chase_cfg = parse_fo_lod_chase_gate(trade.get("fo_lod_chase_gate"))
+    n_fo_lod_chase_block = 0
+    n_fo_lod_chase_scale = 0
     money = str(trade.get("moneyness", "ATM"))
 
     mf_idio_mode = str(sig_cfg.get("mf_idio_mode") or "off").strip().lower()
@@ -1664,10 +1749,24 @@ def run_offline_replay(
         load_syms = list(dict.fromkeys(list(symbols) + list(sig_cfg.get("peer_symbols") or [])))
         # corr_rewire needs QQQ + Mag7 1m history (parsed later; peek trade flag).
         _cr_peek = bool((trade.get("corr_rewire") or {}).get("enabled")) if isinstance(trade.get("corr_rewire"), dict) else False
-        if (mf_idio_on or tcn_enabled_peek or router_rule_peek or watchdog_rule_peek or _cr_peek) and "QQQ" not in {
-            str(s).upper() for s in load_syms
-        }:
+        _chop_peek = bool((profile.get("chop_gate") or {}).get("enabled")) if isinstance(profile.get("chop_gate"), dict) else False
+        _sfg_peek = (
+            bool((profile.get("session_flow_gate") or {}).get("enabled"))
+            if isinstance(profile.get("session_flow_gate"), dict)
+            else False
+        )
+        if (
+            mf_idio_on
+            or tcn_enabled_peek
+            or router_rule_peek
+            or watchdog_rule_peek
+            or _cr_peek
+            or _chop_peek
+            or _sfg_peek
+        ) and "QQQ" not in {str(s).upper() for s in load_syms}:
             load_syms.append("QQQ")
+        if _sfg_peek and "VIXY" not in {str(s).upper() for s in load_syms}:
+            load_syms.append("VIXY")
         for sym in load_syms:
             raw = load_stock_month_files(paths["stock_root"], sym, months)
             if raw.empty:
@@ -1742,6 +1841,13 @@ def run_offline_replay(
     elif topk_backfill and commit_tod is None:
         event_sigs = all_first
         displace_universe = "all_first_backfill"
+    seat_gate_cfg = parse_seat_score_gate(trade.get("seat_score_gate"))
+    n_seat_score_skip = 0
+    if seat_gate_cfg.enabled and commit_tod is None:
+        # Quality seat gate needs the full first-Rule-A stream + fill-cap accounting.
+        event_sigs = all_first
+        displace_universe = "all_first_seat_score"
+        topk_backfill = True
     contract_mode = str(trade.get("contract_mode", "day_lock")).lower()
     quote_source = str(trade.get("quote_source", "1s")).lower()  # 1s | day_iv | auto
     half_spread = float(trade.get("day_iv_half_spread_frac", 0.01))
@@ -1775,7 +1881,14 @@ def run_offline_replay(
     stock_1s_cache: dict[tuple[str, str], pd.DataFrame] = {}
     avs_cfg_early = adverse_vol_share_from_trade(trade)
     entry_avs_cfg = entry_adv_vol_from_trade(trade)
-    use_adv_vol_global = bool(avs_cfg_early.enabled) or bool(entry_avs_cfg.enabled)
+    # Also load 1s when overnight_gap_gate needs adv-share confirm.
+    _og_needs_1s = bool(
+        getattr(overnight_gap_cfg, "enabled", False)
+        and getattr(overnight_gap_cfg, "require_adv_share", None) is not None
+    )
+    use_adv_vol_global = (
+        bool(avs_cfg_early.enabled) or bool(entry_avs_cfg.enabled) or _og_needs_1s
+    )
     n_entry_adv_vol_block = 0
     n_entry_adv_vol_scale = 0
     ttox_cfg = trade_toxic_from_trade(trade)
@@ -1797,6 +1910,14 @@ def run_offline_replay(
 
     if regime_gate is None:
         regime_gate = Mag7RegimeGate.from_profile(profile, months=months)
+    # Causal 1s path: preagg stock_root may be missing; rebuild QQQ/VIXY regime
+    # from the provided stock_by so Watchdog Hunt can arm (begin_day requires gate).
+    if regime_gate is None and stock_by:
+        qqq = stock_by.get("QQQ")
+        if qqq is not None and not getattr(qqq, "empty", True):
+            from maga7.common.stock_1s import regime_gate_from_1s
+
+            regime_gate = regime_gate_from_1s(profile, stock_by)
     # Watchdog is the architecture layer; legacy regime_router bridges into it.
     watchdog = RegimeWatchdog.from_profile(profile)
     router_on, router_labels, router_experts, router_mode, router_rule = _load_regime_router(
@@ -1863,17 +1984,32 @@ def run_offline_replay(
     n_state_gate_block = 0
     n_state_gate_scale = 0
     state_gate_day_counts: dict[str, int] = {}
+    chop_gate = load_chop_gate(profile)
+    chop_gate_on = bool(getattr(chop_gate, "cfg", None) and chop_gate.cfg.enabled)
+    n_chop_gate_block = 0
+    n_chop_gate_scale = 0
+    chop_gate_day_counts: dict[str, int] = {}
+    session_flow_gate = load_session_flow_gate(profile)
+    session_flow_gate_on = bool(
+        getattr(session_flow_gate, "cfg", None) and session_flow_gate.cfg.enabled
+    )
+    n_session_flow_block = 0
+    n_session_flow_scale = 0
+    session_flow_day_counts: dict[str, int] = {}
     lgbm_bouncer = load_lgbm_bouncer(profile)
     lgbm_on = bool(getattr(lgbm_bouncer, "cfg", None) and lgbm_bouncer.cfg.enabled)
     n_lgbm_block = 0
     n_lgbm_scale = 0
-    # Ensure QQQ frame exists for tcn/lgbm/router-rule channels.
+    # Ensure QQQ frame exists for tcn/lgbm/router-rule / chop_gate channels.
     need_qqq = (
         tcn_on
         or lgbm_on
         or (router_on and router_mode == "rule")
         or (watchdog is not None)
         or bool(hold_watchdog_from_trade(trade).enabled)
+        or chop_gate_on
+        or session_flow_gate_on
+        or bool(vrp_size_cfg.enabled)
     )
     if need_qqq and qqq_frame is None and stock_by.get("QQQ") is None:
         try:
@@ -1891,6 +2027,33 @@ def run_offline_replay(
             qqq_frame = None
     elif need_qqq and qqq_frame is None and stock_by.get("QQQ") is not None:
         qqq_frame = stock_by["QQQ"]
+
+    if session_flow_gate_on and stock_by.get("VIXY") is None:
+        try:
+            raw_v = load_stock_month_files(paths["stock_root"], "VIXY", months)
+            if not raw_v.empty:
+                raw_v = raw_v[(raw_v["date"] >= load_start) & (raw_v["date"] <= end)]
+                stock_by["VIXY"] = attach_mf_features(
+                    raw_v,
+                    mf_window=int(sig_cfg.get("mf_window", 10)),
+                    vol_ma_window=int(sig_cfg.get("vol_ma_window", 20)),
+                    mf_fast_window=resolve_mf_fast_window(sig_cfg),
+                )
+        except Exception:
+            pass
+
+    vrp_day_table = None
+    if vrp_size_cfg.enabled:
+        try:
+            vrp_day_table = build_vrp_day_table(
+                qqq_df=qqq_frame if qqq_frame is not None else stock_by.get("QQQ"),
+                start=str(start),
+                end=str(end),
+                cfg=vrp_size_cfg,
+                stock_1s_root=paths.get("stock_1s_root"),
+            )
+        except Exception:
+            vrp_day_table = None
 
     def _mf_idio_armed(loss_streak_n: int) -> bool:
         if not mf_idio_on:
@@ -2392,6 +2555,20 @@ def run_offline_replay(
 
     for date in _loop_dates:
         day_sigs = _by_date.get(str(date), _empty_day)
+        day_seat_armed = False
+        day_seat_arm_reason = "off"
+        if seat_gate_cfg.enabled:
+            topk_day = (
+                top2[top2["date"].astype(str) == str(date)].copy()
+                if len(top2)
+                else top2
+            )
+            day_seat_armed, day_seat_arm_reason = day_gate_armed(
+                seat_gate_cfg,
+                topk_day=topk_day,
+                stock_by=stock_by,
+                date=str(date),
+            )
         # Watchdog / legacy router: restore baseline then apply day's overlay.
         day_route = "baseline"
         day_watchdog_state = WatchdogState.NORMAL.value
@@ -2535,6 +2712,26 @@ def run_offline_replay(
             )
             st_name = str(day_state_dec.state or "unknown")
             state_gate_day_counts[st_name] = int(state_gate_day_counts.get(st_name, 0)) + 1
+        day_chop_dec = None
+        if chop_gate_on:
+            day_chop_dec = chop_gate.begin_day(
+                str(date),
+                stock_by=stock_by,
+                qqq_df=qqq_frame if qqq_frame is not None else stock_by.get("QQQ"),
+                symbols=list(symbols),
+            )
+            ch_name = str(day_chop_dec.state or "unknown")
+            chop_gate_day_counts[ch_name] = int(chop_gate_day_counts.get(ch_name, 0)) + 1
+        if session_flow_gate_on:
+            day_sfg = session_flow_gate.begin_day(
+                str(date),
+                stock_by=stock_by,
+                qqq_df=qqq_frame if qqq_frame is not None else stock_by.get("QQQ"),
+                vixy_df=stock_by.get("VIXY"),
+                symbols=list(symbols),
+            )
+            sf_name = str(day_sfg.state or "unknown")
+            session_flow_day_counts[sf_name] = int(session_flow_day_counts.get(sf_name, 0)) + 1
         syms = list(day_sigs.sort_values("sig_ts")["symbol"].unique())
         # Keep concurrent cap tied to configured top_k even when universe expands.
         n_sym = max(int(sig_cfg.get("top_k", 2)), 1)
@@ -2861,6 +3058,32 @@ def run_offline_replay(
                     continue
                 state_entry_scale = float(sg_dec.size_scale)
 
+            # Chop gate: calm-range / mixed-tape overlay (parallel to state_gate).
+            chop_entry_scale = 1.0
+            chop_entry_tag = None
+            if chop_gate_on:
+                cg_dec = chop_gate.decide_entry(str(direction))
+                chop_entry_tag = f"{cg_dec.state}:{cg_dec.reason}"
+                if not cg_dec.allow:
+                    n_chop_gate_block += 1
+                    continue
+                chop_entry_scale = float(cg_dec.size_scale)
+
+            # Session cumflow + QQQ/VIXY chop gate (proactive leader filter).
+            sfg_entry_scale = 1.0
+            sfg_entry_tag = None
+            if session_flow_gate_on:
+                sfg_dec = session_flow_gate.decide_entry(
+                    symbol=str(sym),
+                    direction=str(direction),
+                    asof_ts=feature_ts,
+                )
+                sfg_entry_tag = f"{sfg_dec.state}:{sfg_dec.reason}"
+                if not sfg_dec.allow:
+                    n_session_flow_block += 1
+                    continue
+                sfg_entry_scale = float(sfg_dec.size_scale)
+
             reason_s = _structure_gate_blocks(
                 stock_by.get(sym),
                 date=str(date),
@@ -2961,6 +3184,130 @@ def run_offline_replay(
                 except (TypeError, ValueError):
                     pass
 
+            # Session-open extension (from_open): hard block before seating.
+            sig_from_open = None
+            from_open_size_mult = 1.0
+            if from_open_cfg.enabled:
+                sig_from_open = session_from_open(
+                    stock_by.get(sym), date=str(date), asof_ts=feature_ts
+                )
+                fo_act, fo_mult, sig_from_open = resolve_from_open_gate(
+                    from_open_cfg,
+                    from_open=sig_from_open,
+                    direction=str(direction),
+                )
+                if fo_act == "block":
+                    n_from_open_block += 1
+                    continue
+                if fo_act == "scale":
+                    from_open_size_mult = float(fo_mult)
+
+            # Overnight gap trap: large open gap aligned with direction.
+            overnight_gap_size_mult = 1.0
+            if overnight_gap_cfg.enabled:
+                og_adv = None
+                og_lag = int(getattr(overnight_gap_cfg, "lag_seconds", 0) or 0)
+                og_ts = to_ny(ts) + pd.Timedelta(seconds=og_lag) if og_lag > 0 else ts
+                if getattr(overnight_gap_cfg, "require_adv_share", None) is not None:
+                    og_adv = adverse_vol_share_asof(
+                        prepare_stock_1s_arrays(get_stock_1s(sym, date)),
+                        now_ts=og_ts,
+                        window_seconds=120,
+                        direction=str(direction),
+                    )
+                og = resolve_overnight_gap_gate(
+                    overnight_gap_cfg,
+                    stock_df=stock_by.get(sym),
+                    date=str(date),
+                    direction=str(direction),
+                    adv_share=og_adv,
+                )
+                if not og.allow:
+                    n_overnight_gap_block += 1
+                    continue
+                if abs(float(og.size_scale) - 1.0) > 1e-12:
+                    overnight_gap_size_mult = float(og.size_scale)
+                    n_overnight_gap_scale += 1
+                    # Causal: waited for adv confirm → enter at measurement clock.
+                    if og_lag > 0:
+                        ts = og_ts
+
+            # Weak-peer + medium overnight gap (SL/TOX stall: 04-08 / 02-18).
+            peer_gap_size_mult = 1.0
+            if peer_gap_cfg.enabled:
+                if sig_from_open is None:
+                    sig_from_open = session_from_open(
+                        stock_by.get(sym), date=str(date), asof_ts=feature_ts
+                    )
+                pg = resolve_peer_gap_gate(
+                    peer_gap_cfg,
+                    stock_df=stock_by.get(sym),
+                    date=str(date),
+                    direction=str(direction),
+                    peer_n=peer_n,
+                    from_open=sig_from_open,
+                )
+                if not pg.allow:
+                    n_peer_gap_block += 1
+                    continue
+                if abs(float(pg.size_scale) - 1.0) > 1e-12:
+                    peer_gap_size_mult = float(pg.size_scale)
+                    n_peer_gap_scale += 1
+
+            # DN gap mid-extension stall (02-17 GOOGL): measure at feature clock.
+            dn_gap_stall_size_mult = 1.0
+            if dn_gap_stall_cfg.enabled:
+                dgs = resolve_dn_gap_stall_gate(
+                    dn_gap_stall_cfg,
+                    stock_df=stock_by.get(sym),
+                    date=str(date),
+                    asof_ts=feature_ts,
+                    direction=str(direction),
+                    peer_n=peer_n,
+                )
+                if not dgs.allow:
+                    n_dn_gap_stall_block += 1
+                    continue
+                if abs(float(dgs.size_scale) - 1.0) > 1e-12:
+                    dn_gap_stall_size_mult = float(dgs.size_scale)
+                    n_dn_gap_stall_scale += 1
+
+            # UP gap early stall (06-11 TSLA): feature clock — entry fo/chase drift.
+            up_gap_stall_size_mult = 1.0
+            if up_gap_stall_cfg.enabled:
+                ugs = resolve_up_gap_stall_gate(
+                    up_gap_stall_cfg,
+                    stock_df=stock_by.get(sym),
+                    date=str(date),
+                    asof_ts=feature_ts,
+                    direction=str(direction),
+                )
+                if not ugs.allow:
+                    n_up_gap_stall_block += 1
+                    continue
+                if abs(float(ugs.size_scale) - 1.0) > 1e-12:
+                    up_gap_stall_size_mult = float(ugs.size_scale)
+                    n_up_gap_stall_scale += 1
+
+            # Large fo + LOD/HOD chase (07-24 TSLA): feature clock.
+            fo_lod_chase_size_mult = 1.0
+            if fo_lod_chase_cfg.enabled:
+                flc = resolve_fo_lod_chase_gate(
+                    fo_lod_chase_cfg,
+                    stock_df=stock_by.get(sym),
+                    date=str(date),
+                    asof_ts=feature_ts,
+                    direction=str(direction),
+                )
+                if not flc.allow:
+                    n_fo_lod_chase_block += 1
+                    continue
+                if abs(float(flc.size_scale) - 1.0) > 1e-12:
+                    fo_lod_chase_size_mult = float(flc.size_scale)
+                    n_fo_lod_chase_scale += 1
+
+            range_stall_size_mult = 1.0
+
             # Entry confirm: wait N bars after Rule-A; keep peer/regime at fire time.
             confirm_ft = None
             confirm_mf = None
@@ -3035,17 +3382,22 @@ def run_offline_replay(
             entry_adv_scale_pending = 1.0
             if bool(entry_avs_cfg.enabled):
                 use_eavs = True
+                dirs_allow = getattr(entry_avs_cfg, "dirs", None)
+                if dirs_allow and str(direction).upper() not in set(dirs_allow):
+                    use_eavs = False
                 if entry_avs_cfg.tod_start and entry_avs_cfg.tod_end:
                     tod0 = _hhmm_to_minutes(entry_avs_cfg.tod_start)
                     tod1 = _hhmm_to_minutes(entry_avs_cfg.tod_end)
                     hm = int(to_ny(ts).hour) * 60 + int(to_ny(ts).minute)
                     if tod0 is not None and tod1 is not None:
-                        use_eavs = tod0 <= hm <= tod1
+                        use_eavs = use_eavs and (tod0 <= hm <= tod1)
                 if use_eavs:
+                    lag_s = int(getattr(entry_avs_cfg, "lag_seconds", 0) or 0)
+                    eavs_ts = to_ny(ts) + pd.Timedelta(seconds=lag_s) if lag_s > 0 else ts
                     arr = prepare_stock_1s_arrays(get_stock_1s(sym, date))
                     share = adverse_vol_share_asof(
                         arr,
-                        now_ts=ts,
+                        now_ts=eavs_ts,
                         window_seconds=int(entry_avs_cfg.window_seconds),
                         direction=str(direction),
                     )
@@ -3061,6 +3413,68 @@ def run_offline_replay(
                             continue
                         if float(entry_avs_cfg.scale) < 1.0 - 1e-12:
                             entry_adv_scale_pending = float(entry_avs_cfg.scale)
+                    # Causal: if we waited for lag to measure share, enter at that clock.
+                    if lag_s > 0:
+                        ts = eavs_ts
+
+            # Range-chase + pre5 stall: measure at final entry clock (after confirms).
+            # feature_ts often still has positive pre5; stall appears by entry_ts.
+            if range_stall_cfg.enabled:
+                rs = resolve_range_stall_gate(
+                    range_stall_cfg,
+                    stock_df=stock_by.get(sym),
+                    date=str(date),
+                    asof_ts=ts,
+                    direction=str(direction),
+                    peer_n=peer_n,
+                )
+                if not rs.allow:
+                    n_range_stall_block += 1
+                    continue
+                if abs(float(rs.size_scale) - 1.0) > 1e-12:
+                    range_stall_size_mult = float(rs.size_scale)
+                    n_range_stall_scale += 1
+
+            # Seat quality gate: low score skips without consuming the daily TopK slot.
+            _is_topk_member = (
+                (str(date), str(sym).upper(), str(direction).upper()) in top2_keys
+                if top2_keys
+                else False
+            )
+            if (
+                seat_gate_cfg.enabled
+                and (not is_hunt)
+                and candidate_gate_active(
+                    seat_gate_cfg,
+                    day_armed=day_seat_armed,
+                    asof_ts=feature_ts,
+                    is_topk_member=_is_topk_member,
+                )
+            ):
+                vz_bar = None
+                sdf_g = stock_by.get(sym)
+                if sdf_g is not None and not sdf_g.empty and "vol_z" in sdf_g.columns:
+                    day_g = sdf_g[sdf_g["date"].astype(str) == str(date)]
+                    if not day_g.empty:
+                        up_g = day_g[day_g["timestamp"] <= to_ny(feature_ts)]
+                        if not up_g.empty:
+                            vz_bar = up_g.iloc[-1].get("vol_z")
+                            try:
+                                vz_bar = float(vz_bar) if pd.notna(vz_bar) else None
+                            except (TypeError, ValueError):
+                                vz_bar = None
+                ok_seat, seat_reason, _seat_sc = seat_score_ok(
+                    seat_gate_cfg,
+                    stock_by=stock_by,
+                    symbol=str(sym),
+                    date=str(date),
+                    asof_ts=feature_ts,
+                    from_prev=float(sig_from_prev) if sig_from_prev is not None else None,
+                    vol_z=vz_bar,
+                )
+                if not ok_seat:
+                    n_seat_score_skip += 1
+                    continue
 
             # Reserve filtered-TopK seat after gates; quote/sim miss still consumes.
             if day_slot_cap is not None:
@@ -3385,6 +3799,15 @@ def run_offline_replay(
                 size_frac = float(size_frac) * float(state_entry_scale)
                 size_reason = f"{size_reason}+state_gate:{state_entry_scale:.2f}"
                 n_state_gate_scale += 1
+            if chop_gate_on and float(chop_entry_scale) < 1.0 - 1e-12:
+                size_frac = float(size_frac) * float(chop_entry_scale)
+                size_reason = f"{size_reason}+chop_gate:{chop_entry_scale:.2f}"
+                n_chop_gate_scale += 1
+            if session_flow_gate_on and abs(float(sfg_entry_scale) - 1.0) > 1e-12:
+                size_frac = float(size_frac) * float(sfg_entry_scale)
+                tag = sfg_entry_tag or f"scale:{sfg_entry_scale:.2f}"
+                size_reason = f"{size_reason}+session_flow:{tag}"
+                n_session_flow_scale += 1
             if cr_on and day_cr_scale < 1.0 - 1e-12:
                 size_frac = float(size_frac) * float(day_cr_scale)
                 size_reason = f"{size_reason}+corr_rewire:{day_cr_scale:.2f}"
@@ -3445,6 +3868,56 @@ def run_offline_replay(
             if abs(sym_scale - 1.0) > 1e-12:
                 size_frac = float(size_frac) * sym_scale
                 size_reason = f"{size_reason}+sym_scale:{sym_scale:.2f}"
+            if dvol_size_cfg.enabled:
+                # Prefer full universe (incl. peers/ref) for causal cs rank.
+                dvol_scale, dvol_rank, _dvol = resolve_dvol_size_scale(
+                    dvol_size_cfg,
+                    stock_by=stock_by,
+                    symbol=str(sym),
+                    date=str(date),
+                    asof_ts=feature_ts,
+                )
+                if abs(dvol_scale - 1.0) > 1e-12:
+                    size_frac = float(size_frac) * float(dvol_scale)
+                    size_reason = (
+                        f"{size_reason}+dvol_size:{dvol_scale:.2f}"
+                        + (f"(rk{dvol_rank})" if dvol_rank is not None else "")
+                    )
+                    if dvol_scale > 1.0 + 1e-12:
+                        n_dvol_size_boost += 1
+            if vrp_size_cfg.enabled:
+                vrp_scale, vrp_reason = resolve_vrp_size_scale(
+                    vrp_size_cfg, date=str(date), day_table=vrp_day_table
+                )
+                if vrp_scale <= 0.0:
+                    n_vrp_skip += 1
+                    continue
+                if abs(float(vrp_scale) - 1.0) > 1e-12:
+                    size_frac = float(size_frac) * float(vrp_scale)
+                    size_reason = f"{size_reason}+{vrp_reason}"
+                    n_vrp_size_scale += 1
+            if from_open_cfg.enabled and abs(float(from_open_size_mult) - 1.0) > 1e-12:
+                size_frac = float(size_frac) * float(from_open_size_mult)
+                size_reason = f"{size_reason}+from_open:{from_open_size_mult:.2f}"
+            if overnight_gap_cfg.enabled and abs(float(overnight_gap_size_mult) - 1.0) > 1e-12:
+                size_frac = float(size_frac) * float(overnight_gap_size_mult)
+                size_reason = f"{size_reason}+overnight_gap:{overnight_gap_size_mult:.2f}"
+            if peer_gap_cfg.enabled and abs(float(peer_gap_size_mult) - 1.0) > 1e-12:
+                size_frac = float(size_frac) * float(peer_gap_size_mult)
+                size_reason = f"{size_reason}+peer_gap:{peer_gap_size_mult:.2f}"
+            if dn_gap_stall_cfg.enabled and abs(float(dn_gap_stall_size_mult) - 1.0) > 1e-12:
+                size_frac = float(size_frac) * float(dn_gap_stall_size_mult)
+                size_reason = f"{size_reason}+dn_gap_stall:{dn_gap_stall_size_mult:.2f}"
+            if up_gap_stall_cfg.enabled and abs(float(up_gap_stall_size_mult) - 1.0) > 1e-12:
+                size_frac = float(size_frac) * float(up_gap_stall_size_mult)
+                size_reason = f"{size_reason}+up_gap_stall:{up_gap_stall_size_mult:.2f}"
+            if fo_lod_chase_cfg.enabled and abs(float(fo_lod_chase_size_mult) - 1.0) > 1e-12:
+                size_frac = float(size_frac) * float(fo_lod_chase_size_mult)
+                size_reason = f"{size_reason}+fo_lod_chase:{fo_lod_chase_size_mult:.2f}"
+            if range_stall_cfg.enabled and abs(float(range_stall_size_mult) - 1.0) > 1e-12:
+                size_frac = float(size_frac) * float(range_stall_size_mult)
+                size_reason = f"{size_reason}+range_stall:{range_stall_size_mult:.2f}"
+                n_from_open_scale += 1
             purity_score = None
             purity_parts = None
             purity_scale = None
@@ -3588,6 +4061,8 @@ def run_offline_replay(
                 row["pe_ma"] = float(pe_ma_val)
             if sig_from_prev is not None:
                 row["sig_from_prev"] = float(sig_from_prev)
+            if sig_from_open is not None:
+                row["sig_from_open"] = float(sig_from_open)
             if confirm_ft is not None:
                 row["confirm_ts"] = confirm_ft
                 row["entry_confirm_bars"] = int(confirm_bars_n)
@@ -3676,6 +4151,10 @@ def run_offline_replay(
         "topk_backfill_on_block": bool(topk_backfill),
         "n_topk_backfill": int(n_topk_backfill),
         "n_topk_backfill_cap_skip": int(n_topk_backfill_cap),
+        "seat_score_gate_enabled": bool(seat_gate_cfg.enabled),
+        "seat_score_gate_mode": str(seat_gate_cfg.mode) if seat_gate_cfg.enabled else None,
+        "seat_score_gate_when": str(seat_gate_cfg.when) if seat_gate_cfg.enabled else None,
+        "n_seat_score_skip": int(n_seat_score_skip),
         "displace_universe": displace_universe,
         "n_regime_block": int(n_regime_block),
         "n_regime_scale": int(n_regime_scale),
@@ -3737,6 +4216,30 @@ def run_offline_replay(
         "n_confirm_block": int(n_confirm_block),
         "max_from_prev_abs": max_from_prev_abs,
         "n_max_fp_block": int(n_max_fp_block),
+        "from_open_gate_enabled": bool(from_open_cfg.enabled),
+        "from_open_gate_max_abs": float(from_open_cfg.max_abs) if from_open_cfg.enabled else None,
+        "from_open_gate_mode": from_open_cfg.mode if from_open_cfg.enabled else None,
+        "n_from_open_block": int(n_from_open_block),
+        "n_from_open_scale": int(n_from_open_scale),
+        "overnight_gap_gate_enabled": bool(overnight_gap_cfg.enabled),
+        "overnight_gap_max_fav": float(overnight_gap_cfg.max_fav_gap) if overnight_gap_cfg.enabled else None,
+        "n_overnight_gap_block": int(n_overnight_gap_block),
+        "n_overnight_gap_scale": int(n_overnight_gap_scale),
+        "peer_gap_gate_enabled": bool(peer_gap_cfg.enabled),
+        "n_peer_gap_block": int(n_peer_gap_block),
+        "n_peer_gap_scale": int(n_peer_gap_scale),
+        "range_stall_gate_enabled": bool(range_stall_cfg.enabled),
+        "n_range_stall_block": int(n_range_stall_block),
+        "n_range_stall_scale": int(n_range_stall_scale),
+        "dn_gap_stall_gate_enabled": bool(dn_gap_stall_cfg.enabled),
+        "n_dn_gap_stall_block": int(n_dn_gap_stall_block),
+        "n_dn_gap_stall_scale": int(n_dn_gap_stall_scale),
+        "up_gap_stall_gate_enabled": bool(up_gap_stall_cfg.enabled),
+        "n_up_gap_stall_block": int(n_up_gap_stall_block),
+        "n_up_gap_stall_scale": int(n_up_gap_stall_scale),
+        "fo_lod_chase_gate_enabled": bool(fo_lod_chase_cfg.enabled),
+        "n_fo_lod_chase_block": int(n_fo_lod_chase_block),
+        "n_fo_lod_chase_scale": int(n_fo_lod_chase_scale),
         "entry_confirm_bars": int(confirm_bars_n) if confirm_bars_n > 0 else None,
         "entry_confirm_mode": confirm_mode if confirm_bars_n > 0 else None,
         "stock_path_confirm_enabled": bool(spc_on),
@@ -3749,6 +4252,16 @@ def run_offline_replay(
         "n_state_gate_block": int(n_state_gate_block),
         "n_state_gate_scale": int(n_state_gate_scale),
         "state_gate_day_counts": dict(state_gate_day_counts),
+        "chop_gate_enabled": bool(chop_gate_on),
+        "chop_gate_mode": chop_gate.cfg.mode if chop_gate_on else None,
+        "n_chop_gate_block": int(n_chop_gate_block),
+        "n_chop_gate_scale": int(n_chop_gate_scale),
+        "chop_gate_day_counts": dict(chop_gate_day_counts),
+        "session_flow_gate_enabled": bool(session_flow_gate_on),
+        "session_flow_gate_when": session_flow_gate.cfg.when if session_flow_gate_on else None,
+        "n_session_flow_block": int(n_session_flow_block),
+        "n_session_flow_scale": int(n_session_flow_scale),
+        "session_flow_day_counts": dict(session_flow_day_counts),
         "corr_rewire_enabled": bool(cr_on),
         "n_corr_rewire_days": int(n_corr_rewire_days),
         "n_corr_rewire_scale": int(n_corr_rewire_scale),
@@ -3788,6 +4301,13 @@ def run_offline_replay(
         "position_frac": pos,
         "position_sizing": sizing_mode_seen or str(trade.get("position_sizing") or "concurrent"),
         "max_concurrent_positions": int(trade.get("max_concurrent_positions") or n_sym),
+        "dvol_size_scale_enabled": bool(dvol_size_cfg.enabled),
+        "dvol_size_scale_max": float(dvol_size_cfg.max_scale) if dvol_size_cfg.enabled else None,
+        "n_dvol_size_boost": int(n_dvol_size_boost),
+        "vrp_size_scale_enabled": bool(vrp_size_cfg.enabled),
+        "vrp_size_scale_mode": vrp_size_cfg.mode if vrp_size_cfg.enabled else None,
+        "n_vrp_size_scale": int(n_vrp_size_scale),
+        "n_vrp_skip": int(n_vrp_skip),
         "n_size_full": int(n_size_full),
         "n_size_split": int(n_size_split),
         "n_skip_max_concurrent": int(n_skip_max_concurrent),

@@ -1,14 +1,56 @@
 {
   "profile": "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1",
   "profile_id": "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1",
-  "description": "Research baseline: extend_mtm T30\u2192T45 + event_calendar=feb_jul_aapl_ceo + peer3 + streak3 + mf_idio + Watchdog L1 + Hunter + TT1 05 + sl55 + trade_toxic + S1 soft stock_path_confirm (timeout allow; delay_on_pos=false; tod 10:30\u201314:00). Ladder OTM3. NOT production freeze / WA_UP not default. Sync calendar via tools/sync_event_calendar.py.",
+  "description": "Research baseline: extend_mtm T30\u2192T45 + event_calendar=feb_jul_aapl_ceo + peer3 + streak3 + mf_idio + Watchdog L1 + Hunter + TT1 05 + sl55 + trade_toxic + S1 soft stock_path_confirm + dvol_size_scale soft boost (cs_rk1\u00d71.25 / rk2\u00d71.15; seats unchanged). Ladder OTM3. NOT production freeze / WA_UP not default. Sync calendar via tools/sync_event_calendar.py.",
   "role": "research_baseline",
-  "result_tag": "research_extend_mtm_full_day_peer3_l2_tt1_05_sl55_tt600d_feb_jul_aapl_ceo_cal_s1",
-  "research_revision": "2026-07-23_s1_path_soft",
+  "result_tag": "research_extend_mtm_full_day_peer3_l2_tt1_05_sl55_tt600d_feb_jul_aapl_ceo_cal_s1_dvolsoft",
+  "research_revision": "2026-07-24_narrow_experts_registry",
   "based_on": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1.json",
   "recommended_scheme": "single",
   "baseline_doc": "docs/research_full_day_peer3_baseline.md",
+  "narrow_experts_doc": "docs/narrow_expert_routing_upgrade.md",
   "frozen_at": "2026-07-20",
+  "narrow_experts": {
+    "enabled": true,
+    "catalog_path": "maga7/CONFIG/narrow_experts/catalog_v1.json",
+    "note": "Registry only (2026-07-24). Spine stays L0+L1+L2. Entry sleeves with QUOTE_REJECT (core_dn_sync / AM HF) stay off — do not wire into scanner until catalog status=ACCEPT_RESEARCH and quote dual PASS. See docs/narrow_expert_routing_upgrade.md."
+  },
+  "qqq_open_cont": {
+    "enabled": true,
+    "clock": "09:45",
+    "from_open_min": 0.002,
+    "tp": 0.10,
+    "sl": 0.25,
+    "max_hold_sec": 900,
+    "entry_frac": 0.75,
+    "exit_frac": 0.75,
+    "position_frac": 0.10,
+    "quote_1s_root": "/mnt/s990/data/raw_1s/dte0_options/QQQ",
+    "note": "Satellite sleeve (event_source=qqq_open_cont). Not Mag7 Rule-A / not Hunt. Shadow drain via Mag7Scanner.drain_open_cont. Catalog ACCEPT_RESEARCH; enabled_on_spine=false."
+  },
+  "am_pulse": {
+    "enabled": true,
+    "execute_mode": "shadow",
+    "arm": "FO",
+    "dirs": ["DN"],
+    "window_start": "09:30",
+    "window_end": "10:25",
+    "flatten_before": "10:30",
+    "min_fav_from_open": 0.008,
+    "lookback_bars": 2,
+    "min_lookback_ret": 0.99,
+    "tp": 0.15,
+    "sl": 0.20,
+    "max_hold_sec": 900,
+    "max_spread_pct": 0.15,
+    "max_lag_sec": 5.0,
+    "min_mid": 0.05,
+    "entry_frac": 0.75,
+    "exit_frac": 0.75,
+    "position_frac": 0.10,
+    "moneyness": "ATM",
+    "note": "Satellite Mag7 DN FO sleeve (event_source=am_pulse_sleeve). Signal≤10:25, flatten≤10:30. execute_mode=shadow: OMS fills only when engine mode=shadow. Set execute_mode=live for paper/live after dry-run. Catalog ACCEPT_RESEARCH; enabled_on_spine=false."
+  },
   "symbols": [
     "NVDA",
     "TSLA",
@@ -141,6 +183,15 @@
     "position_frac": 0.2,
     "position_sizing": "concurrent",
     "max_concurrent_positions": 2,
+    "dvol_size_scale": {
+      "enabled": true,
+      "mode": "cs_rank",
+      "scales": {"1": 1.25, "2": 1.15},
+      "default_scale": 1.0,
+      "min_scale": 1.0,
+      "max_scale": 1.25,
+      "note": "2026-07-23 PROMOTE_LIQ_RESEARCH: soft size only (no TopK seat change). Dual-window accept liq_seat_accept_s1; does not fix 07-22 NVDA miss. See docs/dvol_liq_soft_research.md"
+    },
     "cooldown_minutes": 5,
     "max_entries_per_symbol": 1,
     "day_circuit": null,
@@ -159,6 +210,64 @@
     "entry_confirm_bars": 2,
     "entry_confirm_mode": "mf",
     "entry_confirm_weekdays": [1, 3],
+    "overnight_gap_gate": {
+      "enabled": true,
+      "up_only": true,
+      "mode": "block",
+      "max_fav_gap": 0.04,
+      "require_adv_share": 0.55,
+      "lag_seconds": 60,
+      "on_missing_adv": "pass",
+      "note": "2026-07-26 WIRE: gap+adv confirm hard BLOCK (G4_A55_BLK). up_only & gap≥4% & adv120≥0.55 @lag60 → skip. See docs/event_news_jul_rescue_research.md / results/gap_adv_confirm_dual_v3"
+    },
+    "dn_gap_stall_gate": {
+      "enabled": true,
+      "mode": "block",
+      "min_fav_gap": 0.018,
+      "min_fav_from_open": 0.008,
+      "max_fav_from_open": 0.014,
+      "min_peer": 6,
+      "note": "2026-07-26 WIRE DGS18 (dn_gap_stall_dual_v1): DN & fav_gap≥1.8% & fo∈[0.8%,1.4%] & peer≥6 → block. Clears 02-17 GOOGL after trades backfill restored print toxic (cut25 past max600 → SL). strong keep=1.0. See docs/trade_mark_toxic_path_research.md"
+    },
+    "up_gap_stall_gate": {
+      "enabled": true,
+      "mode": "block",
+      "min_fav_gap": 0.015,
+      "max_abs_from_open": 0.001,
+      "min_chase": 0.9,
+      "max_sess_min": 40.0,
+      "note": "2026-07-26 WIRE UGS15 (priority3_dual_v2): feature_ts UP & fav_gap≥1.5% & |fo|≤0.1% & chase≥0.9 & sess≤40m → block. Clears 06-11 TSLA. strong keep≈1.04 alone / 1.09 with CROWD25. See docs/range_stall_research.md"
+    },
+    "fo_lod_chase_gate": {
+      "enabled": true,
+      "mode": "block",
+      "min_fav_from_open": 0.03,
+      "min_chase": 0.9,
+      "max_dist_ext": 0.003,
+      "dirs": ["DN"],
+      "note": "2026-07-26 WIRE DN30 (fo_lod_chase_dual_v1): feature_ts DN & fav_fo≥3% & chase≥0.9 & dist_LOD≤30bp → block. Clears 07-24 TSLA late put chase. DN-only (UP fo≥3% on HOD kills 04-15/04-16 winners). strong keep≈1.04. See docs/range_stall_research.md"
+    },
+    "peer_gap_gate": {
+      "enabled": true,
+      "mode": "block",
+      "min_fav_gap": 0.015,
+      "max_peer": 3,
+      "note": "2026-07-26 WIRE DUAL_PASS_WIRE P3_G15: peer≤3 & fav_gap≥1.5% → block (04-08 AAPL SL / 02-18 NVDA TOX). See docs/peer_gap_stall_research.md / results/peer_gap_dual_v1"
+    },
+    "range_stall_gate": {
+      "enabled": true,
+      "mode": "block",
+      "min_chase": 0.9,
+      "max_pre5": 0.00025,
+      "pre_seconds": 300,
+      "max_peer": 5,
+      "min_fav_from_open": 0.012,
+      "peer_pre5_max_peer": 3,
+      "crowd_min_peer": 7,
+      "crowd_max_pre5": 0.0025,
+      "crowd_min_fav_from_open": 0.01,
+      "note": "2026-07-26 WIRE C7_FFO012_P25 + CROWD25 (priority3_dual_v2): Arm A chase ffo≥1.2% pre5≤2.5bp peer≤5; peer_pre5≤3; crowd peer≥7&pre5≤25bp&crowd_ffo≥1% (02-18 AMZN / 03-12 AAPL+NVDA; 20bp misses NVDA minute-clock pre5≈24.9bp). strong keep≈1.05. See docs/range_stall_research.md"
+    },
     "hold_watchdog": {
       "enabled": false,
       "qqq_adverse_from_entry": 0.008,
@@ -176,7 +285,9 @@
       "quote_confirm_ret": null,
       "div_mfe_bypass": 0.06,
       "div_stock_adverse_max": 0.005,
-      "note": "Trade-mark toxic + stock-div soft MFE(6%) when underlying adverse<0.5%; max_cut=600s. See docs/trade_mark_toxic_path_research.md"
+      "quote_fallback": true,
+      "quote_fallback_cut_ret": 0.20,
+      "note": "Trade-mark toxic + stock-div soft MFE(6%) when underlying adverse<0.5%; max_cut=600s. 2026-07-26 WIRE quote_fallback + qf_cut20 (QF_C20_MAX600): miss prints → quote-sell mark; print cut25 unchanged. Clears 02-17 GOOGL SL. See docs/trade_mark_toxic_path_research.md / results/trade_toxic_quote_fallback_dual_v1"
     },
     "risk": {
       "max_stock_staleness_sec": 2.0,

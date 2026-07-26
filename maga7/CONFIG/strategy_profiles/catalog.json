@@ -16,9 +16,54 @@
       "path": "strategy_profiles/single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json",
       "role": "research_baseline",
       "scheme": "single",
-      "exit_mode": "hold_extend+trade_toxic+s1_path_soft",
+      "exit_mode": "hold_extend+trade_toxic+s1_path_soft+dvol_size_soft",
       "docs": "docs/research_full_day_peer3_baseline.md",
-      "note": "Research baseline 2026-07-23: + S1 soft path. Offline accept Apr–Jul/Jan–Mar KEEP_S1 (results/s1_research_baseline_accept_apr_jul_jan_mar_v1). Stream parity both windows ok. Production default remains googl_peer3_v1; WA_UP overlay only."
+      "note": "Research baseline 2026-07-26: S1 + dvol + og/peer_gap + range_stall(CROWD25) + dn/up_gap_stall + fo_lod_chase(DN30 clears 07-24). Production default remains googl_peer3_v1."
+    },
+    {
+      "id": "am_launch_slope_open_s3_h120_peer3_v1",
+      "path": "strategy_profiles/am_launch_slope_open_s3_h120_peer3_v1.json",
+      "role": "research_sleeve",
+      "scheme": "launch_option_fill",
+      "exit_mode": "horizon_h120",
+      "docs": "docs/sleeve_portfolio_research.md",
+      "note": "AM sleeve #1: launch_slope open 3s/0.2%/peer3 H120; signal≤10:25. Accept: tools/run_am_sleeve_accept.py."
+    },
+    {
+      "id": "am_pulse_fo08_tp15_sl20_v1",
+      "path": "strategy_profiles/am_pulse_fo08_tp15_sl20_v1.json",
+      "role": "research_sleeve",
+      "scheme": "am_pulse_quote_tpsl",
+      "exit_mode": "tp15_sl20",
+      "docs": "docs/am_pulse_scout.md",
+      "note": "AM Mag7 DN FO≥0.8% 09:30–10:25 ATM put; trades+quote dual PASS at lag5/sp15%. Not wired. tools/scan_am_pulse_*_dual.py."
+    },
+    {
+      "id": "session_am_0930_1000_h120_trades_v1",
+      "path": "strategy_profiles/session_am_0930_1000_h120_trades_v1.json",
+      "role": "research_sleeve",
+      "scheme": "session_h120_trades",
+      "exit_mode": "clock_h120",
+      "docs": "docs/sleeve_portfolio_research.md",
+      "note": "AM 09:30–10:00 causal 60s dir + trades H120. Accept: tools/run_session_h120_trades_accept.py."
+    },
+    {
+      "id": "session_mid_1230_1330_h120_trades_v1",
+      "path": "strategy_profiles/session_mid_1230_1330_h120_trades_v1.json",
+      "role": "research_sleeve",
+      "scheme": "session_h120_trades",
+      "exit_mode": "clock_h120",
+      "docs": "docs/sleeve_portfolio_research.md",
+      "note": "MID 12:30–13:30 causal 60s dir + trades H120. Accept: tools/run_session_h120_trades_accept.py."
+    },
+    {
+      "id": "pm_fade_ext8_c5_h15_dte1_v1",
+      "path": "strategy_profiles/pm_fade_ext8_c5_h15_dte1_v1.json",
+      "role": "research_sleeve",
+      "scheme": "pm_fade_option_fill",
+      "exit_mode": "force_h15",
+      "docs": "docs/sleeve_portfolio_research.md",
+      "note": "PM sleeve: 14:00 ext fade +5m confirm, hold15, 1DTE+. Accept: tools/run_pm_fade_accept.py."
     },
     {
       "id": "single_qqq_open_ladder_atm5otm_peer3_s1_wa_up_v1",

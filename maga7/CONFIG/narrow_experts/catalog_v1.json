@@ -1,0 +1,372 @@
+{
+  "version": "v1",
+  "updated": "2026-07-26",
+  "spine": "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1",
+  "discipline": [
+    "Default always baseline (L0 Rule-A 10:30–14:00).",
+    "One expert = one failure/miss morphology; at most 1–2 knobs.",
+    "Risk experts may soft-scale / block; entry experts require dual-window trades + quote FillSpec PASS.",
+    "Do not promote HF AM sleeves or CORE sync while quote status is REJECT.",
+    "Do not twist global Rule-A to chase recent days."
+  ],
+  "experts": {
+    "rebound_trap_dn": {
+      "kind": "risk",
+      "lane": "watchdog.degrade",
+      "status": "ACCEPT_RESEARCH",
+      "enabled_on_spine": true,
+      "description": "QQQ rebound trap: soft half DN when QQQ>open (degrade expert).",
+      "regime_expert": "rebound_trap_dn"
+    },
+    "washout_gate_halt": {
+      "kind": "risk",
+      "lane": "watchdog.halt",
+      "status": "ACCEPT_RESEARCH",
+      "enabled_on_spine": true,
+      "description": "Mag7 breadth washout+reclaim → hard skip Rule-A that day.",
+      "regime_expert": "washout_gate_halt"
+    },
+    "hunt_washout_reclaim": {
+      "kind": "entry",
+      "lane": "watchdog.hunter",
+      "status": "ACCEPT_RESEARCH",
+      "enabled_on_spine": true,
+      "description": "Second entry morph: per-name deep wash → reclaim open, UP-only short TTL.",
+      "detector": "washout_reclaim",
+      "docs": ["docs/hunter_washout_reclaim_research.md", "docs/l2_hunter_validation_gates.md"]
+    },
+    "qqq_open_cont": {
+      "kind": "entry",
+      "lane": "research_sleeve",
+      "status": "ACCEPT_RESEARCH",
+      "enabled_on_spine": false,
+      "description": "Satellite executable expert: QQQ 0DTE ATM open_cont 09:45 |fo|≥0.2% tp10/sl25. Quote dual PASS (JM/MJ); trades dual PASS incl Jul10–23. Complements Mag7 spine — does not rewrite Rule-A.",
+      "champion": "0945_fo0.002_tp0.10_sl0.25_sp0.15_lag2",
+      "profile": "strategy_profiles/qqq_open_cont_0945_fo02_tp10_sl25_v1.json",
+      "evidence": [
+        "results/research_qqq_open_cont_quote_tpsl_dual",
+        "results/research_qqq_open_cont_trades_tpsl_dual",
+        "results/research_qqq_open_cont_quote_vs_trades_fair"
+      ],
+      "next_gate": "Shadow wire landed (scanner.drain_open_cont + live_engine/redis_consumer). Ops: confirm POSITION_OPEN event_source=qqq_open_cont on next shadow day; extend QQQ dte0 quote past 2026-06-30 for Jul quote parity; IB live needs QQQ option chain subscribe (disk ATM resolve is shadow/dry).",
+      "replay_tag": "research_qqq_open_cont_expert_v1",
+      "live_hook": "Mag7Scanner.drain_open_cont",
+      "docs": ["docs/qqq_open_cont_quote_tpsl.md", "docs/narrow_expert_routing_upgrade.md"]
+    },
+    "prevention_mixed_wash_up": {
+      "kind": "risk",
+      "lane": "watchdog.prevention",
+      "status": "REJECT",
+      "enabled_on_spine": false,
+      "description": "Predictive mixed_wash_up → up_toxic. Dual-window FAIL 2026-07-20 (fires too often).",
+      "docs": ["docs/predictive_prevention_scoreboard.md"]
+    },
+    "vrp_soft_prior": {
+      "kind": "risk",
+      "lane": "trade.vrp_size_scale",
+      "status": "REJECT",
+      "enabled_on_spine": false,
+      "description": "Buyer-side VRP-lite: when QQQ IV−RV is rich (causal pctile), scale×0.5 or skip long-option size. Dual-window FAIL on research_baseline (1s stock): strong May–Jul9 ret −2.06/−3.98 vs off; weak Jan–Mar only trims maxDD, still net −ret. Not short-vol VRP.",
+      "evidence": ["results/research_vrp_soft_prior_dual_v1"],
+      "next_gate": "Do not wire. Revisit only with name-level IV/RV or hold-path prior — not global QQQ size scale on Rule-A.",
+      "docs": ["docs/vrp_soft_prior_research.md"]
+    },
+    "regime_router_ml": {
+      "kind": "router",
+      "lane": "regime_router",
+      "status": "RESEARCH_ONLY",
+      "enabled_on_spine": false,
+      "description": "Oracle day-type has edge; causal ML not promoted. Use Watchdog rule states (NORMAL/DEGRADE/HALT/HUNT) — see regime_factor_routing_playbook.",
+      "docs": ["docs/regime_factor_routing_playbook.md", "docs/regime_router_research.md"]
+    },
+    "am_delayed_confirm": {
+      "kind": "entry",
+      "lane": "research_sleeve",
+      "status": "QUOTE_REJECT",
+      "enabled_on_spine": false,
+      "description": "AM 09:30–10:00 delayed stock confirm (trades soft PASS). Quote dual REJECT — not a router arm.",
+      "evidence": [
+        "results/research_am_delayed_confirm_*",
+        "docs/sleeve_portfolio_research.md"
+      ]
+    },
+    "core_dn_sync": {
+      "kind": "entry",
+      "lane": "research_sleeve",
+      "status": "QUOTE_REJECT",
+      "enabled_on_spine": false,
+      "description": "CORE 10:30–11:30 DN sync morph (stock thr0.3% + stock30 + opt30; tp20/sl15). Trades hard PASS; quote dual REJECT even after lag relaxation.",
+      "champion": "sync_t0.003_ss30_so30_tp0.2_sl0.15",
+      "evidence": [
+        "results/research_certainty_morph_core_dn_sync_dual_n7",
+        "results/research_certainty_morph_core_dn_sync_quote_dual",
+        "results/research_core_dn_sync_quote_coverage",
+        "results/research_certainty_morph_core_dn_sync_quote_dual_lag10",
+        "results/research_certainty_morph_core_dn_sync_quote_dual_lag15"
+      ],
+      "coverage_diagnosis_20260724": {
+        "quote_files": "ok (day/ticker miss≈0)",
+        "primary_at_lag3": "entry lag — first quote after signal p50≈11s; probe fail=lag",
+        "secondary": "opt sync FillSpec lookback often non-pos while trades print green (trades_only≫both)",
+        "lag15_relax": "probe_ok 83/130, fills↑ but quote dual mean/day_win still negative → still REJECT"
+      },
+      "next_gate": "Do not wire. Edge does not survive quote FillSpec; relaxing lag only adds losing fills. Revisit only with denser NBBO or a different confirm mark (not lag≥10 promote).",
+      "docs": ["docs/narrow_expert_routing_upgrade.md"]
+    },
+    "core_up_sync": {
+      "kind": "entry",
+      "lane": "research_sleeve",
+      "status": "REJECT",
+      "enabled_on_spine": false,
+      "description": "CORE 10:30–11:30 UP-only stock+opt sync (mirror of core_dn_sync). Foresight weak pocket; trades dual FAIL 2026-07-25: May–Jul9 OK (best mean≈+2.6% day_win≈58%) but Jul10–23 mean/day_win collapse. opt_chase CORE UP also dual_pass_n=0.",
+      "evidence": [
+        "results/research_certainty_morph_core_up_sync_dual",
+        "results/research_certainty_morph_core_up_chase_dual",
+        "results/research_session_horizon_foresight_jul10_23",
+        "results/research_core_up_vs_baseline_jul10_23"
+      ],
+      "next_gate": "Do not wire. Do not retune thr/tp to Jul alone. Recent participation stays Hunt + qqq_open_cont satellite.",
+      "docs": ["docs/narrow_expert_routing_upgrade.md", "docs/sleeve_portfolio_research.md"]
+    },
+    "impulse_scout": {
+      "kind": "entry",
+      "lane": "research_sleeve",
+      "status": "QUOTE_REJECT",
+      "enabled_on_spine": false,
+      "description": "Independent DN impulse scout (侦查兵): first |ret_lb|≥thr in session → ATM put tp/sl; no baseline-miss filter; parallel book. Trades dual PASS (champ imp_t0.008_lb120_tp0.2_sl0.2); quote FillSpec dual_pass_n=0 (2026-07-25).",
+      "champion": "imp_t0.008_lb120_tp0.2_sl0.2",
+      "evidence": [
+        "results/research_impulse_scout_dn_tpsl_dual",
+        "results/research_impulse_scout_dn_quote_dual",
+        "results/research_impulse_scout_tpsl_dual"
+      ],
+      "next_gate": "Do not wire / Shadow. Trades edge does not survive quote FillSpec (best quote cells Jul mean≈+1.5% n=6 or negative). Revisit only with denser NBBO or different entry mark — not trades-only promote.",
+      "docs": ["docs/impulse_scout_research.md", "docs/narrow_expert_routing_upgrade.md"]
+    },
+    "am_pulse_scout": {
+      "kind": "alert",
+      "lane": "watchdog.scout",
+      "status": "ALERT_ONLY",
+      "enabled_on_spine": false,
+      "description": "AM 09:30–10:30 Mag7 pulse detector (alert-only). FO/LB alerts for ops. Tradable FO sleeve lives under am_pulse_sleeve.",
+      "module": "common/am_pulse_scout.py",
+      "tool": "tools/scan_am_pulse_scout.py",
+      "evidence": ["results/am_pulse_scout_20260724"],
+      "next_gate": "Keep alert-only; trade promotion is am_pulse_sleeve.",
+      "docs": ["docs/am_pulse_scout.md", "docs/range_stall_research.md"]
+    },
+    "am_pulse_sleeve": {
+      "kind": "entry",
+      "lane": "research_sleeve",
+      "status": "ACCEPT_RESEARCH",
+      "enabled_on_spine": false,
+      "description": "Mag7 AM DN FO sleeve: first |fav_from_open|≥0.8% in 09:30–10:25 → ATM put TP/SL. Trades dual PASS (96 cells). Quote FillSpec dual PASS only with max_lag=5s (sp≤15–20%); lag≤3 dual_pass_n=0. Jul10–23 n≈6 floor. Not Rule-A.",
+      "champion": "pulse_FO_t0.008_tp0.15_sl0.2_sp0.15_lag5",
+      "profile": "strategy_profiles/am_pulse_fo08_tp15_sl20_v1.json",
+      "evidence": [
+        "results/research_am_pulse_trades_dual",
+        "results/research_am_pulse_quote_dual",
+        "results/research_am_pulse_quote_dual_v2"
+      ],
+      "quote_gates": {
+        "pass": "max_lag_sec=5, max_spread_pct≤0.15",
+        "fail_strict": "max_lag_sec≤3 dual_pass_n=0"
+      },
+      "next_gate": "Shadow wire on peer3 (execute_mode=shadow). Dry-run via OMS mode=shadow; set execute_mode=live only after OK. Prefer FO over LB. Jul quote n still thin.",
+      "docs": ["docs/am_pulse_scout.md", "docs/narrow_expert_routing_upgrade.md"]
+    },
+    "smc_flow_scout": {
+      "kind": "entry",
+      "lane": "research_sleeve",
+      "status": "QUOTE_REJECT",
+      "enabled_on_spine": false,
+      "description": "Independent DN SMC/ICT-lite scout: BOS/sweep + displacement on stock 1s; OF proxies = down-tick vol share / CLV sec_mf (no aggressor tape). Trades dual weak PASS (flow=off champ); quote dual_pass_n=0. Flow share raises mean but fails day_win gate.",
+      "champion": "bos_disp_dn_sw300_d0.005_foff_tp0.2_sl0.15",
+      "evidence": [
+        "results/research_smc_flow_scout_dn_tpsl_dual",
+        "results/research_smc_flow_scout_dn_quote_dual"
+      ],
+      "next_gate": "Do not wire. Need tick aggressor or denser NBBO before revisiting ICT/OF; do not invent full SMC on 1s OHLCV.",
+      "docs": ["docs/smc_flow_scout_research.md", "docs/narrow_expert_routing_upgrade.md"]
+    },
+    "option_flow_scout": {
+      "kind": "entry",
+      "lane": "research_sleeve",
+      "status": "REJECT",
+      "enabled_on_spine": false,
+      "description": "Independent DN scout: put_share + put_vol_z (+ stock dump). 1s trades dual FAIL. Tick Jul10–23 single-window VALIDATE_PASS (stk_m3 only; best stable n=22 mean≈+3%) — not dual PASS, May–Jul9 tick missing.",
+      "evidence": [
+        "results/research_option_flow_scout_dn_tpsl_dual",
+        "results/research_option_flow_tick_validate_jul10_23"
+      ],
+      "next_gate": "Do not wire. Jul tick: first-fire pocket ~+7.8%/22tr; hold/rising/pulse add trades but kill edge (rising/pulse ~flat). Extend May–Jul9 tick + quote; do not densify fire_mode to chase n.",
+      "docs": ["docs/option_flow_scout_research.md", "docs/narrow_expert_routing_upgrade.md"]
+    },
+    "stock_flow_opt": {
+      "kind": "entry",
+      "lane": "research_sleeve",
+      "status": "SINGLE_WINDOW_ONLY",
+      "enabled_on_spine": false,
+      "description": "Stock 1s OF proxy → ATM put. Only Jul10–23 tick pocket is green; Feb–Apr and May–Jul9 both lose on book despite ~61–63% win (asymmetric tp10/sl25). Do not wire.",
+      "champion": "stk_d0.003_f120_sh0.6_tp0.25_sl0.2",
+      "frozen_baseline_20260725": {
+        "window": "2026-07-10..2026-07-23",
+        "n": 164,
+        "trade_win": 0.4695,
+        "mean": 0.0230,
+        "day_win": 0.70,
+        "book_add": 0.3326,
+        "pricing": "option_tick_last_slip",
+        "results": "results/research_stock_flow_opt_jul10_23"
+      },
+      "evidence": [
+        "results/research_stock_flow_opt_jul10_23",
+        "results/research_stock_flow_winrate_ablation_jul10_23",
+        "results/research_stock_flow_smc_vwap_jul10_23",
+        "results/research_stock_flow_exit_ablation_jul10_23",
+        "results/research_stock_flow_tick_dual_may_jul",
+        "results/research_stock_flow_tick_dual_feb_jul"
+      ],
+      "winrate_candidate": {
+        "name": "baseline+volz15",
+        "extra_filter": "vol_z>=1.5",
+        "n": 114,
+        "trade_win": 0.5088,
+        "day_win": 0.70,
+        "book_add": 0.3513,
+        "note": "Jul entry-only; OOS windows fail on add."
+      },
+      "exit_candidate": {
+        "name": "volz15_tp0.10_sl0.25_h900",
+        "entry": "vol_z>=1.5 on frozen gate",
+        "tp": 0.10,
+        "sl": 0.25,
+        "max_hold_sec": 900,
+        "jul": {"n": 120, "trade_win": 0.7333, "book_add": 0.3440, "day_win": 0.90},
+        "may_jul9": {"n": 509, "trade_win": 0.6248, "book_add": -0.4074, "day_win": 0.4681},
+        "feb_apr": {"n": 499, "trade_win": 0.6152, "book_add": -0.8963, "day_win": 0.3443},
+        "verdict": "SINGLE_WINDOW_ONLY",
+        "note": "OOS dual FAIL: FA+MJ high win / negative book. Jul-only pocket."
+      },
+      "smc_vwap_note": "BOS/sweep+VWAP Jul ablation did not reach 55% without exit redesign; exit redesign did not OOS dual-pass.",
+      "next_gate": "Do not wire / quote promote. Park arm unless new hypothesis (not Jul retune). OOS = Feb_Apr ∩ May1_Jul9 must keep_edge before any FillSpec.",
+      "docs": ["docs/stock_flow_opt_research.md", "docs/narrow_expert_routing_upgrade.md"]
+    },
+    "stock_flow_up": {
+      "kind": "entry",
+      "lane": "research_sleeve",
+      "status": "FORESIGHT_NO_DISTILL",
+      "enabled_on_spine": false,
+      "description": "Quiet-bull mirror: stock up_vol_share + positive ret → ATM call. Discover Feb–Apr foresight lift<1 (NO_DISTILL). Soft causal PASS on discover does not transfer to Jun holdout or Jul blind.",
+      "evidence": ["results/research_stock_flow_up_foresight_feb_jun_jul"],
+      "protocol": {
+        "discover": "2026-02-01..2026-04-30",
+        "holdout": "2026-06-01..2026-06-30",
+        "blind": "2026-07-10..2026-07-23"
+      },
+      "discover_champ_transfer": {
+        "cell": "up_d0.005_f120_sh0.6_tp0.1_sl0.2",
+        "discover_add": 0.0943,
+        "holdout_add": -0.1648,
+        "blind_add": -0.0272
+      },
+      "next_gate": "Do not wire. Prefer qqq_open_cont + Hunt + L0 for Feb–Jun participation; do not retune UP share gates after this foresight fail.",
+      "docs": ["docs/stock_flow_up_foresight_research.md", "docs/narrow_expert_routing_upgrade.md"]
+    },
+    "session_flow_gate": {
+      "kind": "risk",
+      "lane": "trade.session_flow_gate",
+      "status": "REJECT",
+      "enabled_on_spine": false,
+      "description": "Proactive QQQ(+VIXY) chop × session cumflow. v1 block/scale NO_LIFT; v2 narrow+boost still NO_LIFT on Jul (BOOST_NARROW keeps Jul≈0.95× and lifts mid, but does not rescue pocket). Do not wire.",
+      "evidence": [
+        "results/session_flow_gate_ablation_v1",
+        "results/session_flow_gate_ablation_v2"
+      ],
+      "ablation_v1_20260725": {
+        "verdict": "NO_LIFT",
+        "note": "Hard leader filter removes Jul winners; soft also cuts Jul."
+      },
+      "ablation_v2_20260725": {
+        "verdict": "NO_LIFT",
+        "best_keep": "BOOST_NARROW (weak 1.08× mid 1.26× jul 0.95×)",
+        "note": "Leader boost amplifies mid winners but Jul tox names are often near-leaders; stop using cumflow as Jul rescue."
+      },
+      "next_gate": "Do not wire. Park cumflow-for-Jul.",
+      "docs": ["docs/session_flow_gate_research.md"]
+    },
+    "entry_adv_vol": {
+      "kind": "risk",
+      "lane": "trade.entry_adv_vol",
+      "status": "REJECT",
+      "enabled_on_spine": false,
+      "description": "Entry adverse-vol share gate. Triple-window JUL_ONLY_PARTIAL: Jul↑ (AMD scale/block) but mid keep≪0.85. META/MSFT cool-share favorable-into-entry traps. Do not wire.",
+      "evidence": ["results/entry_adv_vol_triple_v1"],
+      "ablation_triple_20260725": {
+        "verdict": "JUL_ONLY_PARTIAL",
+        "best_jul": "BLOCK55_LAG60 (jul 1.58×) — destroys weak/mid",
+        "closest": "SCALE55_W120 (jul 1.18× weak 0.92× mid 0.74×)",
+        "jul_hits": "AMD UP 07-20 (±07-21 at thr50); META/MSFT untouched"
+      },
+      "next_gate": "Do not wire. Prefer overnight_gap_gate for META/AMD gap traps.",
+      "docs": ["docs/entry_adv_vol_research.md"]
+    },
+    "event_calendar_jul_oracle": {
+      "kind": "risk",
+      "lane": "regime.event_symbol_blackout",
+      "status": "ORACLE_ONLY",
+      "enabled_on_spine": false,
+      "description": "Post-hoc blackout META/AMD/MSFT tox days → jul 2.35× with weak/mid flat. Finnhub/live calendar cannot reproduce (wrong dates/names). Do not paste oracle into live preset.",
+      "evidence": ["results/event_news_triple_v1"],
+      "next_gate": "Not wireable. Causal stand-in = overnight_gap_gate.",
+      "docs": ["docs/event_news_jul_rescue_research.md"]
+    },
+    "overnight_gap_gate": {
+      "kind": "risk",
+      "lane": "trade.overnight_gap_gate",
+      "status": "REJECT",
+      "enabled_on_spine": false,
+      "description": "Overnight gap gate. Block dual FAIL; UP-only degrade (gap≥4% UP→×0.5) also DUAL_FAIL: Jul20/21 halved but 07-01 META winner cut → strong still <OFF (best UP035_X50=0.992). Do not wire.",
+      "evidence": [
+        "results/event_news_triple_v1_gap",
+        "results/overnight_gap_dual_v1",
+        "results/overnight_gap_up_degrade_dual_v1"
+      ],
+      "ablation_dual_block_20260725": {
+        "verdict": "DUAL_FAIL",
+        "GAP04_BLOCK": {"weak_vs": 0.876, "strong_vs": 0.950}
+      },
+      "ablation_dual_up_degrade_20260725": {
+        "verdict": "DUAL_FAIL",
+        "rule": "up_only + scale",
+        "best_near": "UP035_X50 weak=0.934 strong=0.992",
+        "UP04_X50": {"weak_vs": 0.934, "strong_vs": 0.978, "jul_pocket": "0.33→0.39"},
+        "note": "Halves AMD 07-20/21 losses; also halves 07-01 META +63% winner."
+      },
+      "next_gate": "Do not wire. Need filter beyond raw gap-up (e.g. gap-up + fade/confirm) before revisit.",
+      "docs": ["docs/event_news_jul_rescue_research.md"]
+    },
+    "am_hf_launch": {
+      "kind": "entry",
+      "lane": "research_sleeve",
+      "status": "QUOTE_REJECT",
+      "enabled_on_spine": false,
+      "description": "AM launch / foresight HF sleeves. Trades may look ok; quote stack repeatedly REJECT. Do not promote.",
+      "docs": ["docs/sleeve_portfolio_research.md"]
+    },
+    "orb_fractal": {
+      "kind": "entry",
+      "lane": "watchdog.hunter",
+      "status": "REJECT",
+      "enabled_on_spine": false,
+      "description": "Legacy hunter detector — rejected; slot reserved, do not re-enable as default."
+    },
+    "early_mf": {
+      "kind": "entry",
+      "lane": "watchdog.hunter",
+      "status": "REJECT",
+      "enabled_on_spine": false,
+      "description": "Legacy hunter detector — rejected; slot reserved, do not re-enable as default."
+    }
+  }
+}
