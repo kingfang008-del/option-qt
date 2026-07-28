@@ -1,0 +1,70 @@
+{
+  "profile": "am_pulse_extend_1025_1130_fo08_tp15_sl20_v1",
+  "profile_id": "am_pulse_extend_1025_1130_fo08_tp15_sl20_v1",
+  "description": "Research AM extension satellite: Mag7 both-dir FO@0.8% in 10:30-11:30, ATM TP15/SL20, confirm_abort UP-only (ca_up_only). Independent trigger budget; does not consume baseline TopK.",
+  "role": "research_sleeve_expert",
+  "result_tag": "research_am_segB_both_ddctrl_20260728",
+  "research_revision": "2026-07-28_ca_up_only_abort10_shadow",
+  "based_on": "strategy_profiles/am_pulse_fo08_tp15_sl20_v1.json",
+  "spine_complement": "strategy_profiles/single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json",
+  "narrow_expert_id": "am_pulse_extension",
+  "docs": [
+    "docs/am_pulse_scout.md",
+    "docs/narrow_expert_routing_upgrade.md"
+  ],
+  "symbols": ["NVDA", "TSLA", "AAPL", "AMZN", "META", "MSFT", "AMD", "GOOGL"],
+  "am_pulse_extension": {
+    "enabled": true,
+    "execute_mode": "shadow",
+    "arm": "FO",
+    "dirs": ["DN", "UP"],
+    "window_start": "10:30",
+    "window_end": "11:30",
+    "flatten_before": "11:45",
+    "min_fav_from_open": 0.008,
+    "lookback_bars": 2,
+    "min_lookback_ret": 0.99,
+    "tp": 0.15,
+    "sl": 0.20,
+    "max_hold_sec": 900,
+    "max_spread_pct": 0.15,
+    "max_lag_sec": 5.0,
+    "min_mid": 0.05,
+    "entry_frac": 0.75,
+    "exit_frac": 0.75,
+    "position_frac": 0.10,
+    "moneyness": "ATM",
+    "prefer_dte": 0,
+    "allowed_dte": [0],
+    "confirm_abort": {
+      "enabled": true,
+      "confirm_sec": 60,
+      "confirm_thr": 0.02,
+      "abort_thr": 0.10,
+      "on_timeout": "abort",
+      "only_entry_before": null,
+      "only_dirs": ["UP"],
+      "note": "ca_up_only abort10 shadow candidate — research_am_B_lock_opt_grid_20260728"
+    },
+    "note": "2026-07-28 LOCK B entry + shadow CA refinement: both FO@0.8%, ca_up_only abort10, 0DTE-only. Independent AM_EXT; never consume baseline TopK."
+  },
+  "portfolio": {
+    "mutex_vs_core": "independent_satellite",
+    "flatten_before": "11:45",
+    "budget_frac": 0.10,
+    "max_concurrent": 2,
+    "consume_baseline_topk": false
+  },
+  "evidence": {
+    "trades_dual": "/mnt/s990/data/maga7/results/research_am_ext_1025_1130_fo_dn_champion",
+    "quote_dual": "/mnt/s990/data/maga7/results/research_am_ext_1025_1130_quote_dual",
+    "quote_champion": "pulse_FO_t0.008_tp0.15_sl0.2_sp0.15_lag5.0",
+    "quote_may": {"n": 36, "mean": 0.1478933782},
+    "quote_jul": {"n": 8, "mean": 0.1429419958},
+    "verdict": "QUOTE_PASS"
+  },
+  "date_range": {
+    "start": "2026-05-01",
+    "end": "2026-07-23"
+  }
+}

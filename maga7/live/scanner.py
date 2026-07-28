@@ -166,6 +166,14 @@ class Mag7Scanner:
     n_hunt_budget_skip: int = 0
     n_hunt_mutex_skip: int = 0
     n_halt_skip: int = 0
+    # Offline-parity entry morph gates (feature / entry clock).
+    n_fo_lod_chase_block: int = 0
+    n_up_gap_stall_block: int = 0
+    n_dn_gap_stall_block: int = 0
+    n_peer_gap_block: int = 0
+    n_overnight_gap_block: int = 0
+    n_range_stall_block: int = 0
+    n_entry_morph_scale: int = 0
     # Satellite sleeve: qqq_open_cont (09:45 continuation; not TopK / not Hunt).
     n_open_cont_signals: int = 0
     n_open_cont_emitted: int = 0
@@ -183,6 +191,14 @@ class Mag7Scanner:
     pending_am_pulse: list = field(default_factory=list)
     _am_pulse_scout: Any = None
     _am_pulse_scout_date: str | None = None
+    # Independent AM_EXT lane (10:25–11:30); never shares AM trigger budget.
+    n_am_pulse_extension_signals: int = 0
+    n_am_pulse_extension_emitted: int = 0
+    n_am_pulse_extension_skip: int = 0
+    n_am_pulse_extension_shadow: int = 0
+    pending_am_pulse_extension: list = field(default_factory=list)
+    _am_pulse_extension_scout: Any = None
+    _am_pulse_extension_scout_date: str | None = None
     event_blackout: set = field(default_factory=set)
     event_symbol_blackout: dict = field(default_factory=dict)  # date -> {SYM}
     event_blackout_meta: dict[str, Any] = field(default_factory=dict)
@@ -288,6 +304,246 @@ class Mag7Scanner:
                 n += 1
         return n
 
+    def _entry_morph_feature_gates(
+        self,
+        *,
+        symbol: str,
+        date: str,
+        direction: str,
+        feature_ts: pd.Timestamp,
+    ) -> tuple[bool, float, dict[str, Any]]:
+        """Offline-parity feature-clock gates (fo_lod / gap stalls / peer_gap / overnight).
+
+        Runs before TopK seat reservation so chase names do not consume seats.
+        """
+        from maga7.common.dn_gap_stall_gate import (
+            parse_dn_gap_stall_gate,
+            resolve_dn_gap_stall_gate,
+        )
+        from maga7.common.fo_lod_chase_gate import (
+            parse_fo_lod_chase_gate,
+            resolve_fo_lod_chase_gate,
+        )
+        from maga7.common.overnight_gap_gate import (
+            parse_overnight_gap_gate,
+            resolve_overnight_gap_gate,
+        )
+        from maga7.common.peer_gap_gate import parse_peer_gap_gate, resolve_peer_gap_gate
+        from maga7.common.up_gap_stall_gate import (
+            parse_up_gap_stall_gate,
+            resolve_up_gap_stall_gate,
+        )
+
+        trade = self.profile.get("trade") or {}
+        sdf = (self.stock_by or {}).get(symbol)
+        size_mult = 1.0
+        meta: dict[str, Any] = {}
+        peer_n = self._peer_align_n(direction, date=date, feature_ts=feature_ts)
+        meta["peer_align_n_gate"] = int(peer_n)
+
+        og_cfg = parse_overnight_gap_gate(trade.get("overnight_gap_gate"))
+        if og_cfg.enabled:
+            adv = None
+            try:
+                from maga7.common.adverse_vol_share import (
+                    adverse_vol_share_asof,
+                    prepare_stock_1s_arrays,
+                )
+                from maga7.common.bar_agg import load_stock_1s_day
+
+                paths = self.profile.get("_paths") or self.profile.get("paths") or {}
+                s1s = paths.get("stock_1s_root")
+                lag = int(getattr(og_cfg, "lag_seconds", 0) or 0)
+                og_ts = (
+                    to_ny(feature_ts) + pd.Timedelta(seconds=lag)
+                    if lag > 0
+                    else to_ny(feature_ts)
+                )
+                if s1s and getattr(og_cfg, "require_adv_share", None) is not None:
+                    day1s = load_stock_1s_day(Path(s1s), symbol, date)
+                    if day1s is not None and not day1s.empty:
+                        adv = adverse_vol_share_asof(
+                            prepare_stock_1s_arrays(day1s),
+                            now_ts=og_ts,
+                            window_seconds=120,
+                            direction=str(direction),
+                        )
+            except Exception:
+                adv = None
+            og = resolve_overnight_gap_gate(
+                og_cfg,
+                stock_df=sdf,
+                date=str(date),
+                direction=str(direction),
+                adv_share=adv,
+            )
+            meta["overnight_gap_reason"] = og.reason
+            if not og.allow:
+                self.n_overnight_gap_block += 1
+                logger.info(
+                    "OVERNIGHT_GAP_BLOCK %s %s %s reason=%s",
+                    date,
+                    symbol,
+                    direction,
+                    og.reason,
+                )
+                return False, 0.0, meta
+            if abs(float(og.size_scale) - 1.0) > 1e-12:
+                size_mult *= float(og.size_scale)
+                self.n_entry_morph_scale += 1
+
+        pg_cfg = parse_peer_gap_gate(trade.get("peer_gap_gate"))
+        if pg_cfg.enabled:
+            pg = resolve_peer_gap_gate(
+                pg_cfg,
+                stock_df=sdf,
+                date=str(date),
+                direction=str(direction),
+                peer_n=peer_n,
+                from_open=None,
+            )
+            meta["peer_gap_reason"] = pg.reason
+            if not pg.allow:
+                self.n_peer_gap_block += 1
+                logger.info(
+                    "PEER_GAP_BLOCK %s %s %s reason=%s peer=%s",
+                    date,
+                    symbol,
+                    direction,
+                    pg.reason,
+                    peer_n,
+                )
+                return False, 0.0, meta
+            if abs(float(pg.size_scale) - 1.0) > 1e-12:
+                size_mult *= float(pg.size_scale)
+                self.n_entry_morph_scale += 1
+
+        dgs_cfg = parse_dn_gap_stall_gate(trade.get("dn_gap_stall_gate"))
+        if dgs_cfg.enabled:
+            dgs = resolve_dn_gap_stall_gate(
+                dgs_cfg,
+                stock_df=sdf,
+                date=str(date),
+                asof_ts=feature_ts,
+                direction=str(direction),
+                peer_n=peer_n,
+            )
+            meta["dn_gap_stall_reason"] = dgs.reason
+            if not dgs.allow:
+                self.n_dn_gap_stall_block += 1
+                logger.info(
+                    "DN_GAP_STALL_BLOCK %s %s %s reason=%s",
+                    date,
+                    symbol,
+                    direction,
+                    dgs.reason,
+                )
+                return False, 0.0, meta
+            if abs(float(dgs.size_scale) - 1.0) > 1e-12:
+                size_mult *= float(dgs.size_scale)
+                self.n_entry_morph_scale += 1
+
+        ugs_cfg = parse_up_gap_stall_gate(trade.get("up_gap_stall_gate"))
+        if ugs_cfg.enabled:
+            ugs = resolve_up_gap_stall_gate(
+                ugs_cfg,
+                stock_df=sdf,
+                date=str(date),
+                asof_ts=feature_ts,
+                direction=str(direction),
+            )
+            meta["up_gap_stall_reason"] = ugs.reason
+            if not ugs.allow:
+                self.n_up_gap_stall_block += 1
+                logger.info(
+                    "UP_GAP_STALL_BLOCK %s %s %s reason=%s",
+                    date,
+                    symbol,
+                    direction,
+                    ugs.reason,
+                )
+                return False, 0.0, meta
+            if abs(float(ugs.size_scale) - 1.0) > 1e-12:
+                size_mult *= float(ugs.size_scale)
+                self.n_entry_morph_scale += 1
+
+        flc_cfg = parse_fo_lod_chase_gate(trade.get("fo_lod_chase_gate"))
+        if flc_cfg.enabled:
+            flc = resolve_fo_lod_chase_gate(
+                flc_cfg,
+                stock_df=sdf,
+                date=str(date),
+                asof_ts=feature_ts,
+                direction=str(direction),
+            )
+            meta["fo_lod_chase_reason"] = flc.reason
+            meta["fo_lod_fav"] = flc.fav_from_open
+            meta["fo_lod_chase"] = flc.chase
+            meta["fo_lod_dist_ext"] = flc.dist_ext
+            if not flc.allow:
+                self.n_fo_lod_chase_block += 1
+                logger.info(
+                    "FO_LOD_CHASE_BLOCK %s %s %s reason=%s fo=%s chase=%s dist=%s",
+                    date,
+                    symbol,
+                    direction,
+                    flc.reason,
+                    flc.fav_from_open,
+                    flc.chase,
+                    flc.dist_ext,
+                )
+                return False, 0.0, meta
+            if abs(float(flc.size_scale) - 1.0) > 1e-12:
+                size_mult *= float(flc.size_scale)
+                self.n_entry_morph_scale += 1
+
+        return True, float(size_mult), meta
+
+    def _entry_morph_range_stall(
+        self,
+        *,
+        symbol: str,
+        date: str,
+        direction: str,
+        entry_ts: pd.Timestamp,
+        peer_n: int | None,
+    ) -> tuple[bool, float, dict[str, Any]]:
+        """Range-chase stall at final entry clock (offline parity)."""
+        from maga7.common.range_stall_gate import (
+            parse_range_stall_gate,
+            resolve_range_stall_gate,
+        )
+
+        trade = self.profile.get("trade") or {}
+        cfg = parse_range_stall_gate(trade.get("range_stall_gate"))
+        meta: dict[str, Any] = {}
+        if not cfg.enabled:
+            return True, 1.0, meta
+        sdf = (self.stock_by or {}).get(symbol)
+        rs = resolve_range_stall_gate(
+            cfg,
+            stock_df=sdf,
+            date=str(date),
+            asof_ts=entry_ts,
+            direction=str(direction),
+            peer_n=peer_n,
+        )
+        meta["range_stall_reason"] = rs.reason
+        if not rs.allow:
+            self.n_range_stall_block += 1
+            logger.info(
+                "RANGE_STALL_BLOCK %s %s %s reason=%s",
+                date,
+                symbol,
+                direction,
+                rs.reason,
+            )
+            return False, 0.0, meta
+        if abs(float(rs.size_scale) - 1.0) > 1e-12:
+            self.n_entry_morph_scale += 1
+            return True, float(rs.size_scale), meta
+        return True, 1.0, meta
+
     def _roll_day(self, date: str) -> None:
         if self.current_date == date:
             return
@@ -306,6 +562,7 @@ class Mag7Scanner:
         self.pending_hunts = []
         self.pending_path = []
         self.pending_am_pulse = []
+        self.pending_am_pulse_extension = []
         self.day_hunt_symbols = set()
         self.day_hunt_dirs = set()
         self.day_topk_syms = set()
@@ -322,6 +579,8 @@ class Mag7Scanner:
         # Am-pulse scout resets each session day.
         self._am_pulse_scout = None
         self._am_pulse_scout_date = None
+        self._am_pulse_extension_scout = None
+        self._am_pulse_extension_scout_date = None
         # Live accumulation starts empty; preloaded research stock_by kept.
         if self.stock_by is None:
             self.stock_by = {}
@@ -1027,32 +1286,62 @@ class Mag7Scanner:
             self.on_signal(sig)
         return [sig]
 
-    def _ensure_am_pulse_scout(self, date: str):
+    @staticmethod
+    def _am_pulse_lane_names(lane: str) -> tuple[str, str, str, str, str, str]:
+        if str(lane) == "am_pulse_extension":
+            return (
+                "_am_pulse_extension_scout",
+                "_am_pulse_extension_scout_date",
+                "pending_am_pulse_extension",
+                "n_am_pulse_extension_signals",
+                "n_am_pulse_extension_emitted",
+                "n_am_pulse_extension_skip",
+            )
+        return (
+            "_am_pulse_scout",
+            "_am_pulse_scout_date",
+            "pending_am_pulse",
+            "n_am_pulse_signals",
+            "n_am_pulse_emitted",
+            "n_am_pulse_skip",
+        )
+
+    def _ensure_am_pulse_scout(self, date: str, lane: str = "am_pulse"):
         from maga7.common.am_pulse_scout import (
             AmPulseScout,
-            am_pulse_enabled,
-            load_am_pulse_cfg,
+            am_pulse_lane_enabled,
+            load_am_pulse_lane_cfg,
             scout_config_from_live,
         )
 
-        if not am_pulse_enabled(self.profile):
+        if not am_pulse_lane_enabled(self.profile, lane):
             return None
-        if self._am_pulse_scout is not None and self._am_pulse_scout_date == date:
-            return self._am_pulse_scout
-        cfg = scout_config_from_live(load_am_pulse_cfg(self.profile))
+        scout_attr, date_attr, *_ = self._am_pulse_lane_names(lane)
+        current = getattr(self, scout_attr)
+        if current is not None and getattr(self, date_attr) == date:
+            return current
+        cfg = scout_config_from_live(load_am_pulse_lane_cfg(self.profile, lane))
         scout = AmPulseScout(cfg=cfg)
         scout.begin_day(str(date))
-        self._am_pulse_scout = scout
-        self._am_pulse_scout_date = str(date)
+        setattr(self, scout_attr, scout)
+        setattr(self, date_attr, str(date))
         return scout
 
-    def _feed_am_pulse_bar(self, symbol: str, bar: dict[str, Any]) -> None:
-        """Push completed Mag7 1m bar into am_pulse detector; queue alerts."""
-        from maga7.common.am_pulse_scout import am_pulse_enabled, load_am_pulse_cfg
+    def _feed_am_pulse_lane_bar(
+        self,
+        lane: str,
+        symbol: str,
+        bar: dict[str, Any],
+    ) -> None:
+        """Push one completed bar into an independent AM pulse lane."""
+        from maga7.common.am_pulse_scout import (
+            am_pulse_lane_enabled,
+            load_am_pulse_lane_cfg,
+        )
 
-        if not am_pulse_enabled(self.profile):
+        if not am_pulse_lane_enabled(self.profile, lane):
             return
-        live = load_am_pulse_cfg(self.profile)
+        live = load_am_pulse_lane_cfg(self.profile, lane)
         if str(live.get("execute_mode") or "shadow") == "off":
             return
         sym = str(symbol).upper()
@@ -1060,10 +1349,15 @@ class Mag7Scanner:
             return
         ts = to_ny(bar.get("timestamp"))
         date = ts.strftime("%Y-%m-%d")
-        scout = self._ensure_am_pulse_scout(date)
+        scout = self._ensure_am_pulse_scout(date, lane)
         if scout is None:
             return
         arm_want = str(live.get("arm") or "FO").upper()
+        # Prefer scanner's official RTH open over late-first-bar latch.
+        st = (self.states or {}).get(sym)
+        day_open = getattr(st, "day_open", None) if st is not None else None
+        if day_open is not None and float(day_open) > 0:
+            scout.seed_day_open(sym, float(day_open))
         alert = scout.on_bar(
             symbol=sym,
             ts=ts,
@@ -1076,53 +1370,86 @@ class Mag7Scanner:
             return
         if arm_want in {"FO", "LB"} and alert.arm != arm_want:
             return
-        self.n_am_pulse_signals += 1
-        self.pending_am_pulse.append(alert)
+        _, _, pending_attr, signals_attr, _, _ = self._am_pulse_lane_names(lane)
+        setattr(self, signals_attr, int(getattr(self, signals_attr)) + 1)
+        getattr(self, pending_attr).append(alert)
 
-    def drain_am_pulse(self, ts: pd.Timestamp) -> list[ScannerSignal]:
-        """Emit queued Mag7 am_pulse sleeve signals (independent of Rule-A / Hunt).
+    def _feed_am_pulse_bar(self, symbol: str, bar: dict[str, Any]) -> None:
+        """Backward-compatible feed for the original AM lane."""
+        self._feed_am_pulse_lane_bar("am_pulse", symbol, bar)
 
-        Requires ``profile.am_pulse.enabled``. Default ``execute_mode=shadow`` —
-        OMS only fills when engine OMS mode is shadow (or execute_mode=live).
-        Signal window ends ``window_end`` (default 10:25); flatten_before 10:30.
-        """
-        from maga7.common.am_pulse_scout import am_pulse_enabled
+    def _drain_am_pulse_lane(
+        self,
+        lane: str,
+        ts: pd.Timestamp,
+    ) -> list[ScannerSignal]:
+        """Emit one AM lane without touching baseline TopK accounting."""
+        from maga7.common.am_pulse_scout import am_pulse_lane_enabled
 
         ts = to_ny(ts)
-        if not am_pulse_enabled(self.profile):
+        if not am_pulse_lane_enabled(self.profile, lane):
             return []
         date = self.current_date or ts.strftime("%Y-%m-%d")
         if self.current_date is None:
             self._roll_day(date)
-        if not self.pending_am_pulse:
+        _, _, pending_attr, *_ = self._am_pulse_lane_names(lane)
+        pending = getattr(self, pending_attr)
+        if not pending:
             return []
         out: list[ScannerSignal] = []
         rest: list = []
-        for alert in list(self.pending_am_pulse):
+        for alert in list(pending):
             # Defer if wall clock still before alert bar (shouldn't happen live).
             alert_ts = to_ny(pd.Timestamp(alert.ts))
             if ts < alert_ts:
                 rest.append(alert)
                 continue
-            sig = self._emit_am_pulse(alert)
+            sig = self._emit_am_pulse_lane(lane, alert)
             if sig is not None:
                 out.append(sig)
-        self.pending_am_pulse = rest
+        setattr(self, pending_attr, rest)
         return out
 
-    def _emit_am_pulse(self, alert: Any) -> ScannerSignal | None:
-        from maga7.common.am_pulse_scout import EVENT_SOURCE, load_am_pulse_cfg
+    def drain_am_pulse(self, ts: pd.Timestamp) -> list[ScannerSignal]:
+        """Drain A lane using its configured window (LOCK: 09:30–10:30)."""
+        return self._drain_am_pulse_lane("am_pulse", ts)
 
-        live = load_am_pulse_cfg(self.profile)
+    def drain_am_pulse_extension(self, ts: pd.Timestamp) -> list[ScannerSignal]:
+        """Drain independent B lane (LOCK: 10:30–11:30)."""
+        return self._drain_am_pulse_lane("am_pulse_extension", ts)
+
+    def _emit_am_pulse_lane(self, lane: str, alert: Any) -> ScannerSignal | None:
+        from maga7.common.am_pulse_scout import load_am_pulse_lane_cfg
+
+        live = load_am_pulse_lane_cfg(self.profile, lane)
+        is_ext = lane == "am_pulse_extension"
+        route = "am_pulse_extension" if is_ext else "am_pulse"
+        event_source = "am_pulse_extension_sleeve" if is_ext else "am_pulse_sleeve"
+        log_tag = "AM_PULSE_EXTENSION" if is_ext else "AM_PULSE"
+        *_, emitted_attr, skip_attr = self._am_pulse_lane_names(lane)
+        shadow_attr = (
+            "n_am_pulse_extension_shadow" if is_ext else "n_am_pulse_shadow"
+        )
         date = str(alert.date)
         sym = str(alert.symbol).upper()
         direction = str(alert.dir).upper()
         if self.is_event_blackout(date, symbol=sym):
-            self.n_am_pulse_skip += 1
-            logger.info("AM_PULSE skip %s %s: event blackout", date, sym)
+            setattr(self, skip_attr, int(getattr(self, skip_attr)) + 1)
+            logger.info("%s skip %s %s: event blackout", log_tag, date, sym)
             return None
         arm_ts = to_ny(pd.Timestamp(alert.ts))
         books = self.books or ContractBooks.from_profile(self.profile)
+        # Lane may override lock DTE (e.g. AM_EXT 0DTE-only).
+        lane_prefer = live.get("prefer_dte")
+        lane_allowed = live.get("allowed_dte")
+        prefer_kw = int(lane_prefer) if lane_prefer is not None else None
+        allowed_kw = None
+        if isinstance(lane_allowed, (list, tuple)) and lane_allowed:
+            allowed_kw = [int(x) for x in lane_allowed]
+        elif isinstance(lane_allowed, str) and lane_allowed.strip():
+            allowed_kw = [
+                int(x.strip()) for x in lane_allowed.split(",") if x.strip()
+            ]
         pick = resolve_entry_contract(
             books,
             symbol=sym,
@@ -1131,10 +1458,12 @@ class Mag7Scanner:
             moneyness=str(live.get("moneyness") or "ATM"),
             sig_ts=arm_ts,
             spot=float(alert.px),
+            prefer_dte=prefer_kw,
+            allowed_dte=allowed_kw,
         )
         if not pick.ticker:
-            self.n_am_pulse_skip += 1
-            logger.info("AM_PULSE skip %s %s %s: no ATM contract", date, sym, direction)
+            setattr(self, skip_attr, int(getattr(self, skip_attr)) + 1)
+            logger.info("%s skip %s %s %s: no ATM contract", log_tag, date, sym, direction)
             return None
 
         hold_sec = int(live.get("max_hold_sec", 900) or 900)
@@ -1161,12 +1490,12 @@ class Mag7Scanner:
             "exit_sl_mult": 1.0 - sl,
             "exit_simple": True,
             "exit_flatten_before": flat_hhmm,
-            "bar_source": "am_pulse",
+            "bar_source": route,
             "contract_source": pick.source,
             "sig_dte": pick.dte,
             "sig_strike": pick.strike,
-            "route": "am_pulse",
-            "event_source": EVENT_SOURCE,
+            "route": route,
+            "event_source": event_source,
             "am_pulse_arm": str(alert.arm),
             "fav_from_open": float(alert.fav_from_open),
             "lookback_ret": alert.lookback_ret,
@@ -1174,9 +1503,16 @@ class Mag7Scanner:
             "execute_mode": exec_mode,
             "max_lag_sec": float(live.get("max_lag_sec", 5.0) or 5.0),
             "max_spread_pct": float(live.get("max_spread_pct", 0.15) or 0.15),
+            "min_mid": float(live.get("min_mid", 0.05) or 0.05),
             "watchdog_state": "satellite",
-            "watchdog_reason": "am_pulse",
+            "watchdog_reason": route,
         }
+        ca_raw = live.get("confirm_abort")
+        if isinstance(ca_raw, dict) and ca_raw.get("enabled"):
+            meta["confirm_abort"] = dict(ca_raw)
+        protect_raw = live.get("profit_protect")
+        if isinstance(protect_raw, dict) and protect_raw.get("enabled"):
+            meta["profit_protect"] = dict(protect_raw)
         sig = ScannerSignal(
             date=date,
             symbol=sym,
@@ -1191,12 +1527,13 @@ class Mag7Scanner:
             moneyness=str(live.get("moneyness") or "ATM"),
             meta=meta,
         )
-        self.n_am_pulse_emitted += 1
+        setattr(self, emitted_attr, int(getattr(self, emitted_attr)) + 1)
         if exec_mode == "shadow":
-            self.n_am_pulse_shadow += 1
+            setattr(self, shadow_attr, int(getattr(self, shadow_attr)) + 1)
         self.signals.append(sig)
         logger.info(
-            "AM_PULSE signal %s %s %s arm=%s fo=%.4f exec=%s contract=%s",
+            "%s signal %s %s %s arm=%s fo=%.4f exec=%s contract=%s",
+            log_tag,
             date,
             sym,
             direction,
@@ -1208,6 +1545,10 @@ class Mag7Scanner:
         if self.on_signal:
             self.on_signal(sig)
         return sig
+
+    def _emit_am_pulse(self, alert: Any) -> ScannerSignal | None:
+        """Backward-compatible emitter for the original AM lane."""
+        return self._emit_am_pulse_lane("am_pulse", alert)
 
     def _emit_hunt(self, h: dict[str, Any]) -> ScannerSignal | None:
         """Build + emit one Hunt ScannerSignal (does not consume TopK day_fires)."""
@@ -1391,13 +1732,53 @@ class Mag7Scanner:
 
         sig_cfg = self.profile.get("signal") or {}
         peer_min = sig_cfg.get("peer_align_min")
-        if (not skip_peer) and peer_min is not None and int(peer_min) > 0:
+        peer_n: int | None = None
+        from maga7.common.range_stall_gate import parse_range_stall_gate
+
+        rs_cfg = parse_range_stall_gate(trade.get("range_stall_gate"))
+        need_peer_for_min = (not skip_peer) and peer_min is not None and int(peer_min) > 0
+        need_peer_for_hunt_rs = bool(rs_cfg.enabled and rs_cfg.hunt_peer_align)
+        if need_peer_for_min or need_peer_for_hunt_rs:
             peer_n = self._peer_align_n(direction, date=date, feature_ts=feature_ts)
             sig.meta["peer_align_n"] = peer_n
-            if peer_n < int(peer_min):
+            if need_peer_for_min and peer_n < int(peer_min):
                 self.n_peer_block += 1
                 logger.info("HUNT_PEER_BLOCK %s %s %s", date, symbol, direction)
                 return None
+
+        rs_asof = entry_ts
+        asof_mode = str(getattr(rs_cfg, "hunt_asof", None) or "").strip()
+        if rs_cfg.enabled and rs_cfg.hunt_peer_align and asof_mode:
+            tod = asof_mode
+            if asof_mode in {"signal_deadline", "deadline", "wash_end"}:
+                tod = str(getattr(wd_cfg, "hunter_signal_deadline", "10:00") or "10:00")
+            try:
+                floor = pd.Timestamp(f"{date} {tod}", tz=to_ny(entry_ts).tz)
+                if to_ny(rs_asof) < floor:
+                    rs_asof = floor
+            except Exception:
+                pass
+        allow_rs, rs_scale, rs_meta = self._entry_morph_range_stall(
+            symbol=symbol,
+            date=date,
+            direction=direction,
+            entry_ts=rs_asof,
+            peer_n=peer_n if need_peer_for_hunt_rs else None,
+        )
+        if not allow_rs:
+            logger.info(
+                "HUNT_RANGE_STALL_BLOCK %s %s %s reason=%s",
+                date,
+                symbol,
+                direction,
+                rs_meta.get("range_stall_reason"),
+            )
+            return None
+        sig.meta.update(rs_meta)
+        if abs(float(rs_scale) - 1.0) > 1e-12:
+            base_scale = float(sig.meta.get("regime_size_scale", 1.0) or 1.0)
+            sig.meta["regime_size_scale"] = base_scale * float(rs_scale)
+            sig.meta["entry_morph_range_scale"] = float(rs_scale)
 
         if self.watchdog is not None:
             self.watchdog.note_hunt_entry()
@@ -1523,9 +1904,11 @@ class Mag7Scanner:
         # Hunt / path-confirm first (time-driven); may emit via on_signal.
         self.drain_hunts(ts)
         self.drain_path_confirms(ts)
-        # AM pulse sleeve: feed completed Mag7 1m → queue → drain (pre-CORE).
+        # Independent AM lanes: each detector owns its trigger budget/runtime.
         self._feed_am_pulse_bar(symbol, bar)
+        self._feed_am_pulse_lane_bar("am_pulse_extension", symbol, bar)
         self.drain_am_pulse(ts)
+        self.drain_am_pulse_extension(ts)
 
         st = self.states.get(symbol)
         if st is None:
@@ -1547,6 +1930,16 @@ class Mag7Scanner:
         cooldown = int(trade.get("cooldown_minutes", 5))
         only_win = resolve_only_win_reenter(trade)
         direction = str(fire["dir"]).upper()
+
+        # Offline-parity morph gates at feature clock — before TopK seat reserve.
+        allow_m, morph_scale, morph_meta = self._entry_morph_feature_gates(
+            symbol=symbol,
+            date=date,
+            direction=direction,
+            feature_ts=feature_ts,
+        )
+        if not allow_m:
+            return None
 
         # Mutex vs prior Hunt (mirror stream/offline).
         if self.watchdog is not None and bool(
@@ -1650,6 +2043,8 @@ class Mag7Scanner:
                 "money": money,
                 "delay": delay,
                 "bar_source": bar.get("bar_source", "1m"),
+                "morph_size_scale": morph_scale,
+                "morph_meta": morph_meta,
             },
         )
         if status in {"pending", "block"}:
@@ -1669,6 +2064,8 @@ class Mag7Scanner:
                 "delay": delay,
                 "bar_source": bar.get("bar_source", "1m"),
                 "path_confirm_reason": path_reason,
+                "morph_size_scale": morph_scale,
+                "morph_meta": morph_meta,
             }
         )
 
@@ -1690,6 +2087,8 @@ class Mag7Scanner:
             else trade.get("bar_availability_delay_seconds", 0) or 0
         )
         path_reason = ctx.get("path_confirm_reason")
+        morph_scale = float(ctx.get("morph_size_scale") or 1.0)
+        morph_meta = dict(ctx.get("morph_meta") or {})
 
         books = self.books or ContractBooks.from_profile(self.profile)
         pick = resolve_entry_contract(
@@ -1733,21 +2132,25 @@ class Mag7Scanner:
                 "route": self._watchdog_route,
                 "event_source": "baseline",
                 "stock_path_confirm_reason": path_reason,
+                **{k: v for k, v in morph_meta.items() if k not in {"peer_align_n_gate"}},
+                "entry_morph_feature_scale": morph_scale,
             },
         )
         if not already:
             self.day_fires.append(sig)
 
+        r_scale = 1.0
         if self.regime_gate is not None:
             dec = self.regime_gate.check(direction, feature_ts)
             sig.meta["regime_reason"] = getattr(dec, "reason", None)
-            sig.meta["regime_size_scale"] = float(getattr(dec, "size_scale", 1.0) or 1.0)
+            r_scale = float(getattr(dec, "size_scale", 1.0) or 1.0)
             if not dec.allow:
                 self.n_regime_block += 1
                 return None
 
         sig_cfg = self.profile.get("signal") or {}
         peer_min = sig_cfg.get("peer_align_min")
+        peer_n: int | None = None
         if peer_min is not None and int(peer_min) > 0:
             peer_n = self._peer_align_n(direction, date=date, feature_ts=feature_ts)
             sig.meta["peer_align_n"] = peer_n
@@ -1763,6 +2166,23 @@ class Mag7Scanner:
                     int(peer_min),
                 )
                 return None
+        elif morph_meta.get("peer_align_n_gate") is not None:
+            peer_n = int(morph_meta["peer_align_n_gate"])
+
+        allow_rs, rs_scale, rs_meta = self._entry_morph_range_stall(
+            symbol=symbol,
+            date=date,
+            direction=direction,
+            entry_ts=ts,
+            peer_n=peer_n,
+        )
+        if not allow_rs:
+            return None
+        sig.meta.update(rs_meta)
+        sig.meta["entry_morph_range_scale"] = float(rs_scale)
+        # OMS reads regime_size_scale; fold offline morph scales into the same knob.
+        combined = float(r_scale) * float(morph_scale) * float(rs_scale)
+        sig.meta["regime_size_scale"] = combined
 
         self.signals.append(sig)
         # m5/emit_all: n_done + last_exit/win only after OMS record_fill (only_win sequencing).

@@ -82,6 +82,7 @@ def test_exit_urgent_may_go_below_bid():
     assert px is not None and px < 1.0
     assert is_urgent_exit_reason("SL")
     assert is_urgent_exit_reason("DAY_CIRCUIT")
+    assert is_urgent_exit_reason("PROFIT_PROTECT")
     assert not is_urgent_exit_reason("TP")
 
 
@@ -101,6 +102,9 @@ def test_oms_try_requote_exit_places_child(tmp_path):
         def delete(self, *args):
             return self
 
+        def set(self, *args, **kwargs):
+            return True
+
         def hset(self, *args, **kwargs):
             return self
 
@@ -114,7 +118,19 @@ def test_oms_try_requote_exit_places_child(tmp_path):
             return None
 
     connector = SimpleNamespace(
-        ib=SimpleNamespace(isConnected=lambda: True, cancelOrder=lambda *_: None),
+        ib=SimpleNamespace(
+            isConnected=lambda: True,
+            cancelOrder=lambda *_: None,
+            positions=lambda: [
+                SimpleNamespace(
+                    account="DU1",
+                    contract=SimpleNamespace(
+                        localSymbol="AAPL260717C00100000"
+                    ),
+                    position=1,
+                )
+            ],
+        ),
         redis=FakeRedis(),
         config=SimpleNamespace(
             port=4002,
@@ -207,3 +223,16 @@ def test_oms_try_requote_exit_places_child(tmp_path):
     assert child.limit_price >= 1.0
     assert placed == [child.intent_id]
     assert oms.positions["AAPL"].status == "EXIT_PENDING"
+    oms.force_flatten("EOD")
+    assert placed == [child.intent_id]
+    child.status = "FILLED"
+    oms.positions["AAPL"].status = "OPEN"
+    connector.ib.isConnected = lambda: False
+    oms.force_flatten("EOD")
+    assert oms.positions["AAPL"].status == "EXIT_PENDING"
+    assert oms._pending_force_exits == {"AAPL": "EOD"}
+    assert placed == [child.intent_id]
+    connector.ib.isConnected = lambda: True
+    oms.on_feed_reconnected()
+    assert oms._pending_force_exits == {}
+    assert len(placed) == 2

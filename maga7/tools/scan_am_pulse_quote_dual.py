@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Quote FillSpec dual for AM pulse sleeve (trades PASS champions first).
 
-Independent sleeve — not Mag7 Rule-A. Signal window 09:30–10:25.
+Independent sleeve — not Mag7 Rule-A. Signal window is configurable.
 
 Example:
   PYTHONPATH=. python -m maga7.tools.scan_am_pulse_quote_dual \\
@@ -23,7 +23,11 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from maga7.common.am_pulse_scout import parse_am_pulse_scout, scan_day
+from maga7.common.am_pulse_scout import (
+    load_am_pulse_lane_cfg,
+    parse_am_pulse_scout,
+    scan_day,
+)
 from maga7.common.bar_agg import load_stock_1s_day
 from maga7.common.config import load_profile
 from maga7.common.fills import FillSpec
@@ -35,7 +39,7 @@ from maga7.common.open_lock import (
 from maga7.common.option_quote_tpsl import entry_quote_row, simulate_quote_tpsl
 from maga7.common.replay import load_quotes, month_list, path_for_ticker, to_ny
 from maga7.common.signals import load_stock_month_files
-from maga7.common.stock_1s import session_dates
+from maga7.common.stock_1s import load_symbol_1s_bars, session_dates
 from maga7.tools.run_morning_sec_option_fill import _portfolio_day
 from maga7.tools.scan_am_delayed_confirm_quote_dual import _ok, _prep_path, _stats
 from maga7.tools.scan_session_horizon_foresight import _spot_at_arr, _stock_arrays
@@ -45,13 +49,10 @@ PROFILE = (
     "maga7/CONFIG/strategy_profiles/"
     "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json"
 )
-WINDOWS = (
+DEFAULT_WINDOWS = (
     ("may_jul09", "2026-05-01", "2026-07-09"),
     ("jul10_23", "2026-07-10", "2026-07-23"),
 )
-SESSION = "AM_0930_1025"
-SIGNAL_END = "10:25"
-
 # Fallback if no champions.json (FO open_cont-like + impulse-like)
 DEFAULT_CELLS = (
     {"name": "pulse_FO_t0.01_tp0.1_sl0.25", "arm": "FO", "thr": 0.01, "lookback_bars": 2, "tp": 0.10, "sl": 0.25},
@@ -60,8 +61,26 @@ DEFAULT_CELLS = (
 )
 
 
-def _window_of(date: str) -> str | None:
-    for name, a, b in WINDOWS:
+def _parse_windows(spec: str | None) -> tuple[tuple[str, str, str], ...]:
+    """Parse ``name:start:end,...`` or fall back to DEFAULT_WINDOWS."""
+    if not spec or not str(spec).strip():
+        return DEFAULT_WINDOWS
+    out: list[tuple[str, str, str]] = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bits = part.split(":")
+        if len(bits) != 3:
+            raise SystemExit(f"bad --eval-windows chunk {part!r}; want name:YYYY-MM-DD:YYYY-MM-DD")
+        out.append((bits[0].strip(), bits[1].strip(), bits[2].strip()))
+    if not out:
+        return DEFAULT_WINDOWS
+    return tuple(out)
+
+
+def _window_of(date: str, windows: tuple[tuple[str, str, str], ...]) -> str | None:
+    for name, a, b in windows:
         if a <= date <= b:
             return name
     return None
@@ -94,13 +113,20 @@ def _load_cells(path: str | None) -> list[dict[str, Any]]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--profile", default=PROFILE)
+    ap.add_argument("--lane", choices=("am_pulse", "am_pulse_extension"), default="am_pulse")
     ap.add_argument("--tag", default="research_am_pulse_quote_dual")
     ap.add_argument("--champions-json", default="")
-    ap.add_argument("--dirs", default="DN")
+    ap.add_argument("--window-start", default="", help="Empty = profile lane value")
+    ap.add_argument("--window-end", default="", help="Empty = profile lane value")
+    ap.add_argument("--flatten-before", default="", help="Empty = profile lane value")
+    ap.add_argument("--session-tag", default="", help="Empty = derived from profile lane")
+    ap.add_argument("--dirs", default="", help="Empty = profile lane directions")
+    ap.add_argument("--allowed-dte", default="", help="Empty = profile lane/lock values")
+    ap.add_argument("--max-fav-from-open", type=float, default=None)
     ap.add_argument("--max-spreads", default="0.10,0.15")
     ap.add_argument("--max-lags", default="2,3")
-    ap.add_argument("--min-mid", type=float, default=0.05)
-    ap.add_argument("--max-hold-sec", type=int, default=900)
+    ap.add_argument("--min-mid", type=float, default=None, help="Empty = profile lane value")
+    ap.add_argument("--max-hold-sec", type=int, default=0, help="0 = profile lane value")
     ap.add_argument("--entry-frac", type=float, default=0.75)
     ap.add_argument("--exit-frac", type=float, default=0.75)
     ap.add_argument("--position-frac", type=float, default=0.10)
@@ -108,40 +134,107 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cooldown-minutes", type=float, default=10.0)
     ap.add_argument("--min-n", type=int, default=8)
     ap.add_argument("--min-day-win", type=float, default=0.55)
+    ap.add_argument(
+        "--eval-windows",
+        default="",
+        help="Dual/eval calendar splits name:start:end,... (default may_jul09+jul10_23)",
+    )
+    ap.add_argument(
+        "--open-locked-map",
+        default="",
+        help="Override paths.open_locked_map (e.g. 2025h2 lock parquet)",
+    )
+    ap.add_argument(
+        "--stock-from-1s",
+        action="store_true",
+        help="Build 1m bars from stock_1s_root (needed when spnq_train lacks months, e.g. 2025H2)",
+    )
+    ap.add_argument(
+        "--write-all-trades",
+        action="store_true",
+        help="Also dump trades CSV for cells that fail dual_pass",
+    )
     args = ap.parse_args(argv)
 
-    dirs = {x.strip().upper() for x in args.dirs.split(",") if x.strip()}
+    prof = load_profile(args.profile)
+    lane_cfg = load_am_pulse_lane_cfg(prof, args.lane)
+    windows = _parse_windows(args.eval_windows or None)
+    window_start = str(args.window_start or lane_cfg.get("window_start") or "09:30")
+    window_end = str(args.window_end or lane_cfg.get("window_end") or "10:30")
+    flatten_before = str(
+        args.flatten_before or lane_cfg.get("flatten_before") or ""
+    ).strip()
+    session = str(
+        args.session_tag
+        or ("AM_EXT_1030_1130" if args.lane == "am_pulse_extension" else "AM_0930_1030")
+    )
+    dirs_spec = args.dirs or ",".join(lane_cfg.get("dirs") or ["DN", "UP"])
+    dirs = {x.strip().upper() for x in dirs_spec.split(",") if x.strip()}
+    max_fo = (
+        float(args.max_fav_from_open)
+        if args.max_fav_from_open is not None
+        else float(lane_cfg.get("max_fav_from_open", 0.0) or 0.0)
+    )
+    min_mid = (
+        float(args.min_mid)
+        if args.min_mid is not None
+        else float(lane_cfg.get("min_mid", 0.05) or 0.05)
+    )
+    max_hold_sec = (
+        int(args.max_hold_sec)
+        if int(args.max_hold_sec) > 0
+        else int(lane_cfg.get("max_hold_sec", 900) or 900)
+    )
+    prefer_dte = int(lane_cfg.get("prefer_dte", 0) or 0)
+    allowed_raw: Any = args.allowed_dte or lane_cfg.get("allowed_dte")
+    if not allowed_raw:
+        allowed_raw = (prof.get("lock") or {}).get("allowed_dte") or [0, 1, 2]
+    if isinstance(allowed_raw, str):
+        allowed_dte = [int(x.strip()) for x in allowed_raw.split(",") if x.strip()]
+    else:
+        allowed_dte = [int(x) for x in allowed_raw]
     cells = _load_cells(args.champions_json or None)
     spreads = [float(x) for x in args.max_spreads.split(",") if x.strip()]
     lags = [float(x) for x in args.max_lags.split(",") if x.strip()]
     fill = FillSpec(entry_frac=float(args.entry_frac), exit_frac=float(args.exit_frac))
 
-    prof = load_profile(args.profile)
     paths = prof["_paths"]
     symbols = list(prof.get("symbols") or [])
     stock_root = Path(paths["stock_root"])
     stock_1s = Path(paths.get("stock_1s_root") or "/mnt/s990/data/raw_1s/stocks").expanduser()
     quote_root = Path(paths["quote_1s_root"])
-    lock = load_multidte_lock_index(Path(paths["open_locked_map"]).expanduser())
+    lock_path = Path(args.open_locked_map).expanduser() if args.open_locked_map else Path(paths["open_locked_map"]).expanduser()
+    lock = load_multidte_lock_index(lock_path)
     otm = resolve_otm_rungs(prof, default=3)
     out = Path(paths["results_dir"]) / args.tag
     out.mkdir(parents=True, exist_ok=True)
 
-    start_all = min(w[1] for w in WINDOWS)
-    end_all = max(w[2] for w in WINDOWS)
+    start_all = min(w[1] for w in windows)
+    end_all = max(w[2] for w in windows)
     dates = [d for d in session_dates(start_all, end_all) if start_all <= d <= end_all]
     months = month_list(start_all, end_all)
     print(
-        f"am_pulse QUOTE dual {start_all}..{end_all} cells={len(cells)} "
-        f"sp={spreads} lag={lags} dirs={sorted(dirs)}",
+        f"am_pulse QUOTE dual {window_start}..{window_end} "
+        f"{start_all}..{end_all} cells={len(cells)} "
+        f"sp={spreads} lag={lags} dirs={sorted(dirs)} lock={lock_path.name}",
         flush=True,
     )
 
     stock_by_sym: dict[str, pd.DataFrame] = {}
-    for sym in symbols:
-        sdf = load_stock_month_files(stock_root, sym, months)
-        if sdf is not None and not sdf.empty:
-            stock_by_sym[sym] = sdf
+    if bool(args.stock_from_1s):
+        print(f"stock source=1s→1m root={stock_1s} days={len(dates)}", flush=True)
+        for sym in symbols:
+            sdf = load_symbol_1s_bars(stock_1s, sym, dates, bar_seconds=60)
+            if sdf is not None and not sdf.empty:
+                stock_by_sym[sym] = sdf
+                print(f"  {sym}: bars={len(sdf)} days={sdf['date'].nunique()}", flush=True)
+    else:
+        for sym in symbols:
+            sdf = load_stock_month_files(stock_root, sym, months)
+            if sdf is not None and not sdf.empty:
+                stock_by_sym[sym] = sdf
+    if not stock_by_sym:
+        print("WARNING: no stock frames loaded — arms will be 0", flush=True)
 
     # Unique (arm, thr, lookback) probes
     probes = {(c["arm"], float(c["thr"]), int(c.get("lookback_bars", 2))) for c in cells}
@@ -173,9 +266,10 @@ def main(argv: list[str] | None = None) -> int:
                     cfg = parse_am_pulse_scout(
                         {
                             "enabled": True,
-                            "window_start": "09:30",
-                            "window_end": SIGNAL_END,
+                            "window_start": window_start,
+                            "window_end": window_end,
                             "min_fav_from_open": thr,
+                            "max_fav_from_open": max_fo,
                             "lookback_bars": lb_bars,
                             "min_lookback_ret": 0.99,
                             "dirs": sorted(dirs),
@@ -186,9 +280,10 @@ def main(argv: list[str] | None = None) -> int:
                     cfg = parse_am_pulse_scout(
                         {
                             "enabled": True,
-                            "window_start": "09:30",
-                            "window_end": SIGNAL_END,
+                            "window_start": window_start,
+                            "window_end": window_end,
                             "min_fav_from_open": 0.99,
+                            "max_fav_from_open": max_fo,
                             "lookback_bars": lb_bars,
                             "min_lookback_ret": thr,
                             "dirs": sorted(dirs),
@@ -209,8 +304,8 @@ def main(argv: list[str] | None = None) -> int:
                         direction=a.dir,
                         moneyness="ATM",
                         spot=spot,
-                        prefer_dte=0,
-                        allowed_dte=[0, 1, 2],
+                        prefer_dte=prefer_dte,
+                        allowed_dte=allowed_dte,
                         clear_otm_thresh=0.01,
                         ladder=True,
                         otm_rungs=otm,
@@ -225,7 +320,7 @@ def main(argv: list[str] | None = None) -> int:
                         arm_ts,
                         max_lag_sec=max(lags),
                         max_spread_pct=max(spreads),
-                        min_mid=float(args.min_mid),
+                        min_mid=min_mid,
                     )
                     if probe is None:
                         continue
@@ -237,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
                             "arm": arm_name,
                             "thr": float(thr),
                             "lookback_bars": int(lb_bars),
-                            "session": SESSION,
+                            "session": session,
                             "arm_ts": arm_ts,
                             "ticker": ticker,
                             "dte": dte,
@@ -260,30 +355,46 @@ def main(argv: list[str] | None = None) -> int:
         for max_sp in spreads:
             for max_lag in lags:
                 name = f"{cell['name']}_sp{max_sp}_lag{max_lag}"
-                win_raw: dict[str, list] = {w[0]: [] for w in WINDOWS}
+                win_raw: dict[str, list] = {w[0]: [] for w in windows}
                 n_sig = n_block = n_fill = 0
                 for arm in arms:
                     if str(arm["arm"]) != arm_n or float(arm["thr"]) != thr:
                         continue
                     if int(arm["lookback_bars"]) != lb:
                         continue
-                    wname = _window_of(str(arm["date"]))
+                    wname = _window_of(str(arm["date"]), windows)
                     if wname is None:
                         continue
                     n_sig += 1
                     if float(arm["probe_spread"]) > max_sp or float(arm["probe_lag"]) > max_lag:
                         n_block += 1
                         continue
+                    hold_sec = max_hold_sec
+                    if flatten_before:
+                        flat_ts = pd.Timestamp(
+                            f"{arm['date']} {flatten_before}", tz=NY
+                        )
+                        hold_sec = min(
+                            hold_sec,
+                            max(
+                                1,
+                                int(
+                                    (
+                                        flat_ts - to_ny(arm["arm_ts"])
+                                    ).total_seconds()
+                                ),
+                            ),
+                        )
                     sim = simulate_quote_tpsl(
                         arm["path"],
                         arm["arm_ts"],
                         tp=tp,
                         sl=sl,
-                        max_hold_sec=int(args.max_hold_sec),
+                        max_hold_sec=hold_sec,
                         fill=fill,
                         max_lag_sec=max_lag,
                         max_spread_pct=max_sp,
-                        min_mid=float(args.min_mid),
+                        min_mid=min_mid,
                     )
                     if sim is None or not np.isfinite(sim["ret"]):
                         n_block += 1
@@ -302,14 +413,18 @@ def main(argv: list[str] | None = None) -> int:
                             "exit_reason": sim["reason"],
                             "hold_sec": sim["hold_sec"],
                             "cell": name,
-                            "event_source": "am_pulse_sleeve",
+                            "event_source": (
+                                "am_pulse_extension_sleeve"
+                                if args.lane == "am_pulse_extension"
+                                else "am_pulse_sleeve"
+                            ),
                             "window": wname,
                         }
                     )
 
                 win_stats: dict[str, Any] = {}
                 sized_all: list[dict] = []
-                for wname, _, _ in WINDOWS:
+                for wname, _, _ in windows:
                     raw = win_raw[wname]
                     by_d: dict[str, list] = {}
                     for r in raw:
@@ -332,9 +447,10 @@ def main(argv: list[str] | None = None) -> int:
                     sized_all.extend(sized)
 
                 both = True
-                for wname, _, _ in WINDOWS:
+                for wi, (wname, _, _) in enumerate(windows):
                     mn = int(args.min_n)
-                    if wname == "jul10_23":
+                    # Second split may be short (legacy jul10_23 used min_n=6).
+                    if wi == 1:
                         mn = min(mn, 6)
                     st = win_stats[wname]
                     if st.get("quote_hold_fail"):
@@ -359,36 +475,45 @@ def main(argv: list[str] | None = None) -> int:
                     "n_block": n_block,
                     "n_fill": n_fill,
                 }
-                for wname, _, _ in WINDOWS:
+                for wname, _, _ in windows:
                     for k, v in win_stats[wname].items():
                         row[f"{wname}_{k}"] = v
                 score_rows.append(row)
+                trade_dump[name] = pd.DataFrame(sized_all)
                 if both:
                     dual_pass.append(row)
-                    trade_dump[name] = pd.DataFrame(sized_all)
+                    w0, w1 = windows[0][0], windows[1][0] if len(windows) > 1 else windows[0][0]
                     print(
                         f"  *** QUOTE DUAL PASS {name} "
-                        f"MJ09 n={row.get('may_jul09_n')} mean={row.get('may_jul09_mean')} "
-                        f"J10 n={row.get('jul10_23_n')} mean={row.get('jul10_23_mean')}",
+                        f"{w0} n={row.get(f'{w0}_n')} mean={row.get(f'{w0}_mean')} "
+                        f"{w1} n={row.get(f'{w1}_n')} mean={row.get(f'{w1}_mean')}",
                         flush=True,
                     )
 
     score = pd.DataFrame(score_rows)
     score.to_csv(out / "scoreboard.csv", index=False)
-    dual_pass = sorted(
-        dual_pass,
-        key=lambda r: float(r.get("may_jul09_add") or 0) + float(r.get("jul10_23_add") or 0),
-        reverse=True,
-    )
+    w_names = [w[0] for w in windows]
+
+    def _add_sum(r: dict[str, Any]) -> float:
+        return float(sum(float(r.get(f"{w}_add") or 0.0) for w in w_names))
+
+    dual_pass = sorted(dual_pass, key=_add_sum, reverse=True)
     for i, p in enumerate(dual_pass[:10]):
         name = p["name"]
         if name in trade_dump and len(trade_dump[name]):
             trade_dump[name].to_csv(out / f"trades_dual{i:02d}_{name}.csv", index=False)
+    if bool(args.write_all_trades):
+        for name, tdf in trade_dump.items():
+            if tdf is None or len(tdf) == 0:
+                continue
+            safe = str(name).replace("/", "_")
+            tdf.to_csv(out / f"trades_all_{safe}.csv", index=False)
 
     summary = {
         "expert_kind": "am_pulse_sleeve",
         "pricing": "quote_FillSpec",
-        "session": SESSION,
+        "session": session,
+        "window": [window_start, window_end],
         "dirs": sorted(dirs),
         "n_arms": int(len(arms)),
         "n_rows": int(len(score_rows)),
@@ -396,7 +521,8 @@ def main(argv: list[str] | None = None) -> int:
         "verdict": "QUOTE_PASS" if dual_pass else "QUOTE_REJECT",
         "champion": dual_pass[0] if dual_pass else None,
         "isolation": "independent sleeve; not Mag7 Rule-A",
-        "windows": [list(w) for w in WINDOWS],
+        "windows": [list(w) for w in windows],
+        "open_locked_map": str(lock_path),
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     (out / "dual_pass.json").write_text(
@@ -405,28 +531,22 @@ def main(argv: list[str] | None = None) -> int:
     print("\n=== verdict", summary["verdict"], "dual_pass_n=", len(dual_pass), flush=True)
     if dual_pass:
         c = dual_pass[0]
-        print(
-            f"champion {c['name']}: "
-            f"MJ09 n={c.get('may_jul09_n')} mean={c.get('may_jul09_mean')} | "
-            f"J10 n={c.get('jul10_23_n')} mean={c.get('jul10_23_mean')}",
-            flush=True,
-        )
-    elif not score.empty:
-        score["_sum"] = score["may_jul09_add"].fillna(0) + score["jul10_23_add"].fillna(0)
-        cols = [
-            c
-            for c in [
-                "name",
-                "may_jul09_n",
-                "may_jul09_mean",
-                "may_jul09_day_win",
-                "jul10_23_n",
-                "jul10_23_mean",
-                "jul10_23_day_win",
-                "n_fill",
-            ]
-            if c in score.columns
+        bits = [
+            f"{w} n={c.get(f'{w}_n')} mean={c.get(f'{w}_mean')}" for w in w_names
         ]
+        print(f"champion {c['name']}: " + " | ".join(bits), flush=True)
+    elif not score.empty:
+        score["_sum"] = 0.0
+        for w in w_names:
+            col = f"{w}_add"
+            if col in score.columns:
+                score["_sum"] = score["_sum"] + score[col].fillna(0)
+        cols = ["name", "n_fill"]
+        for w in w_names:
+            for suf in ("n", "mean", "day_win"):
+                c = f"{w}_{suf}"
+                if c in score.columns:
+                    cols.append(c)
         print(score.sort_values("_sum", ascending=False)[cols].head(12).to_string(index=False))
     print(f"wrote {out}", flush=True)
     return 0 if dual_pass else 1

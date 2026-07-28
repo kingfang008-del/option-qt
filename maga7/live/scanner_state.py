@@ -5,6 +5,7 @@ import json
 import math
 import os
 import tempfile
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,41 @@ def _json_num(value: Any) -> Any:
                 return None
     except Exception:
         pass
+    return value
+
+
+def _runtime_to_dict(value: Any) -> Any:
+    if isinstance(value, (pd.Timestamp,)):
+        return {"__timestamp__": to_ny(value).isoformat()}
+    if is_dataclass(value):
+        return {
+            "__dataclass__": type(value).__name__,
+            "payload": _runtime_to_dict(asdict(value)),
+        }
+    if isinstance(value, set):
+        return [_runtime_to_dict(item) for item in sorted(value, key=str)]
+    if isinstance(value, tuple):
+        return {"__tuple__": [_runtime_to_dict(item) for item in value]}
+    if isinstance(value, list):
+        return [_runtime_to_dict(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _runtime_to_dict(item) for key, item in value.items()}
+    return _json_num(value)
+
+
+def _runtime_from_dict(value: Any) -> Any:
+    if isinstance(value, dict) and set(value) == {"__timestamp__"}:
+        return to_ny(value["__timestamp__"])
+    if isinstance(value, dict) and value.get("__dataclass__") == "AmScoutAlert":
+        from maga7.common.am_pulse_scout import AmScoutAlert
+
+        return AmScoutAlert(**_runtime_from_dict(value.get("payload") or {}))
+    if isinstance(value, dict) and set(value) == {"__tuple__"}:
+        return tuple(_runtime_from_dict(item) for item in value["__tuple__"])
+    if isinstance(value, list):
+        return [_runtime_from_dict(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _runtime_from_dict(item) for key, item in value.items()}
     return value
 
 
@@ -268,6 +304,69 @@ def scanner_snapshot(scanner: Any) -> dict[str, Any]:
         "regime": regime,
         "prevention": prevention,
         "watchdog": watchdog_snap,
+        "runtime": {
+            "pending_hunts": _runtime_to_dict(
+                getattr(scanner, "pending_hunts", None) or []
+            ),
+            "pending_path": _runtime_to_dict(
+                getattr(scanner, "pending_path", None) or []
+            ),
+            "pending_am_pulse": _runtime_to_dict(
+                getattr(scanner, "pending_am_pulse", None) or []
+            ),
+            "pending_am_pulse_extension": _runtime_to_dict(
+                getattr(scanner, "pending_am_pulse_extension", None) or []
+            ),
+            "am_pulse_scout_state": _runtime_to_dict(
+                getattr(getattr(scanner, "_am_pulse_scout", None), "snapshot_state", lambda: None)()
+            ),
+            "am_pulse_extension_scout_state": _runtime_to_dict(
+                getattr(
+                    getattr(scanner, "_am_pulse_extension_scout", None),
+                    "snapshot_state",
+                    lambda: None,
+                )()
+            ),
+            "day_hunt_symbols": sorted(
+                str(s) for s in (getattr(scanner, "day_hunt_symbols", None) or set())
+            ),
+            "day_hunt_dirs": _runtime_to_dict(
+                getattr(scanner, "day_hunt_dirs", None) or set()
+            ),
+            "day_topk_syms": sorted(
+                str(s) for s in (getattr(scanner, "day_topk_syms", None) or set())
+            ),
+            "n_hunt_signals": int(getattr(scanner, "n_hunt_signals", 0) or 0),
+            "n_hunt_emitted": int(getattr(scanner, "n_hunt_emitted", 0) or 0),
+            "n_hunt_budget_skip": int(
+                getattr(scanner, "n_hunt_budget_skip", 0) or 0
+            ),
+            "n_hunt_mutex_skip": int(
+                getattr(scanner, "n_hunt_mutex_skip", 0) or 0
+            ),
+            "n_am_pulse_signals": int(
+                getattr(scanner, "n_am_pulse_signals", 0) or 0
+            ),
+            "n_am_pulse_emitted": int(
+                getattr(scanner, "n_am_pulse_emitted", 0) or 0
+            ),
+            "n_am_pulse_skip": int(getattr(scanner, "n_am_pulse_skip", 0) or 0),
+            "n_am_pulse_shadow": int(
+                getattr(scanner, "n_am_pulse_shadow", 0) or 0
+            ),
+            "n_am_pulse_extension_signals": int(
+                getattr(scanner, "n_am_pulse_extension_signals", 0) or 0
+            ),
+            "n_am_pulse_extension_emitted": int(
+                getattr(scanner, "n_am_pulse_extension_emitted", 0) or 0
+            ),
+            "n_am_pulse_extension_skip": int(
+                getattr(scanner, "n_am_pulse_extension_skip", 0) or 0
+            ),
+            "n_am_pulse_extension_shadow": int(
+                getattr(scanner, "n_am_pulse_extension_shadow", 0) or 0
+            ),
+        },
         "qqq_open_cont": {
             "enabled": bool(
                 ((getattr(scanner, "profile", None) or {}).get("qqq_open_cont") or {}).get(
@@ -297,6 +396,48 @@ def scanner_snapshot(scanner: Any) -> dict[str, Any]:
             "n_skip": int(getattr(scanner, "n_am_pulse_skip", 0) or 0),
             "n_shadow": int(getattr(scanner, "n_am_pulse_shadow", 0) or 0),
             "pending": int(len(getattr(scanner, "pending_am_pulse", []) or [])),
+        },
+        "am_pulse_extension": {
+            "enabled": bool(
+                (
+                    (getattr(scanner, "profile", None) or {}).get(
+                        "am_pulse_extension"
+                    )
+                    or {}
+                ).get("enabled", False)
+            ),
+            "execute_mode": (
+                (
+                    (getattr(scanner, "profile", None) or {}).get(
+                        "am_pulse_extension"
+                    )
+                    or {}
+                ).get("execute_mode", "shadow")
+            ),
+            "n_signals": int(
+                getattr(scanner, "n_am_pulse_extension_signals", 0) or 0
+            ),
+            "n_emitted": int(
+                getattr(scanner, "n_am_pulse_extension_emitted", 0) or 0
+            ),
+            "n_skip": int(
+                getattr(scanner, "n_am_pulse_extension_skip", 0) or 0
+            ),
+            "n_shadow": int(
+                getattr(scanner, "n_am_pulse_extension_shadow", 0) or 0
+            ),
+            "pending": int(
+                len(getattr(scanner, "pending_am_pulse_extension", []) or [])
+            ),
+        },
+        "entry_morph": {
+            "n_fo_lod_chase_block": int(getattr(scanner, "n_fo_lod_chase_block", 0) or 0),
+            "n_up_gap_stall_block": int(getattr(scanner, "n_up_gap_stall_block", 0) or 0),
+            "n_dn_gap_stall_block": int(getattr(scanner, "n_dn_gap_stall_block", 0) or 0),
+            "n_peer_gap_block": int(getattr(scanner, "n_peer_gap_block", 0) or 0),
+            "n_overnight_gap_block": int(getattr(scanner, "n_overnight_gap_block", 0) or 0),
+            "n_range_stall_block": int(getattr(scanner, "n_range_stall_block", 0) or 0),
+            "n_entry_morph_scale": int(getattr(scanner, "n_entry_morph_scale", 0) or 0),
         },
     }
 
@@ -396,6 +537,65 @@ def restore_scanner(scanner: Any, payload: dict[str, Any]) -> None:
             agg.low = saved.get("low")
             agg.close = saved.get("close")
             agg.volume = float(saved.get("volume") or 0.0)
+
+    watchdog = payload.get("watchdog") or {}
+    scanner._watchdog_state = str(watchdog.get("state") or "off")
+    scanner._watchdog_reason = str(watchdog.get("reason") or "off")
+    scanner._watchdog_route = str(watchdog.get("route") or "baseline")
+    scanner._watchdog_closed = bool(watchdog.get("closed", False))
+    scanner._day_halt = bool(watchdog.get("day_halt", False))
+    wd = getattr(scanner, "watchdog", None)
+    if wd is not None and scanner.current_date and hasattr(scanner, "_eval_watchdog"):
+        scanner._eval_watchdog(str(scanner.current_date), force=True)
+
+    runtime = payload.get("runtime") or {}
+    scanner.pending_hunts = _runtime_from_dict(runtime.get("pending_hunts") or [])
+    scanner.pending_path = _runtime_from_dict(runtime.get("pending_path") or [])
+    scanner.pending_am_pulse = _runtime_from_dict(
+        runtime.get("pending_am_pulse") or []
+    )
+    scanner.pending_am_pulse_extension = _runtime_from_dict(
+        runtime.get("pending_am_pulse_extension") or []
+    )
+    scanner.day_hunt_symbols = set(runtime.get("day_hunt_symbols") or [])
+    scanner.day_hunt_dirs = set(
+        _runtime_from_dict(runtime.get("day_hunt_dirs") or [])
+    )
+    scanner.day_topk_syms = set(runtime.get("day_topk_syms") or [])
+    for name in (
+        "n_hunt_signals",
+        "n_hunt_emitted",
+        "n_hunt_budget_skip",
+        "n_hunt_mutex_skip",
+        "n_am_pulse_signals",
+        "n_am_pulse_emitted",
+        "n_am_pulse_skip",
+        "n_am_pulse_shadow",
+        "n_am_pulse_extension_signals",
+        "n_am_pulse_extension_emitted",
+        "n_am_pulse_extension_skip",
+        "n_am_pulse_extension_shadow",
+    ):
+        if name in runtime:
+            setattr(scanner, name, int(runtime[name] or 0))
+    for lane, state_key in (
+        ("am_pulse", "am_pulse_scout_state"),
+        ("am_pulse_extension", "am_pulse_extension_scout_state"),
+    ):
+        scout_state = _runtime_from_dict(runtime.get(state_key))
+        if not isinstance(scout_state, dict) or not scout_state.get("date"):
+            continue
+        if not hasattr(scanner, "_ensure_am_pulse_scout"):
+            continue
+        scout = scanner._ensure_am_pulse_scout(str(scout_state["date"]), lane)
+        if scout is not None and hasattr(scout, "restore_state"):
+            scout.restore_state(scout_state)
+    if wd is not None:
+        wd._hunt_entries_today = int(
+            runtime.get("n_hunt_emitted")
+            or watchdog.get("n_hunt_emitted")
+            or 0
+        )
 
 
 def write_scanner_snapshot(path: Path, payload: dict[str, Any]) -> None:

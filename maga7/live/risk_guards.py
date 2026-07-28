@@ -21,6 +21,15 @@ class RiskConfig:
     max_exit_chase: int = 3
     day_circuit_force_flatten: bool = True
     halt_entries_on_gap: bool = True
+    # Data-integrity entry gates (anti suicide opens on first dirty print / broken feed).
+    halt_entries_on_feed_unhealthy: bool = True
+    require_live_market_data: bool = True
+    require_entry_quote_stable_ticks: int = 2
+    max_universe_stale_frac: float = 0.34
+    universe_stale_mult: float = 2.5
+    entry_cooldown_after_gap_sec: float = 120.0
+    max_future_skew_sec: float = 1.0
+    max_signal_age_sec: float = 0.0
 
 
 def risk_config_from_trade(trade: dict[str, Any] | None, connector_cfg: Any = None) -> RiskConfig:
@@ -43,6 +52,20 @@ def risk_config_from_trade(trade: dict[str, Any] | None, connector_cfg: Any = No
         max_exit_chase=int(risk.get("max_exit_chase", 3)),
         day_circuit_force_flatten=bool(risk.get("day_circuit_force_flatten", True)),
         halt_entries_on_gap=bool(risk.get("halt_entries_on_gap", True)),
+        halt_entries_on_feed_unhealthy=bool(
+            risk.get("halt_entries_on_feed_unhealthy", True)
+        ),
+        require_live_market_data=bool(risk.get("require_live_market_data", True)),
+        require_entry_quote_stable_ticks=max(
+            1, int(risk.get("require_entry_quote_stable_ticks", 2))
+        ),
+        max_universe_stale_frac=float(risk.get("max_universe_stale_frac", 0.34)),
+        universe_stale_mult=float(risk.get("universe_stale_mult", 2.5)),
+        entry_cooldown_after_gap_sec=float(
+            risk.get("entry_cooldown_after_gap_sec", 120.0)
+        ),
+        max_future_skew_sec=max(0.0, float(risk.get("max_future_skew_sec", 1.0))),
+        max_signal_age_sec=max(0.0, float(risk.get("max_signal_age_sec", 0.0))),
     )
 
 
@@ -52,10 +75,17 @@ def quote_mid(bid: float, ask: float) -> float | None:
     return 0.5 * (bid + ask)
 
 
-def is_fresh(ts: float | None, *, now: float, max_age_sec: float) -> bool:
+def is_fresh(
+    ts: float | None,
+    *,
+    now: float,
+    max_age_sec: float,
+    max_future_skew_sec: float = 1.0,
+) -> bool:
     if ts is None or not math.isfinite(float(ts)):
         return False
-    return (now - float(ts)) <= float(max_age_sec)
+    age = float(now) - float(ts)
+    return -float(max_future_skew_sec) <= age <= float(max_age_sec)
 
 
 def spread_pct(bid: float, ask: float) -> float | None:
@@ -124,18 +154,131 @@ def entry_quote_ok(
     ask: float,
     prev_mid: float | None,
     cfg: RiskConfig,
+    max_spread_pct: float | None = None,
+    min_mid: float | None = None,
 ) -> tuple[bool, str, float | None]:
     """Validate option quote for entry. Returns (ok, reason, mid)."""
     mid = quote_mid(bid, ask)
     if mid is None:
         return False, "bad_quote", None
-    ok, reason = spread_ok(bid, ask, max_spread_pct=cfg.max_spread_pct)
+    if min_mid is not None and mid < float(min_mid):
+        return False, "entry_mid_too_low", mid
+    spread_cap = (
+        float(cfg.max_spread_pct)
+        if max_spread_pct is None
+        else min(float(cfg.max_spread_pct), float(max_spread_pct))
+    )
+    ok, reason = spread_ok(bid, ask, max_spread_pct=spread_cap)
     if not ok:
         return False, reason, mid
     jump = mid_jump_pct(prev_mid, mid)
     if jump is not None and jump > cfg.max_entry_mid_jump_pct:
         return False, "entry_mid_jump", mid
     return True, "ok", mid
+
+
+def signal_quote_lag_ok(
+    *,
+    signal_ts: float,
+    quote_ts: float,
+    max_lag_sec: float | None,
+) -> tuple[bool, str, float | None]:
+    """Match offline entry semantics: first usable quote must follow signal promptly."""
+    if max_lag_sec is None or float(max_lag_sec) <= 0:
+        return True, "ok", None
+    if not (
+        math.isfinite(float(signal_ts))
+        and float(signal_ts) > 0
+        and math.isfinite(float(quote_ts))
+        and float(quote_ts) > 0
+    ):
+        return False, "option_quote_timestamp_missing", None
+    lag = float(quote_ts) - float(signal_ts)
+    if lag < 0:
+        return False, "option_quote_before_signal", lag
+    if lag > float(max_lag_sec):
+        return False, "option_quote_lag_exceeded", lag
+    return True, "ok", lag
+
+
+def entry_feed_ok(
+    *,
+    connected: bool,
+    data_mode: str | None,
+    stock_lags_sec: dict[str, float | None],
+    cfg: RiskConfig,
+    now: float | None = None,
+    last_gap_event_ts: float = 0.0,
+) -> tuple[bool, str]:
+    """Hard gate: refuse new entries when the live tape looks broken.
+
+    Covers IB disconnect, non-LIVE MD (incl. shadow/dry), universe staleness,
+    and a cooldown after GAP_FLATTEN so we don't reopen into a sick book.
+    """
+    _ = now  # reserved for future absolute-clock checks
+    if not cfg.halt_entries_on_feed_unhealthy:
+        return True, "ok"
+    if not connected:
+        return False, "ibkr_disconnected"
+    if cfg.require_live_market_data and str(data_mode or "").upper() != "LIVE":
+        mode = str(data_mode or "unknown").lower() or "unknown"
+        return False, f"market_data_{mode}"
+    cooldown = float(cfg.entry_cooldown_after_gap_sec)
+    if cooldown > 0 and last_gap_event_ts > 0 and now is not None:
+        if (float(now) - float(last_gap_event_ts)) < cooldown:
+            return False, "gap_cooldown"
+    symbols = [str(s).upper() for s in stock_lags_sec.keys()]
+    if len(symbols) >= 3:
+        max_lag = max(
+            float(cfg.max_stock_staleness_sec) * float(cfg.universe_stale_mult),
+            float(cfg.max_stock_staleness_sec) + 1.0,
+        )
+        stale_n = 0
+        for sym in symbols:
+            lag = stock_lags_sec.get(sym)
+            if lag is None or not math.isfinite(float(lag)) or float(lag) > max_lag:
+                stale_n += 1
+        frac = stale_n / float(len(symbols))
+        if frac > float(cfg.max_universe_stale_frac):
+            return False, "universe_stale"
+    return True, "ok"
+
+
+def next_entry_quote_stable_ticks(
+    *,
+    prev_stable: int,
+    quote_ok: bool,
+    prev_mid: float | None,
+    require_ticks: int,
+    prev_quote_ts: float | None = None,
+    quote_ts: float | None = None,
+) -> tuple[int, bool, str]:
+    """Accumulate consecutive good option prints before allowing entry.
+
+    First print after missing/stale (prev_mid is None) never opens — it only
+    warms the streak. Returns (new_stable, ready, reason).
+    """
+    need = max(1, int(require_ticks))
+    if not quote_ok:
+        return 0, False, "bad_quote"
+    if (
+        prev_quote_ts is not None
+        and quote_ts is not None
+        and (
+            not math.isfinite(float(prev_quote_ts))
+            or not math.isfinite(float(quote_ts))
+            or float(quote_ts) <= float(prev_quote_ts)
+        )
+    ):
+        return int(prev_stable), False, "option_quote_not_advanced"
+    if max(1, int(require_ticks)) <= 1:
+        return max(1, int(prev_stable)), True, "ok"
+    if prev_mid is None:
+        return 1, False, "option_quote_warmup"
+    stable = int(prev_stable) + 1
+    if stable < need:
+        return stable, False, "option_quote_warmup"
+    return stable, True, "ok"
 
 
 def observe_exit_mid(

@@ -1,7 +1,7 @@
-"""AM pulse scout + tradable sleeve helpers (09:30–10:25).
+"""AM pulse scout + tradable sleeve helpers (A 09:30–10:30; B 10:30–11:30).
 
 Alert path: emits ``AM_SCOUT_ALERT`` (ops / dash).
-Sleeve path: Mag7Scanner.drain_am_pulse → satellite OMS (shadow by default).
+Sleeve path: Mag7Scanner A/B drains → satellite OMS (shadow by default).
 
 Arms (each arm ≤ max_alerts_per_symbol per symbol×day; FO preferred on same bar):
   FO   — |fav_from_open| ≥ min_fav_from_open
@@ -26,10 +26,10 @@ DEFAULT_LIVE: dict[str, Any] = {
     "enabled": False,
     "execute_mode": "shadow",  # shadow | live | off
     "arm": "FO",
-    "dirs": ["DN"],
+    "dirs": ["DN", "UP"],
     "window_start": "09:30",
-    "window_end": "10:25",
-    "flatten_before": "10:30",
+    "window_end": "10:30",
+    "flatten_before": "10:45",
     "min_fav_from_open": 0.008,
     "lookback_bars": 2,
     "min_lookback_ret": 0.99,  # FO-only live default
@@ -52,12 +52,17 @@ class AmPulseScoutConfig:
     window_start: str = "09:30"
     window_end: str = "10:30"  # exclusive — CORE ownership from 10:30
     min_fav_from_open: float = 0.01
+    # 0 = off. Blocks FO when |from_open| already exceeds this (chase).
+    max_fav_from_open: float = 0.0
     lookback_bars: int = 2  # 1m bars → ~2 minutes
     min_lookback_ret: float = 0.008
     min_chase: float | None = None  # optional FO arm tighten
     dirs: tuple[str, ...] = ("DN", "UP")
     max_alerts_per_symbol: int = 1
     symbols: tuple[str, ...] | None = None
+    # If True, only latch day_open from the 09:30 RTH bar (or seed_day_open).
+    # Prevents late-start / restart from treating a mid-session open as RTH open.
+    rth_open_only: bool = True
 
 
 @dataclass(frozen=True)
@@ -99,31 +104,42 @@ def parse_am_pulse_scout(raw: Any) -> AmPulseScoutConfig:
     elif isinstance(syms_raw, (list, tuple)):
         syms = tuple(str(x).strip().upper() for x in syms_raw if str(x).strip())
     chase = raw.get("min_chase")
+    max_fo_raw = raw.get("max_fav_from_open", 0.0)
+    try:
+        max_fo = float(max_fo_raw) if max_fo_raw is not None else 0.0
+    except (TypeError, ValueError):
+        max_fo = 0.0
+    rth_only = raw.get("rth_open_only", True)
     return AmPulseScoutConfig(
         enabled=bool(raw.get("enabled", True)),
         window_start=str(raw.get("window_start") or "09:30"),
         window_end=str(raw.get("window_end") or "10:30"),
         min_fav_from_open=float(raw.get("min_fav_from_open", 0.01) or 0.01),
+        max_fav_from_open=max(0.0, float(max_fo) or 0.0),
         lookback_bars=max(1, int(raw.get("lookback_bars", 2) or 2)),
         min_lookback_ret=float(raw.get("min_lookback_ret", 0.008) or 0.008),
         min_chase=float(chase) if chase is not None else None,
         dirs=dirs,
         max_alerts_per_symbol=max(1, int(raw.get("max_alerts_per_symbol", 1) or 1)),
         symbols=syms,
+        rth_open_only=bool(True if rth_only is None else rth_only),
     )
 
 
-def load_am_pulse_cfg(profile: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Merge profile ``am_pulse`` block onto live champion defaults."""
+def load_am_pulse_lane_cfg(
+    profile: dict[str, Any] | None = None,
+    lane: str = "am_pulse",
+) -> dict[str, Any]:
+    """Merge one AM pulse lane block onto live champion defaults."""
     cfg = dict(DEFAULT_LIVE)
     if not isinstance(profile, dict):
         return cfg
-    block = profile.get("am_pulse")
+    block = profile.get(str(lane))
     if not isinstance(block, dict):
         return cfg
     cfg.update(block)
     # Normalize enums / lists
-    dirs = cfg.get("dirs") or ["DN"]
+    dirs = cfg.get("dirs") or ["DN", "UP"]
     if isinstance(dirs, str):
         cfg["dirs"] = [x.strip().upper() for x in dirs.split(",") if x.strip()]
     else:
@@ -141,13 +157,26 @@ def load_am_pulse_cfg(profile: dict[str, Any] | None = None) -> dict[str, Any]:
     return cfg
 
 
-def am_pulse_enabled(profile: dict[str, Any] | None) -> bool:
+def load_am_pulse_cfg(profile: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Backward-compatible loader for the original ``am_pulse`` lane."""
+    return load_am_pulse_lane_cfg(profile, "am_pulse")
+
+
+def am_pulse_lane_enabled(
+    profile: dict[str, Any] | None,
+    lane: str = "am_pulse",
+) -> bool:
     if not isinstance(profile, dict):
         return False
-    block = profile.get("am_pulse")
+    block = profile.get(str(lane))
     if not isinstance(block, dict):
         return False
     return bool(block.get("enabled", False))
+
+
+def am_pulse_enabled(profile: dict[str, Any] | None) -> bool:
+    """Backward-compatible enabled check for the original lane."""
+    return am_pulse_lane_enabled(profile, "am_pulse")
 
 
 def scout_config_from_live(cfg: dict[str, Any]) -> AmPulseScoutConfig:
@@ -164,16 +193,24 @@ def scout_config_from_live(cfg: dict[str, Any]) -> AmPulseScoutConfig:
         dirs_t = tuple(x.strip().upper() for x in dirs.split(",") if x.strip())
     else:
         dirs_t = tuple(str(x).strip().upper() for x in dirs if str(x).strip())
+    max_fo_raw = cfg.get("max_fav_from_open", 0.0)
+    try:
+        max_fo = float(max_fo_raw) if max_fo_raw is not None else 0.0
+    except (TypeError, ValueError):
+        max_fo = 0.0
+    rth_only = cfg.get("rth_open_only", True)
     return AmPulseScoutConfig(
         enabled=True,
         window_start=str(cfg.get("window_start") or "09:30"),
-        window_end=str(cfg.get("window_end") or "10:25"),
+        window_end=str(cfg.get("window_end") or "10:30"),
         min_fav_from_open=fo,
+        max_fav_from_open=max(0.0, float(max_fo) or 0.0),
         lookback_bars=max(1, int(cfg.get("lookback_bars", 2) or 2)),
         min_lookback_ret=lb,
-        dirs=dirs_t or ("DN",),
+        dirs=dirs_t or ("DN", "UP"),
         max_alerts_per_symbol=1,
         symbols=None,
+        rth_open_only=bool(True if rth_only is None else rth_only),
     )
 
 
@@ -212,8 +249,69 @@ class AmPulseScout:
         self._hi.clear()
         self._lo.clear()
 
+    def seed_day_open(self, symbol: str, day_open: float) -> None:
+        """Latch RTH open from an external source (scanner state / official open).
+
+        Never overwrites an already-latched open for the day.
+        """
+        sym = str(symbol).upper()
+        px = float(day_open)
+        if sym and px > 0 and sym not in self._day_open:
+            self._day_open[sym] = px
+
     def _arm_budget(self, sym: str, arm: str) -> bool:
         return int(self._alerts_n.get((sym, arm), 0)) < int(self.cfg.max_alerts_per_symbol)
+
+    @staticmethod
+    def _is_rth_open_bar(ts: pd.Timestamp) -> bool:
+        t = pd.Timestamp(ts)
+        if t.tzinfo is None:
+            t = t.tz_localize(NY)
+        else:
+            t = t.tz_convert(NY)
+        return int(t.hour) == 9 and int(t.minute) == 30
+
+    def snapshot_state(self) -> dict[str, Any]:
+        """Return JSON-safe detector state for restart continuity."""
+        return {
+            "date": self._date,
+            "alerts_n": [
+                {"symbol": sym, "arm": arm, "n": int(n)}
+                for (sym, arm), n in sorted(self._alerts_n.items())
+            ],
+            "closes": {sym: list(values) for sym, values in self._closes.items()},
+            "day_open": dict(self._day_open),
+            "hi": dict(self._hi),
+            "lo": dict(self._lo),
+        }
+
+    def restore_state(self, payload: dict[str, Any] | None) -> None:
+        """Restore a prior ``snapshot_state`` payload."""
+        raw = payload if isinstance(payload, dict) else {}
+        self._date = str(raw.get("date")) if raw.get("date") else None
+        self._alerts_n = {
+            (str(row.get("symbol") or "").upper(), str(row.get("arm") or "").upper()): int(
+                row.get("n") or 0
+            )
+            for row in (raw.get("alerts_n") or [])
+            if row.get("symbol") and row.get("arm")
+        }
+        self._closes = {
+            str(sym).upper(): [float(value) for value in (values or [])]
+            for sym, values in (raw.get("closes") or {}).items()
+        }
+        self._day_open = {
+            str(sym).upper(): float(value)
+            for sym, value in (raw.get("day_open") or {}).items()
+        }
+        self._hi = {
+            str(sym).upper(): float(value)
+            for sym, value in (raw.get("hi") or {}).items()
+        }
+        self._lo = {
+            str(sym).upper(): float(value)
+            for sym, value in (raw.get("lo") or {}).items()
+        }
 
     def on_bar(
         self,
@@ -232,13 +330,21 @@ class AmPulseScout:
             return None
         if self._date is None:
             return None
-        if not _in_window(ts, self.cfg.window_start, self.cfg.window_end):
-            return None
         if not (open_ > 0 and close > 0 and high > 0 and low > 0):
             return None
 
+        # Latch RTH open only once: prefer 09:30 bar, or first bar if rth_open_only=False.
         if sym not in self._day_open:
-            self._day_open[sym] = float(open_)
+            allow_latch = (not bool(self.cfg.rth_open_only)) or self._is_rth_open_bar(ts)
+            if allow_latch:
+                self._day_open[sym] = float(open_)
+                self._hi[sym] = float(high)
+                self._lo[sym] = float(low)
+                self._closes[sym] = []
+        if sym not in self._day_open:
+            # No official open yet (late start without seed) — do not invent one.
+            return None
+        if sym not in self._hi:
             self._hi[sym] = float(high)
             self._lo[sym] = float(low)
             self._closes[sym] = []
@@ -257,6 +363,10 @@ class AmPulseScout:
             p0 = closes[-(int(self.cfg.lookback_bars) + 1)]
             if p0 > 0:
                 lb_ret = px / p0 - 1.0
+        # Keep RTH-open/session state before a delayed lane starts, but never
+        # consume its independent trigger budget outside that lane's window.
+        if not _in_window(ts, self.cfg.window_start, self.cfg.window_end):
+            return None
 
         def _chase_dist(direction: str) -> tuple[float, float]:
             if hi > lo:
@@ -267,9 +377,14 @@ class AmPulseScout:
                 return float(rng), float((hi - px) / day_open)
             return float(1.0 - rng), float((px - lo) / day_open)
 
+        max_fo = float(self.cfg.max_fav_from_open or 0.0)
+        fo_ok = abs(from_open) + 1e-12 >= float(self.cfg.min_fav_from_open)
+        if max_fo > 0:
+            fo_ok = fo_ok and abs(from_open) - 1e-12 <= max_fo
+
         # Prefer FO arm (opening extension), else lookback impulse.
         alert: AmScoutAlert | None = None
-        if self._arm_budget(sym, "FO") and abs(from_open) + 1e-12 >= float(self.cfg.min_fav_from_open):
+        if self._arm_budget(sym, "FO") and fo_ok:
             d = "UP" if from_open >= 0 else "DN"
             if d in set(self.cfg.dirs):
                 chase, dist = _chase_dist(d)

@@ -222,6 +222,10 @@ class Mag7RedisScannerLoop:
             for sig in self.scanner.drain_am_pulse(frame_ts):
                 if sig not in signals:
                     signals.append(sig)
+        if hasattr(self.scanner, "drain_am_pulse_extension"):
+            for sig in self.scanner.drain_am_pulse_extension(frame_ts):
+                if sig not in signals:
+                    signals.append(sig)
 
         # Phase 4: commit entries after the complete cross-symbol frame.
         if self.stub is not None:

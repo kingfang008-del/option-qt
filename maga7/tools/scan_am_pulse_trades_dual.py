@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""AM pulse scout → tradable sleeve (trades last±slip, TP/SL) dual-window.
+"""A-window AM pulse scout → trades last±slip TP/SL dual-window.
 
-Arms from 1m Mag7 bars in 09:30–10:25 (hard stop before CORE 10:30):
+Defaults come from profile ``am_pulse`` (LOCK: 09:30–10:30, flatten 10:45):
   FO — first |fav_from_open| ≥ thr
   LB — first |ret over lookback_bars| ≥ thr
 
@@ -26,7 +26,11 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from maga7.common.am_pulse_scout import parse_am_pulse_scout, scan_day
+from maga7.common.am_pulse_scout import (
+    load_am_pulse_lane_cfg,
+    parse_am_pulse_scout,
+    scan_day,
+)
 from maga7.common.config import load_profile
 from maga7.common.open_lock import (
     load_multidte_lock_index,
@@ -52,8 +56,7 @@ WINDOWS = (
     ("may_jul09", "2026-05-01", "2026-07-09"),
     ("jul10_23", "2026-07-10", "2026-07-23"),
 )
-SESSION = "AM_0930_1025"
-SIGNAL_END = "10:25"
+SESSION = "AM_0930_1030"
 
 
 def _window_of(date: str) -> str | None:
@@ -79,14 +82,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--profile", default=PROFILE)
     ap.add_argument("--tag", default="research_am_pulse_trades_dual")
     ap.add_argument("--trades-root", default=str(DEFAULT_TRADES))
-    ap.add_argument("--dirs", default="DN")
+    ap.add_argument("--dirs", default="", help="Empty = profile am_pulse directions")
     ap.add_argument("--arms", default="FO,LB", help="FO and/or LB")
     ap.add_argument("--fo-thr", default="0.008,0.01,0.012,0.015")
     ap.add_argument("--lb-thr", default="0.006,0.008,0.01")
     ap.add_argument("--lookback-bars", type=int, default=2)
     ap.add_argument("--tp", default="0.10,0.15,0.20,0.25")
     ap.add_argument("--sl", default="0.12,0.15,0.20,0.25")
-    ap.add_argument("--max-hold-sec", type=int, default=900)
+    ap.add_argument("--max-hold-sec", type=int, default=0, help="0 = profile am_pulse value")
     ap.add_argument("--slip", type=float, default=0.01)
     ap.add_argument("--position-frac", type=float, default=0.10)
     ap.add_argument("--max-concurrent", type=int, default=2)
@@ -95,14 +98,29 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-day-win", type=float, default=0.55)
     args = ap.parse_args(argv)
 
-    dirs = {x.strip().upper() for x in args.dirs.split(",") if x.strip()}
+    prof = load_profile(args.profile)
+    lane_cfg = load_am_pulse_lane_cfg(prof, "am_pulse")
+    dirs_spec = args.dirs or ",".join(lane_cfg.get("dirs") or ["DN", "UP"])
+    dirs = {x.strip().upper() for x in dirs_spec.split(",") if x.strip()}
     want_arms = {x.strip().upper() for x in args.arms.split(",") if x.strip()}
     fo_thrs = [float(x) for x in args.fo_thr.split(",") if x.strip()]
     lb_thrs = [float(x) for x in args.lb_thr.split(",") if x.strip()]
     tps = [float(x) for x in args.tp.split(",") if x.strip()]
     sls = [float(x) for x in args.sl.split(",") if x.strip()]
-
-    prof = load_profile(args.profile)
+    window_start = str(lane_cfg.get("window_start") or "09:30")
+    window_end = str(lane_cfg.get("window_end") or "10:30")
+    flatten_before = str(lane_cfg.get("flatten_before") or "").strip()
+    max_fo = float(lane_cfg.get("max_fav_from_open", 0.0) or 0.0)
+    max_hold_sec = (
+        int(args.max_hold_sec)
+        if int(args.max_hold_sec) > 0
+        else int(lane_cfg.get("max_hold_sec", 900) or 900)
+    )
+    prefer_dte = int(lane_cfg.get("prefer_dte", 0) or 0)
+    allowed_raw = lane_cfg.get("allowed_dte") or (prof.get("lock") or {}).get(
+        "allowed_dte"
+    ) or [0, 1, 2]
+    allowed_dte = [int(x) for x in allowed_raw]
     paths = prof["_paths"]
     symbols = list(prof.get("symbols") or [])
     stock_root = Path(paths["stock_root"])
@@ -167,9 +185,10 @@ def main(argv: list[str] | None = None) -> int:
                     cfg = parse_am_pulse_scout(
                         {
                             "enabled": True,
-                            "window_start": "09:30",
-                            "window_end": SIGNAL_END,
+                            "window_start": window_start,
+                            "window_end": window_end,
                             "min_fav_from_open": thr,
+                            "max_fav_from_open": max_fo,
                             "lookback_bars": int(args.lookback_bars),
                             "min_lookback_ret": 0.99,  # disable LB for this pass
                             "dirs": sorted(dirs),
@@ -190,8 +209,8 @@ def main(argv: list[str] | None = None) -> int:
                             direction=a.dir,
                             moneyness="ATM",
                             spot=spot,
-                            prefer_dte=0,
-                            allowed_dte=[0, 1, 2],
+                            prefer_dte=prefer_dte,
+                            allowed_dte=allowed_dte,
                             clear_otm_thresh=0.01,
                             ladder=True,
                             otm_rungs=otm,
@@ -226,9 +245,10 @@ def main(argv: list[str] | None = None) -> int:
                     cfg = parse_am_pulse_scout(
                         {
                             "enabled": True,
-                            "window_start": "09:30",
-                            "window_end": SIGNAL_END,
+                            "window_start": window_start,
+                            "window_end": window_end,
                             "min_fav_from_open": 0.99,  # disable FO
+                            "max_fav_from_open": max_fo,
                             "lookback_bars": int(args.lookback_bars),
                             "min_lookback_ret": thr,
                             "dirs": sorted(dirs),
@@ -249,8 +269,8 @@ def main(argv: list[str] | None = None) -> int:
                             direction=a.dir,
                             moneyness="ATM",
                             spot=spot,
-                            prefer_dte=0,
-                            allowed_dte=[0, 1, 2],
+                            prefer_dte=prefer_dte,
+                            allowed_dte=allowed_dte,
                             clear_otm_thresh=0.01,
                             ladder=True,
                             otm_rungs=otm,
@@ -327,13 +347,25 @@ def main(argv: list[str] | None = None) -> int:
             if wname is None:
                 continue
             entry_ts = arm["arm_ts"]
+            hold_sec = max_hold_sec
+            if flatten_before:
+                flat_ts = pd.Timestamp(
+                    f"{arm['date']} {flatten_before}", tz=NY
+                )
+                hold_sec = min(
+                    hold_sec,
+                    max(
+                        1,
+                        int((flat_ts - to_ny(entry_ts)).total_seconds()),
+                    ),
+                )
             sim = simulate_trade_tpsl(
                 arm["pts"],
                 arm["plast"],
                 entry_ts,
                 tp=float(cell["tp"]),
                 sl=float(cell["sl"]),
-                max_hold_sec=int(args.max_hold_sec),
+                max_hold_sec=hold_sec,
                 slip=float(args.slip),
             )
             if sim is None or not np.isfinite(sim["ret"]):

@@ -20,7 +20,18 @@ import pandas as pd
 from maga7.common.exit_arms import build_exit_arms, build_exit_health
 from maga7.common.fills import FillSpec
 from maga7.common.hold_watchdog import hold_watchdog_from_trade, qqq_adverse_from_prices
-from maga7.common.delta_time_stop import StockRevExitConfig, stock_rev_exit_from_trade
+from maga7.common.profit_protect import profit_protect_from_raw, profit_protect_on_tick
+from maga7.common.delta_time_stop import (
+    StockRevExitConfig,
+    stock_rev_applies_to_route,
+    stock_rev_exit_from_trade,
+)
+from maga7.common.confirm_abort import (
+    ConfirmAbortState,
+    confirm_abort_applies,
+    confirm_abort_from_raw,
+    confirm_abort_on_tick,
+)
 from maga7.common.wave_confirm import WaveAbortState, wave_abort_from_trade, wave_abort_on_tick
 from maga7.common.ladder_active import ladder_active_from_trade
 from maga7.common.path_fast_pack import (
@@ -48,13 +59,16 @@ from maga7.live.requote import (
     requote_config_from_trade,
 )
 from maga7.live.risk_guards import (
+    entry_feed_ok,
     entry_quote_ok,
     fill_adverse,
     is_fresh,
+    next_entry_quote_stable_ticks,
     observe_exit_mid,
     quote_mid,
     quote_spread_fields,
     risk_config_from_trade,
+    signal_quote_lag_ok,
 )
 from maga7.live.scanner import Mag7Scanner, ScannerSignal
 from qqq_btc.common.fill_model import OptionSpreadFillModel
@@ -78,6 +92,7 @@ FORCE_EXIT_REASONS = {
     "GAP_FLATTEN",
     "ADVERSE_FILL_FLATTEN",
     "TRADE_TOX_RECONNECT",
+    "RECOVERY_GUARD_FLATTEN",
 }
 
 
@@ -124,6 +139,13 @@ class LivePosition:
     exit_hold_sec: float | None = None
     exit_simple: bool = False
     exit_flatten_before: str | None = None  # HH:MM NY — force exit before CORE
+    # AM_EXT post-fill confirm-or-abort (option mark); see confirm_abort.py.
+    confirm_abort: dict[str, Any] | None = None
+    confirm_abort_confirmed: bool = False
+    confirm_abort_done: bool = False
+    # Peak-armed profit floor for satellite sleeves.
+    profit_protect: dict[str, Any] | None = None
+    route: str = "baseline"  # baseline | hunt | am_pulse | …
 
 
 @dataclass
@@ -279,10 +301,15 @@ class Mag7BrokerOms:
         self.pending_signals: dict[str, tuple[ScannerSignal, float]] = {}
         self.open_until: dict[str, pd.Timestamp] = {}
         self.exit_reason_counts: dict[str, int] = {}
+        self._last_size_reject: dict[str, Any] | None = None
         self.seen_fills: set[str] = set()
         self.seen_commissions: set[str] = set()
         self._bound_order_refs: set[str] = set()
         self._last_seen_option_mid: dict[tuple[str, str], float] = {}
+        self._entry_quote_stable: dict[tuple[str, str], int] = {}
+        self._last_entry_quote_ts: dict[tuple[str, str], float] = {}
+        self._last_gap_event_ts: float = 0.0
+        self._pending_force_exits: dict[str, str] = {}
         self._flattening_circuit = False
         self.reconcile_ok = self.mode == "shadow"
         self.last_reconcile: dict[str, Any] = {
@@ -437,6 +464,22 @@ class Mag7BrokerOms:
                 for symbol, (signal, created) in self.pending_signals.items()
             },
             "open_until": {key: value.isoformat() for key, value in self.open_until.items()},
+            "data_guard_state": {
+                "last_gap_event_ts": float(self._last_gap_event_ts or 0.0),
+                "entry_quote_stable": {
+                    f"{symbol}\t{contract}": int(value)
+                    for (symbol, contract), value in self._entry_quote_stable.items()
+                },
+                "last_entry_quote_ts": {
+                    f"{symbol}\t{contract}": float(value)
+                    for (symbol, contract), value in self._last_entry_quote_ts.items()
+                },
+                "last_seen_option_mid": {
+                    f"{symbol}\t{contract}": float(value)
+                    for (symbol, contract), value in self._last_seen_option_mid.items()
+                },
+                "pending_force_exits": dict(self._pending_force_exits),
+            },
             "exit_reason_counts": dict(self.exit_reason_counts),
             "exit_arms": self.exit_arms_snapshot(),
             "exit_health": self.exit_health_snapshot(),
@@ -583,31 +626,13 @@ class Mag7BrokerOms:
         except Exception as exc:
             raise RuntimeError(f"cannot restore OMS state: {exc}") from exc
         if raw.get("profile_hash") != self.profile_hash:
-            # Mid-day live hotfixes change LIVE_FILES hash. Prefer continuing when
-            # this session already has a LOCKED open-lock manifest (even with a
-            # flat or open book); refuse only when lock evidence is missing.
-            locks_ok = False
-            locks_path = self.session_dir / "locks.json"
-            if locks_path.is_file():
-                try:
-                    locks_doc = json.loads(locks_path.read_text(encoding="utf-8"))
-                    locks_ok = (
-                        str(locks_doc.get("status") or "") == "LOCKED"
-                        and str(locks_doc.get("session_id") or "") == self.session_id
-                    )
-                except Exception:
-                    locks_ok = False
-            open_book = bool(raw.get("positions") or {}) or bool(
-                raw.get("intents") or {}
-            ) or bool(raw.get("pending_signals") or {})
-            if not locks_ok:
+            if not bool(self.profile.get("_allow_code_drift", False)):
                 raise RuntimeError("OMS state profile hash mismatch")
             logger.warning(
                 "OMS resume profile_hash mismatch saved=%s live=%s "
-                "(LOCKED session open_book=%s — continuing after code hotfix)",
+                "(explicit code-drift override)",
                 str(raw.get("profile_hash") or "")[:12],
                 str(self.profile_hash or "")[:12],
-                open_book,
             )
         if raw.get("trade_date") != self.trade_date:
             raise RuntimeError("OMS state trade date mismatch")
@@ -651,6 +676,34 @@ class Mag7BrokerOms:
         self.open_until = {
             key: to_ny(value) for key, value in (raw.get("open_until") or {}).items()
         }
+        guard = raw.get("data_guard_state") or {}
+
+        def _restore_contract_map(name: str, cast):
+            restored = {}
+            for key, value in (guard.get(name) or {}).items():
+                parts = str(key).split("\t", 1)
+                if len(parts) != 2:
+                    continue
+                try:
+                    restored[(parts[0].upper(), parts[1])] = cast(value)
+                except (TypeError, ValueError):
+                    continue
+            return restored
+
+        self._last_gap_event_ts = float(guard.get("last_gap_event_ts") or 0.0)
+        self._entry_quote_stable = _restore_contract_map(
+            "entry_quote_stable", int
+        )
+        self._last_entry_quote_ts = _restore_contract_map(
+            "last_entry_quote_ts", float
+        )
+        self._last_seen_option_mid = _restore_contract_map(
+            "last_seen_option_mid", float
+        )
+        self._pending_force_exits = {
+            str(symbol).upper(): str(reason)
+            for symbol, reason in (guard.get("pending_force_exits") or {}).items()
+        }
         raw_counts = raw.get("exit_reason_counts") or {}
         if isinstance(raw_counts, dict):
             self.exit_reason_counts = {
@@ -664,12 +717,18 @@ class Mag7BrokerOms:
                 if position.status in {"OPEN", "EXIT_PENDING"}:
                     position.toxic_reconnect_pending = True
                     armed += 1
+        reconcile = self._reconcile_restored_occupancy()
         self._event(
             "STATE_RESTORED",
             {
                 "positions": len(self.positions),
                 "intents": len(self.intents),
                 "toxic_reconnect_armed": armed,
+                "occupancy": sorted(self._active_occupancy_symbols()),
+                "open_until": {
+                    key: value.isoformat() for key, value in self.open_until.items()
+                },
+                **reconcile,
             },
         )
         if armed:
@@ -677,6 +736,79 @@ class Mag7BrokerOms:
                 "TOXIC_RECONNECT_ARMED",
                 {"n_positions": armed, "cut_ret": float(self.trade_toxic.cut_ret)},
             )
+
+    def _wall_clock_ny(self) -> pd.Timestamp:
+        return pd.Timestamp.now(tz="America/New_York")
+
+    def _sizing_clock(self, entry_ts) -> pd.Timestamp:
+        """Concurrent seats must follow wall time on live deferred signals.
+
+        ``open_until`` is stamped at wall-clock close. Comparing it to a lagged
+        ``sig_ts`` (ENTRY_WAIT retry) keeps just-closed names occupied and
+        falsely trips ``size_gate`` / max_concurrent.
+        """
+        signal_clock = to_ny(entry_ts)
+        wall = self._wall_clock_ny()
+        if signal_clock is None:
+            return wall
+        return wall if wall > signal_clock else signal_clock
+
+    def _active_occupancy_symbols(self) -> list[str]:
+        out: list[str] = []
+        for symbol, position in self.positions.items():
+            if position.status in {"OPEN", "EXIT_PENDING"}:
+                out.append(str(symbol).upper())
+        return out
+
+    def _reconcile_restored_occupancy(self) -> dict[str, Any]:
+        """Drop stale cooldowns; finish shadow EXIT_PENDING so seats free on resume."""
+        wall = self._wall_clock_ny()
+        pruned = [
+            key
+            for key, until in list(self.open_until.items())
+            if until is None or to_ny(until) <= wall
+        ]
+        for key in pruned:
+            self.open_until.pop(key, None)
+        shadow_closed: list[str] = []
+        if self.mode == "shadow":
+            for symbol, position in list(self.positions.items()):
+                if position.status != "EXIT_PENDING":
+                    continue
+                quote = self._position_quote_fallback(position)
+                if quote is None:
+                    mid = float(position.last_good_mid or position.entry_price or 0.0)
+                    if mid <= 0:
+                        # No mark — scrub ghost seat rather than block sizing forever.
+                        self.positions.pop(symbol, None)
+                        shadow_closed.append(str(symbol).upper())
+                        self._event(
+                            "RESUME_SCRUB_POSITION",
+                            {
+                                "symbol": symbol,
+                                "reason": "exit_pending_no_quote",
+                            },
+                        )
+                        continue
+                    quote = {"bid": mid, "ask": mid, "ts": time.time()}
+                limit = float(quote["bid"])
+                self._event(
+                    "RESUME_FORCE_CLOSE",
+                    {
+                        "symbol": symbol,
+                        "reason": "exit_pending_on_restore",
+                        "limit": limit,
+                    },
+                )
+                # Re-open status so _submit_exit accepts the flatten.
+                position.status = "OPEN"
+                self._submit_exit(position, "RESUME_FLATTEN", limit, quote)
+                if symbol not in self.positions:
+                    shadow_closed.append(str(symbol).upper())
+        return {
+            "open_until_pruned": pruned,
+            "shadow_exit_pending_closed": shadow_closed,
+        }
 
     def _runtime_armed(self) -> bool:
         raw = self.redis.hget("meta:runtime_trading_controls:maga7", "trading_enabled")
@@ -724,8 +856,12 @@ class Mag7BrokerOms:
         quote = self.connector.option_quotes.get((symbol, contract))
         if not quote:
             return None
-        age = time.time() - float(quote.get("ts", 0.0))
-        if age > self.risk_cfg.max_option_staleness_sec:
+        if not is_fresh(
+            float(quote.get("ts", 0.0)),
+            now=time.time(),
+            max_age_sec=self.risk_cfg.max_option_staleness_sec,
+            max_future_skew_sec=self.risk_cfg.max_future_skew_sec,
+        ):
             return None
         return quote
 
@@ -866,13 +1002,82 @@ class Mag7BrokerOms:
             float(last),
             now=now_ts,
             max_age_sec=self.risk_cfg.max_stock_staleness_sec,
+            max_future_skew_sec=self.risk_cfg.max_future_skew_sec,
         ):
             return False, "stock_stale"
         return True, "ok"
 
+    def _stock_lag_map(self, *, now: float | None = None) -> dict[str, float | None]:
+        now_ts = time.time() if now is None else float(now)
+        ticks = getattr(self.connector, "last_stock_tick", None) or {}
+        symbols = list(getattr(self.connector, "symbols", None) or [])
+        if not symbols:
+            symbols = list(getattr(self.connector, "trade_symbols", None) or [])
+        out: dict[str, float | None] = {}
+        for raw in symbols:
+            sym = str(raw).upper()
+            last = ticks.get(sym)
+            if last is None:
+                out[sym] = None
+            else:
+                out[sym] = float(now_ts) - float(last)
+        return out
+
+    def _entry_data_ok(self, *, now: float | None = None) -> tuple[bool, str]:
+        """Refuse opens when IB/MD/universe looks unhealthy or post-gap cooldown."""
+        now_ts = time.time() if now is None else float(now)
+        connected = bool(getattr(self.ib, "isConnected", lambda: False)())
+        data_mode = getattr(self.connector, "data_mode", None)
+        return entry_feed_ok(
+            connected=connected,
+            data_mode=str(data_mode) if data_mode is not None else None,
+            stock_lags_sec=self._stock_lag_map(now=now_ts),
+            cfg=self.risk_cfg,
+            now=now_ts,
+            last_gap_event_ts=float(self._last_gap_event_ts or 0.0),
+        )
+
     def _remember_option_mid(self, symbol: str, contract: str, mid: float) -> None:
         if math.isfinite(mid) and mid > 0:
             self._last_seen_option_mid[(symbol.upper(), contract)] = float(mid)
+
+    def _reset_entry_quote_stable(self, symbol: str, contract: str) -> None:
+        key = (str(symbol).upper(), contract)
+        self._entry_quote_stable.pop(key, None)
+        self._last_entry_quote_ts.pop(key, None)
+
+    def _note_gap_event(self, *, now: float | None = None) -> None:
+        self._last_gap_event_ts = time.time() if now is None else float(now)
+
+    def on_feed_reconnected(self) -> None:
+        """Fail closed after an IB reconnect and flush queued force exits."""
+        now = time.time()
+        self._note_gap_event(now=now)
+        self._entry_quote_stable.clear()
+        self._last_entry_quote_ts.clear()
+        for position in self.positions.values():
+            if position.status in {"OPEN", "EXIT_PENDING"}:
+                position.toxic_reconnect_pending = True
+        queued = len(self._pending_force_exits)
+        self._flush_pending_force_exits()
+        self._event(
+            "FEED_RECONNECTED",
+            {"queued_force_exits": queued, "cooldown_started_at": now},
+        )
+        self.publish_state()
+
+    def _flush_pending_force_exits(self) -> None:
+        for symbol, reason in list(self._pending_force_exits.items()):
+            position = self.positions.get(symbol)
+            if position is None:
+                self._pending_force_exits.pop(symbol, None)
+                continue
+            quote = self._position_quote_fallback(position)
+            if quote is None:
+                continue
+            self._pending_force_exits.pop(symbol, None)
+            position.status = "OPEN"
+            self._submit_exit(position, reason, float(quote["bid"]), quote)
 
     def _trip_day_circuit(self, *, day_ret: float) -> None:
         was = self.day_halted
@@ -936,12 +1141,12 @@ class Mag7BrokerOms:
         position_frac_override: float | None = None,
     ) -> tuple[int, float]:
         top_k = max(int((self.profile.get("signal") or {}).get("top_k", 2)), 1)
-        sizing_clock = to_ny(entry_ts)
+        sizing_clock = self._sizing_clock(entry_ts)
         occupancy = dict(self.open_until)
         for active_symbol, position in self.positions.items():
             if position.status in {"OPEN", "EXIT_PENDING"}:
                 occupancy[active_symbol] = sizing_clock + pd.Timedelta(days=1)
-        frac, _, _, allow, _ = resolve_size_frac(
+        frac, _, n_conc, allow, size_reason = resolve_size_frac(
             self.trade_cfg,
             top_k=top_k,
             open_until=occupancy,
@@ -953,10 +1158,29 @@ class Mag7BrokerOms:
             frac = float(position_frac_override)
         frac = apply_size_scale(frac, regime_scale)
         if (not allow) or frac <= 0.0:
+            self._last_size_reject = {
+                "allow": bool(allow),
+                "size_reason": str(size_reason),
+                "n_concurrent": int(n_conc),
+                "occupancy": sorted(str(k).upper() for k in occupancy),
+                "sizing_clock": sizing_clock.isoformat(),
+                "frac": float(frac),
+            }
             return 0, float(frac)
         capital = min(self.equity, self.available_funds)
         qty = int((capital * float(frac)) // max(entry_price * 100.0, 0.01))
-        return max(1, min(self.max_qty, qty)), float(frac)
+        if qty <= 0:
+            self._last_size_reject = {
+                "allow": True,
+                "size_reason": "qty_floor",
+                "n_concurrent": int(n_conc),
+                "occupancy": sorted(str(k).upper() for k in occupancy),
+                "sizing_clock": sizing_clock.isoformat(),
+                "frac": float(frac),
+            }
+            return 0, float(frac)
+        self._last_size_reject = None
+        return min(self.max_qty, qty), float(frac)
 
     @staticmethod
     def _signal_source_fields(signal: ScannerSignal | None) -> dict[str, Any]:
@@ -1041,11 +1265,14 @@ class Mag7BrokerOms:
         contract = str(signal.contract or "").replace("O:", "")
         if not contract or self.has_position(symbol) or self._has_active_buy(symbol):
             return False
-        # Satellite am_pulse: default execute_mode=shadow — only fill in OMS shadow.
+        # AM satellite lanes default execute_mode=shadow — only fill in OMS shadow.
         meta0 = getattr(signal, "meta", None) or {}
-        if str(meta0.get("event_source") or "") == "am_pulse_sleeve" or str(
-            meta0.get("route") or ""
-        ) == "am_pulse":
+        event_source0 = str(meta0.get("event_source") or "")
+        route0 = str(meta0.get("route") or "")
+        if event_source0 in {
+            "am_pulse_sleeve",
+            "am_pulse_extension_sleeve",
+        } or route0 in {"am_pulse", "am_pulse_extension"}:
             exec_mode = str(meta0.get("execute_mode") or "shadow").lower()
             if exec_mode in {"off", "audit", "false", "0"}:
                 self._event(
@@ -1075,6 +1302,17 @@ class Mag7BrokerOms:
                 reason = "event_blackout"
             self._event("ENTRY_REJECT", {"symbol": symbol, "reason": reason})
             return False
+        feed_ok, feed_reason = self._entry_data_ok()
+        if not feed_ok:
+            kind = (
+                "ENTRY_REJECT"
+                if feed_reason.startswith("market_data_") or feed_reason == "ibkr_disconnected"
+                else "ENTRY_WAIT"
+            )
+            self._event(kind, {"symbol": symbol, "reason": feed_reason})
+            if kind == "ENTRY_WAIT":
+                self._defer_signal(signal)
+            return False
         if self.risk_cfg.halt_entries_on_gap and any(
             pos.gap_hold_count > 0 for pos in self.positions.values()
         ):
@@ -1099,23 +1337,99 @@ class Mag7BrokerOms:
             return False
         quote = self._quote(symbol, contract)
         if quote is None:
+            self._reset_entry_quote_stable(symbol, contract)
             self._event("ENTRY_WAIT", {"symbol": symbol, "reason": "option_stale_or_missing"})
             self._defer_signal(signal)
             return False
-        prev_mid = self._last_seen_option_mid.get((symbol, contract))
+        quote_key = (symbol, contract)
+        prev_mid = self._last_seen_option_mid.get(quote_key)
+        quote_ts = float(quote.get("ts") or 0.0)
+        prev_quote_ts = self._last_entry_quote_ts.get(quote_key)
+        route_max_lag = meta0.get("max_lag_sec")
+        try:
+            route_max_lag = float(route_max_lag) if route_max_lag is not None else None
+        except (TypeError, ValueError):
+            route_max_lag = None
+        lag_ok, lag_reason, quote_lag = signal_quote_lag_ok(
+            signal_ts=float(to_ny(signal.sig_ts).timestamp()),
+            quote_ts=quote_ts,
+            max_lag_sec=route_max_lag,
+        )
+        if not lag_ok:
+            self._entry_quote_stable[quote_key] = 0
+            kind = "ENTRY_WAIT" if lag_reason == "option_quote_before_signal" else "ENTRY_REJECT"
+            self._event(
+                kind,
+                {
+                    "symbol": symbol,
+                    "reason": lag_reason,
+                    "quote_lag_sec": quote_lag,
+                    "max_lag_sec": route_max_lag,
+                    **self._signal_source_fields(signal),
+                },
+            )
+            if kind == "ENTRY_WAIT":
+                self._defer_signal(signal)
+            return False
+        route_spread_cap = meta0.get("max_spread_pct")
+        try:
+            route_spread_cap = (
+                float(route_spread_cap) if route_spread_cap is not None else None
+            )
+        except (TypeError, ValueError):
+            route_spread_cap = None
+        route_min_mid = meta0.get("min_mid")
+        try:
+            route_min_mid = float(route_min_mid) if route_min_mid is not None else None
+        except (TypeError, ValueError):
+            route_min_mid = None
         quote_ok, quote_reason, mid = entry_quote_ok(
             bid=float(quote["bid"]),
             ask=float(quote["ask"]),
             prev_mid=prev_mid,
             cfg=self.risk_cfg,
+            max_spread_pct=route_spread_cap,
+            min_mid=route_min_mid,
         )
-        if mid is not None and quote_reason != "entry_mid_jump":
-            self._remember_option_mid(symbol, contract, mid)
         if not quote_ok:
+            self._entry_quote_stable[quote_key] = 0
+            if mid is not None and quote_reason != "entry_mid_jump":
+                self._remember_option_mid(symbol, contract, mid)
             kind = "ENTRY_REJECT" if quote_reason == "entry_mid_jump" else "ENTRY_WAIT"
             self._event(kind, {"symbol": symbol, "reason": quote_reason, "mid": mid})
             if quote_reason != "entry_mid_jump":
                 self._defer_signal(signal)
+            return False
+        prev_stable = int(self._entry_quote_stable.get(quote_key, 0))
+        stable, ready, warm_reason = next_entry_quote_stable_ticks(
+            prev_stable=prev_stable,
+            quote_ok=True,
+            prev_mid=prev_mid,
+            require_ticks=self.risk_cfg.require_entry_quote_stable_ticks,
+            prev_quote_ts=prev_quote_ts,
+            quote_ts=quote_ts,
+        )
+        self._entry_quote_stable[quote_key] = int(stable)
+        if (
+            math.isfinite(quote_ts)
+            and quote_ts > 0
+            and (prev_quote_ts is None or quote_ts > float(prev_quote_ts))
+        ):
+            self._last_entry_quote_ts[quote_key] = quote_ts
+        if mid is not None:
+            self._remember_option_mid(symbol, contract, mid)
+        if not ready:
+            self._event(
+                "ENTRY_WAIT",
+                {
+                    "symbol": symbol,
+                    "reason": warm_reason,
+                    "mid": mid,
+                    "stable_ticks": stable,
+                    "need_ticks": self.risk_cfg.require_entry_quote_stable_ticks,
+                },
+            )
+            self._defer_signal(signal)
             return False
         allowed, reason = self.live_gate()
         if not allowed:
@@ -1133,12 +1447,14 @@ class Mag7BrokerOms:
             position_frac_override=self._position_frac_override(signal),
         )
         if qty <= 0:
+            detail = dict(self._last_size_reject or {})
             self._event(
                 "ENTRY_REJECT",
                 {
                     "symbol": symbol,
                     "reason": "size_gate",
                     "regime_size_scale": r_scale,
+                    **detail,
                     **self._signal_source_fields(signal),
                 },
             )
@@ -1308,11 +1624,24 @@ class Mag7BrokerOms:
                 },
             )
             return
+        feed_ok, feed_reason = self._entry_data_ok()
+        if not feed_ok:
+            self._event(
+                "ICEBERG_STOP",
+                {
+                    "symbol": intent.symbol,
+                    "reason": feed_reason,
+                    "remaining": queue,
+                    "from_intent_id": intent.intent_id,
+                },
+            )
+            return
         signal = intent.signal
         if signal is None:
             return
         quote = self._quote(intent.symbol, intent.contract)
         if quote is None:
+            self._reset_entry_quote_stable(intent.symbol, intent.contract)
             self._event(
                 "ICEBERG_STOP",
                 {
@@ -1328,8 +1657,12 @@ class Mag7BrokerOms:
             ask=float(quote["ask"]),
             prev_mid=self._last_seen_option_mid.get((intent.symbol, intent.contract)),
             cfg=self.risk_cfg,
+            max_spread_pct=(
+                (getattr(signal, "meta", None) or {}).get("max_spread_pct")
+            ),
         )
         if not quote_ok:
+            self._entry_quote_stable[(intent.symbol, intent.contract)] = 0
             self._event(
                 "ICEBERG_STOP",
                 {
@@ -1340,6 +1673,32 @@ class Mag7BrokerOms:
                 },
             )
             return
+        quote_key = (intent.symbol, intent.contract)
+        quote_ts = float(quote.get("ts") or 0.0)
+        prev_quote_ts = self._last_entry_quote_ts.get(quote_key)
+        stable, ready, warm_reason = next_entry_quote_stable_ticks(
+            prev_stable=int(self._entry_quote_stable.get(quote_key, 0)),
+            quote_ok=True,
+            prev_mid=self._last_seen_option_mid.get(quote_key),
+            require_ticks=self.risk_cfg.require_entry_quote_stable_ticks,
+            prev_quote_ts=prev_quote_ts,
+            quote_ts=quote_ts,
+        )
+        self._entry_quote_stable[quote_key] = stable
+        if not ready:
+            self._event(
+                "ICEBERG_STOP",
+                {
+                    "symbol": intent.symbol,
+                    "reason": warm_reason,
+                    "remaining": queue,
+                    "from_intent_id": intent.intent_id,
+                },
+            )
+            return
+        self._last_entry_quote_ts[quote_key] = quote_ts
+        if mid is not None:
+            self._remember_option_mid(intent.symbol, intent.contract, mid)
         mid = mid or quote_mid(float(quote["bid"]), float(quote["ask"])) or float(
             intent.limit_price
         )
@@ -1559,7 +1918,41 @@ class Mag7BrokerOms:
         if intent.replaced_by or remaining_qty <= 0:
             return False
         next_attempt = int(intent.requote_attempt) + 1
-        quote = self._live_option_quote(intent.symbol, intent.contract, intent.con_id)
+        if intent.action == "BUY":
+            feed_ok, feed_reason = self._entry_data_ok()
+            if not feed_ok:
+                self._event(
+                    "REQUOTE_SKIP",
+                    {
+                        "intent_id": intent.intent_id,
+                        "reason": feed_reason,
+                        "attempt": next_attempt,
+                    },
+                )
+                return False
+            quote = self._quote(intent.symbol, intent.contract)
+            quote_key = (intent.symbol, intent.contract)
+            quote_ts = float((quote or {}).get("ts") or 0.0)
+            prev_quote_ts = self._last_entry_quote_ts.get(quote_key)
+            if (
+                quote is None
+                or prev_quote_ts is None
+                or quote_ts <= float(prev_quote_ts)
+            ):
+                self._event(
+                    "REQUOTE_SKIP",
+                    {
+                        "intent_id": intent.intent_id,
+                        "reason": "option_quote_not_advanced",
+                        "attempt": next_attempt,
+                    },
+                )
+                return False
+            self._last_entry_quote_ts[quote_key] = quote_ts
+        else:
+            quote = self._live_option_quote(
+                intent.symbol, intent.contract, intent.con_id
+            )
         if quote is None and intent.action == "SELL":
             position = self.positions.get(intent.symbol)
             if position is not None:
@@ -1615,7 +2008,6 @@ class Mag7BrokerOms:
             position = self.positions.get(intent.symbol)
             if position is None:
                 return False
-            position.status = "OPEN"
 
         child_id = self._intent_id(
             intent.action,
@@ -1871,6 +2263,17 @@ class Mag7BrokerOms:
                     if meta.get("exit_flatten_before")
                     else None
                 ),
+                confirm_abort=(
+                    dict(meta["confirm_abort"])
+                    if isinstance(meta.get("confirm_abort"), dict)
+                    else None
+                ),
+                profit_protect=(
+                    dict(meta["profit_protect"])
+                    if isinstance(meta.get("profit_protect"), dict)
+                    else None
+                ),
+                route=str(meta.get("route") or "baseline").strip().lower() or "baseline",
             )
             self._remember_option_mid(intent.symbol, intent.contract, float(mid))
         spread_row = self._record_trade_spread(
@@ -1899,6 +2302,30 @@ class Mag7BrokerOms:
                 "iceberg_chunks": intent.iceberg_chunks,
             },
         )
+        position = self.positions[intent.symbol]
+        feed_ok, guard_reason = self._entry_data_ok()
+        quote_ok, quote_reason, _ = entry_quote_ok(
+            bid=float(quote["bid"]),
+            ask=float(quote["ask"]),
+            prev_mid=position.last_good_mid,
+            cfg=self.risk_cfg,
+            max_spread_pct=(
+                (getattr(signal, "meta", None) or {}).get("max_spread_pct")
+            ),
+        )
+        if not feed_ok or not quote_ok:
+            reason = guard_reason if not feed_ok else quote_reason
+            self._event(
+                "POST_FILL_GUARD_FLATTEN",
+                {"symbol": intent.symbol, "reason": reason},
+            )
+            self._submit_exit(
+                position,
+                "RECOVERY_GUARD_FLATTEN",
+                float(quote["bid"]),
+                quote,
+            )
+            return
         if str(intent.status).upper() == "FILLED":
             self._maybe_continue_iceberg(intent)
 
@@ -1990,6 +2417,24 @@ class Mag7BrokerOms:
                 continue
             quote = self._quote(symbol, position.contract)
             if quote is None:
+                position.gap_hold_count += 1
+                if position.gap_hold_count >= self.risk_cfg.max_gap_hold_ticks:
+                    fallback = self._position_quote_fallback(position)
+                    if fallback is not None:
+                        self._note_gap_event(now=asof_ts)
+                        self._event(
+                            "OPTION_FEED_GAP_FLATTEN",
+                            {
+                                "symbol": symbol,
+                                "missing_ticks": position.gap_hold_count,
+                            },
+                        )
+                        self._submit_exit(
+                            position,
+                            "GAP_FLATTEN",
+                            float(fallback["bid"]),
+                            fallback,
+                        )
                 continue
             position.last_bid = float(quote["bid"])
             position.last_ask = float(quote["ask"])
@@ -2016,7 +2461,7 @@ class Mag7BrokerOms:
                     },
                 )
                 continue
-            sell_price = self.fills.sell(float(quote["bid"]), float(quote["ask"]))
+            sell_price = self.fill.sell(float(quote["bid"]), float(quote["ask"]))
             reason = ""
             held = asof_ts - position.entry_ts
             mtm_ret = sell_price / position.entry_price - 1.0 if position.entry_price > 0 else float("nan")
@@ -2058,20 +2503,57 @@ class Mag7BrokerOms:
                     flatten_hit = False
             if gap_status == "gap_force":
                 reason = "GAP_FLATTEN"
+                self._note_gap_event(now=float(asof_ts))
             elif flatten_hit:
                 reason = "FLATTEN_BEFORE_CORE"
             elif sell_price >= position.entry_price * pos_tp and (
                 simple or (not use_ladder or lac.keep_outer_rails)
             ):
                 reason = "TP"
+            elif (
+                simple
+                and math.isfinite(mtm_ret)
+                and profit_protect_on_tick(
+                    cfg=profit_protect_from_raw(position.profit_protect),
+                    peak_mfe=float(position.peak_mfe),
+                    opt_mtm=float(mtm_ret),
+                )
+            ):
+                reason = "PROFIT_PROTECT"
             elif toxic_reason:
                 reason = toxic_reason
             elif shock_reason:
                 reason = shock_reason
             elif simple and sell_price <= position.entry_price * pos_sl:
                 reason = "SL"
-            elif simple and held >= pos_hold:
-                reason = "MAX_HOLD"
+            elif simple:
+                if position.confirm_abort and math.isfinite(mtm_ret):
+                    ca_cfg = confirm_abort_from_raw(position.confirm_abort)
+                    if confirm_abort_applies(
+                        ca_cfg,
+                        float(position.signal_ts or position.entry_ts),
+                        direction=str(position.direction or ""),
+                    ):
+                        st = ConfirmAbortState(
+                            confirmed=bool(position.confirm_abort_confirmed),
+                            done=bool(position.confirm_abort_done),
+                        )
+                        do_abort, ca_reason, st = confirm_abort_on_tick(
+                            st,
+                            cfg=ca_cfg,
+                            held_seconds=float(held),
+                            opt_mtm=float(mtm_ret),
+                        )
+                        position.confirm_abort_confirmed = bool(st.confirmed)
+                        position.confirm_abort_done = bool(st.done)
+                        if do_abort:
+                            reason = (
+                                "CONFIRM_ABORT"
+                                if ca_reason == "confirm_abort"
+                                else "EARLY_ABORT"
+                            )
+                if not reason and held >= pos_hold:
+                    reason = "MAX_HOLD"
             elif not simple:
                 # Wave confirm: arm then revocable abort (before STOCK_REV / clock grind).
                 wcfg = wave_abort_from_trade(self.trade_cfg)
@@ -2102,6 +2584,7 @@ class Mag7BrokerOms:
                 if (
                     not reason
                     and srev.enabled
+                    and stock_rev_applies_to_route(srev, getattr(position, "route", None))
                     and held >= float(srev.min_hold_minutes) * 60.0
                     and math.isfinite(mtm_ret)
                     and mtm_ret <= float(srev.opt_mtm_max)
@@ -2215,7 +2698,16 @@ class Mag7BrokerOms:
                         else:
                             mf_ok = mf10 < 0
                     mtm_ok = math.isfinite(mtm_ret) and mtm_ret >= ext_mtm_min
-                    if mtm_ok and mf_ok and ext_hold > hold:
+                    giveback_ok = True
+                    max_gb = self.trade_cfg.get("hold_extend_max_giveback")
+                    if max_gb is not None and math.isfinite(mtm_ret):
+                        min_peak = float(
+                            self.trade_cfg.get("hold_extend_giveback_min_peak") or 0.0
+                        )
+                        peak = float(position.peak_mfe)
+                        if peak >= min_peak:
+                            giveback_ok = (peak - float(mtm_ret)) < float(max_gb)
+                    if mtm_ok and mf_ok and giveback_ok and ext_hold > hold:
                         position.hold_extended = True
                     else:
                         reason = f"T+{hold // 60}"
@@ -2237,14 +2729,88 @@ class Mag7BrokerOms:
         limit_price: float,
         quote: dict[str, float],
     ) -> None:
-        if position.status == "EXIT_PENDING" and reason not in FORCE_EXIT_REASONS:
-            return
-        if self.mode != "shadow" and not self.ib.isConnected():
+        active_sell = next(
+            (
+                item
+                for item in self.intents.values()
+                if item.action == "SELL"
+                and item.symbol == position.symbol
+                and item.contract == position.contract
+                and item.status in {"PENDING", "SUBMITTED", "PARTIAL"}
+            ),
+            None,
+        )
+        if active_sell is not None:
             self._event(
-                "EXIT_BLOCKED",
-                {"symbol": position.symbol, "reason": reason, "gate": "ibkr_disconnected"},
+                "EXIT_DEDUP",
+                {
+                    "symbol": position.symbol,
+                    "reason": reason,
+                    "active_intent_id": active_sell.intent_id,
+                    "active_reason": active_sell.reason,
+                },
             )
             return
+        if position.status != "OPEN":
+            return
+        if self.mode != "shadow" and not self.ib.isConnected():
+            position.status = "EXIT_PENDING"
+            self._pending_force_exits[position.symbol] = str(reason)
+            self._event(
+                "EXIT_QUEUED_DISCONNECTED",
+                {"symbol": position.symbol, "reason": reason},
+            )
+            self.publish_state()
+            return
+        exit_qty = int(position.qty)
+        if self.mode != "shadow":
+            broker_qty = 0
+            try:
+                for row in self.ib.positions() or []:
+                    if (
+                        self.connector.config.account
+                        and str(getattr(row, "account", "") or "")
+                        != self.connector.config.account
+                    ):
+                        continue
+                    contract = getattr(row, "contract", None)
+                    local = str(
+                        getattr(contract, "localSymbol", "") or ""
+                    ).strip()
+                    if local == position.contract:
+                        broker_qty += int(
+                            round(float(getattr(row, "position", 0.0) or 0.0))
+                        )
+            except Exception as exc:
+                if reason in FORCE_EXIT_REASONS:
+                    position.status = "EXIT_PENDING"
+                    self._pending_force_exits[position.symbol] = str(reason)
+                self._event(
+                    "EXIT_BLOCKED",
+                    {
+                        "symbol": position.symbol,
+                        "reason": reason,
+                        "gate": "broker_position_unavailable",
+                        "error": str(exc),
+                    },
+                )
+                return
+            if broker_qty <= 0:
+                if reason in FORCE_EXIT_REASONS:
+                    position.status = "EXIT_PENDING"
+                    self._pending_force_exits[position.symbol] = str(reason)
+                self._event(
+                    "EXIT_BLOCKED",
+                    {
+                        "symbol": position.symbol,
+                        "reason": reason,
+                        "gate": "broker_position_not_long",
+                        "broker_qty": broker_qty,
+                        "internal_qty": position.qty,
+                    },
+                )
+                return
+            exit_qty = min(exit_qty, broker_qty)
         attempt = sum(
             1
             for item in self.intents.values()
@@ -2268,7 +2834,7 @@ class Mag7BrokerOms:
             symbol=position.symbol,
             contract=position.contract,
             con_id=position.con_id,
-            qty=position.qty,
+            qty=exit_qty,
             limit_price=float(limit_price),
             reason=reason,
             created_at=time.time(),
@@ -2286,7 +2852,7 @@ class Mag7BrokerOms:
             },
         )
         if self.mode == "shadow":
-            self._apply_close_fill(intent, position.qty, limit_price, quote)
+            self._apply_close_fill(intent, exit_qty, limit_price, quote)
         else:
             self._place_broker_order(intent)
         self.publish_state()
@@ -2435,6 +3001,8 @@ class Mag7BrokerOms:
                 broker[local] = qty
         internal = {pos.contract: pos.qty for pos in self.positions.values()}
         self.reconcile_ok = broker == internal
+        if not self.reconcile_ok:
+            self.day_halted = True
         self.last_reconcile = {
             "ok": self.reconcile_ok,
             "broker": broker,
@@ -2445,6 +3013,8 @@ class Mag7BrokerOms:
             "RECONCILE",
             {"ok": self.reconcile_ok, "broker": broker, "internal": internal},
         )
+        if self._pending_force_exits and self.ib.isConnected():
+            self._flush_pending_force_exits()
         self.publish_state()
         return self.reconcile_ok
 
@@ -2561,20 +3131,13 @@ class Mag7BrokerOms:
 
     def force_flatten(self, reason: str = "EOD") -> None:
         for position in list(self.positions.values()):
-            if position.status == "OPEN":
-                pass
-            elif (
-                position.status == "EXIT_PENDING"
-                and reason in FORCE_EXIT_REASONS
-                and reason != "DAY_CIRCUIT"
-            ):
-                # Escalate soft/pending exits (EOD / chase / adverse), but do not
-                # double-submit while a day-circuit close is already in flight.
-                position.status = "OPEN"
-            else:
+            if position.status not in {"OPEN", "EXIT_PENDING"}:
                 continue
             quote = self._position_quote_fallback(position)
             if quote is None:
+                if reason in FORCE_EXIT_REASONS:
+                    position.status = "EXIT_PENDING"
+                    self._pending_force_exits[position.symbol] = str(reason)
                 self._event(
                     "EXIT_BLOCKED",
                     {

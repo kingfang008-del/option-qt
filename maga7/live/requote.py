@@ -139,8 +139,12 @@ def is_urgent_exit_reason(reason: str) -> bool:
         "EXIT_CHASE_CAP",
         "GAP_FLATTEN",
         "ADVERSE_FILL_FLATTEN",
+        "TRADE_TOX",
+        "TRADE_TOX_RECONNECT",
+        "HOLD_SHOCK",
+        "PROFIT_PROTECT",
     }:
         return True
-    if reason_u.startswith("SL"):
+    if reason_u.startswith("SL") or reason_u.startswith("TRADE_TOX"):
         return True
     return False

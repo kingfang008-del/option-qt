@@ -4,11 +4,29 @@ from __future__ import annotations
 import pandas as pd
 
 from maga7.common.am_pulse_scout import am_pulse_enabled, load_am_pulse_cfg
+from maga7.common.config import load_profile
 from maga7.common.entry_contract import ContractBooks
 from maga7.common.signals import StreamSignalState
 from maga7.live.broker_oms import Mag7BrokerOms, LivePosition
 from maga7.live.scanner import Mag7Scanner, ScannerSignal
-from maga7.live.scanner_state import scanner_snapshot
+from maga7.live.scanner_state import restore_scanner, scanner_snapshot
+
+
+def test_active_spine_has_shadow_optimization_parameters():
+    profile = load_profile(
+        "maga7/CONFIG/strategy_profiles/"
+        "single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json"
+    )
+    assert profile["am_pulse"]["profit_protect"] == {
+        "enabled": True,
+        "arm_ret": 0.08,
+        "floor_ret": 0.03,
+        "note": (
+            "Shadow candidate ladder_08_03; "
+            "research_am_A_lock_profit_protect_20260728"
+        ),
+    }
+    assert profile["am_pulse_extension"]["confirm_abort"]["abort_thr"] == 0.10
 
 
 def _profile(day: str = "2026-07-24") -> dict:
@@ -29,17 +47,55 @@ def _profile(day: str = "2026-07-24") -> dict:
             "enabled": True,
             "execute_mode": "shadow",
             "arm": "FO",
-            "dirs": ["DN"],
+            "dirs": ["DN", "UP"],
             "window_start": "09:30",
-            "window_end": "10:25",
-            "flatten_before": "10:30",
+            "window_end": "10:30",
+            "flatten_before": "10:45",
             "min_fav_from_open": 0.01,
             "lookback_bars": 2,
             "min_lookback_ret": 0.99,
             "tp": 0.15,
             "sl": 0.20,
             "max_hold_sec": 900,
+            "max_lag_sec": 5.0,
+            "max_spread_pct": 0.15,
+            "min_mid": 0.05,
             "position_frac": 0.10,
+            "profit_protect": {
+                "enabled": True,
+                "arm_ret": 0.08,
+                "floor_ret": 0.03,
+            },
+        },
+        "am_pulse_extension": {
+            "enabled": True,
+            "execute_mode": "shadow",
+            "arm": "FO",
+            "dirs": ["DN", "UP"],
+            "window_start": "10:30",
+            "window_end": "11:30",
+            "flatten_before": "11:45",
+            "min_fav_from_open": 0.008,
+            "lookback_bars": 2,
+            "min_lookback_ret": 0.99,
+            "tp": 0.15,
+            "sl": 0.20,
+            "max_hold_sec": 900,
+            "max_lag_sec": 5.0,
+            "max_spread_pct": 0.15,
+            "min_mid": 0.05,
+            "position_frac": 0.10,
+            "prefer_dte": 0,
+            "allowed_dte": [0],
+            "confirm_abort": {
+                "enabled": True,
+                "confirm_sec": 60,
+                "confirm_thr": 0.02,
+                "abort_thr": 0.10,
+                "on_timeout": "abort",
+                "only_entry_before": None,
+                "only_dirs": ["UP"],
+            },
         },
         "lock": {"dte_mode": "trading", "prefer_dte": 0, "allowed_dte": [0, 1, 2], "otm_rungs": 3},
     }
@@ -49,8 +105,8 @@ def test_load_am_pulse_cfg_defaults():
     cfg = load_am_pulse_cfg({"am_pulse": {"enabled": True}})
     assert am_pulse_enabled({"am_pulse": {"enabled": True}})
     assert cfg["execute_mode"] == "shadow"
-    assert cfg["window_end"] == "10:25"
-    assert cfg["flatten_before"] == "10:30"
+    assert cfg["window_end"] == "10:30"
+    assert cfg["flatten_before"] == "10:45"
 
 
 def test_drain_am_pulse_emits_fo_dn_once():
@@ -98,11 +154,18 @@ def test_drain_am_pulse_emits_fo_dn_once():
     assert sig.meta.get("route") == "am_pulse"
     assert sig.meta.get("execute_mode") == "shadow"
     assert sig.meta.get("exit_simple") is True
-    assert sig.meta.get("exit_flatten_before") == "10:30"
+    assert sig.meta.get("exit_flatten_before") == "10:45"
+    assert sig.meta.get("max_lag_sec") == 5.0
+    assert sig.meta.get("min_mid") == 0.05
+    assert sig.meta.get("profit_protect") == {
+        "enabled": True,
+        "arm_ret": 0.08,
+        "floor_ret": 0.03,
+    }
     assert abs(float(sig.meta.get("position_frac")) - 0.10) < 1e-12
     # hold capped before CORE
     assert float(sig.meta.get("exit_hold_sec")) <= (
-        pd.Timestamp(f"{day} 10:30", tz="America/New_York") - sig.sig_ts
+        pd.Timestamp(f"{day} 10:45", tz="America/New_York") - sig.sig_ts
     ).total_seconds() + 1
     assert Mag7BrokerOms._signal_source_fields(sig)["event_source"] == "am_pulse_sleeve"
     # once/symbol/day
@@ -162,6 +225,149 @@ def test_oms_rejects_am_pulse_shadow_on_paper():
     oms._event = lambda kind, payload: oms.events.append((kind, payload))  # type: ignore
     assert oms.process_signal(sig) is False
     assert any(k == "ENTRY_REJECT" for k, _ in oms.events)
+
+
+def test_original_and_extension_have_independent_symbol_budget_and_topk():
+    day = "2026-07-24"
+    profile = _profile(day)
+    profile["signal"].update({"window_start": "14:00", "window_end": "14:01"})
+    ticker = "TSLA260724P00320000"
+    books = ContractBooks(
+        mode="day_lock",
+        flat_idx={("TSLA", day): {0: ticker}},
+        prefer_dte=0,
+        allowed_dte=[0, 1, 2],
+    )
+    sc = Mag7Scanner(
+        profile=profile,
+        states={
+            "TSLA": StreamSignalState("TSLA", profile["signal"]),
+            "NVDA": StreamSignalState("NVDA", profile["signal"]),
+        },
+        books=books,
+        stock_by={},
+    )
+    open_px = 320.0
+    start = pd.Timestamp(f"{day} 09:30", tz="America/New_York")
+    for i in range(121):
+        ts = start + pd.Timedelta(minutes=i)
+        px = open_px * (1.0 - min(0.02, i * 0.0002))
+        sc.on_stock_bar(
+            "TSLA",
+            {
+                "timestamp": ts,
+                "open": open_px if i == 0 else px + 0.02,
+                "high": max(open_px if i == 0 else px + 0.02, px),
+                "low": px - 0.02,
+                "close": px,
+                "volume": 1000,
+                "symbol": "TSLA",
+            },
+        )
+    am = [
+        s
+        for s in sc.signals
+        if (s.meta or {}).get("event_source") == "am_pulse_sleeve"
+    ]
+    ext = [
+        s
+        for s in sc.signals
+        if (s.meta or {}).get("event_source") == "am_pulse_extension_sleeve"
+    ]
+    assert len(am) == 1
+    assert len(ext) == 1
+    assert ext[0].meta["route"] == "am_pulse_extension"
+    assert ext[0].meta["watchdog_reason"] == "am_pulse_extension"
+    assert ext[0].meta["exit_flatten_before"] == "11:45"
+    assert ext[0].meta["confirm_abort"]["enabled"] is True
+    assert ext[0].meta["confirm_abort"]["confirm_sec"] == 60
+    assert ext[0].meta["confirm_abort"]["abort_thr"] == 0.10
+    assert "confirm_abort" not in (am[0].meta or {})
+    assert "profit_protect" not in (ext[0].meta or {})
+    assert sc.n_am_pulse_signals == sc.n_am_pulse_extension_signals == 1
+    assert sc.day_fires == []
+    assert sc.day_topk_syms == set()
+
+
+def test_extension_pending_counters_and_detector_restore():
+    day = "2026-07-24"
+    profile = _profile(day)
+
+    def build() -> Mag7Scanner:
+        return Mag7Scanner(
+            profile=profile,
+            states={
+                "TSLA": StreamSignalState("TSLA", profile["signal"]),
+                "NVDA": StreamSignalState("NVDA", profile["signal"]),
+            },
+            books=ContractBooks(
+                mode="day_lock",
+                flat_idx={("TSLA", day): {0: "TSLA260724P00320000"}},
+                prefer_dte=0,
+                allowed_dte=[0, 1, 2],
+            ),
+            stock_by={},
+        )
+
+    sc = build()
+    sc._roll_day(day)
+    for hhmm, px in (("09:30", 320.0), ("10:30", 316.0)):
+        sc._feed_am_pulse_lane_bar(
+            "am_pulse_extension",
+            "TSLA",
+            {
+                "timestamp": pd.Timestamp(f"{day} {hhmm}", tz="America/New_York"),
+                "open": 320.0,
+                "high": 320.0,
+                "low": px,
+                "close": px,
+            },
+        )
+    assert sc.n_am_pulse_extension_signals == 1
+    assert len(sc.pending_am_pulse_extension) == 1
+    payload = scanner_snapshot(sc)
+    restored = build()
+    restore_scanner(restored, payload)
+    assert restored.n_am_pulse_extension_signals == 1
+    assert len(restored.pending_am_pulse_extension) == 1
+    assert restored._am_pulse_extension_scout_date == day
+    assert restored._am_pulse_extension_scout._alerts_n[("TSLA", "FO")] == 1
+    out = restored.drain_am_pulse_extension(
+        pd.Timestamp(f"{day} 10:30", tz="America/New_York")
+    )
+    assert len(out) == 1
+    assert out[0].meta["event_source"] == "am_pulse_extension_sleeve"
+
+
+def test_oms_rejects_am_pulse_extension_shadow_on_live():
+    sig = ScannerSignal(
+        date="2026-07-24",
+        symbol="TSLA",
+        direction="DN",
+        sig_ts=pd.Timestamp("2026-07-24 10:30", tz="America/New_York"),
+        spot=316.0,
+        rank=0,
+        bucket_id=0,
+        contract="TSLA260724P00320000",
+        moneyness="ATM",
+        meta={
+            "event_source": "am_pulse_extension_sleeve",
+            "route": "am_pulse_extension",
+            "execute_mode": "shadow",
+        },
+    )
+    oms = Mag7BrokerOms.__new__(Mag7BrokerOms)
+    oms.mode = "live"
+    oms.positions = {}
+    oms.day_halted = False
+    oms.events = []
+    oms.scanner = None
+    oms.risk_cfg = type("R", (), {"halt_entries_on_gap": False})()
+    oms._has_active_buy = lambda _s: False  # type: ignore
+    oms.has_position = lambda _s: False  # type: ignore
+    oms._event = lambda kind, payload: oms.events.append((kind, payload))  # type: ignore
+    assert oms.process_signal(sig) is False
+    assert oms.events[-1][1]["event_source"] == "am_pulse_extension_sleeve"
 
 
 def test_flatten_before_core_reason():

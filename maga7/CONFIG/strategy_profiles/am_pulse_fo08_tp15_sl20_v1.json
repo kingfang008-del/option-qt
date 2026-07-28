@@ -1,10 +1,10 @@
 {
   "profile": "am_pulse_fo08_tp15_sl20_v1",
   "profile_id": "am_pulse_fo08_tp15_sl20_v1",
-  "description": "Research AM sleeve: Mag7 DN FO |fav_from_open|≥0.8% in 09:30–10:25 → ATM put TP15/SL20. Quote FillSpec dual PASS only with max_lag=5s / max_spread≤15% (lag≤3 REJECT). Independent of Rule-A; not wired to spine.",
+  "description": "Research AM sleeve: Mag7 both-dir FO |fav_from_open|≥0.8% in 09:30–10:30 → ATM TP15/SL20. Quote FillSpec dual PASS only with max_lag=5s / max_spread≤15%. Independent of Rule-A; wired as A segment on spine.",
   "role": "research_sleeve_expert",
-  "result_tag": "research_am_pulse_fo08_tp15_sl20_v1",
-  "research_revision": "2026-07-26_quote_pass_lag5",
+  "result_tag": "research_am_morning_both_accept_20260728",
+  "research_revision": "2026-07-28_profit_protect_shadow",
   "based_on": null,
   "spine_complement": "strategy_profiles/single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json",
   "narrow_expert_id": "am_pulse_sleeve",
@@ -17,11 +17,13 @@
     "enabled": true,
     "execute_mode": "shadow",
     "arm": "FO",
-    "dirs": ["DN"],
+    "dirs": ["DN", "UP"],
     "window_start": "09:30",
-    "window_end": "10:25",
-    "flatten_before": "10:30",
+    "window_end": "10:30",
+    "flatten_before": "10:45",
     "min_fav_from_open": 0.008,
+    "max_fav_from_open": 0.015,
+    "rth_open_only": true,
     "lookback_bars": 2,
     "min_lookback_ret": 0.99,
     "tp": 0.15,
@@ -36,11 +38,17 @@
     "moneyness": "ATM",
     "prefer_dte": 0,
     "allowed_dte": [0, 1, 2],
-    "note": "Shadow drain via Mag7Scanner.drain_am_pulse. execute_mode=shadow until dry-run OK; then live. Strict lag≤3 dual_pass_n=0."
+    "profit_protect": {
+      "enabled": true,
+      "arm_ret": 0.08,
+      "floor_ret": 0.03,
+      "note": "Shadow candidate ladder_08_03; research_am_A_lock_profit_protect_20260728"
+    },
+    "note": "2026-07-28 LOCK A entry + shadow profit protection: both FO@0.8%, max_fo=1.5%, arm +8% then floor +3%. Shadow drain via Mag7Scanner.drain_am_pulse."
   },
   "portfolio": {
     "mutex_vs_core": "hard_tod",
-    "flatten_before": "10:30",
+    "flatten_before": "10:45",
     "budget_frac": 0.10
   },
   "date_range": {

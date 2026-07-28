@@ -259,6 +259,10 @@ class Mag7LiveFrameEngine:
             for sig in self.scanner.drain_am_pulse(frame_ts_ny):
                 if sig not in signals:
                     signals.append(sig)
+        if hasattr(self.scanner, "drain_am_pulse_extension"):
+            for sig in self.scanner.drain_am_pulse_extension(frame_ts_ny):
+                if sig not in signals:
+                    signals.append(sig)
 
         # Scanner states now include every completed minute in this cross-symbol
         # frame. Resolve exits first, then admit new entries.
