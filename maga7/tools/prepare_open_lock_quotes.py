@@ -169,12 +169,26 @@ def step_lock(
     paths = profile["_paths"]
     months = month_list(start, end)
     stock_by: dict[str, pd.DataFrame] = {}
+    stock_1s_root = Path(paths.get("stock_1s_root") or "/mnt/s990/data/raw_1s/stocks")
     for sym in symbols:
         raw = load_stock_month_files(paths["stock_root"], sym, months)
-        if raw.empty:
+        if raw.empty and stock_1s_root.is_dir():
+            # Causal fallback: aggregate stock 1s → 1m when preagg stock_root is absent.
+            try:
+                from maga7.common.stock_1s import load_symbol_1s_bars
+
+                dates = [
+                    d.strftime("%Y-%m-%d")
+                    for d in pd.bdate_range(start, end)
+                ]
+                raw = load_symbol_1s_bars(stock_1s_root, sym, dates, bar_seconds=60)
+            except Exception as exc:  # noqa: BLE001
+                print(f"WARN: stock_1s fallback failed for {sym}: {exc}", flush=True)
+                raw = pd.DataFrame()
+        if raw is None or getattr(raw, "empty", True):
             print(f"WARN: no stock bars for {sym}", flush=True)
             continue
-        raw = raw[(raw["date"] >= start) & (raw["date"] <= end)]
+        raw = raw[(raw["date"].astype(str) >= start) & (raw["date"].astype(str) <= end)]
         stock_by[sym] = raw
 
     df = build_open_lock_map(

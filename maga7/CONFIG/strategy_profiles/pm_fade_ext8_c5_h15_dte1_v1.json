@@ -1,0 +1,45 @@
+{
+  "profile": "pm_fade_ext8_c5_h15_dte1_v1",
+  "profile_id": "pm_fade_ext8_c5_h15_dte1_v1",
+  "description": "Research PM sleeve: 14:00 extension fade, 5m confirm reverse, hold 15m, ATM prefer 1DTE (ban 0DTE). position_frac=0.10. Docs: docs/sleeve_portfolio_research.md.",
+  "role": "research_sleeve",
+  "sleeve": "PM",
+  "result_tag": "research_pm_fade_ext8_c5_h15_dte1_v1",
+  "research_revision": "2026-07-23_pm_v1",
+  "based_on": "strategy_profiles/single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json",
+  "baseline_doc": "docs/sleeve_portfolio_research.md",
+  "recommended_scheme": "pm_fade_option_fill",
+  "symbols": ["NVDA", "TSLA", "AAPL", "AMZN", "META", "MSFT", "AMD", "GOOGL"],
+  "pm_fade": {
+    "enabled": true,
+    "session_start": "14:00",
+    "session_end": "15:30",
+    "anchor": "14:00",
+    "clocks": ["14:30", "14:45", "15:00", "15:15"],
+    "step_minutes": 5,
+    "ext_min": 0.008,
+    "confirm_minutes": 5,
+    "require_confirm": true,
+    "hold_minutes": 15,
+    "flatten_by": "15:45",
+    "prefer_dte": 1,
+    "allowed_dte": [1, 2],
+    "position_frac": 0.1
+  },
+  "watchdog": {"enabled": false, "hunter": {"enabled": false}},
+  "trade": {
+    "position_frac": 0.1,
+    "max_concurrent_positions": 2,
+    "cooldown_minutes": 5,
+    "moneyness": "ATM",
+    "contract_mode": "open_ladder",
+    "ladder_otm_rungs": 3,
+    "quote_source": "1s"
+  },
+  "lock": {"prefer_dte": 1, "allowed_dte": [1, 2]},
+  "portfolio": {
+    "budget_frac": 0.15,
+    "mutex_vs_core": "tod_pm",
+    "note": "PM after CORE window; no 0DTE."
+  }
+}

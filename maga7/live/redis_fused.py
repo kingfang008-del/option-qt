@@ -11,11 +11,10 @@ from __future__ import annotations
 
 import logging
 import re
-import sys
 import uuid
-from pathlib import Path
 from typing import Any
 
+import msgpack
 import redis
 
 logger = logging.getLogger("maga7.live.redis_fused")
@@ -24,26 +23,12 @@ STREAM_FUSED_MARKET = "fused_market_stream"
 GROUP_MAG7 = "maga7_scanner_group"
 HASH_OPTION_SNAPSHOT = "live_option_snapshot"
 
-_REPO = Path(__file__).resolve().parents[2]
-_BASELINE = _REPO / "New_Pro" / "baseline_qqq"
-
-
-def _ensure_baseline_path() -> None:
-    if str(_BASELINE) not in sys.path and _BASELINE.is_dir():
-        sys.path.insert(0, str(_BASELINE))
-
-
 def pack_obj(obj: Any) -> bytes:
-    """Pack list or dict via New_Pro msgpack / pickle."""
-    _ensure_baseline_path()
-    try:
-        from utils import serialization_utils as ser  # type: ignore
-
-        return ser.pack(obj)
-    except Exception:
-        import pickle
-
-        return pickle.dumps(obj)
+    """Pack a versioned, code-execution-safe msgpack envelope."""
+    return msgpack.packb(
+        {"__maga7_wire__": 1, "payload": obj},
+        use_bin_type=True,
+    )
 
 
 def pack_batch(batch: list[dict[str, Any]]) -> bytes:
@@ -53,15 +38,19 @@ def pack_batch(batch: list[dict[str, Any]]) -> bytes:
 def unpack_obj(raw: bytes | Any) -> Any:
     if raw is None or isinstance(raw, (dict, list)):
         return raw
-    _ensure_baseline_path()
-    try:
-        from utils import serialization_utils as ser  # type: ignore
-
-        return ser.unpack(raw)
-    except Exception:
-        import pickle
-
-        return pickle.loads(raw)
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        raise TypeError(f"unsupported Redis payload type: {type(raw).__name__}")
+    value = msgpack.unpackb(
+        bytes(raw),
+        raw=False,
+        strict_map_key=False,
+    )
+    if isinstance(value, dict) and "__maga7_wire__" in value:
+        if value.get("__maga7_wire__") != 1 or "payload" not in value:
+            raise ValueError("unsupported Mag7 wire schema")
+        return value["payload"]
+    # Safe compatibility for pre-hardening msgpack records. Pickle is never read.
+    return value
 
 
 def unpack_batch(raw: bytes | Any) -> list[dict[str, Any]]:
@@ -69,18 +58,10 @@ def unpack_batch(raw: bytes | Any) -> list[dict[str, Any]]:
         return []
     if isinstance(raw, list):
         return raw
-    try:
-        obj = unpack_obj(raw)
-        if isinstance(obj, list):
-            return obj
-        return [obj] if isinstance(obj, dict) else []
-    except Exception:
-        import pickle
-
-        obj = pickle.loads(raw)
-        if isinstance(obj, list):
-            return obj
-        return [obj] if isinstance(obj, dict) else []
+    obj = unpack_obj(raw)
+    if isinstance(obj, list):
+        return obj
+    return [obj] if isinstance(obj, dict) else []
 
 
 def redis_client(
@@ -99,7 +80,14 @@ def run_keys(run_id: str) -> dict[str, str]:
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", rid):
         raise ValueError(f"invalid Mag7 run_id: {rid!r}")
     return {
+        # RTH authority stream consumed by Scanner/OMS (full-symbol frames only).
         "stream": f"{STREAM_FUSED_MARKET}:maga7:{rid}",
+        # Stock-only publisher stream (option_contracts empty); options process ingests.
+        "stream_stock": f"{STREAM_FUSED_MARKET}:maga7:{rid}:stock",
+        "group_stock": f"{GROUP_MAG7}:{rid}:stock",
+        # Pre/post validation streams (partial frames OK; not consumed by OMS).
+        "stream_pre": f"{STREAM_FUSED_MARKET}:maga7:{rid}:pre",
+        "stream_post": f"{STREAM_FUSED_MARKET}:maga7:{rid}:post",
         "group": f"{GROUP_MAG7}:{rid}",
         "option_snapshot": f"{HASH_OPTION_SNAPSHOT}:maga7:{rid}",
         "clock": f"replay:current_ts:{rid}",
@@ -114,38 +102,69 @@ def init_maga7_redis(
     *,
     run_id: str | None = None,
     reset: bool = True,
+    md_role: str = "combined",
 ) -> str:
     """Create an isolated stream/group; never mutate the shared FCS bus."""
     run_id = run_id or str(uuid.uuid4())[:8]
     if not reset:
         return run_id
     keys = run_keys(run_id)
+    role = str(md_role or "combined").lower()
 
-    # A repeated explicit run_id is reset only inside its own namespace.
-    try:
-        r.delete(
-            keys["stream"],
-            keys["option_snapshot"],
-            keys["clock"],
-            keys["status"],
-            keys["ack_ts"],
-            keys["ack_frame"],
+    delete_keys = []
+    if role in {"combined", "stock"}:
+        delete_keys.extend(
+            [
+                keys["stream_stock"],
+                keys.get("stream_pre"),
+                keys.get("stream_post"),
+            ]
         )
+    if role in {"combined", "options"}:
+        delete_keys.extend(
+            [
+                keys["stream"],
+                keys["option_snapshot"],
+                keys["clock"],
+                keys["status"],
+                keys["ack_ts"],
+                keys["ack_frame"],
+            ]
+        )
+        if role == "combined":
+            delete_keys.extend([keys.get("stream_pre"), keys.get("stream_post")])
+    try:
+        r.delete(*[key for key in delete_keys if key])
     except Exception:
         pass
 
-    try:
-        r.xgroup_create(keys["stream"], keys["group"], id="0-0", mkstream=True)
-    except Exception:
-        r.xgroup_destroy(keys["stream"], keys["group"])
-        r.xgroup_create(keys["stream"], keys["group"], id="0-0", mkstream=True)
+    if role in {"combined", "options"}:
+        try:
+            r.xgroup_create(keys["stream"], keys["group"], id="$", mkstream=True)
+        except Exception:
+            r.xgroup_destroy(keys["stream"], keys["group"])
+            r.xgroup_create(keys["stream"], keys["group"], id="$", mkstream=True)
+        r.set(keys["status"], "INIT")
+    if role in {"combined", "stock"}:
+        try:
+            r.xgroup_create(
+                keys["stream_stock"], keys["group_stock"], id="$", mkstream=True
+            )
+        except Exception:
+            try:
+                r.xgroup_destroy(keys["stream_stock"], keys["group_stock"])
+            except Exception:
+                pass
+            r.xgroup_create(
+                keys["stream_stock"], keys["group_stock"], id="$", mkstream=True
+            )
 
-    r.set(keys["status"], "INIT")
     logger.info(
-        "Mag7 Redis init OK | run_id=%s stream=%s group=%s",
+        "Mag7 Redis init OK | run_id=%s role=%s stream=%s stock=%s",
         run_id,
+        role,
         keys["stream"],
-        keys["group"],
+        keys["stream_stock"],
     )
     return run_id
 

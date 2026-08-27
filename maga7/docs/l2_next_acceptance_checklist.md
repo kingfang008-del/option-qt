@@ -40,14 +40,18 @@
 
 Smoke：07-02 空 `stock_by` 按序喂 1m → ~09:51 arm → 发出 `AMD UP` Hunt。Redis / live_engine 帧时钟也会 `drain_hunts`。
 
-## 上线过渡（还没做，本地替不了）
+## 上线过渡
 
-1. **Shadow 连跑几天**（确认 live 路径也能打出 Hunt）  
-2. **日志里能分清** Hunt / 基线单  
-3. **看板** 能看见今天 Halt / Hunt  
-4. **日终** 实盘日志 vs 当天回放对一下  
+| # | 项 | 状态（2026-07-24） |
+|---|----|-------------------|
+| 1 | Shadow 连跑几天打出 Hunt | **待 Shadow 会话**（本地替不了） |
+| 2 | 日志分清 Hunt / 基线 | **已补**：`event_source` / `hunt_detector` 进 OMS `POSITION_OPEN` + dry meta |
+| 3 | 看板 Halt / Hunt | **已补**：Live Board「Watchdog / Hunt」卡（`scanner_state.watchdog` / `oms_meta.watchdog`） |
+| 4 | 日终 session vs offline | **工具已落**：`python -m maga7.tools.run_hunt_session_eod_align --date … --session-dir …` |
 
-本地工程侧：`stock_by` 已从空缓存按分钟累积，不必再预灌全日数据。下一关就是 Paper/Shadow。
+另：OMS 对齐 offline Hunt `position_frac` 覆盖（`meta.position_frac` → `_size`）。
+
+本地工程侧：`stock_by` 已从空缓存按分钟累积。下一关：**Paper/Shadow 连跑** + 有 Hunt 日跑 eod align。
 
 ---
 

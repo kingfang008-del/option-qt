@@ -130,7 +130,12 @@ class Mag7OmsDryRunner:
             )
             return None
 
-        from maga7.common.position_size import regime_scale_from_meta
+        from maga7.common.position_size import apply_size_scale, regime_scale_from_meta
+        from maga7.common.session_risk_budget import (
+            current_drawdown,
+            parse_session_risk_budget,
+            resolve_session_risk_budget,
+        )
 
         qty_frac, allow, _n_conc = self.session.size_frac_for(
             sig.symbol,
@@ -144,6 +149,22 @@ class Mag7OmsDryRunner:
                     "symbol": sig.symbol,
                     "contract": sig.contract,
                     "reason": "max_concurrent",
+                    "sig_ts": str(sig.sig_ts),
+                }
+            )
+            return None
+        bud = parse_session_risk_budget((self.profile.get("trade") or {}).get("session_risk_budget"))
+        bud_sc, _ = resolve_session_risk_budget(
+            bud, current_dd=current_drawdown(self.eq, self.peak)
+        )
+        qty_frac = apply_size_scale(qty_frac, bud_sc)
+        if qty_frac <= 0:
+            self.skipped.append(
+                {
+                    "date": sig.date,
+                    "symbol": sig.symbol,
+                    "contract": sig.contract,
+                    "reason": "session_risk_budget",
                     "sig_ts": str(sig.sig_ts),
                 }
             )
@@ -205,7 +226,10 @@ class Mag7OmsDryRunner:
                     "size_frac": qty_frac,
                     "regime_size_scale": float((sig.meta or {}).get("regime_size_scale", 1.0) or 1.0),
                     "watchdog_state": (sig.meta or {}).get("watchdog_state"),
+                    "watchdog_reason": (sig.meta or {}).get("watchdog_reason"),
                     "route": (sig.meta or {}).get("route"),
+                    "event_source": (sig.meta or {}).get("event_source", "baseline"),
+                    "hunt_detector": (sig.meta or {}).get("hunt_detector"),
                 },
             )
         )

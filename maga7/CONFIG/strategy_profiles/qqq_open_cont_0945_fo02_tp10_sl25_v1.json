@@ -1,0 +1,43 @@
+{
+  "profile": "qqq_open_cont_0945_fo02_tp10_sl25_v1",
+  "profile_id": "qqq_open_cont_0945_fo02_tp10_sl25_v1",
+  "description": "Executable satellite entry expert: QQQ 0DTE ATM open_cont at 09:45, |from_open|≥0.2%, tp10/sl25, FillSpec 0.75. Quote dual PASS (Jan–Mar / May–Jun); trades dual PASS incl Jul. NOT Mag7 Rule-A; does not modify research_baseline.",
+  "role": "research_sleeve_expert",
+  "result_tag": "research_qqq_open_cont_expert_v1",
+  "research_revision": "2026-07-24_accept_research",
+  "based_on": null,
+  "spine_complement": "strategy_profiles/single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json",
+  "narrow_expert_id": "qqq_open_cont",
+  "docs": [
+    "docs/qqq_open_cont_quote_tpsl.md",
+    "docs/narrow_expert_routing_upgrade.md"
+  ],
+  "symbols": ["QQQ"],
+  "qqq_open_cont": {
+    "enabled": true,
+    "clock": "09:45",
+    "from_open_min": 0.002,
+    "tp": 0.10,
+    "sl": 0.25,
+    "max_hold_sec": 900,
+    "max_spread_pct": 0.15,
+    "max_lag_sec": 2.0,
+    "min_mid": 0.05,
+    "entry_frac": 0.75,
+    "exit_frac": 0.75,
+    "position_frac": 0.10,
+    "slip": 0.01,
+    "book": "auto",
+    "note": "auto=quote FillSpec when dte0 quote exists, else trades last±slip (Jul quote gap)."
+  },
+  "paths": {
+    "stock_1s_root": "/mnt/s990/data/raw_1s/stocks",
+    "quote_1s_root": "/mnt/s990/data/raw_1s/dte0_options/QQQ",
+    "option_trades_root": "/mnt/s990/new_option_data_s3_trades",
+    "results_dir": "/mnt/s990/data/maga7/results"
+  },
+  "date_range": {
+    "start": "2026-05-01",
+    "end": "2026-07-23"
+  }
+}

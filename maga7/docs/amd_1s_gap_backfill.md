@@ -1,6 +1,8 @@
 # AMD 数据缺口补齐（2026-04~07）
 
-> 承接 [`missed_movers_apr_jul.md`](missed_movers_apr_jul.md)：`eligible_topk_but_no_fill` 里 AMD 占多数。
+> 承接 [`missed_movers_apr_jul.md`](missed_movers_apr_jul.md)：`eligible_topk_but_no_fill` 里 AMD 占多数。  
+> **2026-02~03 弱窗：** 缺 quote 的 **16/41** 交易日几乎全是周一/周二；上游 `option_1m` 上 `min_dte≥3`，**freeze `{0,1,2}` 锁约行数=0**——补 1s quote **无效**。见 [`missed_movers_feb_mar.md`](missed_movers_feb_mar.md) §5.2。  
+> （对照：同日 GOOGL Feb lock 已补并 merge，02-20 已可成交。）
 
 ## 1. 正股 1s（已补）
 

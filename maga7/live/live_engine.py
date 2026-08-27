@@ -53,8 +53,8 @@ class Mag7LiveFrameEngine:
         self._last_disk_snapshot = 0.0
         self._last_redis_snapshot = 0.0
         self._snapshot_interval_sec = 5.0
-        self._ensure_group()
         self._restore_progress()
+        self._ensure_group()
 
     @property
     def health_key(self) -> str:
@@ -64,17 +64,34 @@ class Mag7LiveFrameEngine:
     def scanner_state_key(self) -> str:
         return f"maga7:scanner_state:{self.session_id}"
 
+    @property
+    def dead_letter_key(self) -> str:
+        return f"maga7:live_dead_letter:{self.session_id}"
+
     def _ensure_group(self) -> None:
         try:
             self.redis.xgroup_create(
                 self.keys["stream"],
                 self.keys["group"],
-                id="0-0",
+                # Connector publishes while contracts are prepared/locked.
+                # A fresh live engine must start at the current stream tail;
+                # replaying that startup backlog makes valid old frames trip
+                # the runtime stale-frame fail-closed guard.
+                id="$",
                 mkstream=True,
             )
         except Exception as exc:
             if "BUSYGROUP" not in str(exc):
                 raise
+            # Connector/init may have created the group earlier. For a fresh
+            # engine (no restored progress) jump to the live tail.
+            if float(self.metrics.last_frame_ts or 0.0) <= 0.0:
+                try:
+                    self.redis.xgroup_setid(
+                        self.keys["stream"], self.keys["group"], id="$"
+                    )
+                except Exception as set_exc:
+                    logger.warning("xgroup setid $ skipped: %s", set_exc)
 
     def _restore_progress(self) -> None:
         raw = self.redis.hgetall(self.health_key) or {}
@@ -130,6 +147,45 @@ class Mag7LiveFrameEngine:
             },
         )
 
+    def _quarantine_message(
+        self, message_id: Any, fields: dict[Any, Any], exc: Exception
+    ) -> None:
+        raw = fields.get(b"batch") if b"batch" in fields else fields.get("batch")
+        pipe = self.redis.pipeline(transaction=True)
+        pipe.xadd(
+            self.dead_letter_key,
+            {
+                "original_id": (
+                    message_id.decode()
+                    if isinstance(message_id, bytes)
+                    else str(message_id)
+                ),
+                "error": f"{type(exc).__name__}: {exc}",
+                "failed_at": str(time.time()),
+                "batch": raw or b"",
+            },
+            maxlen=10_000,
+            approximate=True,
+        )
+        pipe.xack(self.keys["stream"], self.keys["group"], message_id)
+        pipe.execute()
+
+    def _fail_closed_on_processing_error(self, exc: Exception) -> None:
+        # Startup backlog / late delivery is already quarantined. Permanent
+        # day halt is reserved for true processing faults, not stale catch-up.
+        if "stale live frame" in str(exc):
+            if hasattr(self.oms, "_note_gap_event"):
+                self.oms._note_gap_event()
+            logger.warning("skip stale live frame without day halt: %s", exc)
+            return
+        self.oms.day_halted = True
+        if hasattr(self.oms, "_note_gap_event"):
+            self.oms._note_gap_event()
+        try:
+            self.oms.force_flatten("GAP_FLATTEN")
+        except Exception:
+            logger.exception("force flatten after frame rejection failed: %s", exc)
+
     def _ingest_options(self, payload: dict[str, Any], frame_ts: float) -> None:
         symbol = str(payload.get("symbol") or "").upper()
         for row in payload.get("option_contracts") or []:
@@ -168,6 +224,18 @@ class Mag7LiveFrameEngine:
             raise ValueError("duplicate symbol in frame")
         frame_id = next(iter(frame_ids))
         frame_ts = next(iter(frame_ts_values))
+        risk_cfg = getattr(self.oms, "risk_cfg", None)
+        max_frame_age = float(getattr(risk_cfg, "max_signal_age_sec", 0.0) or 0.0)
+        if max_frame_age > 0:
+            frame_age = time.time() - frame_ts
+            max_future_skew = float(
+                getattr(risk_cfg, "max_future_skew_sec", 1.0) or 1.0
+            )
+            if frame_age > max_frame_age or frame_age < -max_future_skew:
+                raise ValueError(
+                    f"stale live frame age={frame_age:.3f}s "
+                    f"limit={max_frame_age:.3f}s"
+                )
         if frame_id in self.seen:
             self.metrics.duplicates += 1
             self.redis.xack(self.keys["stream"], self.keys["group"], message_id)
@@ -176,6 +244,25 @@ class Mag7LiveFrameEngine:
             raise ValueError(
                 f"out-of-order frame {frame_ts} <= {self.metrics.last_frame_ts}"
             )
+        if (
+            self.metrics.last_frame_ts
+            and frame_ts > self.metrics.last_frame_ts + 1.0
+        ):
+            if hasattr(self.oms, "_note_gap_event"):
+                self.oms._note_gap_event(now=frame_ts)
+            if hasattr(self.oms, "_entry_quote_stable"):
+                self.oms._entry_quote_stable.clear()
+            if hasattr(self.oms, "_last_entry_quote_ts"):
+                self.oms._last_entry_quote_ts.clear()
+            if hasattr(self.oms, "_event"):
+                self.oms._event(
+                    "FEED_FRAME_GAP",
+                    {
+                        "previous_frame_ts": self.metrics.last_frame_ts,
+                        "frame_ts": frame_ts,
+                        "gap_sec": frame_ts - self.metrics.last_frame_ts,
+                    },
+                )
 
         # Same-second option quotes become visible before stock/minute decisions.
         # Drop callback-time/future quotes; OMS may only see quotes serialized in
@@ -263,6 +350,10 @@ class Mag7LiveFrameEngine:
             for sig in self.scanner.drain_am_pulse_extension(frame_ts_ny):
                 if sig not in signals:
                     signals.append(sig)
+        if hasattr(self.scanner, "drain_am_v2"):
+            for sig in self.scanner.drain_am_v2(frame_ts_ny):
+                if sig not in signals:
+                    signals.append(sig)
 
         # Scanner states now include every completed minute in this cross-symbol
         # frame. Resolve exits first, then admit new entries.
@@ -331,7 +422,13 @@ class Mag7LiveFrameEngine:
             )
             messages = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else []
             for message_id, fields in messages:
-                self._process_message(message_id, fields)
+                try:
+                    self._process_message(message_id, fields)
+                except Exception as exc:
+                    self.metrics.rejected += 1
+                    self._fail_closed_on_processing_error(exc)
+                    self._quarantine_message(message_id, fields, exc)
+                    self._publish_health("DEGRADED", error=str(exc))
         except Exception as exc:
             # Redis < 6.2 has no XAUTOCLAIM; a new live session normally starts
             # with a fresh group, so this is observable but not fatal.
@@ -354,8 +451,10 @@ class Mag7LiveFrameEngine:
                     self._process_message(message_id, fields)
                 except Exception as exc:
                     self.metrics.rejected += 1
-                    self._publish_health("ERROR", error=str(exc))
-                    raise
+                    self._fail_closed_on_processing_error(exc)
+                    self._quarantine_message(message_id, fields, exc)
+                    self._publish_health("DEGRADED", error=str(exc))
+                    continue
                 count += 1
         return count
 
@@ -379,8 +478,10 @@ class Mag7LiveFrameEngine:
                         self._process_message(message_id, fields)
                     except Exception as exc:
                         self.metrics.rejected += 1
-                        self._publish_health("ERROR", error=str(exc))
-                        raise
+                        self._fail_closed_on_processing_error(exc)
+                        self._quarantine_message(message_id, fields, exc)
+                        self._publish_health("DEGRADED", error=str(exc))
+                        continue
                     await asyncio.sleep(0)
 
     def stop(self) -> None:

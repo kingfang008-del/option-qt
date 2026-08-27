@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "bundle_id": "deploy_bundle_v4_frozen_v1",
+  "description": "TFT V4 deploy bundle: frozen_norm + outer gates + Gate fail degrade. Research rolling KPI is not live expected PnL.",
+  "created": "2026-07-22",
+  "model": {
+    "checkpoint": "checkpoint/checkpoints_qqq_v4/best.pth",
+    "slow_feature_config": "qqq_btc/CONFIG/slow_feature_qqq_v4.json",
+    "frozen_norm": "qqq_btc/CONFIG/frozen_norm_qqq_daily.npz",
+    "note": "ckpt + frozen_norm + slow_feature are version-locked; change any → re-run Gate1–3"
+  },
+  "strategy_profile": "qqq_btc/CONFIG/strategy_profiles/v4_vx_jul_full_frozen_v1.json",
+  "parity": {
+    "gate1_raw": "qqq_btc/tools/compare_debug_raw_offline.py",
+    "gate2_norm": "qqq_btc/tools/compare_debug_slow_offline.py",
+    "gate3_trades": "stream fill_audit vs offline trades",
+    "order": ["gate1", "gate2", "gate3"],
+    "norm_rule": "offline KPI / stream / live MUST share frozen_norm; rolling_norm = RESEARCH_ONLY"
+  },
+  "outer_controls": {
+    "selector": "vx",
+    "put_gate_mode": "vixy_z",
+    "edge_q10_floor": -0.2,
+    "position_frac": 0.25,
+    "next_day_put_quarantine_loss": -0.02,
+    "next_day_put_quarantine_vx_slope_min": 0.06,
+    "tick_exits": "disaster_only_for_prod_or_off_for_parity"
+  },
+  "degrade_on_gate_fail": {
+    "enabled": true,
+    "modes": {
+      "NORMAL": "allow new entries under outer_controls",
+      "NO_NEW": "flatten only; block new entries",
+      "HALT": "block entries and alert; require human clear"
+    },
+    "rules": [
+      {
+        "when": "gate1_fail",
+        "action": "NO_NEW",
+        "ttl_hours": 24,
+        "reason": "raw feature drift vs offline gold"
+      },
+      {
+        "when": "gate2_fail",
+        "action": "NO_NEW",
+        "ttl_hours": 24,
+        "reason": "frozen_norm feature drift"
+      },
+      {
+        "when": "gate3_fail_or_unexplained_day_loss",
+        "action": "HALT",
+        "ttl_hours": 48,
+        "reason": "trade/PnL path diverged or toxic day"
+      },
+      {
+        "when": "manual_kill",
+        "action": "HALT",
+        "ttl_hours": null,
+        "reason": "operator kill switch"
+      }
+    ],
+    "state_file": "qqq_btc/results/deploy_runtime/degrade_state.json"
+  },
+  "july_full_replay": {
+    "scope": "2026-07-01..2026-07-20 (07-03 holiday; 07-21 pending valid API key)",
+    "tool": "qqq_btc/tools/run_july_full_frozen_replay.sh"
+  }
+}

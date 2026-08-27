@@ -1,0 +1,80 @@
+{
+  "profile": "am_pocket_vd_multi_tp8_sl15_v1",
+  "profile_id": "am_pocket_vd_multi_tp8_sl15_v1",
+  "description": "Research AM pocket sleeve (NOT wired to scanner yet). Freeze: no_b_up + vd_soft ∩ cont60 ∩ mf100+ ∩ volr12 → TP8/SL15/h240 @20%/max5. Offline gate = option trade-last (slip 1%) econ dual PASS (research_am_pocket_trades_dual). Historical 09:30 quotes sparse — do not block on FillSpec. Live shadow may use IB NBBO when drain is wired. Docs: am_pocket_trades_dual.md.",
+  "role": "research_sleeve_expert",
+  "result_tag": "research_am_pocket_trades_dual",
+  "research_revision": "2026-07-29_trades_dual_offline_pass",
+  "based_on": null,
+  "spine_complement": "strategy_profiles/single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json",
+  "narrow_expert_id": "am_pocket_sleeve",
+  "docs": [
+    "docs/am_pocket_trades_dual.md",
+    "docs/am_pocket_combo_opt.md",
+    "docs/am_pocket_quote_ready.md"
+  ],
+  "symbols": ["NVDA", "TSLA", "AAPL", "AMZN", "META", "MSFT", "AMD", "GOOGL"],
+  "am_pocket": {
+    "enabled": false,
+    "execute_mode": "shadow",
+    "wired": false,
+    "wire_note": "No Mag7Scanner.drain_am_pocket yet. Offline gate is trade-last; enable spine shadow after drain exists.",
+    "pockets": "no_b_up",
+    "entry": {
+      "vd_soft": {
+        "accel_min": 0.0,
+        "accel_max": 0.00025,
+        "fo_min": 0.003,
+        "fo_max": 0.015,
+        "vd_min": 0.002,
+        "vd_max": 0.007
+      },
+      "require_cont60": true,
+      "require_mf100_align": true,
+      "min_volume_ratio_60": 1.2,
+      "decision_delay_sec": 0,
+      "decision_delay_note": "quote_ready scan: delay>=30s kills dual; keep 0."
+    },
+    "exit": {
+      "tp": 0.08,
+      "sl": 0.15,
+      "max_hold_sec": 240
+    },
+    "fill": {
+      "research_mark": "trade_last",
+      "research_slip": 0.01,
+      "live_mark": "nbbo_or_trade",
+      "max_spread_pct": 0.15,
+      "max_lag_sec": 5.0,
+      "min_mid": 0.05,
+      "entry_frac": 0.75,
+      "exit_frac": 0.75,
+      "note": "Offline accept on trades; quote FillSpec not required for research promote."
+    },
+    "position_frac": 0.20,
+    "max_concurrent": 5,
+    "moneyness": "ATM",
+    "prefer_dte": 0,
+    "allowed_dte": [0, 1, 2],
+    "mutex_vs_am_pulse": "prefer_pocket_when_wired",
+    "note": "2026-07-29: trade_d0 dual PASS; quote_wait FAIL; FO Pulse causal LOCK negative — pocket is AM research successor, not yet live."
+  },
+  "portfolio": {
+    "mutex_vs_core": "hard_tod",
+    "budget_frac": 0.20,
+    "flatten_before": "11:00"
+  },
+  "date_range": {
+    "start": "2026-05-01",
+    "end": "2026-07-23"
+  },
+  "acceptance": {
+    "offline_mark": "trade_last_slip_1pct",
+    "trade_last_econ_dual": "PASS",
+    "trade_last_pulse_dual": "FAIL_blind_n4",
+    "quote_fillspec_dual": "SKIPPED_no_open_quotes",
+    "quote_ready_delay": "FAIL_edge_dies",
+    "promote_to_spine_shadow": false,
+    "next": "Wire Mag7Scanner.drain_am_pocket shadow; optional disable FO Pulse causal LOCK"
+  }
+}

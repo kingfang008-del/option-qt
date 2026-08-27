@@ -8,6 +8,7 @@ from maga7.live.broker_oms import Mag7BrokerOms
 from maga7.live.risk_guards import (
     entry_feed_ok,
     entry_quote_ok,
+    entry_stock_drift_ok,
     fill_adverse,
     is_fresh,
     next_entry_quote_stable_ticks,
@@ -71,6 +72,35 @@ def test_satellite_quote_must_follow_signal_within_lag_cap():
     )
     assert not ok and reason == "option_quote_lag_exceeded"
     assert lag is not None and abs(lag - 5.1) < 1e-9
+
+
+def test_am_entry_stock_drift_blocks_chase_and_reversal():
+    ok, reason, drift = entry_stock_drift_ok(
+        signal_spot=100.0,
+        current_spot=100.2,
+        direction="UP",
+        max_chase=0.003,
+        max_reversal=0.0015,
+    )
+    assert ok and reason == "ok" and drift is not None
+
+    ok, reason, _ = entry_stock_drift_ok(
+        signal_spot=100.0,
+        current_spot=100.4,
+        direction="UP",
+        max_chase=0.003,
+        max_reversal=0.0015,
+    )
+    assert not ok and reason == "entry_stock_chase_exceeded"
+
+    ok, reason, _ = entry_stock_drift_ok(
+        signal_spot=100.0,
+        current_spot=100.2,
+        direction="DN",
+        max_chase=0.003,
+        max_reversal=0.0015,
+    )
+    assert not ok and reason == "entry_stock_reversed"
 
 
 def test_entry_feed_blocks_delayed_and_universe_stale():
@@ -304,7 +334,17 @@ def test_oms_blocks_first_option_print_until_warmup(tmp_path):
         bucket_id=0,
         contract="AMZN260727P00232500",
         moneyness="ATM",
-        meta={"event_source": "am_pulse_sleeve", "route": "am_pulse", "execute_mode": "shadow"},
+        meta={
+            "event_source": "am_pulse_sleeve",
+            "route": "am_pulse",
+            "execute_mode": "shadow",
+            "max_lag_sec": 5.0,
+            # Feature bar is old; OMS must anchor quote lag to availability.
+            "decision_ts": __import__("pandas")
+            .Timestamp(now - 1.0, unit="s", tz="UTC")
+            .tz_convert("America/New_York")
+            .isoformat(),
+        },
     )
     assert oms.process_signal(sig) is False
     assert any(

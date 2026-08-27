@@ -211,6 +211,37 @@ def eval_router_rule(
         if _washout_hit():
             return washout_expert
         return None
+    if rule in {
+        "mixed_wash_up",
+        "dispersion_wash_up",
+        "up_dispersion_risk",
+        "predict_up_toxic",
+    }:
+        # Predictive UP-toxic day: several names washed by 10:00 but Mag7 is
+        # mixed (not a broad red day). Classic washout_and_reclaim miss —
+        # e.g. 2026-07-20 (breadth=4, frac_above≈0.62) stayed NORMAL.
+        breadth_min = int(cfg.get("washout_breadth_min", 3) or 3)
+        orb_cfg = OrbOpenConfig(
+            wash_window_end=str(cfg.get("wash_window_end", "10:00")),
+            wash_drop_min=float(cfg.get("wash_drop_min", 0.008) or 0.008),
+            wash_min_bars=int(cfg.get("wash_min_bars", 3) or 3),
+        )
+        n_wash, _ = count_open_washout(stock_by, date=date, symbols=symbols, cfg=orb_cfg)
+        frac_lo = float(cfg.get("frac_above_min", 0.35) or 0.35)
+        frac_hi = float(cfg.get("frac_above_max", 0.70) or 0.70)
+        bounce_max = cfg.get("bounce_max")
+        bounce_ok = True
+        if bounce_max is not None:
+            bounce_ok = float(bounce) <= float(bounce_max) + 1e-12
+        if (
+            n_wash >= breadth_min
+            and frac_lo - 1e-12 <= mag7_frac_above <= frac_hi + 1e-12
+            and bounce_ok
+        ):
+            if bool(cfg.get("prefer_risk_off", False)):
+                return str(cfg.get("risk_off_expert") or "up_toxic_block")
+            return str(cfg.get("soft_expert") or cfg.get("prevention_expert") or "up_toxic")
+        return None
     return None
 
 
@@ -275,6 +306,12 @@ class WatchdogConfig:
     halt_expert: str = "washout_gate_halt"
     halt_ttl_minutes: int | None = None
     halt_router_cfg: dict[str, Any] = field(default_factory=dict)
+    # prevention lane (predictive; fires only when halt/degrade miss)
+    prevention_enabled: bool = False
+    prevention_rule: str = "mixed_wash_up"
+    prevention_expert: str = "up_toxic"
+    prevention_ttl_minutes: int | None = None
+    prevention_router_cfg: dict[str, Any] = field(default_factory=dict)
     # hunt lane (arm → short TTL → budget; default off)
     hunter_enabled: bool = False
     hunter_ttl_minutes: int = 15
@@ -379,6 +416,7 @@ class WatchdogConfig:
         raw = raw or {}
         deg = raw.get("degrade") if isinstance(raw.get("degrade"), dict) else {}
         halt = raw.get("halt") if isinstance(raw.get("halt"), dict) else {}
+        prev = raw.get("prevention") if isinstance(raw.get("prevention"), dict) else {}
         hunt = raw.get("hunter") if isinstance(raw.get("hunter"), dict) else {}
         labels: dict[str, str] = {}
         lp = raw.get("labels_path") or raw.get("day_type_path")
@@ -422,6 +460,27 @@ class WatchdogConfig:
         if "washout_expert" not in halt_cfg and halt.get("expert"):
             halt_cfg["washout_expert"] = halt.get("expert")
 
+        prev_cfg = dict(prev.get("router_cfg") or {})
+        for k in (
+            "wash_drop_min",
+            "washout_breadth_min",
+            "wash_window_end",
+            "wash_min_bars",
+            "frac_above_min",
+            "frac_above_max",
+            "bounce_max",
+            "prefer_risk_off",
+            "risk_off_expert",
+            "soft_expert",
+            "prevention_expert",
+        ):
+            if k in prev and k not in prev_cfg:
+                prev_cfg[k] = prev[k]
+        if "soft_expert" not in prev_cfg and prev.get("expert"):
+            prev_cfg["soft_expert"] = prev.get("expert")
+        if "prevention_expert" not in prev_cfg and prev.get("expert"):
+            prev_cfg["prevention_expert"] = prev.get("expert")
+
         mode = str(raw.get("mode") or "rule").strip().lower()
         if mode in {"labels", "label", "oracle"}:
             mode = "oracle"
@@ -443,6 +502,13 @@ class WatchdogConfig:
             halt_expert=str(halt.get("expert") or "washout_gate_halt"),
             halt_ttl_minutes=int(halt["ttl_minutes"]) if halt.get("ttl_minutes") is not None else None,
             halt_router_cfg=halt_cfg,
+            prevention_enabled=bool(prev.get("enabled", False)),
+            prevention_rule=str(prev.get("rule") or "mixed_wash_up"),
+            prevention_expert=str(prev.get("expert") or "up_toxic"),
+            prevention_ttl_minutes=(
+                int(prev["ttl_minutes"]) if prev.get("ttl_minutes") is not None else None
+            ),
+            prevention_router_cfg=prev_cfg,
             hunter_enabled=bool(hunt.get("enabled", False)),
             hunter_ttl_minutes=int(hunt.get("ttl_minutes", 15) or 15),
             hunter_max_entries_per_day=int(hunt.get("max_entries_per_day", 1) or 1),
@@ -639,6 +705,45 @@ class RegimeWatchdog:
                     reason=f"degrade:{self.cfg.degrade_rule}",
                     asof=asof,
                     armed_until=_ttl_until(asof, self.cfg.degrade_ttl_minutes),
+                    expert=expert,
+                )
+
+        # 3) PREVENTION lane — predictive catch when L1 halt/degrade miss.
+        if self.cfg.prevention_enabled and self.cfg.prevention_rule:
+            hit = eval_router_rule(
+                self.cfg.prevention_rule,
+                date=date,
+                stock_by=stock_by,
+                qqq_df=qqq_df,
+                symbols=symbols,
+                asof_hhmm=self.cfg.asof,
+                router_cfg=self.cfg.prevention_router_cfg,
+            )
+            if hit:
+                expert = hit if hit in self.experts else (self.cfg.prevention_expert or hit)
+                # Hard blocks (UP/DN) escalate to HALT semantics for baseline entries.
+                patch = (self.experts.get(expert) or {}).get("regime") or {}
+                blocks = {
+                    str(x).upper()
+                    for x in (patch.get("block_directions") or [])
+                }
+                state = (
+                    WatchdogState.HALT
+                    if {"UP", "DN"}.issubset(blocks) or blocks == {"UP", "DN"}
+                    else WatchdogState.DEGRADE
+                )
+                # Directional risk-off (e.g. block UP only) still uses DEGRADE + overlay.
+                if blocks and not {"UP", "DN"}.issubset(blocks):
+                    state = WatchdogState.DEGRADE
+                ov = self._expert_overlay(
+                    expert, state=state, reason="prevention_rule"
+                )
+                return WatchdogDecision(
+                    state=state,
+                    overlay=ov,
+                    reason=f"prevention:{self.cfg.prevention_rule}",
+                    asof=asof,
+                    armed_until=_ttl_until(asof, self.cfg.prevention_ttl_minutes),
                     expert=expert,
                 )
 

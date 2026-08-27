@@ -41,6 +41,12 @@ class RangeStallGateConfig:
     crowd_max_pre5: float | None = None
     crowd_min_fav_from_open: float | None = None
     on_missing: str = "allow"  # allow | block
+    # Hunt skips peer_align_min by default; when True, still compute peer_n for
+    # this gate only (not peer_gap). Does not restore peer_min.
+    hunt_peer_align: bool = False
+    # Hunt washout fills often wait until signal_deadline (~10:00) for quotes;
+    # measure stall at that floor when set (e.g. "10:00"), else decision ``ts``.
+    hunt_asof: str | None = None  # None | "signal_deadline" | "HH:MM"
 
 
 @dataclass(frozen=True)
@@ -88,6 +94,11 @@ def parse_range_stall_gate(raw: Any) -> RangeStallGateConfig:
     on_miss = str(raw.get("on_missing") or "allow").strip().lower()
     if on_miss not in {"allow", "block"}:
         on_miss = "allow"
+    hunt_peer = raw.get("hunt_peer_align")
+    if hunt_peer is None:
+        hunt_peer = raw.get("hunt_use_peer")
+    hunt_asof_raw = raw.get("hunt_asof")
+    hunt_asof = str(hunt_asof_raw).strip() if hunt_asof_raw not in (None, "") else None
     return RangeStallGateConfig(
         enabled=bool(raw.get("enabled", False)),
         min_chase=float(raw.get("min_chase", 0.9) or 0.9),
@@ -103,6 +114,8 @@ def parse_range_stall_gate(raw: Any) -> RangeStallGateConfig:
         crowd_max_pre5=cpre_f,
         crowd_min_fav_from_open=cmfo_f,
         on_missing=on_miss,
+        hunt_peer_align=bool(hunt_peer) if hunt_peer is not None else False,
+        hunt_asof=hunt_asof,
     )
 
 

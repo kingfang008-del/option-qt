@@ -12,10 +12,28 @@ from typing import Any
 
 import pandas as pd
 
-from maga7.common.bar_agg import aggregate_1s_to_1m, load_stock_1s_day
+from maga7.common.bar_agg import aggregate_1s_to_1m, aggregate_1s_to_bars, load_stock_1s_day
 from maga7.common.signals import attach_mf_features, resolve_mf_fast_window
 
 NY = "America/New_York"
+
+
+def shift_completed_1m(sdf: pd.DataFrame) -> pd.DataFrame:
+    """Expose left-labeled 1m bars only after the minute closes.
+
+    Relabel timestamp → timestamp+1m so ``timestamp <= asof`` means completed.
+    """
+    if sdf is None or sdf.empty:
+        return pd.DataFrame()
+    out = sdf.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"])
+    if getattr(out["timestamp"].dt, "tz", None) is None:
+        out["timestamp"] = out["timestamp"].dt.tz_localize(NY)
+    else:
+        out["timestamp"] = out["timestamp"].dt.tz_convert(NY)
+    out["timestamp"] = out["timestamp"] + pd.Timedelta(minutes=1)
+    out["tod"] = out["timestamp"].dt.strftime("%H:%M")
+    return out.sort_values("timestamp").reset_index(drop=True)
 
 
 def session_dates(start: str, end: str) -> list[str]:
@@ -27,15 +45,24 @@ def load_symbol_1s_bars(
     stock_1s_root: Path | str,
     symbol: str,
     dates: list[str],
+    *,
+    bar_seconds: int = 60,
 ) -> pd.DataFrame:
-    """Load and aggregate 1s → left-labeled RTH 1m bars for ``dates``."""
+    """Load and aggregate 1s → left-labeled RTH bars for ``dates``.
+
+    Default ``bar_seconds=60`` (1m). Research HF paths use 5 / 15.
+    """
     root = Path(stock_1s_root)
+    n = int(bar_seconds)
     frames: list[pd.DataFrame] = []
     for date in dates:
         raw = load_stock_1s_day(root, symbol, date)
         if raw.empty:
             continue
-        bars = aggregate_1s_to_1m(raw, symbol=symbol, rth_only=True)
+        if n == 60:
+            bars = aggregate_1s_to_1m(raw, symbol=symbol, rth_only=True)
+        else:
+            bars = aggregate_1s_to_bars(raw, bar_seconds=n, symbol=symbol, rth_only=True)
         if bars.empty:
             continue
         bars = bars.copy()
@@ -52,21 +79,22 @@ def load_symbol_1s_bars(
         out["timestamp"] = out["timestamp"].dt.tz_convert(NY)
     out = out.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
     out["date"] = out["timestamp"].dt.strftime("%Y-%m-%d")
+    # HH:MM keeps Rule-A window filters; denser bars share the same minute tod.
     out["tod"] = out["timestamp"].dt.strftime("%H:%M")
     return out
 
 
-def build_stock_by_from_1s(
+def build_bars_by_from_1s(
     profile: dict[str, Any],
     *,
     dates: list[str] | None = None,
     include_refs: bool = True,
+    bar_seconds: int = 60,
 ) -> dict[str, pd.DataFrame]:
-    """Feature frames for Mag7 symbols (+ optional QQQ/VIXY) from stock 1s only."""
+    """OHLCV (+date/tod) frames from stock 1s — no mf features yet."""
     stock_1s = Path(profile["_paths"]["stock_1s_root"])
     if not stock_1s.is_dir():
         raise FileNotFoundError(f"stock_1s_root missing: {stock_1s}")
-    sig = profile.get("signal") or {}
     start = profile["date_range"]["start"]
     end = profile["date_range"]["end"]
     dates = dates or session_dates(start, end)
@@ -77,16 +105,57 @@ def build_stock_by_from_1s(
                 symbols.append(ref)
     out: dict[str, pd.DataFrame] = {}
     for sym in symbols:
-        raw = load_symbol_1s_bars(stock_1s, sym, dates)
-        if raw.empty:
+        raw = load_symbol_1s_bars(stock_1s, sym, dates, bar_seconds=int(bar_seconds))
+        if not raw.empty:
+            out[sym] = raw
+    return out
+
+
+def attach_features_stock_by(
+    bars_by: dict[str, pd.DataFrame],
+    *,
+    mf_window: int = 10,
+    vol_ma_window: int = 20,
+    mf_fast_window: int | None = None,
+    signal_cfg: dict[str, Any] | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Attach mf/streak/vol_z onto pre-aggregated bars (any bar seconds)."""
+    sig = signal_cfg or {}
+    fast = mf_fast_window if mf_fast_window is not None else resolve_mf_fast_window(sig)
+    out: dict[str, pd.DataFrame] = {}
+    for sym, raw in bars_by.items():
+        if raw is None or raw.empty:
             continue
         out[sym] = attach_mf_features(
             raw,
-            mf_window=int(sig.get("mf_window", 10)),
-            vol_ma_window=int(sig.get("vol_ma_window", 20)),
-            mf_fast_window=resolve_mf_fast_window(sig),
+            mf_window=int(mf_window),
+            vol_ma_window=int(vol_ma_window),
+            mf_fast_window=fast,
         )
     return out
+
+
+def build_stock_by_from_1s(
+    profile: dict[str, Any],
+    *,
+    dates: list[str] | None = None,
+    include_refs: bool = True,
+    bar_seconds: int = 60,
+) -> dict[str, pd.DataFrame]:
+    """Feature frames for Mag7 symbols (+ optional QQQ/VIXY) from stock 1s only."""
+    sig = profile.get("signal") or {}
+    bars = build_bars_by_from_1s(
+        profile,
+        dates=dates,
+        include_refs=include_refs,
+        bar_seconds=int(bar_seconds),
+    )
+    return attach_features_stock_by(
+        bars,
+        mf_window=int(sig.get("mf_window", 10)),
+        vol_ma_window=int(sig.get("vol_ma_window", 20)),
+        signal_cfg=sig,
+    )
 
 
 def coverage_report(

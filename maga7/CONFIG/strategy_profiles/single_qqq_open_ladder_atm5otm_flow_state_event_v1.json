@@ -1,0 +1,320 @@
+{
+  "profile": "single_qqq_open_ladder_atm5otm_flow_state_event_v1",
+  "profile_id": "single_qqq_open_ladder_atm5otm_flow_state_event_v1",
+  "description": "Research candidate after ablation v1/v1b: Rule-A flow → soft stock_path_confirm (adverse-first veto only; timeout allow) → optional state_gate. Hard path+always-on time-stops REJECTED (destroy strong edge). NOT freeze.",
+  "role": "research_flow_state_event",
+  "result_tag": "research_flow_soft_path_v1",
+  "based_on": "strategy_profiles/single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json",
+  "recommended_scheme": "single",
+  "baseline_doc": "docs/flow_state_event_architecture.md",
+  "frozen_at": null,
+  "symbols": [
+    "NVDA",
+    "TSLA",
+    "AAPL",
+    "AMZN",
+    "META",
+    "MSFT",
+    "AMD",
+    "GOOGL"
+  ],
+  "signal": {
+    "window_start": "10:30",
+    "window_end": "14:00",
+    "mf_window": 10,
+    "streak_min": 8,
+    "from_prev_abs": 0.02,
+    "vol_z_min": 1.0,
+    "vol_ma_window": 20,
+    "top_k": 2,
+    "rank_by": "earliest",
+    "peer_align_min": 3,
+    "peer_align_mode": "mf10",
+    "peer_symbols": [
+      "NVDA",
+      "TSLA",
+      "AAPL",
+      "AMZN",
+      "META",
+      "MSFT",
+      "AMD"
+    ],
+    "mf_idio_mode": "pos",
+    "mf_idio_action": "scale",
+    "mf_idio_scale": 0.5,
+    "mf_idio_after_loss_streak": 1,
+    "mf_idio_beta_days": 5,
+    "mf_idio_beta_on": "ret"
+  },
+  "tcn_gate": {
+    "enabled": false,
+    "action": "scale",
+    "p_min": 0.75,
+    "scale_when_low": 0.5,
+    "scale_mode": "floor",
+    "window": 15,
+    "model_path": null,
+    "block_on_missing": false,
+    "channels": [
+      "net$",
+      "ret1",
+      "range_pct",
+      "qqq_ret1"
+    ]
+  },
+  "lgbm_bouncer": {
+    "enabled": false,
+    "action": "scale",
+    "p_min": 0.55,
+    "scale_when_low": 0.5,
+    "model_path": "maga7/results/lgbm_bouncer/lgbm_bouncer_dn_v1.txt",
+    "block_on_missing": false,
+    "only_directions": [
+      "DN"
+    ]
+  },
+  "regime_router": {
+    "enabled": false,
+    "mode": "rule",
+    "rule": "reclaim_disp55",
+    "asof": "10:30",
+    "experts_path": "maga7/CONFIG/regime_router/experts_v1.json"
+  },
+  "watchdog": {
+    "enabled": true,
+    "mode": "rule",
+    "asof": "10:30",
+    "experts_path": "maga7/CONFIG/regime_router/experts_v1.json",
+    "description": "P2 (2026-07-18): research baseline opens L1 + L2 Hunter washout_reclaim (old exit T30+extend). Gate: Feb–Apr vs L0 lift; 2025H2 noted but not hard veto (Friday-option / regime mismatch).",
+    "degrade": {
+      "enabled": true,
+      "rule": "reclaim_disp55",
+      "expert": "rebound_trap_dn",
+      "ttl_minutes": null
+    },
+    "halt": {
+      "enabled": true,
+      "rule": "washout_and_reclaim",
+      "expert": "washout_gate_halt",
+      "wash_drop_min": 0.008,
+      "washout_breadth_min": 5,
+      "wash_window_end": "10:00",
+      "ttl_minutes": null
+    },
+    "prevention": {
+      "enabled": false,
+      "rule": "mixed_wash_up",
+      "expert": "up_toxic",
+      "prefer_risk_off": true,
+      "risk_off_expert": "up_toxic_block",
+      "wash_drop_min": 0.008,
+      "washout_breadth_min": 3,
+      "wash_window_end": "10:00",
+      "frac_above_min": 0.35,
+      "frac_above_max": 0.7,
+      "ttl_minutes": null,
+      "note": "OFF: superseded by state_gate (breadth≥5). See docs/flow_state_event_architecture.md"
+    },
+    "hunter": {
+      "enabled": true,
+      "detector": "washout_reclaim",
+      "wash_drop_min": 0.015,
+      "wash_window_end": "10:00",
+      "signal_deadline": "10:15",
+      "reclaim_level": "open",
+      "hold_confirm_bars": 0,
+      "ttl_minutes": 20,
+      "max_entries_per_day": 1,
+      "top_k": 1,
+      "mutex_with_baseline": true,
+      "block_when_degrade": true,
+      "block_when_halt": true,
+      "require_breadth_min": 0,
+      "skip_peer": true,
+      "skip_qqq_align": true,
+      "only_up": true,
+      "mutex_scope": "symbol_dir",
+      "allow_baseline_opposite": true,
+      "reclaim_buffer_pct": 0.0
+    },
+    "note": "L0+L1+L2 on research_baseline. Hunt uses trade exit (T30+extend). Docs: docs/watchdog_stack_architecture.md"
+  },
+  "trade": {
+    "tp_mult": 1.6,
+    "sl_mult": 0.45,
+    "hold_minutes": 30,
+    "position_frac": 0.2,
+    "position_sizing": "concurrent",
+    "max_concurrent_positions": 2,
+    "cooldown_minutes": 5,
+    "max_entries_per_symbol": 1,
+    "day_circuit": null,
+    "reentry_mode": "cooldown_only",
+    "only_reenter_after_win": false,
+    "exit_mode": "hold_extend",
+    "exit_mf_grace_seconds": 60,
+    "bar_availability_delay_seconds": 60,
+    "moneyness": "ATM",
+    "contract_mode": "open_ladder",
+    "ladder_otm_rungs": 3,
+    "quote_source": "1s",
+    "day_iv_half_spread_frac": 0.01,
+    "clear_otm_ban_0dte_pct": 0.01,
+    "max_entry_abs_otm_pct": 0.005,
+    "entry_confirm_bars": 2,
+    "entry_confirm_mode": "mf",
+    "entry_confirm_weekdays": [
+      1,
+      3
+    ],
+    "hold_watchdog": {
+      "enabled": false,
+      "qqq_adverse_from_entry": 0.008,
+      "min_hold_seconds": 60,
+      "require_option_mtm_max": null,
+      "note": "Position Watchdog research: flatten if QQQ moves ≥0.8% against trade after entry. Default OFF until ablation; see docs/hold_watchdog_research.md"
+    },
+    "trade_toxic": {
+      "enabled": true,
+      "cut_ret": 0.25,
+      "mfe_bypass": 0.05,
+      "min_hold_seconds": 60,
+      "persist_seconds": 0,
+      "max_cut_seconds": 600,
+      "quote_confirm_ret": null,
+      "div_mfe_bypass": 0.06,
+      "div_stock_adverse_max": 0.005,
+      "note": "Trade-mark toxic + stock-div soft MFE(6%) when underlying adverse<0.5%; max_cut=600s. See docs/trade_mark_toxic_path_research.md"
+    },
+    "risk": {
+      "max_stock_staleness_sec": 2.0,
+      "max_option_staleness_sec": 5.0,
+      "max_spread_pct": 0.25,
+      "max_entry_mid_jump_pct": 0.15,
+      "max_exit_mid_jump_pct": 0.2,
+      "max_gap_hold_ticks": 3,
+      "max_fill_spread_frac": 0.95,
+      "max_exit_chase": 3,
+      "day_circuit_force_flatten": true,
+      "halt_entries_on_gap": true,
+      "requote": {
+        "enabled": true,
+        "entry_timeout_sec": 3.0,
+        "exit_timeout_sec": 2.0,
+        "max_entry_requotes": 3,
+        "max_exit_requotes": 3,
+        "entry_frac_step": 0.05,
+        "entry_max_slippage_pct": 0.08,
+        "entry_step_cap_pct": 0.03,
+        "exit_step": 0.01,
+        "cancel_settle_sec": 0.5
+      }
+    },
+    "iceberg": {
+      "enabled": true,
+      "ask_size_frac": 0.5,
+      "min_chunk_qty": 1,
+      "max_chunks": 5,
+      "fallback_notional": 8000,
+      "max_total_sec": 15
+    },
+    "hold_extend_minutes": 45,
+    "hold_extend_mtm_min": 0.0,
+    "hold_extend_require_mf": false,
+    "early_exit_mode": null,
+    "mae_cut_ret": 0.25,
+    "mae_cut_mfe_bypass": 0.2,
+    "mae_cut_min_hold_minutes": 5,
+    "mae_cut_only_dn": false,
+    "stock_path_confirm": {
+      "enabled": true,
+      "thr_pos": 0.0015,
+      "thr_neg": -0.003,
+      "max_wait_seconds": 300,
+      "on_timeout": "allow",
+      "delay_on_pos": false,
+      "tod_start": "10:30",
+      "tod_end": "14:00",
+      "note": "Ablation S1: adverse-first veto only. Hard timeout-block rejected."
+    },
+    "delta_time_stop": {
+      "enabled": false
+    },
+    "roi_time_stop": {
+      "enabled": false
+    }
+  },
+  "regime": {
+    "enabled": true,
+    "qqq_align": true,
+    "qqq_from_prev_eps": 0.0,
+    "vix_reversal_max": null,
+    "put_vixy_z_min": null,
+    "qqq_mf10_align": false,
+    "day_loss_streak_halt": 3,
+    "block_on_missing": false,
+    "event_calendar_block": true,
+    "event_calendar": "feb_jul_aapl_ceo",
+    "event_blackout_sessions": 0,
+    "event_calendar_path": "maga7/CONFIG/event_calendar_live.json",
+    "company_news_mode": "hard_risk",
+    "company_news_direction_from_news": false,
+    "company_news_use_llm_for_blackout": false
+  },
+  "fill": {
+    "model": "spread_frac",
+    "entry_frac": 0.75,
+    "exit_frac": 0.75
+  },
+  "buckets": {
+    "UP_ATM": 2,
+    "UP_OTM": 3,
+    "DN_ATM": 0,
+    "DN_OTM": 1
+  },
+  "paths": {
+    "stock_root": "~/train_data/spnq_train",
+    "option_1m_root": "/mnt/s990/new_option_data_s3",
+    "day_iv_root": "~/train_data/nq_options_day_iv",
+    "locked_map": "~/train_data/locked_targets_map_maga7_mf10_jan_jul.parquet",
+    "open_locked_map": "~/train_data/locked_targets_map_maga7_googl_open_ladder_atm5otm_jan_jul.parquet",
+    "quote_1s_root": "/mnt/s990/data/raw_1s/maga7_mf10_open_ladder_otm5",
+    "option_trades_root": "/mnt/s990/new_option_data_s3_trades",
+    "stock_1s_root": "/mnt/s990/data/raw_1s/stocks",
+    "results_dir": "/mnt/s990/data/maga7/results",
+    "live_sessions_dir": "/mnt/s990/data/maga7/live_sessions"
+  },
+  "date_range": {
+    "start": "2026-05-01",
+    "end": "2026-07-17"
+  },
+  "lock": {
+    "dte_mode": "trading",
+    "prefer_dte": 0,
+    "allowed_dte": [
+      0,
+      1,
+      2
+    ],
+    "otm_rungs": 3
+  },
+  "state_gate": {
+    "enabled": false,
+    "asof": "10:30",
+    "mixed_wash": {
+      "washout_breadth_min": 5,
+      "wash_drop_min": 0.008,
+      "frac_above_min": 0.35,
+      "frac_above_max": 0.7,
+      "action": "block_up"
+    },
+    "reclaim_trap": {
+      "rule": "washout_and_reclaim",
+      "action": "scale",
+      "scale": 0.5,
+      "wash_drop_min": 0.015,
+      "washout_breadth_min": 5
+    },
+    "note": "S0 ablation: enable for mixed_wash UP veto (keeps ~79% strong). Default off in soft-path candidate."
+  }
+}

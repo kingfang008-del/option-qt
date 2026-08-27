@@ -125,6 +125,15 @@ class ScannerSignal:
 
 
 @dataclass
+class _AmPulseEmitOutcome:
+    """Internal result for AM sleeve emit — supports retryable skips."""
+
+    signal: ScannerSignal | None = None
+    skip_reason: str | None = None
+    retryable: bool = False
+
+
+@dataclass
 class Mag7Scanner:
     """Causal multi-symbol scanner.
 
@@ -188,6 +197,8 @@ class Mag7Scanner:
     n_am_pulse_emitted: int = 0
     n_am_pulse_skip: int = 0
     n_am_pulse_shadow: int = 0
+    n_am_pulse_wait: int = 0
+    am_pulse_skip_events: list = field(default_factory=list)
     pending_am_pulse: list = field(default_factory=list)
     _am_pulse_scout: Any = None
     _am_pulse_scout_date: str | None = None
@@ -196,9 +207,24 @@ class Mag7Scanner:
     n_am_pulse_extension_emitted: int = 0
     n_am_pulse_extension_skip: int = 0
     n_am_pulse_extension_shadow: int = 0
+    n_am_pulse_extension_wait: int = 0
+    am_pulse_extension_skip_events: list = field(default_factory=list)
     pending_am_pulse_extension: list = field(default_factory=list)
+    _pending_rth_opens: dict[str, float] = field(default_factory=dict)
+    _rth_open_live_root: str | None = None
+    _rth_open_redis: Any = None
     _am_pulse_extension_scout: Any = None
     _am_pulse_extension_scout_date: str | None = None
+    # Satellite sleeve: am_v2 launch (10:00–11:30 quote-promoted; not TopK).
+    n_am_v2_signals: int = 0
+    n_am_v2_emitted: int = 0
+    n_am_v2_skip: int = 0
+    n_am_v2_shadow: int = 0
+    n_am_v2_wait: int = 0
+    am_v2_skip_events: list = field(default_factory=list)
+    pending_am_v2: list = field(default_factory=list)
+    _am_v2_trackers: dict = field(default_factory=dict)
+    _am_v2_tracker_date: str | None = None
     event_blackout: set = field(default_factory=set)
     event_symbol_blackout: dict = field(default_factory=dict)  # date -> {SYM}
     event_blackout_meta: dict[str, Any] = field(default_factory=dict)
@@ -563,6 +589,13 @@ class Mag7Scanner:
         self.pending_path = []
         self.pending_am_pulse = []
         self.pending_am_pulse_extension = []
+        self.pending_am_v2 = []
+        self.am_pulse_skip_events = []
+        self.am_pulse_extension_skip_events = []
+        self.am_v2_skip_events = []
+        self.n_am_pulse_wait = 0
+        self.n_am_pulse_extension_wait = 0
+        self.n_am_v2_wait = 0
         self.day_hunt_symbols = set()
         self.day_hunt_dirs = set()
         self.day_topk_syms = set()
@@ -581,6 +614,8 @@ class Mag7Scanner:
         self._am_pulse_scout_date = None
         self._am_pulse_extension_scout = None
         self._am_pulse_extension_scout_date = None
+        self._am_v2_trackers = {}
+        self._am_v2_tracker_date = None
         # Live accumulation starts empty; preloaded research stock_by kept.
         if self.stock_by is None:
             self.stock_by = {}
@@ -635,6 +670,37 @@ class Mag7Scanner:
         else:
             self.stock_by[symbol] = pd.DataFrame([row])
         self._stamp_from_prev(symbol)
+        self._maybe_persist_rth_open(symbol, bar)
+
+    def _maybe_persist_rth_open(self, symbol: str, bar: dict[str, Any]) -> None:
+        """Write trade-date scoped 09:30 opens so mid-day restarts keep FO anchors."""
+        ts = to_ny(bar.get("timestamp"))
+        if ts is None or not (int(ts.hour) == 9 and int(ts.minute) == 30):
+            return
+        open_px = float(bar.get("open") or 0.0)
+        if open_px <= 0:
+            return
+        symbol_u = str(symbol).upper()
+        self._pending_rth_opens[symbol_u] = open_px
+        st = (self.states or {}).get(symbol_u)
+        if st is not None and (getattr(st, "day_open", None) in (None, 0, 0.0)):
+            st.day_open = open_px
+        live_root = self._rth_open_live_root
+        if not live_root:
+            return
+        try:
+            from maga7.live.rth_open_store import upsert_rth_open
+
+            upsert_rth_open(
+                live_root,
+                ts.strftime("%Y-%m-%d"),
+                symbol_u,
+                open_px,
+                redis_client=self._rth_open_redis,
+                source="scanner_0930_bar",
+            )
+        except Exception:
+            logger.exception("failed to persist rth open symbol=%s", symbol_u)
 
     def _stamp_from_prev(self, symbol: str) -> None:
         df = self.stock_by.get(symbol)
@@ -1356,7 +1422,19 @@ class Mag7Scanner:
         # Prefer scanner's official RTH open over late-first-bar latch.
         st = (self.states or {}).get(sym)
         day_open = getattr(st, "day_open", None) if st is not None else None
-        if day_open is not None and float(day_open) > 0:
+        if day_open is None or float(day_open or 0.0) <= 0:
+            day_open = (self._pending_rth_opens or {}).get(sym)
+        bars = getattr(st, "bars", None) or []
+        first_bar_ts = (
+            to_ny(bars[0].get("timestamp")) if bars and bars[0].get("timestamp") else None
+        )
+        has_true_rth_open = bool(
+            first_bar_ts is not None and first_bar_ts.strftime("%H:%M") == "09:30"
+        )
+        # Seed from durable trade-date opens even when this process never saw 09:30.
+        if day_open is not None and float(day_open) > 0 and (
+            has_true_rth_open or sym in (self._pending_rth_opens or {})
+        ):
             scout.seed_day_open(sym, float(day_open))
         alert = scout.on_bar(
             symbol=sym,
@@ -1378,6 +1456,36 @@ class Mag7Scanner:
         """Backward-compatible feed for the original AM lane."""
         self._feed_am_pulse_lane_bar("am_pulse", symbol, bar)
 
+    def _record_am_pulse_skip(
+        self,
+        lane: str,
+        *,
+        reason: str,
+        symbol: str,
+        direction: str,
+        retryable: bool,
+        alert_ts: str = "",
+    ) -> None:
+        events_attr = (
+            "am_pulse_extension_skip_events"
+            if lane == "am_pulse_extension"
+            else "am_pulse_skip_events"
+        )
+        events = getattr(self, events_attr)
+        events.append(
+            {
+                "lane": lane,
+                "reason": str(reason),
+                "symbol": str(symbol).upper(),
+                "direction": str(direction).upper(),
+                "retryable": bool(retryable),
+                "alert_ts": str(alert_ts or ""),
+                "frame_ts": str(self.current_date or ""),
+            }
+        )
+        if len(events) > 32:
+            del events[:-32]
+
     def _drain_am_pulse_lane(
         self,
         lane: str,
@@ -1393,6 +1501,11 @@ class Mag7Scanner:
         if self.current_date is None:
             self._roll_day(date)
         _, _, pending_attr, *_ = self._am_pulse_lane_names(lane)
+        wait_attr = (
+            "n_am_pulse_extension_wait"
+            if lane == "am_pulse_extension"
+            else "n_am_pulse_wait"
+        )
         pending = getattr(self, pending_attr)
         if not pending:
             return []
@@ -1404,9 +1517,19 @@ class Mag7Scanner:
             if ts < alert_ts:
                 rest.append(alert)
                 continue
-            sig = self._emit_am_pulse_lane(lane, alert)
-            if sig is not None:
-                out.append(sig)
+            # Tradable only after the feature bar is complete (+1m).
+            if ts < alert_ts + pd.Timedelta(minutes=1):
+                rest.append(alert)
+                continue
+            outcome = self._emit_am_pulse_lane(lane, alert, decision_ts=ts)
+            if outcome.signal is not None:
+                out.append(outcome.signal)
+                continue
+            if outcome.retryable:
+                setattr(self, wait_attr, int(getattr(self, wait_attr)) + 1)
+                rest.append(alert)
+                continue
+            # Permanent skip — already counted inside emit.
         setattr(self, pending_attr, rest)
         return out
 
@@ -1418,7 +1541,256 @@ class Mag7Scanner:
         """Drain independent B lane (LOCK: 10:30–11:30)."""
         return self._drain_am_pulse_lane("am_pulse_extension", ts)
 
-    def _emit_am_pulse_lane(self, lane: str, alert: Any) -> ScannerSignal | None:
+    def _ensure_am_v2_trackers(self, date: str) -> dict[str, Any]:
+        from maga7.common.am_v2_sleeve import am_v2_enabled, load_am_v2_cfg, tracker_from_cfg
+
+        if not am_v2_enabled(self.profile):
+            return {}
+        if self._am_v2_tracker_date == date and self._am_v2_trackers:
+            return self._am_v2_trackers
+        cfg = load_am_v2_cfg(self.profile)
+        syms = list(cfg.get("symbols") or self.profile.get("symbols") or [])
+        self._am_v2_trackers = {str(s).upper(): tracker_from_cfg(cfg) for s in syms}
+        self._am_v2_tracker_date = date
+        return self._am_v2_trackers
+
+    def _record_am_v2_skip(
+        self,
+        *,
+        reason: str,
+        symbol: str,
+        direction: str,
+        retryable: bool,
+        alert_ts: str | None = None,
+    ) -> None:
+        events = self.am_v2_skip_events
+        events.append(
+            {
+                "reason": reason,
+                "symbol": symbol,
+                "dir": direction,
+                "retryable": bool(retryable),
+                "alert_ts": alert_ts,
+            }
+        )
+        if len(events) > 32:
+            del events[:-32]
+
+    def _feed_am_v2_second(self, symbol: str, tick: dict[str, Any]) -> None:
+        """Ingest 1s close into launch tracker; queue rising-edge alerts."""
+        from maga7.common.am_v2_sleeve import am_v2_enabled, in_am_v2_window, load_am_v2_cfg
+
+        if not am_v2_enabled(self.profile):
+            return
+        cfg = load_am_v2_cfg(self.profile)
+        sym = str(symbol).upper()
+        ts = to_ny(tick["timestamp"])
+        date = ts.strftime("%Y-%m-%d")
+        if self.current_date is None:
+            self._roll_day(date)
+        if not in_am_v2_window(ts, cfg):
+            return
+        trackers = self._ensure_am_v2_trackers(date)
+        tr = trackers.get(sym)
+        if tr is None:
+            return
+        try:
+            px = float(tick.get("close", tick.get("price", tick.get("last"))))
+        except Exception:
+            return
+        alert = tr.on_close(ts, px)
+        if alert is None:
+            return
+        alert.symbol = sym
+        self.n_am_v2_signals += 1
+        self.pending_am_v2.append(alert)
+
+    def drain_am_v2(self, ts: pd.Timestamp) -> list[ScannerSignal]:
+        """Emit am_v2 launch sleeve signals (independent of TopK / Pulse)."""
+        from maga7.common.am_v2_sleeve import am_v2_enabled
+
+        ts = to_ny(ts)
+        if not am_v2_enabled(self.profile):
+            return []
+        date = self.current_date or ts.strftime("%Y-%m-%d")
+        if self.current_date is None:
+            self._roll_day(date)
+        pending = self.pending_am_v2
+        if not pending:
+            return []
+        out: list[ScannerSignal] = []
+        rest: list = []
+        for alert in list(pending):
+            alert_ts = to_ny(pd.Timestamp(alert.ts))
+            if ts < alert_ts:
+                rest.append(alert)
+                continue
+            outcome = self._emit_am_v2(alert, decision_ts=ts)
+            if outcome.signal is not None:
+                out.append(outcome.signal)
+                continue
+            if outcome.retryable:
+                self.n_am_v2_wait += 1
+                rest.append(alert)
+                continue
+        self.pending_am_v2 = rest
+        return out
+
+    def _emit_am_v2(
+        self,
+        alert: Any,
+        *,
+        decision_ts: pd.Timestamp | None = None,
+    ) -> _AmPulseEmitOutcome:
+        from maga7.common.am_v2_sleeve import load_am_v2_cfg
+
+        live = load_am_v2_cfg(self.profile)
+        date = str(alert.date)
+        sym = str(alert.symbol).upper()
+        direction = str(alert.dir).upper()
+        arm_ts = to_ny(pd.Timestamp(alert.ts))
+        # Launch is 1s-causal — tradable at print (research decision_ts=feature_ts).
+        observed = (
+            to_ny(pd.Timestamp(decision_ts)) if decision_ts is not None else arm_ts
+        )
+        decision_ts = max(observed, arm_ts)
+        if bool(live.get("event_calendar_block", False)) and self.is_event_blackout(
+            date, symbol=sym
+        ):
+            self.n_am_v2_skip += 1
+            self._record_am_v2_skip(
+                reason="event_blackout",
+                symbol=sym,
+                direction=direction,
+                retryable=False,
+                alert_ts=arm_ts.isoformat(),
+            )
+            return _AmPulseEmitOutcome(skip_reason="event_blackout", retryable=False)
+        flat_hhmm = str(live.get("flatten_before") or "11:45")
+        try:
+            flat_ts = pd.Timestamp(f"{date} {flat_hhmm}", tz="America/New_York")
+        except Exception:
+            flat_ts = None
+        if flat_ts is not None and decision_ts >= flat_ts:
+            self.n_am_v2_skip += 1
+            self._record_am_v2_skip(
+                reason="past_flatten",
+                symbol=sym,
+                direction=direction,
+                retryable=False,
+                alert_ts=arm_ts.isoformat(),
+            )
+            return _AmPulseEmitOutcome(skip_reason="past_flatten", retryable=False)
+        books = self.books or ContractBooks.from_profile(self.profile)
+        lane_prefer = live.get("prefer_dte")
+        lane_allowed = live.get("allowed_dte")
+        prefer_kw = int(lane_prefer) if lane_prefer is not None else None
+        allowed_kw = None
+        if isinstance(lane_allowed, (list, tuple)) and lane_allowed:
+            allowed_kw = [int(x) for x in lane_allowed]
+        pick = resolve_entry_contract(
+            books,
+            symbol=sym,
+            date=date,
+            direction=direction,
+            moneyness=str(live.get("moneyness") or "ATM"),
+            sig_ts=arm_ts,
+            spot=float(alert.px),
+            prefer_dte=prefer_kw,
+            allowed_dte=allowed_kw,
+        )
+        if not pick.ticker:
+            self._record_am_v2_skip(
+                reason="no_atm_contract",
+                symbol=sym,
+                direction=direction,
+                retryable=True,
+                alert_ts=arm_ts.isoformat(),
+            )
+            return _AmPulseEmitOutcome(skip_reason="no_atm_contract", retryable=True)
+
+        hold_sec = int(live.get("max_hold_sec", 900) or 900)
+        try:
+            max_to_flat = max(1, int((flat_ts - decision_ts).total_seconds()))
+            hold_sec = min(hold_sec, max_to_flat)
+        except Exception:
+            pass
+        tp = float(live.get("tp", 0.15) or 0.15)
+        sl = float(live.get("sl", 0.25) or 0.25)
+        fill_frac = float(live.get("entry_frac", 0.75) or 0.75)
+        pos_frac = float(live.get("position_frac", 0.10) or 0.10)
+        exec_mode = str(live.get("execute_mode") or "shadow")
+        meta = {
+            "fill_frac": fill_frac,
+            "tp_mult": 1.0 + tp,
+            "sl_mult": 1.0 - sl,
+            "hold_minutes": max(1, int(round(hold_sec / 60.0))),
+            "exit_hold_sec": hold_sec,
+            "exit_tp_mult": 1.0 + tp,
+            "exit_sl_mult": 1.0 - sl,
+            "exit_simple": True,
+            "exit_flatten_before": flat_hhmm,
+            "bar_source": "am_v2",
+            "contract_source": pick.source,
+            "sig_dte": pick.dte,
+            "sig_strike": pick.strike,
+            "route": "am_v2",
+            "event_source": "am_v2_sleeve",
+            "feature_ts": arm_ts.isoformat(),
+            "decision_ts": decision_ts.isoformat(),
+            "bar_availability_delay_seconds": max(
+                0, int((decision_ts - arm_ts).total_seconds())
+            ),
+            "ret_k": float(alert.ret_k),
+            "slope_sec": int(live.get("slope_sec", 3) or 3),
+            "abs_ret_min": float(live.get("abs_ret_min", 0.002) or 0.002),
+            "cooldown_sec": float(live.get("cooldown_sec", 300) or 300),
+            "position_frac": pos_frac,
+            "execute_mode": exec_mode,
+            "max_lag_sec": float(live.get("max_lag_sec", 5.0) or 5.0),
+            "max_spread_pct": float(live.get("max_spread_pct", 0.15) or 0.15),
+            "min_mid": float(live.get("min_mid", 0.05) or 0.05),
+            "watchdog_state": "satellite",
+            "watchdog_reason": "am_v2",
+        }
+        sig = ScannerSignal(
+            date=date,
+            symbol=sym,
+            direction=direction,
+            sig_ts=arm_ts,
+            spot=float(alert.px),
+            rank=0,
+            bucket_id=int(pick.bucket_id) if pick.bucket_id is not None else (
+                2 if direction == "UP" else 0
+            ),
+            contract=str(pick.ticker),
+            moneyness=str(live.get("moneyness") or "ATM"),
+            meta=meta,
+        )
+        self.n_am_v2_emitted += 1
+        if exec_mode == "shadow":
+            self.n_am_v2_shadow += 1
+        self.signals.append(sig)
+        logger.info(
+            "AM_V2 signal %s %s %s ret_k=%.4f exec=%s contract=%s",
+            date,
+            sym,
+            direction,
+            float(alert.ret_k),
+            exec_mode,
+            pick.ticker,
+        )
+        if self.on_signal:
+            self.on_signal(sig)
+        return _AmPulseEmitOutcome(signal=sig)
+
+    def _emit_am_pulse_lane(
+        self,
+        lane: str,
+        alert: Any,
+        *,
+        decision_ts: pd.Timestamp | None = None,
+    ) -> _AmPulseEmitOutcome:
         from maga7.common.am_pulse_scout import load_am_pulse_lane_cfg
 
         live = load_am_pulse_lane_cfg(self.profile, lane)
@@ -1433,11 +1805,58 @@ class Mag7Scanner:
         date = str(alert.date)
         sym = str(alert.symbol).upper()
         direction = str(alert.dir).upper()
-        if self.is_event_blackout(date, symbol=sym):
-            setattr(self, skip_attr, int(getattr(self, skip_attr)) + 1)
-            logger.info("%s skip %s %s: event blackout", log_tag, date, sym)
-            return None
         arm_ts = to_ny(pd.Timestamp(alert.ts))
+        # The profile-level event calendar belongs to the CORE baseline.
+        # A/B sleeves opt in explicitly if research later proves they need it.
+        if bool(live.get("event_calendar_block", False)) and self.is_event_blackout(
+            date, symbol=sym
+        ):
+            setattr(self, skip_attr, int(getattr(self, skip_attr)) + 1)
+            self._record_am_pulse_skip(
+                lane,
+                reason="event_blackout",
+                symbol=sym,
+                direction=direction,
+                retryable=False,
+                alert_ts=arm_ts.isoformat(),
+            )
+            logger.info("%s skip %s %s: event blackout", log_tag, date, sym)
+            return _AmPulseEmitOutcome(skip_reason="event_blackout", retryable=False)
+        # alert.ts is the feature bar label. A completed minute bar becomes
+        # tradable on the next minute; live drain supplies the exact frame time.
+        observed_decision_ts = (
+            to_ny(pd.Timestamp(decision_ts))
+            if decision_ts is not None
+            else arm_ts + pd.Timedelta(minutes=1)
+        )
+        decision_ts = max(
+            observed_decision_ts,
+            arm_ts + pd.Timedelta(minutes=1),
+        )
+        flat_hhmm = str(live.get("flatten_before") or "10:30")
+        try:
+            flat_ts = pd.Timestamp(f"{date} {flat_hhmm}", tz="America/New_York")
+        except Exception:
+            flat_ts = None
+        if flat_ts is not None and decision_ts >= flat_ts:
+            setattr(self, skip_attr, int(getattr(self, skip_attr)) + 1)
+            self._record_am_pulse_skip(
+                lane,
+                reason="past_flatten",
+                symbol=sym,
+                direction=direction,
+                retryable=False,
+                alert_ts=arm_ts.isoformat(),
+            )
+            logger.info(
+                "%s skip %s %s %s: past flatten_before=%s",
+                log_tag,
+                date,
+                sym,
+                direction,
+                flat_hhmm,
+            )
+            return _AmPulseEmitOutcome(skip_reason="past_flatten", retryable=False)
         books = self.books or ContractBooks.from_profile(self.profile)
         # Lane may override lock DTE (e.g. AM_EXT 0DTE-only).
         lane_prefer = live.get("prefer_dte")
@@ -1462,16 +1881,28 @@ class Mag7Scanner:
             allowed_dte=allowed_kw,
         )
         if not pick.ticker:
-            setattr(self, skip_attr, int(getattr(self, skip_attr)) + 1)
-            logger.info("%s skip %s %s %s: no ATM contract", log_tag, date, sym, direction)
-            return None
+            # Locks may still be filling mid-restart — keep pending until flatten.
+            self._record_am_pulse_skip(
+                lane,
+                reason="no_atm_contract",
+                symbol=sym,
+                direction=direction,
+                retryable=True,
+                alert_ts=arm_ts.isoformat(),
+            )
+            logger.info(
+                "%s wait %s %s %s: no ATM contract (retry until flatten)",
+                log_tag,
+                date,
+                sym,
+                direction,
+            )
+            return _AmPulseEmitOutcome(skip_reason="no_atm_contract", retryable=True)
 
         hold_sec = int(live.get("max_hold_sec", 900) or 900)
         # Cap hold so position cannot spill into CORE (flatten_before).
-        flat_hhmm = str(live.get("flatten_before") or "10:30")
         try:
-            flat_ts = pd.Timestamp(f"{date} {flat_hhmm}", tz="America/New_York")
-            max_to_flat = max(1, int((flat_ts - arm_ts).total_seconds()))
+            max_to_flat = max(1, int((flat_ts - decision_ts).total_seconds()))
             hold_sec = min(hold_sec, max_to_flat)
         except Exception:
             pass
@@ -1497,6 +1928,11 @@ class Mag7Scanner:
             "route": route,
             "event_source": event_source,
             "am_pulse_arm": str(alert.arm),
+            "feature_ts": arm_ts.isoformat(),
+            "decision_ts": decision_ts.isoformat(),
+            "bar_availability_delay_seconds": max(
+                0, int((decision_ts - arm_ts).total_seconds())
+            ),
             "fav_from_open": float(alert.fav_from_open),
             "lookback_ret": alert.lookback_ret,
             "position_frac": pos_frac,
@@ -1504,6 +1940,9 @@ class Mag7Scanner:
             "max_lag_sec": float(live.get("max_lag_sec", 5.0) or 5.0),
             "max_spread_pct": float(live.get("max_spread_pct", 0.15) or 0.15),
             "min_mid": float(live.get("min_mid", 0.05) or 0.05),
+            "entry_stock_drift_gate": dict(
+                live.get("entry_stock_drift_gate") or {}
+            ),
             "watchdog_state": "satellite",
             "watchdog_reason": route,
         }
@@ -1544,11 +1983,11 @@ class Mag7Scanner:
         )
         if self.on_signal:
             self.on_signal(sig)
-        return sig
+        return _AmPulseEmitOutcome(signal=sig)
 
     def _emit_am_pulse(self, alert: Any) -> ScannerSignal | None:
         """Backward-compatible emitter for the original AM lane."""
-        return self._emit_am_pulse_lane("am_pulse", alert)
+        return self._emit_am_pulse_lane("am_pulse", alert).signal
 
     def _emit_hunt(self, h: dict[str, Any]) -> ScannerSignal | None:
         """Build + emit one Hunt ScannerSignal (does not consume TopK day_fires)."""
@@ -1845,6 +2284,9 @@ class Mag7Scanner:
         # Even without a completed 1m bar, Hunt / path-confirm may become due.
         self.drain_hunts(ts)
         self.drain_path_confirms(ts)
+        # am_v2 launch is 1s-causal — feed every second, not only on 1m close.
+        self._feed_am_v2_second(symbol, tick)
+        self.drain_am_v2(ts)
         bar = self.minute_agg.on_second(symbol, tick)
         if bar is None:
             return None

@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from maga7.common.am_pulse_scout import (
+    am_pulse_decision_ts,
     load_am_pulse_lane_cfg,
     parse_am_pulse_scout,
     scan_day,
@@ -127,6 +128,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-lags", default="2,3")
     ap.add_argument("--min-mid", type=float, default=None, help="Empty = profile lane value")
     ap.add_argument("--max-hold-sec", type=int, default=0, help="0 = profile lane value")
+    ap.add_argument(
+        "--bar-delay-sec",
+        type=int,
+        default=60,
+        help="decision_ts = feature_ts + delay (left-labeled 1m availability)",
+    )
     ap.add_argument("--entry-frac", type=float, default=0.75)
     ap.add_argument("--exit-frac", type=float, default=0.75)
     ap.add_argument("--position-frac", type=float, default=0.10)
@@ -185,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
         if int(args.max_hold_sec) > 0
         else int(lane_cfg.get("max_hold_sec", 900) or 900)
     )
+    bar_delay_sec = max(0, int(args.bar_delay_sec))
     prefer_dte = int(lane_cfg.get("prefer_dte", 0) or 0)
     allowed_raw: Any = args.allowed_dte or lane_cfg.get("allowed_dte")
     if not allowed_raw:
@@ -294,6 +302,9 @@ def main(argv: list[str] | None = None) -> int:
                     if a.arm != arm_name or a.dir not in dirs:
                         continue
                     arm_ts = to_ny(pd.Timestamp(a.ts))
+                    decision_ts = am_pulse_decision_ts(
+                        arm_ts, delay_seconds=bar_delay_sec
+                    )
                     spot = None
                     if ts_ns is not None and px is not None:
                         spot = _spot_at_arr(ts_ns, px, arm_ts)
@@ -317,7 +328,7 @@ def main(argv: list[str] | None = None) -> int:
                         continue
                     probe = entry_quote_row(
                         path,
-                        arm_ts,
+                        decision_ts,
                         max_lag_sec=max(lags),
                         max_spread_pct=max(spreads),
                         min_mid=min_mid,
@@ -334,6 +345,7 @@ def main(argv: list[str] | None = None) -> int:
                             "lookback_bars": int(lb_bars),
                             "session": session,
                             "arm_ts": arm_ts,
+                            "decision_ts": decision_ts,
                             "ticker": ticker,
                             "dte": dte,
                             "path": path,
@@ -380,14 +392,14 @@ def main(argv: list[str] | None = None) -> int:
                                 1,
                                 int(
                                     (
-                                        flat_ts - to_ny(arm["arm_ts"])
+                                        flat_ts - to_ny(arm["decision_ts"])
                                     ).total_seconds()
                                 ),
                             ),
                         )
                     sim = simulate_quote_tpsl(
                         arm["path"],
-                        arm["arm_ts"],
+                        arm["decision_ts"],
                         tp=tp,
                         sl=sl,
                         max_hold_sec=hold_sec,
@@ -515,6 +527,8 @@ def main(argv: list[str] | None = None) -> int:
         "session": session,
         "window": [window_start, window_end],
         "dirs": sorted(dirs),
+        "bar_delay_sec": int(bar_delay_sec),
+        "entry_anchor": "decision_ts=feature_ts+bar_delay_sec",
         "n_arms": int(len(arms)),
         "n_rows": int(len(score_rows)),
         "dual_pass_n": int(len(dual_pass)),

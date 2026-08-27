@@ -1,7 +1,9 @@
-"""Causal 1s stock ticks → RTH 1m OHLCV bars for Mag7 Rule-A.
+"""Causal 1s stock ticks → RTH OHLCV bars for Mag7 Rule-A.
 
-Signal clock stays on 1m (mf10 / streak / vol_z). Seconds are only the
-ingest source; do not evaluate Rule-A on second-level features.
+Default production path aggregates to 1m (mf10 / streak / vol_z on minute
+clock). Research may also build 5s / 15s bars from the same 1s source; use
+``bar_availability_delay_seconds = bar_seconds`` so left-labeled bars are only
+visible after the bar closes.
 """
 from __future__ import annotations
 
@@ -26,6 +28,15 @@ def to_ny_ts(ts) -> pd.Timestamp:
 def minute_floor(ts: pd.Timestamp) -> pd.Timestamp:
     t = to_ny_ts(ts)
     return t.floor("min")
+
+
+def bar_floor(ts: pd.Timestamp, bar_seconds: int) -> pd.Timestamp:
+    """Left-label floor to ``bar_seconds`` (must divide 60 for clean RTH grid)."""
+    t = to_ny_ts(ts)
+    n = int(bar_seconds)
+    if n <= 0:
+        raise ValueError(f"bar_seconds must be > 0, got {bar_seconds}")
+    return t.floor(f"{n}s")
 
 
 def in_rth(ts: pd.Timestamp) -> bool:
@@ -214,3 +225,59 @@ def aggregate_1s_to_1m(df: pd.DataFrame, *, symbol: str = "", rth_only: bool = T
     if "symbol" in out.columns:
         out = out.drop(columns=["symbol"])
     return out
+
+
+def aggregate_1s_to_bars(
+    df: pd.DataFrame,
+    *,
+    bar_seconds: int = 5,
+    symbol: str = "",
+    rth_only: bool = True,
+) -> pd.DataFrame:
+    """Batch-resample 1s OHLCV to left-labeled RTH bars of ``bar_seconds``.
+
+    ``bar_seconds=60`` delegates to ``aggregate_1s_to_1m`` (same causal path).
+    For 5/15/… use pandas resample ``label=left, closed=left``; caller should set
+    ``bar_availability_delay_seconds=bar_seconds`` so the bar is only used after close.
+    """
+    n = int(bar_seconds)
+    if n <= 0:
+        raise ValueError(f"bar_seconds must be > 0, got {bar_seconds}")
+    if n == 60:
+        return aggregate_1s_to_1m(df, symbol=symbol, rth_only=rth_only)
+    cols = ["timestamp", "open", "high", "low", "close", "volume"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+    x = df.copy()
+    x["timestamp"] = pd.to_datetime(x["timestamp"])
+    if getattr(x["timestamp"].dt, "tz", None) is None:
+        x["timestamp"] = x["timestamp"].dt.tz_localize(NY)
+    else:
+        x["timestamp"] = x["timestamp"].dt.tz_convert(NY)
+    if rth_only:
+        x = x[x["timestamp"].map(in_rth)]
+    if x.empty:
+        return pd.DataFrame(columns=cols)
+    if "close" not in x.columns:
+        raise ValueError("aggregate_1s_to_bars requires close")
+    for col in ("open", "high", "low"):
+        if col not in x.columns:
+            x[col] = x["close"]
+    if "volume" not in x.columns:
+        x["volume"] = 0.0
+    x = x.sort_values("timestamp").set_index("timestamp")
+    out = (
+        x.resample(f"{n}s", label="left", closed="left")
+        .agg(
+            open=("open", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+            volume=("volume", "sum"),
+        )
+        .dropna(subset=["close"])
+        .reset_index()
+    )
+    if out.empty:
+        return pd.DataFrame(columns=cols)
+    return out[cols]

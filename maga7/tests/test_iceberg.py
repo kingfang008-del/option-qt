@@ -69,6 +69,7 @@ def _oms(tmp_path, *, max_qty: int = 20) -> Mag7BrokerOms:
                 "max_option_staleness_sec": 30.0,
                 "max_spread_pct": 0.5,
                 "max_entry_mid_jump_pct": 1.0,
+                "require_entry_quote_stable_ticks": 1,
             },
         },
         "fill": {"entry_frac": 0.8, "exit_frac": 0.8},

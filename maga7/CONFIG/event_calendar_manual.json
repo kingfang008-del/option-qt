@@ -2,6 +2,55 @@
   "description": "Manual overlay for events APIs miss (IPO, rate spike, geopolitics). Merged by sync_event_calendar.py.",
   "events": [
     {
+      "date": "2026-02-05",
+      "tag": "mag7_capex_shock",
+      "source": "manual",
+      "symbol": null,
+      "note": "Loss-day scan: AMZN/GOOGL AI capex guides; Mag7 risk-off (research ≤-5% day)"
+    },
+    {
+      "date": "2026-02-11",
+      "tag": "nfp",
+      "source": "manual",
+      "symbol": null,
+      "note": "Loss-day scan: BLS Employment Situation (Jan; delayed); strong beat / Fed path"
+    },
+    {
+      "date": "2026-02-13",
+      "tag": "cpi",
+      "source": "manual",
+      "symbol": null,
+      "note": "Loss-day scan: BLS CPI (Jan; delayed); worst ≤-5% account day in Feb–Jul"
+    },
+    {
+      "date": "2026-03-03",
+      "tag": "geopol_risk",
+      "source": "manual",
+      "symbol": null,
+      "note": "Loss-day scan: Middle East / oil risk-off session (TSLA DN dominant)"
+    },
+    {
+      "date": "2026-04-21",
+      "tag": "aapl_ceo_succession",
+      "source": "manual",
+      "symbol": "AAPL",
+      "note": "Soft research: Cook→Ternus CEO succession announce window; opt-in feb_jul_aapl_ceo"
+    },
+    {
+      "date": "2026-04-22",
+      "tag": "aapl_ceo_succession",
+      "source": "manual",
+      "symbol": "AAPL",
+      "note": "Soft research: post-succession session; remaining ≤-5% day under feb_jul"
+    },
+    {
+      "date": "2026-04-29",
+      "tag": "fomc_decision",
+      "source": "manual",
+      "symbol": null,
+      "note": "Loss-day scan: FOMC hold + 4 dissents; same day Mag7 mega-earnings AH"
+    },
+    {
       "date": "2026-05-19",
       "tag": "ust_30y_spike",
       "source": "manual",
@@ -35,6 +84,20 @@
       "source": "manual",
       "symbol": null,
       "note": "FOMC decision next session (prefer trading-calendar expand in live)"
+    },
+    {
+      "date": "2026-07-22",
+      "tag": "earnings_ah",
+      "source": "manual",
+      "symbol": "TSLA",
+      "note": "Finnhub Jul2026: TSLA earnings AMC. Live sync (2026-07-20) missed Jul Mag7 AH; patch so AH-day symbol blackout. Overnight gap 07-23 ≈−8.8%; long-vol/straddle sleeve still research-only."
+    },
+    {
+      "date": "2026-07-22",
+      "tag": "earnings_ah",
+      "source": "manual",
+      "symbol": "GOOGL",
+      "note": "Finnhub Jul2026: GOOGL earnings AMC (same session as TSLA). Live sync miss patch; symbol-only blackout on AH day."
     }
   ]
 }

@@ -18,6 +18,12 @@
       "direction_size_scale": {"UP": 0.5}
     }
   },
+  "up_toxic_block": {
+    "description": "Predictive UP risk-off: hard skip UP Rule-A (DN still allowed)",
+    "regime": {
+      "block_directions": ["UP"]
+    }
+  },
   "washout_gate_dn": {
     "description": "Open washout breadth: soft half DN (do not open full size into chop)",
     "regime": {

@@ -7,14 +7,21 @@ Arms (each arm ≤ max_alerts_per_symbol per symbol×day; FO preferred on same b
   FO   — |fav_from_open| ≥ min_fav_from_open
   LB   — |ret over lookback_bars| ≥ min_lookback_ret (1m bars)
 
-Live/stream: feed completed 1m bars via ``AmPulseScout.on_bar``.
-Offline: ``scan_day`` / ``tools/scan_am_pulse_scout``.
+Feature sources:
+  bar_1m   — left-labeled 1m close vs RTH open (legacy). Tradable only after
+             ``decision_ts = feature_ts + bar_availability_delay_seconds``.
+  vwap_1s  — causal trailing VWAP over 10/20/30s from stock 1s prints vs RTH
+             open. Feature and decision share the sample clock (delay=0).
+
+Live/stream: feed completed 1m bars via ``AmPulseScout.on_bar`` (bar_1m), or
+offline ``scan_day_1s_vwap`` for second-level research.
 """
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 NY = "America/New_York"
@@ -33,6 +40,10 @@ DEFAULT_LIVE: dict[str, Any] = {
     "min_fav_from_open": 0.008,
     "lookback_bars": 2,
     "min_lookback_ret": 0.99,  # FO-only live default
+    "feature_mode": "bar_1m",  # bar_1m | vwap_1s
+    "vwap_win_sec": 30,
+    "vwap_agree_wins": [],
+    "sample_every_sec": 10,
     "tp": 0.15,
     "sl": 0.20,
     "max_hold_sec": 900,
@@ -63,6 +74,15 @@ class AmPulseScoutConfig:
     # If True, only latch day_open from the 09:30 RTH bar (or seed_day_open).
     # Prevents late-start / restart from treating a mid-session open as RTH open.
     rth_open_only: bool = True
+    # bar_1m: 1m close FO/LB. vwap_1s: trailing VWAP FO from 1s prints.
+    feature_mode: str = "bar_1m"
+    vwap_win_sec: int = 30
+    # If non-empty, every listed window must share dir and clear min_fav.
+    vwap_agree_wins: tuple[int, ...] = ()
+    sample_every_sec: int = 10
+    # If True, require |vwap_fast| >= |vwap_primary| with same sign (acceleration).
+    vwap_accel: bool = False
+    vwap_fast_sec: int = 10
 
 
 @dataclass(frozen=True)
@@ -82,9 +102,25 @@ class AmScoutAlert:
     session_hi: float
     session_lo: float
     source: str = "am_pulse_scout"
+    feature_mode: str = "bar_1m"
+    vwap_win_sec: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _parse_agree_wins(raw: Any) -> tuple[int, ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        return tuple(int(p) for p in parts)
+    if isinstance(raw, (list, tuple)):
+        return tuple(int(x) for x in raw if str(x).strip())
+    try:
+        return (int(raw),)
+    except (TypeError, ValueError):
+        return ()
 
 
 def parse_am_pulse_scout(raw: Any) -> AmPulseScoutConfig:
@@ -110,6 +146,9 @@ def parse_am_pulse_scout(raw: Any) -> AmPulseScoutConfig:
     except (TypeError, ValueError):
         max_fo = 0.0
     rth_only = raw.get("rth_open_only", True)
+    mode = str(raw.get("feature_mode") or "bar_1m").strip().lower()
+    if mode not in {"bar_1m", "vwap_1s"}:
+        mode = "bar_1m"
     return AmPulseScoutConfig(
         enabled=bool(raw.get("enabled", True)),
         window_start=str(raw.get("window_start") or "09:30"),
@@ -123,6 +162,12 @@ def parse_am_pulse_scout(raw: Any) -> AmPulseScoutConfig:
         max_alerts_per_symbol=max(1, int(raw.get("max_alerts_per_symbol", 1) or 1)),
         symbols=syms,
         rth_open_only=bool(True if rth_only is None else rth_only),
+        feature_mode=mode,
+        vwap_win_sec=max(1, int(raw.get("vwap_win_sec", 30) or 30)),
+        vwap_agree_wins=_parse_agree_wins(raw.get("vwap_agree_wins")),
+        sample_every_sec=max(1, int(raw.get("sample_every_sec", 10) or 10)),
+        vwap_accel=bool(raw.get("vwap_accel", False)),
+        vwap_fast_sec=max(1, int(raw.get("vwap_fast_sec", 10) or 10)),
     )
 
 
@@ -179,6 +224,22 @@ def am_pulse_enabled(profile: dict[str, Any] | None) -> bool:
     return am_pulse_lane_enabled(profile, "am_pulse")
 
 
+def am_pulse_decision_ts(
+    feature_ts: Any,
+    *,
+    delay_seconds: int = 60,
+) -> pd.Timestamp:
+    """Earliest tradable clock after a feature sample.
+
+    - ``bar_1m``: left-labeled minute M → delay 60s (bar close).
+    - ``vwap_1s``: trailing VWAP already uses prints ≤ feature_ts → delay 0.
+    """
+    from maga7.common.replay import to_ny
+
+    delay = max(0, int(delay_seconds))
+    return to_ny(pd.Timestamp(feature_ts)) + pd.Timedelta(seconds=delay)
+
+
 def scout_config_from_live(cfg: dict[str, Any]) -> AmPulseScoutConfig:
     """Build detector config from live champion (FO-only unless arm allows LB)."""
     arm = str(cfg.get("arm") or "FO").upper()
@@ -199,6 +260,9 @@ def scout_config_from_live(cfg: dict[str, Any]) -> AmPulseScoutConfig:
     except (TypeError, ValueError):
         max_fo = 0.0
     rth_only = cfg.get("rth_open_only", True)
+    mode = str(cfg.get("feature_mode") or "bar_1m").strip().lower()
+    if mode not in {"bar_1m", "vwap_1s"}:
+        mode = "bar_1m"
     return AmPulseScoutConfig(
         enabled=True,
         window_start=str(cfg.get("window_start") or "09:30"),
@@ -211,6 +275,12 @@ def scout_config_from_live(cfg: dict[str, Any]) -> AmPulseScoutConfig:
         max_alerts_per_symbol=1,
         symbols=None,
         rth_open_only=bool(True if rth_only is None else rth_only),
+        feature_mode=mode,
+        vwap_win_sec=max(1, int(cfg.get("vwap_win_sec", 30) or 30)),
+        vwap_agree_wins=_parse_agree_wins(cfg.get("vwap_agree_wins")),
+        sample_every_sec=max(1, int(cfg.get("sample_every_sec", 10) or 10)),
+        vwap_accel=bool(cfg.get("vwap_accel", False)),
+        vwap_fast_sec=max(1, int(cfg.get("vwap_fast_sec", 10) or 10)),
     )
 
 
@@ -249,14 +319,19 @@ class AmPulseScout:
         self._hi.clear()
         self._lo.clear()
 
-    def seed_day_open(self, symbol: str, day_open: float) -> None:
+    def seed_day_open(
+        self, symbol: str, day_open: float, *, force: bool = False
+    ) -> None:
         """Latch RTH open from an external source (scanner state / official open).
 
-        Never overwrites an already-latched open for the day.
+        By default never overwrites an already-latched open. Pass ``force=True``
+        when restoring a durable trade-date open over a late pseudo latch.
         """
         sym = str(symbol).upper()
         px = float(day_open)
-        if sym and px > 0 and sym not in self._day_open:
+        if not sym or px <= 0:
+            return
+        if force or sym not in self._day_open:
             self._day_open[sym] = px
 
     def _arm_budget(self, sym: str, arm: str) -> bool:
@@ -464,4 +539,183 @@ def scan_day(
         )
         if a is not None:
             out.append(a)
+    return out
+
+
+def scan_day_1s_vwap(
+    stock_1s_day: pd.DataFrame,
+    *,
+    date: str,
+    symbol: str,
+    cfg: AmPulseScoutConfig | None = None,
+    day_open: float | None = None,
+    arr: dict[str, Any] | None = None,
+    vwap_cache: dict[int, Any] | None = None,
+) -> list[AmScoutAlert]:
+    """Causal FO scout on trailing 1s VWAP (10/20/30s), not 1m close.
+
+    Samples every ``cfg.sample_every_sec`` once the primary VWAP window is warm.
+    ``fav_from_open = vwap_win / day_open - 1``. Optional ``vwap_agree_wins``
+    requires every listed window to share direction and clear ``min_fav_from_open``.
+
+    Pass ``arr`` / ``vwap_cache`` to reuse prepared arrays across many probe cfgs.
+    """
+    from maga7.common.session_1s_features import (
+        prepare_day_arrays,
+        rolling_vwap_series,
+    )
+
+    cfg = cfg or AmPulseScoutConfig(feature_mode="vwap_1s")
+    if stock_1s_day is None or stock_1s_day.empty:
+        return []
+    sym = str(symbol).upper()
+    if cfg.symbols is not None and sym not in set(cfg.symbols):
+        return []
+    arr = arr if arr is not None else prepare_day_arrays(stock_1s_day)
+    ts_ns = arr["ts_ns"]
+    if len(ts_ns) < max(30, int(cfg.vwap_win_sec) + 5):
+        return []
+    open_px = float(day_open) if day_open is not None and day_open > 0 else float(arr["day_open"])
+    if not np.isfinite(open_px) or open_px <= 0:
+        return []
+
+    primary = int(cfg.vwap_win_sec)
+    agree = tuple(int(x) for x in (cfg.vwap_agree_wins or ()))
+    fast = int(cfg.vwap_fast_sec) if bool(cfg.vwap_accel) else None
+    wins = tuple(sorted(set((primary,) + agree + ((fast,) if fast else ()))))
+    cache = vwap_cache if vwap_cache is not None else {}
+    vwap_by_w: dict[int, Any] = {}
+    for w in wins:
+        if w not in cache:
+            cache[w] = rolling_vwap_series(arr, w)
+        vwap_by_w[w] = cache[w]
+    close = arr["close"]
+    if "sess_hi" not in arr:
+        high = arr["high"]
+        low = arr["low"]
+        arr["sess_hi"] = np.maximum.accumulate(
+            np.where(np.isfinite(high), high, -np.inf)
+        )
+        arr["sess_lo"] = np.minimum.accumulate(
+            np.where(np.isfinite(low), low, np.inf)
+        )
+    sess_hi = arr["sess_hi"]
+    sess_lo = arr["sess_lo"]
+
+    sample = max(1, int(cfg.sample_every_sec))
+    min_fo = float(cfg.min_fav_from_open)
+    max_fo = float(cfg.max_fav_from_open or 0.0)
+    dirs = set(cfg.dirs)
+    win0 = _hhmm_to_min(cfg.window_start)
+    win1 = _hhmm_to_min(cfg.window_end)
+
+    hm_arr = arr["hm"]
+    sec_arr = arr["sec_of_day"]
+    ts_ny = arr["ts_ny"]
+
+    # First eligible sample index: need primary window warm from RTH open.
+    t0 = int(ts_ns[0])
+    warm_ns = t0 + np.int64(primary) * np.int64(1_000_000_000)
+    i0 = int(np.searchsorted(ts_ns, warm_ns, side="left"))
+
+    sample_key = ("sample_idx", sample, win0, win1, primary, i0)
+    sample_idx = cache.get(sample_key)
+    if sample_idx is None:
+        in_win = (hm_arr >= win0) & (hm_arr < win1) & (np.arange(len(ts_ns)) >= i0)
+        buckets = sec_arr // sample
+        sample_idx = []
+        last_b = None
+        for i in np.flatnonzero(in_win):
+            b = int(buckets[i])
+            if last_b is not None and b == last_b:
+                continue
+            last_b = b
+            sample_idx.append(int(i))
+        cache[sample_key] = sample_idx
+
+    out: list[AmScoutAlert] = []
+    fired_fo = 0
+    for i in sample_idx:
+        t = pd.Timestamp(ts_ny[i])
+        if t.tzinfo is None:
+            t = t.tz_localize(NY)
+        else:
+            t = t.tz_convert(NY)
+
+        primary_vwap = float(vwap_by_w[primary][i])
+        if not np.isfinite(primary_vwap) or primary_vwap <= 0:
+            continue
+        from_open = primary_vwap / open_px - 1.0
+        fo_ok = abs(from_open) + 1e-12 >= min_fo
+        if max_fo > 0:
+            fo_ok = fo_ok and abs(from_open) - 1e-12 <= max_fo
+        if not fo_ok:
+            continue
+        d = "UP" if from_open >= 0 else "DN"
+        if d not in dirs:
+            continue
+        if agree:
+            agree_ok = True
+            for w in agree:
+                vw = float(vwap_by_w[w][i])
+                if not np.isfinite(vw) or vw <= 0:
+                    agree_ok = False
+                    break
+                fo_w = vw / open_px - 1.0
+                if abs(fo_w) + 1e-12 < min_fo:
+                    agree_ok = False
+                    break
+                if ("UP" if fo_w >= 0 else "DN") != d:
+                    agree_ok = False
+                    break
+            if not agree_ok:
+                continue
+        if fast is not None:
+            vw_f = float(vwap_by_w[fast][i])
+            if not np.isfinite(vw_f) or vw_f <= 0:
+                continue
+            fo_f = vw_f / open_px - 1.0
+            if ("UP" if fo_f >= 0 else "DN") != d:
+                continue
+            # Acceleration: faster window at least as extended as primary.
+            if abs(fo_f) + 1e-12 < abs(from_open):
+                continue
+
+        px = float(close[i]) if np.isfinite(close[i]) and close[i] > 0 else primary_vwap
+        hi = float(sess_hi[i]) if np.isfinite(sess_hi[i]) else px
+        lo = float(sess_lo[i]) if np.isfinite(sess_lo[i]) else px
+        if hi > lo:
+            rng = (px - lo) / (hi - lo)
+        else:
+            rng = 0.5
+        if d == "UP":
+            chase, dist = float(rng), float((hi - px) / open_px)
+        else:
+            chase, dist = float(1.0 - rng), float((px - lo) / open_px)
+        if cfg.min_chase is not None and chase + 1e-12 < float(cfg.min_chase):
+            continue
+
+        out.append(
+            AmScoutAlert(
+                event=EVENT,
+                date=str(date),
+                symbol=sym,
+                dir=d,
+                ts=str(t),
+                arm="FO",
+                fav_from_open=float(abs(from_open)),
+                chase=float(chase),
+                dist_ext=float(dist),
+                lookback_ret=None,
+                day_open=float(open_px),
+                px=float(primary_vwap),
+                session_hi=hi,
+                session_lo=lo,
+                feature_mode="vwap_1s",
+                vwap_win_sec=int(primary),
+            )
+        )
+        fired_fo += 1
+        if fired_fo >= int(cfg.max_alerts_per_symbol):
+            break
     return out

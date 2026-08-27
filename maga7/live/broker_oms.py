@@ -40,6 +40,7 @@ from maga7.common.path_fast_pack import (
     path_fast_pack_from_trade,
 )
 from maga7.common.option_trades import (
+    trade_toxic_cut_ret,
     trade_toxic_from_trade,
     trade_toxic_in_cut_window,
     trade_toxic_is_dig,
@@ -61,6 +62,7 @@ from maga7.live.requote import (
 from maga7.live.risk_guards import (
     entry_feed_ok,
     entry_quote_ok,
+    entry_stock_drift_ok,
     fill_adverse,
     is_fresh,
     next_entry_quote_stable_ticks,
@@ -973,6 +975,8 @@ class Mag7BrokerOms:
             peak_mfe=float(position.peak_mfe),
             cfg=cfg,
             stock_adverse=self._stock_adverse_from_entry(position),
+            # Live positions are marked from executable quote-sell prices.
+            cut_ret=trade_toxic_cut_ret(cfg, mark_source="quote"),
         )
         if dig and in_window:
             if position.trade_dig_since <= 0:
@@ -1272,14 +1276,25 @@ class Mag7BrokerOms:
         if event_source0 in {
             "am_pulse_sleeve",
             "am_pulse_extension_sleeve",
-        } or route0 in {"am_pulse", "am_pulse_extension"}:
+            "am_v2_sleeve",
+        } or route0 in {"am_pulse", "am_pulse_extension", "am_v2"}:
             exec_mode = str(meta0.get("execute_mode") or "shadow").lower()
+            off_reason = (
+                "am_v2_execute_off"
+                if event_source0 == "am_v2_sleeve" or route0 == "am_v2"
+                else "am_pulse_execute_off"
+            )
+            shadow_reason = (
+                "am_v2_shadow_only"
+                if event_source0 == "am_v2_sleeve" or route0 == "am_v2"
+                else "am_pulse_shadow_only"
+            )
             if exec_mode in {"off", "audit", "false", "0"}:
                 self._event(
                     "ENTRY_SHADOW",
                     {
                         "symbol": symbol,
-                        "reason": "am_pulse_execute_off",
+                        "reason": off_reason,
                         **self._signal_source_fields(signal),
                     },
                 )
@@ -1289,7 +1304,7 @@ class Mag7BrokerOms:
                     "ENTRY_REJECT",
                     {
                         "symbol": symbol,
-                        "reason": "am_pulse_shadow_only",
+                        "reason": shadow_reason,
                         "oms_mode": self.mode,
                         **self._signal_source_fields(signal),
                     },
@@ -1327,6 +1342,34 @@ class Mag7BrokerOms:
             )
             self._defer_signal(signal)
             return False
+        drift_cfg = meta0.get("entry_stock_drift_gate")
+        if isinstance(drift_cfg, dict) and drift_cfg.get("enabled"):
+            stock_bar = (getattr(self.connector, "stock_bars", None) or {}).get(
+                symbol
+            ) or {}
+            current_spot = float(stock_bar.get("close") or 0.0)
+            drift_ok, drift_reason, directional_drift = entry_stock_drift_ok(
+                signal_spot=float(getattr(signal, "spot", 0.0) or 0.0),
+                current_spot=current_spot,
+                direction=str(getattr(signal, "direction", "") or ""),
+                max_chase=float(drift_cfg.get("max_chase", 0.003) or 0.003),
+                max_reversal=float(
+                    drift_cfg.get("max_reversal", 0.0015) or 0.0015
+                ),
+            )
+            if not drift_ok:
+                self._event(
+                    "ENTRY_REJECT",
+                    {
+                        "symbol": symbol,
+                        "reason": drift_reason,
+                        "directional_drift": directional_drift,
+                        "signal_spot": getattr(signal, "spot", None),
+                        "current_spot": current_spot,
+                        **self._signal_source_fields(signal),
+                    },
+                )
+                return False
         lock = self._lock_for_contract(symbol, contract)
         if lock is None:
             self._event("ENTRY_REJECT", {"symbol": symbol, "reason": "contract_not_locked"})
@@ -1350,8 +1393,15 @@ class Mag7BrokerOms:
             route_max_lag = float(route_max_lag) if route_max_lag is not None else None
         except (TypeError, ValueError):
             route_max_lag = None
+        lag_anchor = to_ny(signal.sig_ts)
+        decision_ts_raw = meta0.get("decision_ts")
+        if decision_ts_raw:
+            try:
+                lag_anchor = to_ny(pd.Timestamp(decision_ts_raw))
+            except Exception:
+                pass
         lag_ok, lag_reason, quote_lag = signal_quote_lag_ok(
-            signal_ts=float(to_ny(signal.sig_ts).timestamp()),
+            signal_ts=float(lag_anchor.timestamp()),
             quote_ts=quote_ts,
             max_lag_sec=route_max_lag,
         )
@@ -1365,6 +1415,7 @@ class Mag7BrokerOms:
                     "reason": lag_reason,
                     "quote_lag_sec": quote_lag,
                     "max_lag_sec": route_max_lag,
+                    "lag_anchor_ts": lag_anchor.isoformat(),
                     **self._signal_source_fields(signal),
                 },
             )
@@ -2493,7 +2544,11 @@ class Mag7BrokerOms:
             flatten_hit = False
             if simple and position.exit_flatten_before:
                 try:
-                    ny = pd.Timestamp(float(asof_ts), unit="s", tz="UTC").tz_convert(
+                    # Sleeve flatten is a wall-clock hard stop (e.g. 10:45 before
+                    # CORE). Use max(frame, wall) so lagged fused frames cannot
+                    # spill holdings past the designed window.
+                    flat_clock = max(float(asof_ts), float(time.time()))
+                    ny = pd.Timestamp(flat_clock, unit="s", tz="UTC").tz_convert(
                         "America/New_York"
                     )
                     parts = str(position.exit_flatten_before).split(":")
@@ -2736,7 +2791,8 @@ class Mag7BrokerOms:
                 if item.action == "SELL"
                 and item.symbol == position.symbol
                 and item.contract == position.contract
-                and item.status in {"PENDING", "SUBMITTED", "PARTIAL"}
+                and item.status
+                in {"PENDING", "SUBMITTED", "PARTIAL", "PARTIALLY_FILLED"}
             ),
             None,
         )

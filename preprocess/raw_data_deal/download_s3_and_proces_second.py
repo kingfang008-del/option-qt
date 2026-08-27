@@ -1,9 +1,11 @@
-# 秒级成交（默认）
-#python preprocess/raw_data_deal/download_s3_and_process.py
+# 秒级成交聚合（默认 trades → 1s OHLCV）
+#   python preprocess/raw_data_deal/download_s3_and_proces_second.py
+# 期权成交 tick（同 trades_v1 源，不聚合；落盘 new_option_data_s3_tick）
+#   S3_DATA_KIND=tick python preprocess/raw_data_deal/download_s3_and_proces_second.py
 # 仍下分钟
-#S3_DATA_KIND=minute python preprocess/raw_data_deal/download_s3_and_process.py
+#   S3_DATA_KIND=minute python preprocess/raw_data_deal/download_s3_and_proces_second.py
 # 盘口（慎用，体积大）
-#S3_DATA_KIND=quotes python preprocess/raw_data_deal/download_s3_and_process.py
+#   S3_DATA_KIND=quotes python preprocess/raw_data_deal/download_s3_and_proces_second.py
 
 
 import boto3
@@ -32,24 +34,29 @@ BUCKET_NAME = "flatfiles"
 # [下载设置]
 # Polygon OPRA flat files 无独立 second_aggs；秒级用 trades（tick）再可选聚合成 1s。
 #   minute  → us_options_opra/minute_aggs_v1   （分钟 OHLCV，已有）
-#   trades  → us_options_opra/trades_v1        （成交 tick / 秒级，体积适中）
+#   trades  → us_options_opra/trades_v1        （默认聚合成 1s OHLCV → *_trades）
+#   tick    → us_options_opra/trades_v1        （同源，强制不聚合 → *_tick）
 #   quotes  → us_options_opra/quotes_v1        （盘口 tick，单日可达 100GB+，需分块）
-DATA_KIND = os.environ.get("S3_DATA_KIND", "trades").strip().lower()  # minute | trades | quotes
+DATA_KIND = os.environ.get("S3_DATA_KIND", "trades").strip().lower()  # minute | trades | tick | quotes
 S3_PREFIX_BY_KIND = {
     "minute": "us_options_opra/minute_aggs_v1",
     "trades": "us_options_opra/trades_v1",
+    "tick": "us_options_opra/trades_v1",  # alias: keep prints, do not 1s-agg
     "quotes": "us_options_opra/quotes_v1",
 }
 if DATA_KIND not in S3_PREFIX_BY_KIND:
     raise ValueError(f"DATA_KIND must be one of {sorted(S3_PREFIX_BY_KIND)}, got {DATA_KIND!r}")
 S3_PREFIX = S3_PREFIX_BY_KIND[DATA_KIND]
-# trades → 聚合成 1s OHLCV（v/o/c/h/l/t/n）；False 则保留 tick
-AGGREGATE_TRADES_TO_1S = os.environ.get("S3_AGG_1S", "1").strip() not in {"0", "false", "False"}
+# trades → 聚合成 1s OHLCV（v/o/c/h/l/t/n）；tick kind 强制 False（忽略 S3_AGG_1S）
+_AGG_ENV = os.environ.get("S3_AGG_1S", "1").strip() not in {"0", "false", "False"}
+AGGREGATE_TRADES_TO_1S = False if DATA_KIND == "tick" else _AGG_ENV
 # quotes → 每合约每秒最后一档盘口
 AGGREGATE_QUOTES_TO_1S = os.environ.get("S3_QUOTE_AGG_1S", "1").strip() not in {"0", "false", "False"}
+# kinds that read trades_v1 chunks (agg or raw print)
+_TRADES_LIKE_KINDS = frozenset({"trades", "tick"})
 
-START_DATE = datetime.date(2026, 7, 17)
-END_DATE = datetime.date(2026, 7, 18)  # 先下 Jul1 烟雾；需要多天再改 END_DATE
+START_DATE = datetime.date(2026, 1, 10)
+END_DATE = datetime.date(2026, 4, 24)  # 先下 Jul1 烟雾；需要多天再改 END_DATE
 
 # [路径]
 # RAW_DIR: 临时存放 S3 原始大文件的目录 (处理完会删除)
@@ -61,8 +68,8 @@ PROCESSED_DIR = (
 )
 #from config import TARGET_SYMBOLS
 # [目标股票列表] (Tier 1 ~ Tier 5 + Macro)
-TARGET_SYMBOLS =   ['QQQ','NVDA', 'TSLA', 'AMD', 'INTC', 'MSFT', 'AMZN', 'GOOGL', 'META', 'AAPL' ,'MU','AVGO']
-#TARGET_SYMBOLS =   ['GOOGL']
+#TARGET_SYMBOLS =   ['QQQ','NVDA', 'TSLA', 'AMD', 'INTC', 'MSFT', 'AMZN', 'GOOGL', 'META', 'AAPL' ,'MU','AVGO']
+TARGET_SYMBOLS =   ['GOOGL']
 # [Polygon API Token] 用于预检合约
 API_KEY = "JXuIcG_dpoRiCE6jP7c73nVWweEVSpUp"
 
@@ -297,7 +304,7 @@ class S3Pipeline:
             df_merged = pd.concat([df_exist, group_to_save], ignore_index=True)
             # 1s 聚合跨 chunk 可能重复同一 (ticker,timestamp)，再压一遍
             if (
-                DATA_KIND == "trades"
+                DATA_KIND in _TRADES_LIKE_KINDS
                 and AGGREGATE_TRADES_TO_1S
                 and {"ticker", "timestamp", "o", "h", "l", "c", "v"}.issubset(df_merged.columns)
             ):
@@ -325,6 +332,18 @@ class S3Pipeline:
                     .groupby(["ticker", "timestamp"], as_index=False)
                     .tail(1)
                     .reset_index(drop=True)
+                )
+            elif DATA_KIND == "tick":
+                # keep prints; dedupe by SIP identity when present
+                subset = [
+                    c
+                    for c in ("ticker", "sip_timestamp", "price", "size", "exchange")
+                    if c in df_merged.columns
+                ]
+                df_merged = (
+                    df_merged.drop_duplicates(subset=subset)
+                    if subset
+                    else df_merged.drop_duplicates()
                 )
             else:
                 df_merged = df_merged.drop_duplicates()
@@ -457,15 +476,15 @@ class S3Pipeline:
         date_str = date_obj.strftime("%Y-%m-%d")
         logger.info(f"⚙️ 正在处理清洗 {date_str} | kind={DATA_KIND} | prefix={S3_PREFIX}")
 
-        # quotes / trades 可能很大：分块读
-        chunksize = 1_000_000 if DATA_KIND in {"trades", "quotes"} else None
+        # quotes / trades / tick 可能很大：分块读
+        chunksize = 1_000_000 if DATA_KIND in {"trades", "tick", "quotes"} else None
 
         for fp in file_paths:
             try:
                 if DATA_KIND == "minute":
                     df = pd.read_csv(fp)
                     self._process_minute_chunk(df, date_str)
-                elif DATA_KIND == "trades":
+                elif DATA_KIND in _TRADES_LIKE_KINDS:
                     for chunk in pd.read_csv(fp, chunksize=chunksize):
                         self._process_trades_chunk(chunk, date_str)
                 elif DATA_KIND == "quotes":
@@ -537,8 +556,10 @@ if __name__ == "__main__":
     print(f"日期: {START_DATE} → {END_DATE}")
     print(f"数据存放于: {PROCESSED_DIR}")
     print(f"临时缓存于: {RAW_DIR} (处理后自动删除)")
-    if DATA_KIND == "trades":
+    if DATA_KIND in _TRADES_LIKE_KINDS:
         print(f"AGGREGATE_TRADES_TO_1S: {AGGREGATE_TRADES_TO_1S}")
+        if DATA_KIND == "tick":
+            print("tick kind: same S3 trades_v1 prefix; forced no 1s agg → *_tick")
     if DATA_KIND == "quotes":
         print(f"AGGREGATE_QUOTES_TO_1S: {AGGREGATE_QUOTES_TO_1S}")
         print("⚠️ quotes 单日可达 ~100GB+，确认磁盘空间后再跑")

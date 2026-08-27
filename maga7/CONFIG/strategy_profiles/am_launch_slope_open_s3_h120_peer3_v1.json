@@ -1,0 +1,81 @@
+{
+  "profile": "am_launch_slope_open_s3_h120_peer3_v1",
+  "profile_id": "am_launch_slope_open_s3_h120_peer3_v1",
+  "description": "Research AM sleeve #1: launch_slope open 3s / |ret|≥0.2% / peer3 / horizon H=120s (fill-anchored). Signal 09:30–10:25 (hard stop before CORE 10:30). position_frac=0.10. NOT Rule-A morning_sleeve (that book is negative). Docs: docs/launch_slope_research.md · docs/sleeve_portfolio_research.md.",
+  "role": "research_sleeve",
+  "sleeve": "AM",
+  "result_tag": "research_am_launch_slope_open_s3_h120_peer3_v1",
+  "research_revision": "2026-07-23_am_v1",
+  "based_on": "strategy_profiles/single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json",
+  "baseline_doc": "docs/sleeve_portfolio_research.md",
+  "recommended_scheme": "launch_option_fill",
+  "symbols": [
+    "NVDA",
+    "TSLA",
+    "AAPL",
+    "AMZN",
+    "META",
+    "MSFT",
+    "AMD",
+    "GOOGL"
+  ],
+  "launch_slope": {
+    "enabled": true,
+    "session": "open_0930_1030",
+    "signal_start": "09:30",
+    "signal_end": "10:25",
+    "slope_sec": 3,
+    "abs_ret_min": 0.002,
+    "horizon_sec": 120,
+    "from_prev_min": 0.0,
+    "vol_z_min": 0.0,
+    "peer_min": 3,
+    "mf_confirm": false,
+    "exit_book": "horizon",
+    "candidate_name": "s3_r002_h120_fp0_p3"
+  },
+  "signal": {
+    "window_start": "09:30",
+    "window_end": "10:25",
+    "note": "Not Rule-A; launch_slope runner only."
+  },
+  "watchdog": {
+    "enabled": false,
+    "hunter": {"enabled": false}
+  },
+  "trade": {
+    "tp_mult": 1.6,
+    "sl_mult": 0.45,
+    "hold_minutes": 2,
+    "position_frac": 0.1,
+    "position_sizing": "concurrent",
+    "max_concurrent_positions": 2,
+    "cooldown_minutes": 5,
+    "max_entries_per_symbol": 1,
+    "moneyness": "ATM",
+    "contract_mode": "open_ladder",
+    "ladder_otm_rungs": 3,
+    "quote_source": "1s",
+    "exit_mode": null,
+    "force_horizon_seconds": 120,
+    "trade_toxic": {
+      "enabled": true,
+      "cut_ret": 0.25,
+      "mfe_bypass": 0.05,
+      "min_hold_seconds": 30,
+      "persist_seconds": 0,
+      "max_cut_seconds": 120
+    }
+  },
+  "lock": {
+    "prefer_dte": 0,
+    "allowed_dte": [0, 1, 2]
+  },
+  "portfolio": {
+    "budget_frac": 0.15,
+    "mutex_vs_core": "hard_tod",
+    "flatten_before": "10:30",
+    "note": "AM must not overlap CORE 10:30 book; budget ≤15% of day risk unit."
+  },
+  "note": "Frozen research cell from research_launch_slope_option_fill_may_jul_v2 (horizon +19% / win56% / maxdd−8%). Dual-window accept via tools/run_am_sleeve_accept.py."
+}

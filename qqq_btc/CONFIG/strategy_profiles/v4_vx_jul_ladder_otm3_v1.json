@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "profile_id": "v4_vx_jul_ladder_otm3_v1",
+  "description": "July TFT on maga7 open-ladder vehicle (July_ladder_1dte_ATM_OTM3_2026-07-01_2026-07-13). Not open_4bucket; not training foresight lock.",
+  "base_replay": "LIVE_REPLAY",
+  "model": {
+    "checkpoint": "checkpoint/checkpoints_qqq_v4/best.pth"
+  },
+  "inputs": {
+    "infer_by_month": {
+      "2026-07": "qqq_btc/results/v4_jul_ladder_otm3_frozen_infer/test_infer.parquet"
+    },
+    "raw1_by_month": {
+      "2026-07": "/home/kingfang007/train_data/july_tft_ladder_otm3/quote_features_raw/QQQ/regular/09:30-16:00/1min/2026-07.parquet"
+    },
+    "opt1m_by_month": {
+      "2026-07": "/home/kingfang007/train_data/july_tft_ladder_otm3/options_1m"
+    }
+  },
+  "replay_overrides": {
+    "edge_q10_floor": -0.2,
+    "apply_put_entry_quantile": false,
+    "next_day_put_quarantine_loss": -0.02,
+    "next_day_put_quarantine_vx_slope_min": 0.06,
+    "next_day_all_leg_defense_loss": -0.05,
+    "next_day_all_leg_defense_position_frac": 0.125,
+    "next_day_all_leg_defense_vx_slope_min": 0.06
+  },
+  "selector": {
+    "mode": "vx",
+    "rule_profiles": "qqq_btc/CONFIG/rule_profiles.json",
+    "vx_term_structure": "/mnt/s990/data/raw_1m/vix_futures_databento/vx_term_structure_1d.parquet",
+    "spot_root": "~/train_data/spnq_train_resampled"
+  },
+  "execution": {
+    "put_gate_mode": "vixy_z",
+    "tick_exits": "off",
+    "live_label_shift_sec": 60,
+    "fill_spread_frac": 0.775,
+    "execution_delay_bars": 0,
+    "oms_signal_delay_bars": 0
+  },
+  "features": {
+    "slow_feature_config": "qqq_btc/CONFIG/slow_feature_qqq_v4.json",
+    "frozen_norm": "qqq_btc/CONFIG/frozen_norm_qqq_daily.npz",
+    "scope_label": "July_ladder_1dte_ATM_OTM3_2026-07-01_2026-07-13"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "version": "failure_detector_impulse_mae_v1",
+  "description": "Phase3 promoted: early MAE cut on Impulse seats only. Smooth keeps baseline trail/smooth-break.",
+  "funnel_version": "top2_smooth_impulse_v1",
+  "scope": "impulse_only",
+  "smooth": {
+    "enabled": false
+  },
+  "impulse": {
+    "enabled": true,
+    "min_hold_minutes": 1.0,
+    "max_eval_minutes": 10.0,
+    "early_mae_cut": 0.0035,
+    "early_giveback": 9.0,
+    "path_min_up_frac": -1.0,
+    "structure_lookback": 0,
+    "lose_open": false,
+    "lose_vwap": false
+  },
+  "evidence": {
+    "result_dir": "/mnt/s990/data/maga7/results/failure_detector_ablation_v1",
+    "full_ret_baseline": -0.0708,
+    "full_ret_impulse_mae": -0.0387,
+    "net_attr": 0.1342,
+    "oos_folds_improve": "2/3",
+    "note": "Smooth MAE cut is net-negative; do not enable on Smooth."
+  }
+}

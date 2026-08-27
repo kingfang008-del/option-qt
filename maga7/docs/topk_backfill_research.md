@@ -47,7 +47,7 @@ Freeze profile **不打开**。实现：`maga7/common/replay.py`（`topk_backfil
 
 大行情进场了，但持仓窗内期权仍亏——说明「吃到日线大票 ≠ 策略窗内赚钱」。
 
-## 结论
+## 结论（旧 freeze 窗）
 
 **REJECT for freeze。**
 
@@ -59,9 +59,42 @@ Freeze profile **不打开**。实现：`maga7/common/replay.py`（`topk_backfil
 
 相关：成交额重排 TopK 见 [`topk_dollar_vol_research.md`](topk_dollar_vol_research.md)。
 
+---
+
+## 2026-07-23 复验（S1 research_baseline）
+
+基线已含 S1 soft `stock_path_confirm`。工具：`python -m maga7.tools.run_topk_backfill_accept`  
+产物：`/mnt/s990/data/maga7/results/topk_backfill_accept_s1_apr_jul_jan_mar_v1/`
+
+| window | PRE (top2) | BF (top2+backfill) | TOP3 | BF keep |
+|--------|------------:|-------------------:|-----:|--------:|
+| 强 Apr–Jul→07-22 | +4386% / −14.1% / n=79 | +4116% / −14.1% / n=91（bf=25） | +3398% / −17.3% / n=100 | **0.94** |
+| 弱 Jan–Mar | +104.6% / −17.8% / n=55 | +89.9% / **−23.8%** / n=58（bf=9） | +88.1% / −20.2% / n=64 | 变差 |
+| 七月 07-01..22 | **+90.7%** / −7.6% / n=15 | +57.9% / −12.7% / n=18 | +61.4% / −17.3% / n=18 | **0.64 fail** |
+| 孤立 07-22 | AMD −1.5%（漏 NVDA） | **AMD+NVDA +5.1%**（抓住 NVDA TP） | 同 BF | — |
+
+### 决策
+
+| 臂 | 决策 | 理由 |
+|----|------|------|
+| **BF** | **`REJECT_FOR_BASELINE`** | 强窗 keep≈0.94 过线，但弱窗收益/回撤双差，七月 keep≈0.64≪0.95；仅孤立 07-22 修好漏抓 |
+| **TOP3** | **`REJECT_FOR_BASELINE`** | 强窗 keep≈0.77 不过；弱/七月均差于 PRE |
+
+**加仓位**（`position_frac`↑）不在本表：它不改变 TopK 座位，治不好漏抓。
+
+### 实务含义
+
+- **漏抓最有价值票**：BF / TOP3 在孤立 07-22 都能补上 NVDA；连续窗里 07-22 路径依赖不同（常成交 MSFT DN），不会自动复现「去 AMD → NVDA」。
+- **升 research / freeze 基线：否** —— 与旧结论一致。
+- **可留作 overlay / 日终诊断开关**；下一步若再做，优先「仅当原 TopK 被 regime 挡才顺延」的窄触发，而不是无条件 backfill 或盲升 Top3。
+
 ## 复跑
 
 ```bash
+# 双窗验收（推荐）
+python -m maga7.tools.run_topk_backfill_accept
+
+# 单窗手搓
 python - <<'PY'
 from copy import deepcopy
 from maga7.common.config import load_profile

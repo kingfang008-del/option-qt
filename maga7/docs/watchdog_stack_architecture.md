@@ -1,9 +1,10 @@
 # Mag7 新架构落盘：Baseline · Watchdog · Hunter
 
-> 状态日期：2026-07-18  
-> 角色：**研究栈文档**（freeze / 生产默认仍关闭 overlay）  
+> 状态日期：2026-07-24（Hunt 已进 research_baseline；窄专家注册表见下）  
+> 角色：**研究栈文档**（freeze / 生产默认仍关闭部分 overlay）  
 > 时钟与 OMS 契约仍以 [`current_architecture.md`](current_architecture.md) 为准。  
-> **完善优化路线**：[`watchdog_optimization_roadmap.md`](watchdog_optimization_roadmap.md)
+> **完善优化路线**：[`watchdog_optimization_roadmap.md`](watchdog_optimization_roadmap.md)  
+> **窄形态专家升级**：[`narrow_expert_routing_upgrade.md`](narrow_expert_routing_upgrade.md)
 
 ## 1. 一句话
 
@@ -23,9 +24,13 @@
 │      Halt:    Mag7 广度 washout_and_reclaim → 全日禁开仓     │
 ├─────────────────────────────────────────────────────────────┤
 │  L2  Hunter 短窗槽   (washout_reclaim v2 ACCEPT_RESEARCH)   │
-│      单票深洗→收回开盘 · 日≤1 · 默认同向 mutex               │
+│      单票深洗→收回开盘 · 日≤1 · mutex symbol_dir            │
 │      + allow_baseline_opposite（不挡反向 Rule-A）           │
-│      research_baseline 上 hunter.enabled=false              │
+│      research_baseline 上 hunter.enabled=true（P2 升线）    │
+├─────────────────────────────────────────────────────────────┤
+│  Registry  窄形态专家目录（非第二基线）                     │
+│      CONFIG/narrow_experts/catalog_v1.json                  │
+│      开仓类候选（CORE DN sync / AM）QUOTE_REJECT → 默认 off │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -34,9 +39,10 @@ Halt 日默认不 arm Hunt（`block_when_halt=true`）。
 
 | 层 | Profile / Config | 验收 |
 |----|-----------------|------|
-| L0+L1 | `…_extend_mtm_full_day_peer3_v1.json`（P1.1） | 研究基线，见 [`research_full_day_peer3_baseline.md`](research_full_day_peer3_baseline.md) |
-| L1 对照 | `…_watchdog_v1.json` + `CONFIG/watchdog/degrade_halt_v1.json` | 双窗 ≥95% L0；May–Jul ~108% |
-| L2 | `…_watchdog_hunter_washout_reclaim_v1.json` + `degrade_halt_hunter_washout_reclaim_v1.json` | 双窗 ≥95%；May–Jul ~**155%** / Feb–Apr ~**108%** |
+| L0+L1+L2 | `…_extend_mtm_full_day_peer3_v1.json` | 研究基线，见 [`research_full_day_peer3_baseline.md`](research_full_day_peer3_baseline.md) |
+| L1 对照 | 关 `hunter.enabled` / `…_watchdog_v1.json` | 双窗 ≥95% L0；May–Jul ~108% |
+| L2 细则 | washout_reclaim + opp | 见 [`l2_hunter_validation_gates.md`](l2_hunter_validation_gates.md) |
+| 窄专家注册 | `narrow_experts.catalog_path` | [`narrow_expert_routing_upgrade.md`](narrow_expert_routing_upgrade.md) |
 
 否决检测器（槽位保留，勿升）：`orb_fractal`、`early_mf`。  
 Hunter 细则：[`hunter_washout_reclaim_research.md`](hunter_washout_reclaim_research.md)。  
@@ -59,11 +65,12 @@ Summary：`n_hunt_*`、`watchdog_state_counts`、`n_hunt_mutex_skip`。
 | 开关 | research_baseline | 备注 |
 |------|-------------------|------|
 | `watchdog.enabled` | **true**（P1.1） | L0-only 对照可临时关 |
-| `hunter.enabled` | **false** | 仅 L2 研究 profile |
+| `hunter.enabled` | **true**（P2） | washout_reclaim；新 detector 默认 off |
+| `narrow_experts` | **registry on** | 目录启用；QUOTE_REJECT 开仓臂仍 off |
 | `tcn_gate` / `lgbm_bouncer` / `regime_router` | **false** | 各自研究线 |
 | Rule-A `window_start` | **10:30** | 禁止为吃早盘而改基线窗 |
 
-升线顺序建议：L1 纸面 → L1 签字 → L2 纸面 → L2 签字；**禁止跳过 L1 直接开 Hunter**。
+升线顺序：L1 → L2（已进研究基线）→ 新开仓专家须 **quote 双窗 PASS** 才挂进 registry/ACCEPT。
 
 ```bash
 # L1 验收
@@ -117,22 +124,23 @@ python -m maga7.tools.run_washout_reclaim_hunter_scoreboard \
 
 | 用途 | 开什么 |
 |------|--------|
-| 日常研究 / shadow | **L0+L1**（Hunter off）；L0-only 对照临时关 `watchdog.enabled` |
-| 坏日防护试点 | L0 + **L1**（Hunter 仍 off） |
-| 早盘增量试点 | L0 + L1 + **L2**（研究 profile，非生产） |
+| 日常研究 / shadow | **L0+L1+L2**（research_baseline）；L0-only 对照临时关 `watchdog.enabled` |
+| 坏日防护对照 | L0 + **L1**（关 `hunter.enabled`） |
+| 新形态试点 | 先写 `catalog_v1.json`；quote PASS 前 **禁止**默认注入 |
 
-### 7.1 收益速查（防忘：~1200% ≠ 当前基线）
+### 7.1 收益速查（防忘：~1200% 是 L2 对照窗，非无脑复利预期）
 
 同窗 May–Jul（→07-17），锁参 2026-07-18：
 
-| 档 | total_ret | vs L0 | 基线？ |
-|----|----------:|------:|--------|
-| L0 | +810% | 100% | 对照 |
-| **L1（现默认）** | **+875%** | ~108% | **是** |
-| **L2 Hunt v2** | **+1255%** | ~155% | **否** |
+| 档 | total_ret | vs L0 | research_baseline？ |
+|----|----------:|------:|---------------------|
+| L0 | +810% | 100% | 对照（关 watchdog） |
+| L1 | +875% | ~108% | 子集 |
+| **L2 Hunt v2** | **+1255%** | ~155% | **是**（与 L1 同开） |
 
 完整表与分月：[`research_full_day_peer3_baseline.md`](research_full_day_peer3_baseline.md)。  
-L2 细则：[`hunter_washout_reclaim_research.md`](hunter_washout_reclaim_research.md)。
+L2 细则：[`hunter_washout_reclaim_research.md`](hunter_washout_reclaim_research.md)。  
+窄专家队列：[`narrow_expert_routing_upgrade.md`](narrow_expert_routing_upgrade.md)。
 
 明细结果：
 
@@ -144,4 +152,4 @@ L2 细则：[`hunter_washout_reclaim_research.md`](hunter_washout_reclaim_resear
 - L2 邻域：`results/watchdog/hunter_wd_neighborhood/` → `PASS_NEIGHBORHOOD`  
 - L2 流式对拍：`results/parity_l2_hunter_washout_reclaim_20260501_0717/` → ok  
 - **P0 hold-out**：`results/watchdog/holdout_p0/` → Verdict `PASS_P0`（L2 OOS 弱于 L1）  
-- **升线总闸**：[`l2_hunter_validation_gates.md`](l2_hunter_validation_gates.md) → **仍不进 baseline**
+- **升线总闸**：[`l2_hunter_validation_gates.md`](l2_hunter_validation_gates.md) → L2 已进 research_baseline；生产 freeze 另议

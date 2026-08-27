@@ -73,3 +73,72 @@ def test_one_alert_per_arm():
     # LB may or may not fire before FO depending on grind path; never more than 1 each
     assert arms.count("LB") <= 1
     assert len(alerts) == len(set(arms))
+
+
+def test_late_bar_does_not_latch_day_open():
+    cfg = AmPulseScoutConfig(enabled=True, min_fav_from_open=0.008, dirs=("DN",), rth_open_only=True)
+    scout = AmPulseScout(cfg=cfg)
+    scout.begin_day("2026-07-24")
+    a = scout.on_bar(
+        symbol="NVDA",
+        ts=pd.Timestamp("2026-07-24 10:13:00", tz="America/New_York"),
+        open_=202.84,
+        high=203.0,
+        low=201.0,
+        close=201.03,
+    )
+    assert a is None
+    assert "NVDA" not in scout._day_open
+
+
+def test_seed_day_open_uses_rth_open():
+    cfg = AmPulseScoutConfig(enabled=True, min_fav_from_open=0.008, dirs=("DN",), rth_open_only=True)
+    scout = AmPulseScout(cfg=cfg)
+    scout.begin_day("2026-07-24")
+    scout.seed_day_open("NVDA", 208.02)
+    a = scout.on_bar(
+        symbol="NVDA",
+        ts=pd.Timestamp("2026-07-24 10:13:00", tz="America/New_York"),
+        open_=202.84,
+        high=203.0,
+        low=201.0,
+        close=201.03,
+    )
+    # 3.36% FO from true open — fires, and day_open stays seeded
+    assert a is not None and a.arm == "FO" and a.dir == "DN"
+    assert abs(a.day_open - 208.02) < 1e-9
+    assert a.fav_from_open > 0.03
+
+
+def test_seed_force_overwrites_pseudo_open():
+    cfg = AmPulseScoutConfig(enabled=True, min_fav_from_open=0.008, dirs=("DN",), rth_open_only=True)
+    scout = AmPulseScout(cfg=cfg)
+    scout.begin_day("2026-07-24")
+    scout.seed_day_open("NVDA", 200.0)  # wrong / pseudo
+    scout.seed_day_open("NVDA", 208.02, force=True)
+    assert abs(scout._day_open["NVDA"] - 208.02) < 1e-9
+    # Without force, later seed must not clobber.
+    scout.seed_day_open("NVDA", 199.0, force=False)
+    assert abs(scout._day_open["NVDA"] - 208.02) < 1e-9
+
+
+def test_max_fav_from_open_blocks_chase():
+    cfg = AmPulseScoutConfig(
+        enabled=True,
+        min_fav_from_open=0.008,
+        max_fav_from_open=0.015,
+        dirs=("DN",),
+        rth_open_only=True,
+    )
+    scout = AmPulseScout(cfg=cfg)
+    scout.begin_day("2026-07-24")
+    scout.seed_day_open("NVDA", 208.02)
+    a = scout.on_bar(
+        symbol="NVDA",
+        ts=pd.Timestamp("2026-07-24 10:13:00", tz="America/New_York"),
+        open_=202.84,
+        high=203.0,
+        low=201.0,
+        close=201.03,
+    )
+    assert a is None

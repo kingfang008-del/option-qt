@@ -10,18 +10,26 @@
 **Event calendar feb_jul:** 2026-07-20 — 在 May–Jul 原集上并入 loss-scan：02-05 capex / 02-11 NFP / 02-13 CPI / 03-03 geopol / 04-29 FOMC（见 [`loss_day_event_scan.md`](../results/research_extend_mtm_full_day_peer3_l2_tt1_05_sl55_tt600d_feb_jul/loss_day_event_scan.md)；消融 `research_event_calendar_extend_ablation_*`）  
 **Event calendar +AAPL CEO:** 2026-07-20 — `feb_jul_aapl_ceo` = feb_jul + 04-21/22 Cook→Ternus（见 [`remaining9_stock_news.md`](../results/research_extend_mtm_full_day_peer3_l2_tt1_05_sl55_tt600d_feb_jul/remaining9_stock_news.md)；消融 `research_event_calendar_aapl_ceo_ablation_*`）  
 **Company-news policy:** 2026-07-20 — **不定方向**；live `company_news_mode=hard_risk`（仅 CEO 可自动禁票）；大单/合作只审计+LLM；宏观/财报分层禁入（见 [`event_news_policy.py`](../common/event_news_policy.py)）  
+**Jul Mag7 AH 补丁：** 2026-07-26 — `2026-07-22` **TSLA/GOOGL `earnings_ah`** 写入 live+manual，peer3 `event_symbol_blackout`（AH 当日禁该标的；**不**禁 07-23；长波动/straddle sleeve 未接线）。见 [`event_calendar_finnhub_jul2026_validation.md`](event_calendar_finnhub_jul2026_validation.md)。  
+**AH straddle scoreboard：** 2026-07-26 跑分 → **2026-07-27 ABANDONED**（隔夜双边不晋级；AH 禁入保留）。见 [`earnings_ah_straddle_scoreboard.md`](earnings_ah_straddle_scoreboard.md)。  
+**Hunt×RS peer（06-24 AMD）：** 2026-07-27 — `HUNT_RS_PEER_T10` 清 AMD Hunt，但砍 07-01 META Hunt TP，strong keep≈0.92 → **DUAL_FAIL 不接线**。见 [`hunt_range_stall_peer_research.md`](hunt_range_stall_peer_research.md)。  
+**crowd6（06-24 GOOGL）：** 2026-07-27 — `crowd_min_peer=6` 清 GOOGL、留 AMZN，但弱窗 keep≈0.74（误杀 Apr TP）→ **DUAL_FAIL**；GOOGL 仍靠 TRADE_TOX。见 [`crowd6_googl_0624_research.md`](crowd6_googl_0624_research.md)。  
 **L3 causal exit (STOCK_REV):** 2026-07-22 — 细网格已过晋级条，**shadow 候选已落盘**，**未**并入本基线；见 [`peer3_l3_causal_exit_research.md`](peer3_l3_causal_exit_research.md)  
 **Tail-first shadow:** 2026-07-22 — `tox_cut20 + wash_m3`（压单笔 ≤−25%）；见 [`peer3_tail_loss_research.md`](peer3_tail_loss_research.md) · profile `..._peer3_tail_tox20_wash_m3_v1`  
 **S1 soft path_confirm:** 2026-07-23 — `trade.stock_path_confirm` enabled（thr_pos=+15bp / thr_neg=−30bp / max_wait=300s / **on_timeout=allow** / delay_on_pos=false / tod 10:30–14:00）。**已并入本 research_baseline**。  
 **软加仓 `dvol_size_scale`:** 2026-07-23 — 截面 $vol rk1×1.25 / rk2×1.15（只抬不砍，不改 TopK 座位）。双窗 `PROMOTE_LIQ_RESEARCH` 后写入本 profile（`research_revision=2026-07-23_s1_dvol_soft`）。见 [`dvol_liq_soft_research.md`](dvol_liq_soft_research.md)。  
 **窄形态专家注册表:** 2026-07-24 — `narrow_experts.catalog_path` → `CONFIG/narrow_experts/catalog_v1.json`（脊骨仍 L0+L1+L2；`core_dn_sync` / AM HF 为 **QUOTE_REJECT** 研究队列，不接线）。见 [`narrow_expert_routing_upgrade.md`](narrow_expert_routing_upgrade.md)。  
-**Overnight gap+adv BLOCK:** 2026-07-26 — `trade.overnight_gap_gate` **已接线**（up_only · gap≥4% · adv120≥0.55 @lag60 · `mode=block`）。双窗 `gap_adv_confirm_dual_v3` / `G4_A55_BLK`；见 [`event_news_jul_rescue_research.md`](event_news_jul_rescue_research.md)。  
-**Peer+gap stall BLOCK:** 2026-07-26 — `trade.peer_gap_gate` **已接线**（peer≤3 · fav_gap≥1.5% · `mode=block`）。`DUAL_PASS_WIRE` `peer_gap_dual_v1` / `P3_G15`（清 04-08 AAPL SL、砍 02-18 NVDA TOX）；见 [`peer_gap_stall_research.md`](peer_gap_stall_research.md)。  
-**Range-chase+pre5 stall BLOCK:** 2026-07-26 — `trade.range_stall_gate` **已接线**（entry 时钟 · chase≥0.9 · pre5≤**2.5bp** · peer≤5 · fav_ffo≥**1.2%** + `peer_pre5_max_peer=3` + **`crowd_min_peer=7`/`crowd_max_pre5=25bp`/`crowd_min_fav_from_open=1%`**）。`C7_FFO012_P25`+`CROWD25` 清 02-06/02-25/03-18/**02-18**/**03-12**；见 [`range_stall_research.md`](range_stall_research.md) / `results/priority3_dual_v2`。  
-**UP gap early stall BLOCK:** 2026-07-26 — `trade.up_gap_stall_gate` **已接线**（**feature** 时钟 · UP · gap≥1.5% · `|fo|≤0.1%` · chase≥0.9 · sess≤40m）。`UGS15` 清 **06-11 TSLA**；与 CROWD25 组合 `DUAL_PASS_WIRE`（weak **1.11** / strong **1.09**）。  
-**FO+LOD chase BLOCK:** 2026-07-26 — `trade.fo_lod_chase_gate` **已接线**（**feature** · **DN-only** · fav_fo≥3% · chase≥0.9 · dist_LOD≤30bp）。`DN30` 清 **07-24 TSLA** 追尾 put；weak **1.00** / strong **1.04**（窗含 07-24）。见 [`range_stall_research.md`](range_stall_research.md) / `results/fo_lod_chase_dual_v1`。
+**Overnight gap+adv BLOCK:** 2026-07-26 接线 → **2026-08-14 C5 DEPRECATED**（strip 强窗 keep=1.06；合关确认 keep=1.025）。`enabled=false`。见 [`core_architecture_adaptability.md`](core_architecture_adaptability.md) §8.4。  
+**Peer+gap stall BLOCK:** 2026-07-26 — `trade.peer_gap_gate` **已接线**（peer≤3 · fav_gap≥1.5% · `mode=block`）。`DUAL_PASS_WIRE` `peer_gap_dual_v1` / `P3_G15`（清 04-08 AAPL SL、砍 02-18 NVDA TOX）；见 [`peer_gap_stall_research.md`](peer_gap_stall_research.md)。**C5 KEEP**（strip 强窗 keep=0.87）。  
+**Range-chase+pre5 stall BLOCK:** 2026-07-26 — `trade.range_stall_gate` **已接线**（entry 时钟 · chase≥0.9 · pre5≤**2.5bp** · peer≤5 · fav_ffo≥**1.2%** + `peer_pre5_max_peer=3` + **`crowd_min_peer=7`/`crowd_max_pre5=25bp`/`crowd_min_fav_from_open=1%`**）。`C7_FFO012_P25`+`CROWD25` 清 02-06/02-25/03-18/**02-18**/**03-12**；见 [`range_stall_research.md`](range_stall_research.md) / `results/priority3_dual_v2`。**C5 KEEP**（strip 弱+17 / 强+7 笔，keep 0.90/0.73）。  
+**UP gap early stall BLOCK:** 2026-07-26 接线 → **2026-08-14 C5 DEPRECATED**（strip 强窗 keep=0.965）。`enabled=false`。  
+**FO+LOD chase BLOCK:** 2026-07-26 接线 → **2026-08-14 C5 DEPRECATED**（strip nΔ=0，block 未变成成交）。`enabled=false`。  
+**C5 morph freeze:** 2026-08-14 — 硬 BLOCK **6→3**；`morph_debt.policy=no_net_new_hard_block`。禁止再净增替换门。生产 freeze 不变。  
+**C6 session risk budget:** 2026-08-14 — `trade.session_risk_budget` **已接线**（`dd_step` · 已实现权益 DD≤−5% → size×0.5）。弱 keep **0.975** MaxDD −8.8%→−7.1%；强 keep **0.998**。不是气候标签（C2 仍 FAIL），不是 morph。见 [`core_architecture_adaptability.md`](core_architecture_adaptability.md) §8.5。  
+**Live Scanner 对齐（entry morph）：** 2026-07-26 — `Mag7Scanner` 已挂同一组 price/vol 门：feature 时钟 `overnight_gap` / `peer_gap` / `dn_gap_stall` / `up_gap_stall` / `fo_lod_chase`（**TopK 占座前**）；entry 时钟 `range_stall`；size scale 并入 `meta.regime_size_scale`。计数器见 snapshot `entry_morph.*`。
 
 **AM Pulse sleeve (shadow):** 2026-07-26 — Mag7 DN FO≥0.8% · 09:30–10:25 · flatten≤10:30；`drain_am_pulse` 已挂 peer3，默认 `execute_mode=shadow`（OMS shadow-only）。见 [`am_pulse_scout.md`](am_pulse_scout.md) / `results/research_am_pulse_quote_dual_v2`。  
+**Stack freeze (2026-07-27):** 研究栈只保留 **本基线 CORE + AM pulse**。`qqq_open_cont` 已关；午盘 FO / LOD-reclaim（12:30–13:30）**ABANDONED**（弱边、与 CORE 抢钟）。见 [`am_pulse_scout.md`](am_pulse_scout.md) §Lunch。  
 生产 / freeze / `default_profile` 仍是 `googl_peer3_v1`。  
 **S1 离线验收（标准双窗，2026-07-23）：** PRE（关 S1）vs S1 — **`KEEP_S1_RESEARCH_BASELINE`**  
 | 窗 | PRE total_ret | S1 total_ret | keep | MaxDD PRE→S1 |
@@ -43,7 +51,7 @@
 | Layer | Setting |
 |-------|---------|
 | Causal core | Mag7+GOOGL open_ladder **OTM3**, peer_align_min=3, QQQ align, rails delay 60s |
-| Exit | `hold_extend` T30→T45, MTM≥0, `hold_extend_require_mf=false`（Hunt 同此） |
+| Exit | `hold_extend` T30→T45, MTM≥0, `hold_extend_require_mf=false`；**giveback gb12_p15**（peak≥15% 且 peak−mtm≥12% → 拒延期；2026-07-28 双窗 PASS） |
 | Events | `event_calendar_block` + **`feb_jul_aapl_ceo`** + live **`company_news_mode=hard_risk`**（新闻不定方向；CEO/财报 symbol、宏观 full-day） |
 | Day halt | `day_loss_streak_halt=3` |
 | Size gate | `mf_idio_mode=pos`, `action=scale`, `scale=0.5`, `after_loss_streak=1`, ret β 5d |

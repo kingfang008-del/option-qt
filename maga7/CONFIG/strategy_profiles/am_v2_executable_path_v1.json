@@ -1,0 +1,100 @@
+{
+  "profile": "am_v2_executable_path_v1",
+  "profile_id": "am_v2_executable_path_v1",
+  "description": "AM v2 architecture reset: executable satellite path. Quote FillSpec is the only promotion mark. Reuses Mag7 open-lock / 1s stack; does not inherit Pulse/pocket/launch narratives.",
+  "role": "research_sleeve_expert",
+  "result_tag": "research_am_v2_blind_lift",
+  "research_revision": "2026-08-09_blind_lift_r0025",
+  "based_on": null,
+  "spine_complement": "strategy_profiles/single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json",
+  "narrow_expert_id": "am_v2_executable_path",
+  "docs": [
+    "docs/am_v2_path.md",
+    "docs/am_architecture_reassessment.md"
+  ],
+  "north_star": "executable_quote_fill",
+  "promotion_mark": "quote_FillSpec",
+  "diagnostic_mark": "option_trade_last",
+  "symbols": ["NVDA", "TSLA", "AAPL", "AMZN", "META", "MSFT", "AMD", "GOOGL"],
+  "am_v2": {
+    "enabled": true,
+    "execute_mode": "shadow",
+    "wired": true,
+    "event_calendar_block": false,
+    "window_start": "10:00",
+    "window_end": "11:30",
+    "flatten_before": "11:45",
+    "step": 4,
+    "signal": "launch_s3_r0025_cd300_post10",
+    "exit": "tp15_sl25_h900",
+    "slope_sec": 3,
+    "abs_ret_min": 0.0025,
+    "cooldown_sec": 300,
+    "peak_lookback_sec": 60,
+    "dirs": ["UP", "DN"],
+    "step1": {
+      "tag": "research_am_v2_step1_quote_baseline",
+      "pass": true
+    },
+    "step2": {
+      "tag": "research_am_v2_step2_signal_bakeoff",
+      "pass": false,
+      "promote": "NONE"
+    },
+    "step2b": {
+      "tag": "research_am_v2_step2b_signal_bakeoff",
+      "pass": true,
+      "promote": "STEP2B_launch_s3_r002_cd300_post10"
+    },
+    "step3": {
+      "tag": "research_am_v2_step3_exit_grid",
+      "pass": true,
+      "promote": "STEP3_tp15_sl25_h900"
+    },
+    "step4": {
+      "pass": true,
+      "wire": "Mag7Scanner.drain_am_v2 + peer3 am_v2.execute_mode=shadow"
+    },
+    "blind_lift": {
+      "tag": "research_am_v2_blind_lift",
+      "pass": true,
+      "promote": "BLIND_LIFT_r0025_cd300_1000_1130",
+      "quote": {
+        "n": 141,
+        "tpd": 2.35,
+        "mean": 0.0152,
+        "disc": 0.049,
+        "blind": 0.119
+      },
+      "note": "Raised abs_ret_min 0.002→0.0025; blind +2%→+12%; tpd 4.8→2.4. No densify."
+    },
+    "moneyness": "ATM",
+    "prefer_dte": 0,
+    "allowed_dte": [0, 1, 2],
+    "max_lag_sec": 5.0,
+    "max_spread_pct": 0.15,
+    "min_mid": 0.05,
+    "entry_frac": 0.75,
+    "exit_frac": 0.75,
+    "position_frac": 0.10,
+    "tp": 0.15,
+    "sl": 0.25,
+    "max_hold_sec": 900,
+    "note": "Frozen after blind-lift r0025. Next Step5 OMS dry/paper."
+  },
+  "portfolio": {
+    "mutex_vs_core": "hard_tod",
+    "flatten_before": "11:45",
+    "budget_frac": 0.10
+  },
+  "frozen_legacy": [
+    "am_pulse_sleeve KEEP narrative",
+    "am_pocket RETREAT_vd_soft_ride",
+    "LAUNCH_MULTI densify",
+    "am_high_freq_scalp"
+  ],
+  "date_range": {
+    "start": "2026-05-01",
+    "end": "2026-07-23"
+  }
+}

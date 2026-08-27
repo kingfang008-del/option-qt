@@ -219,6 +219,20 @@ class Mag7OmsStub:
         )
         if not allow or size_frac <= 0:
             return 0
+        from maga7.common.session_risk_budget import (
+            current_drawdown,
+            parse_session_risk_budget,
+            resolve_session_risk_budget,
+        )
+        from maga7.common.position_size import apply_size_scale
+
+        bud = parse_session_risk_budget((self.profile.get("trade") or {}).get("session_risk_budget"))
+        bud_sc, _ = resolve_session_risk_budget(
+            bud, current_dd=current_drawdown(self._eq, self._peak)
+        )
+        size_frac = apply_size_scale(size_frac, bud_sc)
+        if size_frac <= 0:
+            return 0
         notional = self.equity * size_frac
         raw = int(notional // (limit_px * 100.0))
         return max(1, min(self.max_qty, max(raw, 1)))
@@ -300,11 +314,27 @@ class Mag7OmsStub:
         if self.prefer_redis_quotes and resolve_pending:
             self.try_resolve_pending(asof_ts=ts)
 
+    def _sync_live_stock_into_session(self) -> None:
+        """Prefer scanner-accumulated 1m bars when disk stock_by lacks the session date.
+
+        Offline stock roots may end before a live stress day (e.g. 2026-07-20);
+        STOCK_REV / DELTA_STOP need underlying path from the fused/live tape.
+        """
+        assert self._session is not None
+        live = getattr(self.scanner, "stock_by", None) if self.scanner is not None else None
+        if not isinstance(live, dict) or not live:
+            return
+        for sym, df in live.items():
+            if df is None or getattr(df, "empty", True):
+                continue
+            self._session.stock_by[str(sym).upper()] = df
+
     def try_resolve_pending(self, *, asof_ts: float | pd.Timestamp | None = None) -> list[DryTrade]:
         """Resolve deferred Redis signals once quote book covers hold / early exit."""
         assert self._session is not None
         if not self._session.pending:
             return []
+        self._sync_live_stock_into_session()
         asof = None
         if asof_ts is not None:
             if isinstance(asof_ts, (int, float)) and not isinstance(asof_ts, bool):
@@ -327,7 +357,35 @@ class Mag7OmsStub:
                 continue
             hold_end = to_ny(sig.sig_ts) + pd.Timedelta(minutes=pend.hold_minutes)
             path_max = to_ny(path["timestamp"].iloc[-1])
-            early = sim.reason in ("TP", "SL", "MF_FLIP", "STREAK0")
+            rsn = str(sim.reason or "")
+            # Time-based exits need full hold coverage (partial Redis path may pin SEC_MAX/T+).
+            time_exit = rsn == "SEC_MAX" or rsn.startswith("T+")
+            early = (not time_exit) and (
+                rsn
+                in {
+                    "TP",
+                    "SL",
+                    "MF_FLIP",
+                    "STREAK0",
+                    "TRAIL",
+                    "TRAIL_LADDER",
+                    "PROFIT_STALL",
+                    "DELTA_STOP",
+                    "STOCK_REV",
+                    "ADVERSE_SOFT",
+                    "STALE_CUT",
+                    "MTM_FLOOR",
+                    "MAE_CUT",
+                    "HOLD_SHOCK",
+                    "TRADE_TOX",
+                    "FLOW_DIE",
+                    "FLOW_MTM",
+                }
+                or rsn.startswith("SL_LADDER")
+                or rsn.startswith("TP_LADDER")
+                or rsn.startswith("ROI_TIME")
+                or rsn.startswith("TRADE_TOX")
+            )
             ready = False
             if early and (asof is None or to_ny(sim.exit_ts) <= asof):
                 ready = True
@@ -347,6 +405,7 @@ class Mag7OmsStub:
         assert self._session is not None
         if not self._session.pending:
             return []
+        self._sync_live_stock_into_session()
         # allow resolve without asof gate
         done: list[DryTrade] = []
         still: list[PendingRedisSignal] = []

@@ -155,6 +155,23 @@
       "next_gate": "Keep alert-only; trade promotion is am_pulse_sleeve.",
       "docs": ["docs/am_pulse_scout.md", "docs/range_stall_research.md"]
     },
+    "am_v2_executable_path": {
+      "kind": "entry",
+      "lane": "research_sleeve",
+      "status": "ACCEPT_RESEARCH",
+      "enabled_on_spine": false,
+      "description": "AM v2 executable satellite (2026-08-09). Quote FillSpec dual PASS on launch_s3_r0025_cd300_post10 + TP15/SL25/h900 (blind-lift). Shadow drain via Mag7Scanner.drain_am_v2 on peer3; paper/live reject until Step5.",
+      "champion": "launch_s3_r0025_cd300_post10_tp15_sl25_h900",
+      "profile": "strategy_profiles/am_v2_executable_path_v1.json",
+      "evidence": [
+        "results/research_am_v2_step1_quote_baseline",
+        "results/research_am_v2_step2b_signal_bakeoff",
+        "results/research_am_v2_step3_exit_grid",
+        "results/research_am_v2_blind_lift"
+      ],
+      "next_gate": "Blind-lift r0025 adopted. Step5=OMS dry/paper before any live execute_mode.",
+      "docs": ["docs/am_v2_path.md", "docs/am_architecture_reassessment.md"]
+    },
     "am_pulse_sleeve": {
       "kind": "entry",
       "lane": "research_sleeve",
@@ -172,7 +189,30 @@
         "pass": "max_lag_sec=5, max_spread_pct≤0.15",
         "fail_strict": "max_lag_sec≤3 dual_pass_n=0"
       },
-      "next_gate": "Shadow wire on peer3 (execute_mode=shadow). Dry-run via OMS mode=shadow; set execute_mode=live only after OK. Prefer FO over LB. Jul quote n still thin.",
+      "next_gate": "2026-08-08 FROZEN narrative — superseded by am_v2_executable_path for new AM work. Shadow may remain; do not promote further until am_v2 Step2+ closes Pulse re-test.",
+      "docs": ["docs/am_pulse_scout.md", "docs/narrow_expert_routing_upgrade.md", "docs/am_v2_path.md"]
+    },
+    "am_pulse_extension": {
+      "kind": "entry",
+      "lane": "research_sleeve",
+      "status": "ACCEPT_RESEARCH",
+      "enabled_on_spine": true,
+      "description": "Independent Mag7 DN FO extension: first fav_from_open<=-0.8% in 10:25–11:30 → ATM put TP15/SL20, max hold 15m, flatten by 11:45. Trades dual PASS and quote FillSpec dual PASS at max_lag=5s / max_spread<=15%; does not consume baseline TopK.",
+      "champion": "pulse_FO_t0.008_tp0.15_sl0.2_sp0.15_lag5.0",
+      "profile": "strategy_profiles/am_pulse_extend_1025_1130_fo08_tp15_sl20_v1.json",
+      "evidence": [
+        "results/research_am_ext_1025_1130_fo_dn_champion",
+        "results/research_am_ext_1025_1130_quote_dual"
+      ],
+      "quote_metrics": {
+        "may": {"n": 36, "mean": 0.1478933782},
+        "jul": {"n": 8, "mean": 0.1429419958}
+      },
+      "quote_gates": {
+        "pass": "max_lag_sec=5, max_spread_pct<=0.15",
+        "fail_strict": "max_lag_sec<=3 misses Jul min-n"
+      },
+      "next_gate": "Live shadow wired as a separate AM_EXT detector/counter. Validate POSITION_OPEN/reject audit before any execute_mode promotion.",
       "docs": ["docs/am_pulse_scout.md", "docs/narrow_expert_routing_upgrade.md"]
     },
     "smc_flow_scout": {

@@ -4,7 +4,16 @@
   "description": "Research baseline: extend_mtm T30\u2192T45 + giveback gate (max_gb=0.12, min_peak=0.15) + event_calendar=feb_jul_aapl_ceo + peer3 + streak3 + mf_idio + Watchdog L1 + Hunter + TT1 05 + sl55 + trade_toxic + S1 soft stock_path_confirm + dvol_size_scale soft boost (cs_rk1\u00d71.25 / rk2\u00d71.15; seats unchanged). Ladder OTM3. NOT production freeze / WA_UP not default. Sync calendar via tools/sync_event_calendar.py.",
   "role": "research_baseline",
   "result_tag": "research_extend_mtm_full_day_peer3_l2_tt1_05_sl55_tt600d_feb_jul_aapl_ceo_cal_s1_dvolsoft_gb12p15",
-  "research_revision": "2026-07-28_giveback_extend_gb12_p15",
+  "research_revision": "2026-08-14_c6_dd5_budget",
+  "morph_debt": {
+    "frozen_at": "2026-08-14",
+    "policy": "no_net_new_hard_block",
+    "audit": "research_core_c5_morph_debt",
+    "dropped": ["overnight_gap_gate", "up_gap_stall_gate", "fo_lod_chase_gate"],
+    "kept": ["peer_gap_gate", "range_stall_gate", "dn_gap_stall_gate"],
+    "drop3_confirm": "weak keep=1.00 / strong keep=1.025 vs C3 baseline",
+    "note": "C5 strip-one: disable gates with dual keep>=0.95. Do not add a replacement BLOCK. range_stall / peer_gap / dn_gap still load-bearing. Production freeze unchanged."
+  },
   "based_on": "strategy_profiles/single_qqq_open_ladder_atm5otm_t30_rails_p20_googl_peer3_v1.json",
   "recommended_scheme": "single",
   "baseline_doc": "docs/research_full_day_peer3_baseline.md",
@@ -31,6 +40,7 @@
   "am_pulse": {
     "enabled": true,
     "execute_mode": "shadow",
+    "event_calendar_block": false,
     "arm": "FO",
     "dirs": ["DN", "UP"],
     "window_start": "09:30",
@@ -47,6 +57,11 @@
     "max_spread_pct": 0.15,
     "max_lag_sec": 5.0,
     "min_mid": 0.05,
+    "entry_stock_drift_gate": {
+      "enabled": true,
+      "max_chase": 0.003,
+      "max_reversal": 0.0015
+    },
     "entry_frac": 0.75,
     "exit_frac": 0.75,
     "position_frac": 0.10,
@@ -62,6 +77,7 @@
   "am_pulse_extension": {
     "enabled": true,
     "execute_mode": "shadow",
+    "event_calendar_block": false,
     "arm": "FO",
     "dirs": ["DN", "UP"],
     "window_start": "10:30",
@@ -76,6 +92,11 @@
     "max_spread_pct": 0.15,
     "max_lag_sec": 5.0,
     "min_mid": 0.05,
+    "entry_stock_drift_gate": {
+      "enabled": true,
+      "max_chase": 0.003,
+      "max_reversal": 0.0015
+    },
     "entry_frac": 0.75,
     "exit_frac": 0.75,
     "position_frac": 0.10,
@@ -93,6 +114,35 @@
       "note": "2026-07-28 B ca_up_only abort10 shadow candidate — research_am_B_lock_opt_grid_20260728; CA only on UP, DN plain TP/SL."
     },
     "note": "2026-07-28 LOCK B entry + shadow CA refinement — both FO@0.8% 10:30–11:30, ca_up_only abort10, 0DTE-only. event_source=am_pulse_extension_sleeve. Flatten by 11:45."
+  },
+  "am_v2": {
+    "enabled": true,
+    "execute_mode": "shadow",
+    "wired": true,
+    "event_calendar_block": false,
+    "window_start": "10:00",
+    "window_end": "11:30",
+    "flatten_before": "11:45",
+    "slope_sec": 3,
+    "abs_ret_min": 0.0025,
+    "cooldown_sec": 300,
+    "peak_lookback_sec": 60,
+    "dirs": ["UP", "DN"],
+    "tp": 0.15,
+    "sl": 0.25,
+    "max_hold_sec": 900,
+    "max_lag_sec": 5.0,
+    "max_spread_pct": 0.15,
+    "min_mid": 0.05,
+    "entry_frac": 0.75,
+    "exit_frac": 0.75,
+    "position_frac": 0.10,
+    "moneyness": "ATM",
+    "prefer_dte": 0,
+    "allowed_dte": [0, 1, 2],
+    "signal": "launch_s3_r0025_cd300_post10",
+    "exit": "tp15_sl25_h900",
+    "note": "2026-08-09 Step4 shadow + blind-lift r0025 (research_am_v2_blind_lift). Quote disc≈+5% blind≈+12% tpd≈2.4. OMS paper/live reject until execute_mode!=shadow."
   },
   "symbols": [
     "NVDA",
@@ -235,6 +285,13 @@
       "max_scale": 1.25,
       "note": "2026-07-23 PROMOTE_LIQ_RESEARCH: soft size only (no TopK seat change). Dual-window accept liq_seat_accept_s1; does not fix 07-22 NVDA miss. See docs/dvol_liq_soft_research.md"
     },
+    "session_risk_budget": {
+      "enabled": true,
+      "mode": "dd_step",
+      "dd_trigger": -0.05,
+      "scale": 0.5,
+      "note": "C6 PASS 2026-08-14: remaining size ×0.5 when realized equity DD<=-5%. Not a climate label (C2 FAIL). Weak keep=0.975 MaxDD -8.8→-7.1; strong keep=0.998 n_scaled=2. Production freeze unchanged. See research_core_c6_session_budget."
+    },
     "cooldown_minutes": 5,
     "max_entries_per_symbol": 1,
     "day_circuit": -0.03,
@@ -254,14 +311,14 @@
     "entry_confirm_mode": "mf",
     "entry_confirm_weekdays": [1, 3],
     "overnight_gap_gate": {
-      "enabled": true,
+      "enabled": false,
       "up_only": true,
       "mode": "block",
       "max_fav_gap": 0.04,
       "require_adv_share": 0.55,
       "lag_seconds": 60,
       "on_missing_adv": "pass",
-      "note": "2026-07-26 WIRE: gap+adv confirm hard BLOCK (G4_A55_BLK). up_only & gap≥4% & adv120≥0.55 @lag60 → skip. See docs/event_news_jul_rescue_research.md / results/gap_adv_confirm_dual_v3"
+      "note": "C5 DEPRECATED 2026-08-14: strip keep weak=1.00 / strong=1.06 (n+2). Net-negative on current stack. Was 2026-07-26 G4_A55_BLK. Do not replace with another BLOCK. See research_core_c5_morph_debt."
     },
     "dn_gap_stall_gate": {
       "enabled": true,
@@ -273,22 +330,22 @@
       "note": "2026-07-26 WIRE DGS18 (dn_gap_stall_dual_v1): DN & fav_gap≥1.8% & fo∈[0.8%,1.4%] & peer≥6 → block. Clears 02-17 GOOGL after trades backfill restored print toxic (cut25 past max600 → SL). strong keep=1.0. See docs/trade_mark_toxic_path_research.md"
     },
     "up_gap_stall_gate": {
-      "enabled": true,
+      "enabled": false,
       "mode": "block",
       "min_fav_gap": 0.015,
       "max_abs_from_open": 0.001,
       "min_chase": 0.9,
       "max_sess_min": 40.0,
-      "note": "2026-07-26 WIRE UGS15 (priority3_dual_v2): feature_ts UP & fav_gap≥1.5% & |fo|≤0.1% & chase≥0.9 & sess≤40m → block. Clears 06-11 TSLA. strong keep≈1.04 alone / 1.09 with CROWD25. See docs/range_stall_research.md"
+      "note": "C5 DEPRECATED 2026-08-14: strip keep weak=1.00 / strong=0.965 (n+1). Was 2026-07-26 UGS15 (06-11 TSLA). Do not replace. See research_core_c5_morph_debt."
     },
     "fo_lod_chase_gate": {
-      "enabled": true,
+      "enabled": false,
       "mode": "block",
       "min_fav_from_open": 0.03,
       "min_chase": 0.9,
       "max_dist_ext": 0.003,
       "dirs": ["DN"],
-      "note": "2026-07-26 WIRE DN30 (fo_lod_chase_dual_v1): feature_ts DN & fav_fo≥3% & chase≥0.9 & dist_LOD≤30bp → block. Clears 07-24 TSLA late put chase. DN-only (UP fo≥3% on HOD kills 04-15/04-16 winners). strong keep≈1.04. See docs/range_stall_research.md"
+      "note": "C5 DEPRECATED 2026-08-14: strip keep=1.00/1.00 and n_delta=0 (5 feature blocks never became fills). Was 2026-07-26 DN30. Do not replace. See research_core_c5_morph_debt."
     },
     "peer_gap_gate": {
       "enabled": true,

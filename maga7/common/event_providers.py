@@ -468,12 +468,20 @@ def build_sync_payload(
     end: str,
     sources: list[str],
 ) -> dict[str, Any]:
-    dates = sorted({e["date"] for e in events})
+    from maga7.common.event_calendar import plan_from_events
+
+    plan = plan_from_events(events)
     return {
-        "description": "Auto-synced Mag7 event blackout (Phase A). Safe for MAG7_EVENT_CALENDAR_PATH.",
+        "description": (
+            "Auto-synced Mag7 event blackout. "
+            "dates=full-day macro only; symbol_blackout=earnings/news per ticker."
+        ),
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "range": {"start": start, "end": end},
         "sources": sources,
-        "dates": dates,
+        "dates": sorted(plan.full_days),
+        "symbol_blackout": {
+            d: sorted(syms) for d, syms in sorted(plan.symbol_days.items())
+        },
         "events": events,
     }

@@ -80,6 +80,8 @@ def attach_mf_features(
 
     def _streak(mask: pd.Series) -> pd.Series:
         x = mask.astype(int)
+        if out.empty:
+            return pd.Series(dtype=int)
         parts = []
         for _, s in x.groupby(out["date"]):
             c = 0
@@ -88,6 +90,8 @@ def attach_mf_features(
                 c = c + 1 if v else 0
                 vals.append(c)
             parts.append(pd.Series(vals, index=s.index))
+        if not parts:
+            return pd.Series(0, index=out.index, dtype=int)
         return pd.concat(parts).sort_index()
 
     out["streak_up"] = _streak(out["mf10"] > 0)
@@ -330,7 +334,7 @@ def sync_index(
         df = stock_by_symbol.get(sym)
         if df is None or df.empty:
             continue
-        day = df[df["date"] == date]
+        day = df[df["date"].astype(str) == str(date)]
         if day.empty:
             continue
         bar = day[day["timestamp"] <= asof].tail(1)
@@ -496,7 +500,7 @@ def count_peer_align(
         df = stock_by_symbol.get(sym)
         if df is None or df.empty:
             continue
-        day = df[df["date"] == date]
+        day = df[df["date"].astype(str) == str(date)]
         if day.empty:
             continue
         bar = day[day["timestamp"] <= asof].tail(1)
@@ -824,10 +828,15 @@ class StreamSignalState:
             self.streak_dn = 0
             self.fired_today = False
             self.first_fire = None
-            self.day_open = float(bar["open"])
+            # Official RTH open only — never latch a mid-session restart first bar.
+            self.day_open = (
+                float(bar["open"])
+                if int(ts.hour) == 9 and int(ts.minute) == 30
+                else None
+            )
 
         o, h, l, c, v = float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"]), float(bar["volume"])
-        if self.day_open is None:
+        if self.day_open is None and int(ts.hour) == 9 and int(ts.minute) == 30:
             self.day_open = o
         hl = h - l
         buy = ((c - l) / hl * v) if hl > 0 else 0.5 * v
@@ -859,7 +868,12 @@ class StreamSignalState:
         vols = [b["volume"] for b in self.bars]
         vol_ma = float(np.mean(vols[-self.vol_ma_window:])) if len(vols) >= 5 else np.nan
         vol_z = (v / vol_ma) if vol_ma and vol_ma > 0 else np.nan
-        prev = self.prev_close if self.prev_close is not None else float(self.day_open)
+        if self.prev_close is not None:
+            prev = float(self.prev_close)
+        elif self.day_open is not None:
+            prev = float(self.day_open)
+        else:
+            return None
         from_prev = c / prev - 1.0
         tod = ts.strftime("%H:%M")
 

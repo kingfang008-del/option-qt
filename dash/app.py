@@ -14,7 +14,9 @@ for path in (str(DASH_DIR), str(REPO)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
+from boards.common import render_live_ops_sidebar  # noqa: E402
 from boards.data_board import render_data_board  # noqa: E402
+from boards.event_news_board import render_event_news_board  # noqa: E402
 from boards.live_board import render_live_board  # noqa: E402
 from boards.offline_board import render_offline_board  # noqa: E402
 from boards.parity_board import render_parity_board  # noqa: E402
@@ -33,12 +35,14 @@ st.set_page_config(
 )
 
 
-@st.cache_data(ttl=5)
+@st.cache_resource(ttl=5)
 def _runs():
+    # cache_resource: RunArtifact / LiveSessionArtifact are not reliably
+    # pickleable across Streamlit module reloads (cache_data → CacheError).
     return discover_maga7_runs(limit=150)
 
 
-@st.cache_data(ttl=5)
+@st.cache_resource(ttl=5)
 def _live_sessions():
     return discover_live_sessions(limit=150)
 
@@ -46,7 +50,6 @@ def _live_sessions():
 @st.cache_data(ttl=30)
 def _profile(path: str):
     return profile_snapshot(Path(path))
-
 
 st.markdown("## Mag7 Control Plane")
 st.caption(
@@ -58,12 +61,13 @@ with st.sidebar:
     st.header("导航")
     board = st.radio(
         "Board",
-        options=["Download", "Offline Replay", "Stream Parity", "Live"],
+        options=["Download", "Offline Replay", "Stream Parity", "Live", "Event News"],
         index=0,
         help=(
             "Download=补数据；Offline=离线金标；"
             "Stream Parity=流式/S5 对拍（模拟数据与成交）；"
-            "Live=Shadow/Paper/Live 持仓与 session"
+            "Live=Shadow/Paper/Live 持仓与 session；"
+            "Event News=日历/公司新闻审核（防误杀）"
         ),
     )
     st.divider()
@@ -78,6 +82,7 @@ with st.sidebar:
     )
     if st.button("刷新"):
         st.cache_data.clear()
+        st.cache_resource.clear()
         st.rerun()
     st.divider()
     st.info("安全边界")
@@ -94,6 +99,14 @@ with st.sidebar:
     passed = sum(1 for g in gates if g["status"] == "PASS")
     st.metric("Gates PASS", f"{passed}/{len(gates)}")
 
+    st.divider()
+    render_live_ops_sidebar(
+        host=redis_host,
+        port=int(redis_port),
+        db=int(redis_db),
+        profile=prof_preview,
+    )
+
 runs = _runs()
 live_sessions = _live_sessions()
 profile = _profile(profile_path)
@@ -104,6 +117,8 @@ elif board == "Offline Replay":
     render_offline_board(runs, profile)
 elif board == "Stream Parity":
     render_parity_board(runs, profile)
+elif board == "Event News":
+    render_event_news_board()
 else:
     render_live_board(
         host=redis_host,

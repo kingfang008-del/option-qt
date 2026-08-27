@@ -91,6 +91,10 @@ def _runtime_from_dict(value: Any) -> Any:
         from maga7.common.am_pulse_scout import AmScoutAlert
 
         return AmScoutAlert(**_runtime_from_dict(value.get("payload") or {}))
+    if isinstance(value, dict) and value.get("__dataclass__") == "AmV2Alert":
+        from maga7.common.am_v2_sleeve import AmV2Alert
+
+        return AmV2Alert(**_runtime_from_dict(value.get("payload") or {}))
     if isinstance(value, dict) and set(value) == {"__tuple__"}:
         return tuple(_runtime_from_dict(item) for item in value["__tuple__"])
     if isinstance(value, list):
@@ -317,6 +321,9 @@ def scanner_snapshot(scanner: Any) -> dict[str, Any]:
             "pending_am_pulse_extension": _runtime_to_dict(
                 getattr(scanner, "pending_am_pulse_extension", None) or []
             ),
+            "pending_am_v2": _runtime_to_dict(
+                getattr(scanner, "pending_am_v2", None) or []
+            ),
             "am_pulse_scout_state": _runtime_to_dict(
                 getattr(getattr(scanner, "_am_pulse_scout", None), "snapshot_state", lambda: None)()
             ),
@@ -327,6 +334,15 @@ def scanner_snapshot(scanner: Any) -> dict[str, Any]:
                     lambda: None,
                 )()
             ),
+            "am_v2_tracker_state": {
+                str(sym): (
+                    tr.snapshot_state()
+                    if tr is not None and hasattr(tr, "snapshot_state")
+                    else None
+                )
+                for sym, tr in (getattr(scanner, "_am_v2_trackers", None) or {}).items()
+            },
+            "am_v2_tracker_date": getattr(scanner, "_am_v2_tracker_date", None),
             "day_hunt_symbols": sorted(
                 str(s) for s in (getattr(scanner, "day_hunt_symbols", None) or set())
             ),
@@ -354,6 +370,10 @@ def scanner_snapshot(scanner: Any) -> dict[str, Any]:
             "n_am_pulse_shadow": int(
                 getattr(scanner, "n_am_pulse_shadow", 0) or 0
             ),
+            "n_am_pulse_wait": int(getattr(scanner, "n_am_pulse_wait", 0) or 0),
+            "am_pulse_skip_events": list(
+                getattr(scanner, "am_pulse_skip_events", []) or []
+            ),
             "n_am_pulse_extension_signals": int(
                 getattr(scanner, "n_am_pulse_extension_signals", 0) or 0
             ),
@@ -365,6 +385,20 @@ def scanner_snapshot(scanner: Any) -> dict[str, Any]:
             ),
             "n_am_pulse_extension_shadow": int(
                 getattr(scanner, "n_am_pulse_extension_shadow", 0) or 0
+            ),
+            "n_am_pulse_extension_wait": int(
+                getattr(scanner, "n_am_pulse_extension_wait", 0) or 0
+            ),
+            "am_pulse_extension_skip_events": list(
+                getattr(scanner, "am_pulse_extension_skip_events", []) or []
+            ),
+            "n_am_v2_signals": int(getattr(scanner, "n_am_v2_signals", 0) or 0),
+            "n_am_v2_emitted": int(getattr(scanner, "n_am_v2_emitted", 0) or 0),
+            "n_am_v2_skip": int(getattr(scanner, "n_am_v2_skip", 0) or 0),
+            "n_am_v2_shadow": int(getattr(scanner, "n_am_v2_shadow", 0) or 0),
+            "n_am_v2_wait": int(getattr(scanner, "n_am_v2_wait", 0) or 0),
+            "am_v2_skip_events": list(
+                getattr(scanner, "am_v2_skip_events", []) or []
             ),
         },
         "qqq_open_cont": {
@@ -395,7 +429,9 @@ def scanner_snapshot(scanner: Any) -> dict[str, Any]:
             "n_emitted": int(getattr(scanner, "n_am_pulse_emitted", 0) or 0),
             "n_skip": int(getattr(scanner, "n_am_pulse_skip", 0) or 0),
             "n_shadow": int(getattr(scanner, "n_am_pulse_shadow", 0) or 0),
+            "n_wait": int(getattr(scanner, "n_am_pulse_wait", 0) or 0),
             "pending": int(len(getattr(scanner, "pending_am_pulse", []) or [])),
+            "skip_events": list(getattr(scanner, "am_pulse_skip_events", []) or [])[-8:],
         },
         "am_pulse_extension": {
             "enabled": bool(
@@ -426,9 +462,34 @@ def scanner_snapshot(scanner: Any) -> dict[str, Any]:
             "n_shadow": int(
                 getattr(scanner, "n_am_pulse_extension_shadow", 0) or 0
             ),
+            "n_wait": int(
+                getattr(scanner, "n_am_pulse_extension_wait", 0) or 0
+            ),
             "pending": int(
                 len(getattr(scanner, "pending_am_pulse_extension", []) or [])
             ),
+            "skip_events": list(
+                getattr(scanner, "am_pulse_extension_skip_events", []) or []
+            )[-8:],
+        },
+        "am_v2": {
+            "enabled": bool(
+                ((getattr(scanner, "profile", None) or {}).get("am_v2") or {}).get(
+                    "enabled", False
+                )
+            ),
+            "execute_mode": (
+                ((getattr(scanner, "profile", None) or {}).get("am_v2") or {}).get(
+                    "execute_mode", "shadow"
+                )
+            ),
+            "n_signals": int(getattr(scanner, "n_am_v2_signals", 0) or 0),
+            "n_emitted": int(getattr(scanner, "n_am_v2_emitted", 0) or 0),
+            "n_skip": int(getattr(scanner, "n_am_v2_skip", 0) or 0),
+            "n_shadow": int(getattr(scanner, "n_am_v2_shadow", 0) or 0),
+            "n_wait": int(getattr(scanner, "n_am_v2_wait", 0) or 0),
+            "pending": int(len(getattr(scanner, "pending_am_v2", []) or [])),
+            "skip_events": list(getattr(scanner, "am_v2_skip_events", []) or [])[-8:],
         },
         "entry_morph": {
             "n_fo_lod_chase_block": int(getattr(scanner, "n_fo_lod_chase_block", 0) or 0),
@@ -557,6 +618,7 @@ def restore_scanner(scanner: Any, payload: dict[str, Any]) -> None:
     scanner.pending_am_pulse_extension = _runtime_from_dict(
         runtime.get("pending_am_pulse_extension") or []
     )
+    scanner.pending_am_v2 = _runtime_from_dict(runtime.get("pending_am_v2") or [])
     scanner.day_hunt_symbols = set(runtime.get("day_hunt_symbols") or [])
     scanner.day_hunt_dirs = set(
         _runtime_from_dict(runtime.get("day_hunt_dirs") or [])
@@ -571,13 +633,36 @@ def restore_scanner(scanner: Any, payload: dict[str, Any]) -> None:
         "n_am_pulse_emitted",
         "n_am_pulse_skip",
         "n_am_pulse_shadow",
+        "n_am_pulse_wait",
         "n_am_pulse_extension_signals",
         "n_am_pulse_extension_emitted",
         "n_am_pulse_extension_skip",
         "n_am_pulse_extension_shadow",
+        "n_am_pulse_extension_wait",
+        "n_am_v2_signals",
+        "n_am_v2_emitted",
+        "n_am_v2_skip",
+        "n_am_v2_shadow",
+        "n_am_v2_wait",
     ):
         if name in runtime:
             setattr(scanner, name, int(runtime[name] or 0))
+    if "am_pulse_skip_events" in runtime:
+        scanner.am_pulse_skip_events = list(runtime.get("am_pulse_skip_events") or [])
+    if "am_pulse_extension_skip_events" in runtime:
+        scanner.am_pulse_extension_skip_events = list(
+            runtime.get("am_pulse_extension_skip_events") or []
+        )
+    if "am_v2_skip_events" in runtime:
+        scanner.am_v2_skip_events = list(runtime.get("am_v2_skip_events") or [])
+    tr_date = runtime.get("am_v2_tracker_date")
+    tr_states = runtime.get("am_v2_tracker_state") or {}
+    if tr_date and isinstance(tr_states, dict) and hasattr(scanner, "_ensure_am_v2_trackers"):
+        trackers = scanner._ensure_am_v2_trackers(str(tr_date))
+        for sym, st in tr_states.items():
+            tr = trackers.get(str(sym).upper())
+            if tr is not None and hasattr(tr, "restore_state"):
+                tr.restore_state(st)
     for lane, state_key in (
         ("am_pulse", "am_pulse_scout_state"),
         ("am_pulse_extension", "am_pulse_extension_scout_state"),
@@ -590,6 +675,32 @@ def restore_scanner(scanner: Any, payload: dict[str, Any]) -> None:
         scout = scanner._ensure_am_pulse_scout(str(scout_state["date"]), lane)
         if scout is not None and hasattr(scout, "restore_state"):
             scout.restore_state(scout_state)
+    qqq_cont = payload.get("qqq_open_cont") or {}
+    if isinstance(qqq_cont, dict):
+        if "done_date" in qqq_cont:
+            scanner._open_cont_done_date = qqq_cont.get("done_date")
+        if "n_signals" in qqq_cont:
+            scanner.n_open_cont_signals = int(qqq_cont.get("n_signals") or 0)
+        if "n_emitted" in qqq_cont:
+            scanner.n_open_cont_emitted = int(qqq_cont.get("n_emitted") or 0)
+        if "n_skip" in qqq_cont:
+            scanner.n_open_cont_skip = int(qqq_cont.get("n_skip") or 0)
+        if "qqq_rth_open" in qqq_cont:
+            raw_open = qqq_cont.get("qqq_rth_open")
+            try:
+                scanner._qqq_rth_open = (
+                    float(raw_open) if raw_open is not None and float(raw_open) > 0 else None
+                )
+            except (TypeError, ValueError):
+                scanner._qqq_rth_open = None
+        if "qqq_last_px" in qqq_cont:
+            raw_px = qqq_cont.get("qqq_last_px")
+            try:
+                scanner._qqq_last_px = (
+                    float(raw_px) if raw_px is not None and float(raw_px) > 0 else None
+                )
+            except (TypeError, ValueError):
+                scanner._qqq_last_px = None
     if wd is not None:
         wd._hunt_entries_today = int(
             runtime.get("n_hunt_emitted")

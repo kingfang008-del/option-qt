@@ -201,6 +201,31 @@ def signal_quote_lag_ok(
     return True, "ok", lag
 
 
+def entry_stock_drift_ok(
+    *,
+    signal_spot: float,
+    current_spot: float,
+    direction: str,
+    max_chase: float,
+    max_reversal: float,
+) -> tuple[bool, str, float | None]:
+    """Reject delayed AM entries that chase or reverse after signal formation."""
+    if not (
+        math.isfinite(float(signal_spot))
+        and float(signal_spot) > 0
+        and math.isfinite(float(current_spot))
+        and float(current_spot) > 0
+    ):
+        return False, "entry_stock_price_missing", None
+    raw = float(current_spot) / float(signal_spot) - 1.0
+    directional = raw if str(direction).upper() == "UP" else -raw
+    if directional > float(max_chase):
+        return False, "entry_stock_chase_exceeded", directional
+    if directional < -float(max_reversal):
+        return False, "entry_stock_reversed", directional
+    return True, "ok", directional
+
+
 def entry_feed_ok(
     *,
     connected: bool,

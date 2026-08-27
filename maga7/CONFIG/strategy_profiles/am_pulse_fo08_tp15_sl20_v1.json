@@ -16,6 +16,7 @@
   "am_pulse": {
     "enabled": true,
     "execute_mode": "shadow",
+    "event_calendar_block": false,
     "arm": "FO",
     "dirs": ["DN", "UP"],
     "window_start": "09:30",
@@ -32,6 +33,11 @@
     "max_spread_pct": 0.15,
     "max_lag_sec": 5.0,
     "min_mid": 0.05,
+    "entry_stock_drift_gate": {
+      "enabled": true,
+      "max_chase": 0.003,
+      "max_reversal": 0.0015
+    },
     "entry_frac": 0.75,
     "exit_frac": 0.75,
     "position_frac": 0.10,

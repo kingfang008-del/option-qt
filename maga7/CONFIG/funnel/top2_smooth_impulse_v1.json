@@ -1,0 +1,36 @@
+{
+  "funnel_version": "top2_smooth_impulse_v1",
+  "description": "Frozen V2 Phase-0 candidate + Top2 funnel. Do not edit without version bump.",
+  "symbols": ["NVDA", "TSLA", "AAPL", "AMZN", "META", "MSFT", "AMD", "GOOGL"],
+  "max_positions": 2,
+  "first_per_symbol_dir": true,
+  "prefer_smooth": true,
+  "directions": ["UP", "DN"],
+  "smooth": {
+    "scan_start": "09:45",
+    "scan_end": "11:30",
+    "min_look_ret": 0.002,
+    "cooldown_minutes": 60,
+    "lookback_minutes": 10,
+    "min_path_eff": 0.40,
+    "min_up_frac": 0.60,
+    "max_dd": -0.004,
+    "min_from_trough": 0.002
+  },
+  "impulse": {
+    "scan_start": "09:45",
+    "scan_end": "11:30",
+    "min_look_ret": 0.004,
+    "lookback_minutes": 5,
+    "cooldown_minutes": 30
+  },
+  "label": {
+    "horizon_minutes": 90,
+    "good_mfe_pct": 0.01,
+    "toxic_mae_pct": 0.005,
+    "atr_days": 14,
+    "atr_window": 60,
+    "good_mfe_atr": 0.50,
+    "toxic_mae_atr": 0.25
+  }
+}

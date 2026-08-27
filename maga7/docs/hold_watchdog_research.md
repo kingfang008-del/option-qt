@@ -64,4 +64,6 @@ python -m maga7.tools.run_hold_watchdog_ablation \
 
 ## Live 备注
 
-Shadow/dry 走 `simulate_trade` 即生效。Paper/Live 真实 IB 持仓需在 OMS 帧循环里复用同一 QQQ 判定（后续工程项）；先以 offline 消融定阈值。
+`broker_oms.evaluate_exits` 已接 `HOLD_SHOCK`（QQQ 用 `scanner.stock_by` 末 bar；默认仍 **off**）。
+开启时需 QQQ 参考订阅（`run_live_session` 在 `hold_watchdog.enabled` 或 L1 watchdog 时拉 QQQ）。
+出口臂状态见 `oms_meta.exit_arms` / `exit_health.json` / Dash「出口臂」卡。

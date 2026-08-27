@@ -27,6 +27,13 @@ def test_active_spine_has_shadow_optimization_parameters():
         ),
     }
     assert profile["am_pulse_extension"]["confirm_abort"]["abort_thr"] == 0.10
+    assert profile["am_pulse"]["event_calendar_block"] is False
+    assert profile["am_pulse_extension"]["event_calendar_block"] is False
+    assert profile["am_pulse"]["entry_stock_drift_gate"] == {
+        "enabled": True,
+        "max_chase": 0.003,
+        "max_reversal": 0.0015,
+    }
 
 
 def _profile(day: str = "2026-07-24") -> dict:
@@ -60,6 +67,11 @@ def _profile(day: str = "2026-07-24") -> dict:
             "max_lag_sec": 5.0,
             "max_spread_pct": 0.15,
             "min_mid": 0.05,
+            "entry_stock_drift_gate": {
+                "enabled": True,
+                "max_chase": 0.003,
+                "max_reversal": 0.0015,
+            },
             "position_frac": 0.10,
             "profit_protect": {
                 "enabled": True,
@@ -84,6 +96,11 @@ def _profile(day: str = "2026-07-24") -> dict:
             "max_lag_sec": 5.0,
             "max_spread_pct": 0.15,
             "min_mid": 0.05,
+            "entry_stock_drift_gate": {
+                "enabled": True,
+                "max_chase": 0.003,
+                "max_reversal": 0.0015,
+            },
             "position_frac": 0.10,
             "prefer_dte": 0,
             "allowed_dte": [0],
@@ -130,6 +147,8 @@ def test_drain_am_pulse_emits_fo_dn_once():
         books=books,
         stock_by={},
     )
+    # Macro event dates are a CORE baseline gate, not an A/B sleeve halt.
+    sc.set_event_blackout({day}, {"active_today": True})
     # Grind DN from 320 → cross -1% fo around bar ~10
     open_px = 320.0
     for i in range(15):
@@ -157,6 +176,15 @@ def test_drain_am_pulse_emits_fo_dn_once():
     assert sig.meta.get("exit_flatten_before") == "10:45"
     assert sig.meta.get("max_lag_sec") == 5.0
     assert sig.meta.get("min_mid") == 0.05
+    assert sig.meta.get("entry_stock_drift_gate") == {
+        "enabled": True,
+        "max_chase": 0.003,
+        "max_reversal": 0.0015,
+    }
+    assert (
+        pd.Timestamp(sig.meta["decision_ts"])
+        - pd.Timestamp(sig.meta["feature_ts"])
+    ).total_seconds() == 60
     assert sig.meta.get("profit_protect") == {
         "enabled": True,
         "arm_ret": 0.08,
@@ -333,7 +361,7 @@ def test_extension_pending_counters_and_detector_restore():
     assert restored._am_pulse_extension_scout_date == day
     assert restored._am_pulse_extension_scout._alerts_n[("TSLA", "FO")] == 1
     out = restored.drain_am_pulse_extension(
-        pd.Timestamp(f"{day} 10:30", tz="America/New_York")
+        pd.Timestamp(f"{day} 10:31", tz="America/New_York")
     )
     assert len(out) == 1
     assert out[0].meta["event_source"] == "am_pulse_extension_sleeve"
@@ -368,6 +396,119 @@ def test_oms_rejects_am_pulse_extension_shadow_on_live():
     oms._event = lambda kind, payload: oms.events.append((kind, payload))  # type: ignore
     assert oms.process_signal(sig) is False
     assert oms.events[-1][1]["event_source"] == "am_pulse_extension_sleeve"
+
+
+def test_am_pulse_no_atm_waits_then_emits_when_books_ready():
+    day = "2026-07-24"
+    profile = _profile(day)
+    books_empty = ContractBooks(
+        mode="day_lock",
+        flat_idx={},
+        prefer_dte=0,
+        allowed_dte=[0, 1, 2],
+    )
+    sc = Mag7Scanner(
+        profile=profile,
+        states={
+            "TSLA": StreamSignalState("TSLA", profile["signal"]),
+            "NVDA": StreamSignalState("NVDA", profile["signal"]),
+        },
+        books=books_empty,
+        stock_by={},
+    )
+    open_px = 320.0
+    for i in range(12):
+        ts = pd.Timestamp(f"{day} 09:30:00", tz="America/New_York") + pd.Timedelta(minutes=i)
+        px = open_px - i * 0.40
+        sc.on_stock_bar(
+            "TSLA",
+            {
+                "timestamp": ts,
+                "open": open_px if i == 0 else px + 0.2,
+                "high": max(open_px, px) + 0.05,
+                "low": px - 0.1,
+                "close": px,
+                "volume": 1000,
+                "symbol": "TSLA",
+            },
+        )
+    assert sc.n_am_pulse_signals >= 1
+    assert sc.n_am_pulse_emitted == 0
+    assert sc.n_am_pulse_wait >= 1
+    assert sc.pending_am_pulse
+    assert any(e.get("reason") == "no_atm_contract" for e in sc.am_pulse_skip_events)
+
+    # Locks arrive — next bar should emit instead of dropping the alert.
+    sc.books = ContractBooks(
+        mode="day_lock",
+        flat_idx={("TSLA", day): {0: "TSLA260724P00320000"}},
+        prefer_dte=0,
+        allowed_dte=[0, 1, 2],
+    )
+    late = pd.Timestamp(f"{day} 09:45:00", tz="America/New_York")
+    sc.on_stock_bar(
+        "TSLA",
+        {
+            "timestamp": late,
+            "open": 315.0,
+            "high": 315.0,
+            "low": 314.0,
+            "close": 314.5,
+            "volume": 1,
+            "symbol": "TSLA",
+        },
+    )
+    pulses = [s for s in sc.signals if (s.meta or {}).get("event_source") == "am_pulse_sleeve"]
+    assert len(pulses) == 1
+    assert sc.n_am_pulse_emitted == 1
+    assert sc.pending_am_pulse == []
+
+
+def test_am_pulse_past_flatten_permanent_skip():
+    day = "2026-07-24"
+    profile = _profile(day)
+    sc = Mag7Scanner(
+        profile=profile,
+        states={
+            "TSLA": StreamSignalState("TSLA", profile["signal"]),
+            "NVDA": StreamSignalState("NVDA", profile["signal"]),
+        },
+        books=ContractBooks(mode="day_lock", flat_idx={}, prefer_dte=0, allowed_dte=[0, 1, 2]),
+        stock_by={},
+    )
+    open_px = 320.0
+    for i in range(12):
+        ts = pd.Timestamp(f"{day} 09:30:00", tz="America/New_York") + pd.Timedelta(minutes=i)
+        px = open_px - i * 0.40
+        sc.on_stock_bar(
+            "TSLA",
+            {
+                "timestamp": ts,
+                "open": open_px if i == 0 else px + 0.2,
+                "high": max(open_px, px) + 0.05,
+                "low": px - 0.1,
+                "close": px,
+                "volume": 1000,
+                "symbol": "TSLA",
+            },
+        )
+    assert sc.pending_am_pulse
+    # Past flatten_before — permanent skip, pending cleared.
+    sc.on_stock_bar(
+        "TSLA",
+        {
+            "timestamp": pd.Timestamp(f"{day} 10:45:00", tz="America/New_York"),
+            "open": 300.0,
+            "high": 300.0,
+            "low": 299.0,
+            "close": 299.5,
+            "volume": 1,
+            "symbol": "TSLA",
+        },
+    )
+    assert sc.pending_am_pulse == []
+    assert sc.n_am_pulse_skip >= 1
+    assert any(e.get("reason") == "past_flatten" for e in sc.am_pulse_skip_events)
 
 
 def test_flatten_before_core_reason():

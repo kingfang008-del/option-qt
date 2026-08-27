@@ -20,7 +20,11 @@ if str(ROOT) not in sys.path:
 from maga7.common.bar_agg import load_stock_1s_day
 from maga7.common.config import load_profile
 from maga7.common.replay import month_list, run_offline_replay
-from maga7.common.signals import load_stock_month_files
+from maga7.common.signals import (
+    attach_mf_features,
+    load_stock_month_files,
+    resolve_mf_fast_window,
+)
 from maga7.live.oms_dry import Mag7OmsDryRunner
 from maga7.live.scanner import Mag7Scanner, write_signal_audit
 
@@ -37,6 +41,92 @@ def _dates(start: str, end: str) -> list[str]:
     return [d.strftime("%Y-%m-%d") for d in pd.bdate_range(start, end)]
 
 
+def _apply_event_blackout(scanner: Mag7Scanner, profile: dict, start: str, end: str) -> None:
+    """Wire research blackout plan into Scanner (parity with offline / stream_engine)."""
+    from maga7.common.event_calendar import resolve_event_blackout_plan
+
+    trade = profile.get("trade") or {}
+    reg = profile.get("regime") or {}
+    keys = (
+        "event_calendar_block",
+        "event_calendar",
+        "event_dates",
+        "event_blackout_sessions",
+        "event_symbol_blackout",
+    )
+    cfg = {**{k: reg[k] for k in keys if k in reg}, **{k: trade[k] for k in keys if k in trade}}
+    sessions = [d.strftime("%Y-%m-%d") for d in pd.bdate_range(start, end)]
+    plan = resolve_event_blackout_plan(cfg, session_dates=sessions)
+    scanner.set_event_blackout(
+        set(plan.full_days),
+        {
+            "symbol_blackout": {d: sorted(s) for d, s in plan.symbol_days.items()},
+            "event_plan": plan,
+        },
+    )
+
+
+def _stock_load_start(profile: dict, start: str) -> str:
+    """Match offline replay lookback (mf_idio / watchdog / TCN need prior sessions)."""
+    sig = profile.get("signal") or {}
+    trade = profile.get("trade") or {}
+    wd = profile.get("watchdog") or {}
+    tcn = profile.get("tcn_gate") or sig.get("tcn_gate") or {}
+    mf_idio_on = str(sig.get("mf_idio_mode") or "off").strip().lower() not in {
+        "",
+        "off",
+        "none",
+        "false",
+        "0",
+    }
+    need = bool(mf_idio_on or wd.get("enabled") or tcn.get("enabled"))
+    if not need:
+        return str(start)
+    lookback_days = max(14, int(sig.get("mf_idio_beta_days", 5) or 5) * 3)
+    return (pd.Timestamp(start) - pd.Timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+
+def _preload_stock_by(scanner: Mag7Scanner, profile: dict, load_start: str, end: str) -> None:
+    """Load 1m research bars + mf features (same frames offline uses for peer/from_prev)."""
+    sig = profile.get("signal") or {}
+    paths = profile["_paths"]
+    months = month_list(load_start, end)
+    load_syms = list(
+        dict.fromkeys(list(profile.get("symbols") or []) + list(sig.get("peer_symbols") or []) + ["QQQ"])
+    )
+    stock_by: dict[str, pd.DataFrame] = {}
+    for sym in load_syms:
+        raw = load_stock_month_files(paths["stock_root"], sym, months)
+        if raw.empty:
+            continue
+        raw = raw[(raw["date"] >= load_start) & (raw["date"] <= end)]
+        if raw.empty:
+            continue
+        stock_by[sym] = attach_mf_features(
+            raw,
+            mf_window=int(sig.get("mf_window", 10)),
+            vol_ma_window=int(sig.get("vol_ma_window", 20)),
+            mf_fast_window=resolve_mf_fast_window(sig),
+        )
+    scanner.stock_by = stock_by
+    scanner.stock_by_frozen = True
+
+
+def _seed_prev_closes(scanner: Mag7Scanner, trade_start: str) -> None:
+    """Seed overnight prev_close so from_prev matches offline (not open-as-prev)."""
+    for sym, st in (scanner.states or {}).items():
+        sdf = (scanner.stock_by or {}).get(sym)
+        if sdf is None or getattr(sdf, "empty", True):
+            continue
+        prior = sdf[sdf["date"].astype(str) < str(trade_start)]
+        if prior.empty:
+            continue
+        try:
+            st.prev_close = float(prior.iloc[-1]["close"])
+        except Exception:
+            continue
+
+
 def _drive_interleaved(
     profile: dict,
     start: str,
@@ -49,6 +139,11 @@ def _drive_interleaved(
     scanner = Mag7Scanner.from_profile(profile, scheme=scheme)
     runner.scanner = scanner
     scanner.on_signal = runner.process_one
+    _apply_event_blackout(scanner, profile, start, end)
+
+    load_start = _stock_load_start(profile, start)
+    _preload_stock_by(scanner, profile, load_start, end)
+    _seed_prev_closes(scanner, start)
 
     if ingest == "1s":
         stock_1s = profile["_paths"]["stock_1s_root"]
@@ -78,15 +173,17 @@ def _drive_interleaved(
             )
         scanner.flush_seconds()
     else:
-        months = month_list(start, end)
+        # Drive trade-window 1m bars from preloaded research frames (parity with offline).
         frames = []
         for sym in profile["symbols"]:
-            raw = load_stock_month_files(profile["_paths"]["stock_root"], sym, months)
-            if raw.empty:
+            feat = (scanner.stock_by or {}).get(sym)
+            if feat is None or getattr(feat, "empty", True):
                 continue
-            raw = raw[(raw["date"] >= start) & (raw["date"] <= end)].copy()
-            raw["symbol"] = sym
-            frames.append(raw)
+            day = feat[(feat["date"].astype(str) >= start) & (feat["date"].astype(str) <= end)].copy()
+            if day.empty:
+                continue
+            day["symbol"] = sym
+            frames.append(day)
         if not frames:
             raise SystemExit("no 1m stock bars")
         all_bars = pd.concat(frames, ignore_index=True).sort_values(["timestamp", "symbol"])

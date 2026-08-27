@@ -29,6 +29,7 @@ from maga7.common.replay import (
     stock_path_confirm_ok,
     to_ny,
 )
+from maga7.common.dvol_size_scale import parse_dvol_size_scale, resolve_dvol_size_scale
 from maga7.common.signals import StreamSignalState
 
 
@@ -119,6 +120,8 @@ class StreamEngine:
     n_trade_path: int = 0
     n_trade_path_miss: int = 0
     n_trade_toxic: int = 0
+    n_dvol_size_boost: int = 0
+    dvol_size_cfg: Any = None
 
     @classmethod
     def from_profile(cls, profile: dict[str, Any], *, scheme: str = "single") -> "StreamEngine":
@@ -141,6 +144,7 @@ class StreamEngine:
             regime_gate = Mag7RegimeGate.from_profile(profile, months=month_list(start, end))
         except Exception:
             regime_gate = None
+        trade = profile.get("trade") or {}
         return cls(
             profile=profile,
             fill=fill,
@@ -148,6 +152,7 @@ class StreamEngine:
             states=states,
             scheme=scheme,
             regime_gate=regime_gate,
+            dvol_size_cfg=parse_dvol_size_scale(trade.get("dvol_size_scale")),
         )
 
     def _mf_idio_cfg(self) -> dict[str, Any]:
@@ -816,6 +821,24 @@ class StreamEngine:
                 size_frac = float(size_frac) * idio_mult
                 size_reason = f"{size_reason}+mf_idio_scale:{idio_mult:.2f}"
                 self.n_mf_idio_scale += 1
+        dvol_cfg = self.dvol_size_cfg
+        if dvol_cfg is not None and bool(getattr(dvol_cfg, "enabled", False)):
+            full = self.stock_by_full or self.stock_by
+            dvol_scale, dvol_rank, _ = resolve_dvol_size_scale(
+                dvol_cfg,
+                stock_by=full,
+                symbol=str(sym),
+                date=str(date),
+                asof_ts=feature_ts,
+            )
+            if abs(dvol_scale - 1.0) > 1e-12:
+                size_frac = float(size_frac) * float(dvol_scale)
+                size_reason = (
+                    f"{size_reason}+dvol_size:{dvol_scale:.2f}"
+                    + (f"(rk{dvol_rank})" if dvol_rank is not None else "")
+                )
+                if dvol_scale > 1.0 + 1e-12:
+                    self.n_dvol_size_boost += 1
         self.equity *= 1.0 + size_frac * sim.ret
         self.peak = max(self.peak, self.equity)
         self.maxdd = min(self.maxdd, self.equity / self.peak - 1.0)

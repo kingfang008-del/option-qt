@@ -36,6 +36,10 @@ def test_catalog_loads_and_spine_experts_active():
     assert cat.get("am_pulse_sleeve").status == "ACCEPT_RESEARCH"
     assert cat.get("am_pulse_sleeve").may_promote_entry
     assert not cat.get("am_pulse_sleeve").enabled_on_spine
+    assert cat.get("am_v2_executable_path") is not None
+    assert cat.get("am_v2_executable_path").status == "ACCEPT_RESEARCH"
+    assert cat.get("am_v2_executable_path").may_promote_entry
+    assert not cat.get("am_v2_executable_path").enabled_on_spine
 
 
 def test_profile_points_at_catalog():

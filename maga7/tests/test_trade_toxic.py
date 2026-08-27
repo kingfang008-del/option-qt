@@ -4,13 +4,28 @@ from __future__ import annotations
 import pandas as pd
 
 from maga7.common.fills import FillSpec
-from maga7.common.option_trades import trade_toxic_from_trade
+from maga7.common.option_trades import trade_toxic_cut_ret, trade_toxic_from_trade
 from maga7.common.replay import simulate_trade
 
 
 def test_trade_toxic_config_default_off():
     assert trade_toxic_from_trade({}).enabled is False
     assert trade_toxic_from_trade({"trade_toxic": {"enabled": True}}).enabled is True
+
+
+def test_trade_toxic_mark_source_resolves_one_shared_threshold():
+    cfg = trade_toxic_from_trade(
+        {
+            "trade_toxic": {
+                "enabled": True,
+                "cut_ret": 0.25,
+                "quote_fallback": True,
+                "quote_fallback_cut_ret": 0.20,
+            }
+        }
+    )
+    assert trade_toxic_cut_ret(cfg, mark_source="print") == 0.25
+    assert trade_toxic_cut_ret(cfg, mark_source="quote") == 0.20
 
 
 def test_simulate_trade_trade_toxic_cuts_on_prints():
@@ -233,3 +248,89 @@ def test_simulate_trade_skips_without_trade_path():
     )
     assert sim is not None
     assert sim.reason != "TRADE_TOX"
+
+
+def test_quote_fallback_cuts_when_prints_missing():
+    """No OPRA prints → quote-sell mark can still fire TRADE_TOX."""
+    ts0 = pd.Timestamp("2026-02-17 10:36:00", tz="America/New_York")
+    qrows = []
+    # Bleed to -25% on quotes inside max_cut=600.
+    mids = [1.00, 0.95, 0.88, 0.80, 0.74, 0.70]
+    for i, mid in enumerate(mids):
+        t = ts0 + pd.Timedelta(minutes=i)
+        qrows.append({"timestamp": t, "bid": mid - 0.01, "ask": mid + 0.01})
+    sim = simulate_trade(
+        pd.DataFrame(qrows),
+        ts0,
+        fill=FillSpec(0.5, 0.5),
+        direction="DN",
+        hold_minutes=30,
+        sl_mult=0.4,
+        trade_path=None,
+        trade_toxic={
+            "enabled": True,
+            "cut_ret": 0.25,
+            "mfe_bypass": 0.05,
+            "min_hold_seconds": 60,
+            "max_cut_seconds": 600,
+            "quote_fallback": True,
+        },
+    )
+    assert sim is not None
+    assert sim.reason == "TRADE_TOX"
+    assert sim.ret <= -0.20
+
+
+def test_quote_fallback_cut_ret_only_when_prints_missing():
+    """qf_cut20 applies only on quote-fallback mark; prints keep cut25."""
+    ts0 = pd.Timestamp("2026-02-17 10:36:00", tz="America/New_York")
+    qrows = []
+    mids = [1.00, 0.95, 0.88, 0.80, 0.74, 0.70]
+    for i, mid in enumerate(mids):
+        t = ts0 + pd.Timedelta(minutes=i)
+        qrows.append({"timestamp": t, "bid": mid - 0.01, "ask": mid + 0.01})
+    trows = [
+        {"timestamp": ts0 + pd.Timedelta(minutes=i), "last": last}
+        for i, last in enumerate([1.00, 0.96, 0.90, 0.86, 0.84, 0.82])
+    ]
+    sim_prints = simulate_trade(
+        pd.DataFrame(qrows),
+        ts0,
+        fill=FillSpec(0.5, 0.5),
+        direction="UP",
+        hold_minutes=30,
+        sl_mult=0.4,
+        trade_path=pd.DataFrame(trows),
+        trade_toxic={
+            "enabled": True,
+            "cut_ret": 0.25,
+            "mfe_bypass": 0.05,
+            "min_hold_seconds": 60,
+            "max_cut_seconds": 600,
+            "quote_fallback": True,
+            "quote_fallback_cut_ret": 0.20,
+        },
+    )
+    assert sim_prints is not None
+    assert sim_prints.reason != "TRADE_TOX"
+
+    sim_qf = simulate_trade(
+        pd.DataFrame(qrows),
+        ts0,
+        fill=FillSpec(0.5, 0.5),
+        direction="UP",
+        hold_minutes=30,
+        sl_mult=0.4,
+        trade_path=None,
+        trade_toxic={
+            "enabled": True,
+            "cut_ret": 0.25,
+            "mfe_bypass": 0.05,
+            "min_hold_seconds": 60,
+            "max_cut_seconds": 600,
+            "quote_fallback": True,
+            "quote_fallback_cut_ret": 0.20,
+        },
+    )
+    assert sim_qf is not None
+    assert sim_qf.reason == "TRADE_TOX"

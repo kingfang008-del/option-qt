@@ -39,7 +39,8 @@ Focus 日（相对 OFF）：
 
 ## 5. 接线
 
-**2026-07-26：已 WIRE research baseline** `trade.range_stall_gate` = RS90_FFO2_P5。
+**2026-07-26：已 WIRE research baseline** `trade.range_stall_gate` = RS90_FFO2_P5。  
+**Live：** 同日 `Mag7Scanner._entry_morph_range_stall` 在 final entry 时钟对齐 offline（与 `fo_lod` / gap stalls 一并进 live）。
 
 ### 5.1 peer_pre5 臂（清 03-16，接受强窗小回撤）
 

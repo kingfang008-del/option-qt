@@ -35,6 +35,11 @@ class TradeToxicConfig:
     # If stock adverse ret < div_stock_adverse_max, allow peak MFE < div_mfe_bypass.
     div_mfe_bypass: float | None = None
     div_stock_adverse_max: float | None = None
+    # When OPRA trade prints are missing, mark toxic on quote sell path (live parity).
+    quote_fallback: bool = False
+    # Optional dig threshold used only on the quote-fallback mark (prints missing).
+    # Do NOT apply in parallel with prints — dual-window FAIL (strong keep≈0.52).
+    quote_fallback_cut_ret: float | None = None
 
 
 def _opt_float(v: Any) -> float | None:
@@ -67,6 +72,8 @@ def trade_toxic_from_trade(trade: dict[str, Any] | None) -> TradeToxicConfig:
             quote_confirm_ret=_opt_float(qconf),
             div_mfe_bypass=_opt_float((trade or {}).get("trade_toxic_div_mfe_bypass")),
             div_stock_adverse_max=_opt_float((trade or {}).get("trade_toxic_div_stock_adverse_max")),
+            quote_fallback=bool((trade or {}).get("trade_toxic_quote_fallback", False)),
+            quote_fallback_cut_ret=_opt_float((trade or {}).get("trade_toxic_quote_fallback_cut_ret")),
         )
     max_cut = raw.get("max_cut_seconds")
     return TradeToxicConfig(
@@ -79,6 +86,8 @@ def trade_toxic_from_trade(trade: dict[str, Any] | None) -> TradeToxicConfig:
         quote_confirm_ret=_opt_float(raw.get("quote_confirm_ret")),
         div_mfe_bypass=_opt_float(raw.get("div_mfe_bypass")),
         div_stock_adverse_max=_opt_float(raw.get("div_stock_adverse_max")),
+        quote_fallback=bool(raw.get("quote_fallback", False)),
+        quote_fallback_cut_ret=_opt_float(raw.get("quote_fallback_cut_ret")),
     )
 
 
@@ -156,6 +165,44 @@ def prepare_trade_mark_arrays(
     return ts_ns, px, entry
 
 
+def prepare_quote_mark_arrays(
+    timestamps: list | np.ndarray | pd.Series,
+    sell_px: list | np.ndarray | pd.Series,
+    *,
+    entry_px: float,
+    fill_ts: pd.Timestamp,
+) -> tuple[np.ndarray, np.ndarray, float] | None:
+    """Causal quote-sell marks at/after fill (live OMS parity when prints missing).
+
+    Returns ``(ts_ns, sell_px, entry_px)`` or None.
+    """
+    entry = float(entry_px)
+    if not np.isfinite(entry) or entry <= 0:
+        return None
+    ft = pd.Timestamp(fill_ts)
+    if ft.tzinfo is None:
+        ft = ft.tz_localize(NY)
+    else:
+        ft = ft.tz_convert(NY)
+    ft_ns = int(ft.value)
+    ts_out: list[int] = []
+    px_out: list[float] = []
+    for raw_t, raw_p in zip(timestamps, sell_px):
+        t = pd.Timestamp(raw_t)
+        if t.tzinfo is None:
+            t = t.tz_localize(NY)
+        else:
+            t = t.tz_convert(NY)
+        p = float(raw_p)
+        if int(t.value) < ft_ns or (not np.isfinite(p)) or p <= 0:
+            continue
+        ts_out.append(int(t.value))
+        px_out.append(p)
+    if not ts_out:
+        return None
+    return np.asarray(ts_out, dtype=np.int64), np.asarray(px_out, dtype=float), entry
+
+
 def trade_mtm_asof(
     ts_ns: np.ndarray,
     px: np.ndarray,
@@ -197,3 +244,69 @@ def trade_peak_mfe_asof(
     if window.size == 0:
         return None
     return float(window.max() / trade_entry - 1.0)
+
+
+def trade_toxic_mfe_limit(
+    cfg: TradeToxicConfig,
+    *,
+    stock_adverse: float | None = None,
+) -> float:
+    """Effective peak-MFE bypass threshold (includes stock-divergence soft MFE)."""
+    mfe_lim = float(cfg.mfe_bypass)
+    if (
+        cfg.div_mfe_bypass is not None
+        and cfg.div_stock_adverse_max is not None
+        and stock_adverse is not None
+        and np.isfinite(float(stock_adverse))
+        and float(stock_adverse) < float(cfg.div_stock_adverse_max)
+    ):
+        mfe_lim = max(mfe_lim, float(cfg.div_mfe_bypass))
+    return mfe_lim
+
+
+def trade_toxic_in_cut_window(
+    held_seconds: float,
+    cfg: TradeToxicConfig,
+    *,
+    bypass_max_cut: bool = False,
+) -> bool:
+    """True when held long enough and still inside the asymmetric cut window."""
+    if held_seconds < float(cfg.min_hold_seconds or 0):
+        return False
+    if bypass_max_cut:
+        return True
+    max_cut = cfg.max_cut_seconds
+    if max_cut is None:
+        return True
+    return held_seconds <= float(max_cut)
+
+
+def trade_toxic_cut_ret(
+    cfg: TradeToxicConfig,
+    *,
+    mark_source: str,
+) -> float:
+    """Resolve the toxic threshold for an OPRA print or quote-fallback mark."""
+    if (
+        str(mark_source).strip().lower() == "quote"
+        and cfg.quote_fallback
+        and cfg.quote_fallback_cut_ret is not None
+    ):
+        return float(cfg.quote_fallback_cut_ret)
+    return float(cfg.cut_ret)
+
+
+def trade_toxic_is_dig(
+    *,
+    mtm_ret: float,
+    peak_mfe: float,
+    cfg: TradeToxicConfig,
+    stock_adverse: float | None = None,
+    cut_ret: float | None = None,
+) -> bool:
+    """Core dig predicate: peak MFE below bypass and MTM ≤ −cut_ret."""
+    if not np.isfinite(float(mtm_ret)) or not np.isfinite(float(peak_mfe)):
+        return False
+    mfe_lim = trade_toxic_mfe_limit(cfg, stock_adverse=stock_adverse)
+    cut = float(cfg.cut_ret) if cut_ret is None else float(cut_ret)
+    return float(peak_mfe) < mfe_lim and float(mtm_ret) <= -cut

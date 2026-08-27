@@ -39,4 +39,6 @@ def test_merge_and_payload():
     )
     assert len(rows) == 2
     payload = build_sync_payload(rows, start="2026-05-01", end="2026-07-31", sources=["t"])
-    assert payload["dates"] == ["2026-05-20", "2026-06-17"]
+    # Macro (FOMC) stays in full-day dates; symbol earnings go to symbol_blackout.
+    assert payload["dates"] == ["2026-06-17"]
+    assert payload["symbol_blackout"] == {"2026-05-20": ["NVDA"]}

@@ -21,11 +21,19 @@ artifact 判定，不能用单元测试或 Redis replay 代替。
 
 ## 事件日禁入（开盘前）
 
-可预知宏观日（FOMC / Mag7 财报 / 巨型 IPO）在开盘前写入黑名单，当日不入场：
+可预知宏观日（FOMC / Mag7 财报 / 巨型 IPO）+ **公司新闻 hard 命中**（Finnhub company-news + Investing RSS，关键词无 LLM）在开盘前写入黑名单，当日不入场：
 
 ```bash
-# 1) 编辑日期文件（JSON dates 列表）
-#    maga7/CONFIG/event_calendar_live.json
+# 0) 推荐：一键流程（sync + 今日禁入摘要 + 启动）
+cd maga7/SHELL
+./run_maga7_live_flow.sh                 # shadow
+./run_maga7_live_flow.sh preopen         # 只准备
+# 或拆步：
+./start_maga7_live_session.sh sync-calendar
+# 新闻完全不自动禁： MAG7_NEWS_MODE=audit ./run_maga7_live_flow.sh preopen
+# 关掉新闻拉取：     MAG7_NO_NEWS=1 ./run_maga7_live_flow.sh preopen
+
+# 1) 导出日期文件路径
 export MAG7_EVENT_CALENDAR_PATH=maga7/CONFIG/event_calendar_live.json
 
 # 2) 或 Redis（开盘前写入）
@@ -35,8 +43,15 @@ export MAG7_EVENT_CALENDAR_PATH=maga7/CONFIG/event_calendar_live.json
 # export MAG7_EVENT_BLACKOUT_TODAY=1
 ```
 
-启动后若今日命中，日志会出现 `EVENT_BLACKOUT active today=...`，OMS `day_halted`。  
-研究消融见 [`event_calendar_block_research.md`](event_calendar_block_research.md)。
+启动后：
+- **full-day** → `EVENT_BLACKOUT FULL-DAY` + OMS `day_halted`
+- **仅个股** → `EVENT_BLACKOUT SYMBOL symbols=[...]`，OMS **不停全日**，Scanner 只跳过这些标的
+
+研究消融见 [`event_calendar_block_research.md`](event_calendar_block_research.md)。  
+新闻规则见 [`event_calendar_full_day.md`](event_calendar_full_day.md) §Phase C。
+
+开盘前建议在 dash **Event News** 核对；驳回误杀写入 `event_news_suppress.json`。  
+每天跑 `sync-calendar` 拉取财报+新闻（不是只靠研究 curated 那几天）。
 
 ## 盘前一天流式对拍（开盘前 / 改代码后）
 
@@ -89,10 +104,15 @@ python -m maga7.tools.run_live_session \
   --profile "$PROFILE" \
   --mode shadow \
   --scheme m5_circuit \
+  --prelock-time auto \
   --lock-time 09:30 \
   --end-time 15:55 \
   --redis-db 0
 ```
+
+`--prelock-time auto` 会在最终锁定前10分钟预取期权链与合约详情；09:30只读取首个
+RTH股票价格、选择ATM/OTM并qualify所选合约。这样保持09:30开盘锁的因果口径，
+同时避免在A窗开始后才下载整条期权链。`off`仅用于旧单阶段行为对照。
 
 
 Shadow 不发券商订单，但使用同一实时行情、锁约、Scanner、限价模型和退出状态机。

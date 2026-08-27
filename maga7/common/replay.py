@@ -39,6 +39,7 @@ from maga7.common.option_trades import (
     prepare_trade_mark_arrays,
     trade_mtm_asof,
     trade_peak_mfe_asof,
+    trade_toxic_cut_ret,
     trade_toxic_from_trade,
 )
 from maga7.common.scale_in import (
@@ -62,6 +63,16 @@ from maga7.common.vrp_prior import (
     build_vrp_day_table,
     parse_vrp_size_scale,
     resolve_vrp_size_scale,
+)
+from maga7.common.climate_prior import (
+    load_climate_day_table,
+    parse_climate_prior,
+    resolve_climate_prior,
+)
+from maga7.common.session_risk_budget import (
+    current_drawdown,
+    parse_session_risk_budget,
+    resolve_session_risk_budget,
 )
 from maga7.common.from_open_gate import (
     parse_from_open_gate,
@@ -107,6 +118,7 @@ from maga7.common.delta_time_stop import (
     delta_time_stop_from_trade,
     morning_r5_scale_from_trade,
     roi_time_stop_from_trade,
+    stock_rev_applies_to_route,
     stock_rev_day_should_arm,
     stock_rev_exit_from_trade,
 )
@@ -737,6 +749,8 @@ def simulate_trade(
     hold_extend_require_stock: bool = False,
     hold_extend_stock_min: float = 0.0,
     hold_extend_min_peak_mfe: float | None = None,
+    hold_extend_max_giveback: float | None = None,
+    hold_extend_giveback_min_peak: float | None = None,
     hold_extend_max_qqq_adverse: float | None = None,
     stale_cut_minutes: float | None = None,
     stale_cut_mtm_max: float = 0.0,
@@ -821,6 +835,8 @@ def simulate_trade(
         extend deadline to ``hold_extend_minutes`` (default 45). Rails still apply.
         Optional feature gates (default off): ``hold_extend_require_stock`` /
         ``hold_extend_stock_min``, ``hold_extend_min_peak_mfe``,
+        ``hold_extend_max_giveback`` / ``hold_extend_giveback_min_peak``
+        (refuse extend when peak−MTM giveback is too large),
         ``hold_extend_max_qqq_adverse``. Mid-hold ``stale_cut_minutes`` can flatten
         losers early (MTM≤``stale_cut_mtm_max`` and stock≤``stale_cut_stock_max``)
         without abolishing the T30 clock for healthy trades.
@@ -991,6 +1007,14 @@ def simulate_trade(
     ext_stock_min = float(hold_extend_stock_min)
     ext_min_peak = (
         float(hold_extend_min_peak_mfe) if hold_extend_min_peak_mfe is not None else None
+    )
+    ext_max_giveback = (
+        float(hold_extend_max_giveback) if hold_extend_max_giveback is not None else None
+    )
+    ext_giveback_min_peak = (
+        float(hold_extend_giveback_min_peak)
+        if hold_extend_giveback_min_peak is not None
+        else 0.0
     )
     ext_max_qqq_adv = (
         float(hold_extend_max_qqq_adverse)
@@ -1318,6 +1342,12 @@ def simulate_trade(
                 peak_ok = True
                 if ext_min_peak is not None:
                     peak_ok = bool(np.isfinite(peak_ret) and float(peak_ret) >= ext_min_peak)
+                giveback_ok = True
+                if ext_max_giveback is not None and np.isfinite(peak_ret):
+                    peak_v = float(peak_ret)
+                    if peak_v >= float(ext_giveback_min_peak):
+                        giveback = peak_v - float(cur_ret)
+                        giveback_ok = giveback < float(ext_max_giveback)
                 qqq_ok = True
                 if ext_max_qqq_adv is not None and qqq_day is not None:
                     fired, _signed = qqq_adverse_from_entry(
@@ -1329,7 +1359,14 @@ def simulate_trade(
                         bar_delay_seconds=int(stock_bar_delay_seconds),
                     )
                     qqq_ok = not bool(fired)
-                if mtm_ok and mf_ok and stock_ok and peak_ok and qqq_ok:
+                if (
+                    mtm_ok
+                    and mf_ok
+                    and stock_ok
+                    and peak_ok
+                    and giveback_ok
+                    and qqq_ok
+                ):
                     extended = True
                     end_ts = ext_end
                     continue
@@ -1432,12 +1469,10 @@ def simulate_trade(
             in_cut_window = t >= trade_cut_until and (
                 trade_cut_deadline is None or t <= trade_cut_deadline
             )
-            cut_lim = float(ttox.cut_ret)
-            if (
-                trade_mark_source == "quote"
-                and ttox.quote_fallback_cut_ret is not None
-            ):
-                cut_lim = float(ttox.quote_fallback_cut_ret)
+            cut_lim = trade_toxic_cut_ret(
+                ttox,
+                mark_source=str(trade_mark_source or "print"),
+            )
             mfe_lim = float(ttox.mfe_bypass)
             if adv_armed:
                 cut_lim = min(cut_lim, float(adv.tight_cut_ret))
@@ -1687,6 +1722,14 @@ def run_offline_replay(
     n_dvol_size_boost = 0
     vrp_size_cfg = parse_vrp_size_scale(trade.get("vrp_size_scale"))
     n_vrp_size_scale = 0
+    climate_prior_cfg = parse_climate_prior(
+        trade.get("climate_prior") or profile.get("climate_prior")
+    )
+    n_climate_prior_scale = 0
+    session_budget_cfg = parse_session_risk_budget(
+        trade.get("session_risk_budget") or profile.get("session_risk_budget")
+    )
+    n_session_budget_scale = 0
     n_vrp_skip = 0
     from_open_cfg = parse_from_open_gate(trade.get("from_open_gate"))
     n_from_open_block = 0
@@ -2054,6 +2097,14 @@ def run_offline_replay(
             )
         except Exception:
             vrp_day_table = None
+
+    climate_day_table = None
+    if climate_prior_cfg.enabled:
+        climate_day_table = load_climate_day_table(
+            climate_prior_cfg.dataset,
+            start=str(start),
+            end=str(end),
+        )
 
     def _mf_idio_armed(loss_streak_n: int) -> bool:
         if not mf_idio_on:
@@ -2470,6 +2521,8 @@ def run_offline_replay(
         hold_extend_require_stock=bool(trade.get("hold_extend_require_stock", False)),
         hold_extend_stock_min=float(trade.get("hold_extend_stock_min", 0.0) or 0.0),
         hold_extend_min_peak_mfe=trade.get("hold_extend_min_peak_mfe"),
+        hold_extend_max_giveback=trade.get("hold_extend_max_giveback"),
+        hold_extend_giveback_min_peak=trade.get("hold_extend_giveback_min_peak"),
         hold_extend_max_qqq_adverse=trade.get("hold_extend_max_qqq_adverse"),
         stale_cut_minutes=trade.get("stale_cut_minutes"),
         stale_cut_mtm_max=float(trade.get("stale_cut_mtm_max", 0.0) or 0.0),
@@ -3105,13 +3158,27 @@ def run_offline_replay(
                 continue
 
             peer_n = None
+            peer_n_range_stall = None
             si_val = None
             pe_val = None
             pe_ma_val = None
             skip_peer = bool(
                 is_hunt and watchdog is not None and watchdog.cfg.hunter_skip_peer
             )
-            if (not skip_peer) and peer_align_min_i is not None and peer_align_min_i > 0:
+            # Hunt may skip peer_align_min / peer_gap peer_n. Optionally compute a
+            # separate peer for range_stall only (hunt_peer_align) so peer_gap is
+            # not side-effected (07-01 META was a false peer_gap kill).
+            need_peer_for_min = (
+                (not skip_peer)
+                and peer_align_min_i is not None
+                and peer_align_min_i > 0
+            )
+            need_peer_for_hunt_rs = bool(
+                is_hunt
+                and range_stall_cfg.enabled
+                and bool(getattr(range_stall_cfg, "hunt_peer_align", False))
+            )
+            if need_peer_for_min:
                 peer_n = count_peer_align(
                     stock_by,
                     date=str(date),
@@ -3124,6 +3191,16 @@ def run_offline_replay(
                 if peer_n < peer_align_min_i:
                     n_peer_block += 1
                     continue
+            if need_peer_for_hunt_rs:
+                peer_n_range_stall = count_peer_align(
+                    stock_by,
+                    date=str(date),
+                    asof_ts=feature_ts,
+                    direction=str(direction),
+                    peer_symbols=peer_symbols,
+                    mode=peer_align_mode,
+                    streak_min=int(sig_cfg.get("streak_min", 8)),
+                )
 
             if not is_hunt and not _mf_idio_allows_entry(
                 sym, direction, feature_ts, str(date), loss_streak_n=loss_streak
@@ -3419,14 +3496,34 @@ def run_offline_replay(
 
             # Range-chase + pre5 stall: measure at final entry clock (after confirms).
             # feature_ts often still has positive pre5; stall appears by entry_ts.
+            # Hunt: optional floor at signal_deadline (quotes often start ~10:00).
             if range_stall_cfg.enabled:
+                rs_asof = to_ny(ts)
+                rs_peer = peer_n
+                if is_hunt and bool(getattr(range_stall_cfg, "hunt_peer_align", False)):
+                    rs_peer = peer_n_range_stall
+                    asof_mode = str(getattr(range_stall_cfg, "hunt_asof", None) or "").strip()
+                    if asof_mode:
+                        tod = asof_mode
+                        if asof_mode in {"signal_deadline", "deadline", "wash_end"}:
+                            tod = (
+                                str(getattr(watchdog.cfg, "hunter_signal_deadline", "10:00"))
+                                if watchdog is not None
+                                else "10:00"
+                            )
+                        try:
+                            floor = pd.Timestamp(f"{date} {tod}", tz=rs_asof.tz)
+                            if rs_asof < floor:
+                                rs_asof = floor
+                        except Exception:
+                            pass
                 rs = resolve_range_stall_gate(
                     range_stall_cfg,
                     stock_df=stock_by.get(sym),
                     date=str(date),
-                    asof_ts=ts,
+                    asof_ts=rs_asof,
                     direction=str(direction),
-                    peer_n=peer_n,
+                    peer_n=rs_peer,
                 )
                 if not rs.allow:
                     n_range_stall_block += 1
@@ -3434,6 +3531,9 @@ def run_offline_replay(
                 if abs(float(rs.size_scale) - 1.0) > 1e-12:
                     range_stall_size_mult = float(rs.size_scale)
                     n_range_stall_scale += 1
+                if is_hunt and rs_peer is not None and peer_n is None:
+                    # Surface Hunt RS peer on the trade row without enabling peer_min.
+                    peer_n = rs_peer
 
             # Seat quality gate: low score skips without consuming the daily TopK slot.
             _is_topk_member = (
@@ -3638,6 +3738,13 @@ def run_offline_replay(
                 if "exit_mode" in hov:
                     exit_mode = str(hov.pop("exit_mode"))
                 sim_kw.update(hov)
+            # Route filter after hunt/fast-pack overrides (hunt_only STOCK_REV etc.).
+            route_name = "hunt" if is_hunt else "baseline"
+            srev_for_trade = sim_kw.get("stock_rev_exit")
+            if isinstance(srev_for_trade, StockRevExitConfig) and not stock_rev_applies_to_route(
+                srev_for_trade, route_name
+            ):
+                sim_kw["stock_rev_exit"] = StockRevExitConfig(enabled=False)
             tpath = get_trade_path(sym, date, ticker)
             if use_trade_toxic_global:
                 if tpath is not None and not tpath.empty:
@@ -3741,6 +3848,12 @@ def run_offline_replay(
                                     pack=fast_pack_cfg,
                                 )
                             )
+                        vic_route = str(old_row.get("route") or "baseline").strip().lower() or "baseline"
+                        srev_v = sim_v_kw.get("stock_rev_exit")
+                        if isinstance(srev_v, StockRevExitConfig) and not stock_rev_applies_to_route(
+                            srev_v, vic_route
+                        ):
+                            sim_v_kw["stock_rev_exit"] = StockRevExitConfig(enabled=False)
                         sim_v = simulate_trade(
                             vic_path,
                             old_row["entry_ts"],
@@ -3896,6 +4009,27 @@ def run_offline_replay(
                     size_frac = float(size_frac) * float(vrp_scale)
                     size_reason = f"{size_reason}+{vrp_reason}"
                     n_vrp_size_scale += 1
+            if climate_prior_cfg.enabled:
+                cl_scale, cl_reason = resolve_climate_prior(
+                    climate_prior_cfg, date=str(date), day_table=climate_day_table
+                )
+                if cl_scale <= 0.0:
+                    continue
+                if abs(float(cl_scale) - 1.0) > 1e-12:
+                    size_frac = float(size_frac) * float(cl_scale)
+                    size_reason = f"{size_reason}+{cl_reason}"
+                    n_climate_prior_scale += 1
+            if session_budget_cfg.enabled:
+                bud_scale, bud_reason = resolve_session_risk_budget(
+                    session_budget_cfg,
+                    current_dd=current_drawdown(eq, peak),
+                )
+                if bud_scale <= 0.0:
+                    continue
+                if abs(float(bud_scale) - 1.0) > 1e-12:
+                    size_frac = float(size_frac) * float(bud_scale)
+                    size_reason = f"{size_reason}+{bud_reason}"
+                    n_session_budget_scale += 1
             if from_open_cfg.enabled and abs(float(from_open_size_mult) - 1.0) > 1e-12:
                 size_frac = float(size_frac) * float(from_open_size_mult)
                 size_reason = f"{size_reason}+from_open:{from_open_size_mult:.2f}"
@@ -4308,6 +4442,11 @@ def run_offline_replay(
         "vrp_size_scale_mode": vrp_size_cfg.mode if vrp_size_cfg.enabled else None,
         "n_vrp_size_scale": int(n_vrp_size_scale),
         "n_vrp_skip": int(n_vrp_skip),
+        "climate_prior_enabled": bool(climate_prior_cfg.enabled),
+        "n_climate_prior_scale": int(n_climate_prior_scale),
+        "session_risk_budget_enabled": bool(session_budget_cfg.enabled),
+        "session_risk_budget_mode": session_budget_cfg.mode if session_budget_cfg.enabled else None,
+        "n_session_budget_scale": int(n_session_budget_scale),
         "n_size_full": int(n_size_full),
         "n_size_split": int(n_size_split),
         "n_skip_max_concurrent": int(n_skip_max_concurrent),

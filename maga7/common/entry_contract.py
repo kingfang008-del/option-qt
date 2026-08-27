@@ -135,9 +135,16 @@ def resolve_entry_contract(
     moneyness: str,
     sig_ts,
     spot: float | None,
+    prefer_dte: int | None = None,
+    allowed_dte: list[int] | tuple[int, ...] | None = None,
 ) -> EntryContract:
     bid = BUCKET_MAP[(direction, moneyness)]
     mode = books.mode
+    prefer = int(books.prefer_dte if prefer_dte is None else prefer_dte)
+    if allowed_dte is not None:
+        allowed = [int(x) for x in allowed_dte] or [0, 1, 2]
+    else:
+        allowed = list(books.allowed_dte or [0, 1, 2])
 
     if mode in ("open_lock", "open", "open_ladder", "open_lock_ladder"):
         by_dte = books.multi_idx.get((symbol, date)) if books.multi_idx else None
@@ -146,8 +153,8 @@ def resolve_entry_contract(
             direction=direction,
             moneyness=moneyness,
             spot=spot,
-            prefer_dte=books.prefer_dte,
-            allowed_dte=books.allowed_dte or [0, 1, 2],
+            prefer_dte=prefer,
+            allowed_dte=allowed,
             clear_otm_thresh=books.clear_otm_thresh,
             ladder=books.ladder or mode in ("open_ladder", "open_lock_ladder"),
             otm_rungs=books.otm_rungs,
@@ -178,8 +185,8 @@ def resolve_entry_contract(
             sig_ts=sig_ts,
             spot=spot,
             day_lock_ticker=day_ticker,
-            prefer_dte=books.prefer_dte,
-            allowed_dte=books.allowed_dte or [0, 1, 2],
+            prefer_dte=prefer,
+            allowed_dte=allowed,
             fallback_day_lock=True,
         )
         if pick is None:
@@ -188,8 +195,11 @@ def resolve_entry_contract(
         dte = pick.dte if pick.dte >= 0 else None
         source = pick.source
         strike = pick.strike if np.isfinite(pick.strike) else strike_from_occ(ticker)
+        # Clear-OTM 0DTE skip only when 1DTE+ is still allowed by the caller.
+        allow_skip0 = any(int(d) >= 1 for d in allowed)
         if (
-            books.clear_otm_thresh is not None
+            allow_skip0
+            and books.clear_otm_thresh is not None
             and dte == 0
             and spot is not None
             and strike is not None
@@ -204,7 +214,7 @@ def resolve_entry_contract(
                 spot=spot,
                 day_lock_ticker=day_ticker,
                 prefer_dte=1,
-                allowed_dte=[d for d in (books.allowed_dte or [1, 2]) if int(d) >= 1] or [1, 2],
+                allowed_dte=[d for d in allowed if int(d) >= 1] or [1, 2],
                 fallback_day_lock=False,
             )
             if pick2 is not None:

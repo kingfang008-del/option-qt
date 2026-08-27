@@ -38,6 +38,9 @@ def _fake_redis():
         def delete(self, *args):
             return self
 
+        def set(self, *args, **kwargs):
+            return True
+
         def hset(self, *args, **kwargs):
             return self
 
@@ -146,6 +149,46 @@ def test_fault_exit_gap_force_flatten_after_hold_ticks():
             last_good_mid=good, mid=1.5, gap_hold_count=hold, cfg=cfg
         )
     assert status == "gap_force" and hold == 3
+
+
+def test_fault_oms_gap_hold_then_flattens_093_to_070(tmp_path):
+    """A large quote jump may be held briefly, but cannot leave risk open indefinitely."""
+    oms, events = _oms(tmp_path)
+    now = time.time()
+    oms.positions["NVDA"] = LivePosition(
+        symbol="NVDA",
+        contract="NVDA260717C00100000",
+        con_id=1,
+        direction="UP",
+        qty=1,
+        entry_price=0.93,
+        entry_ts=now - 180,
+        signal_ts=now - 190,
+        rank=1,
+        qty_frac=0.2,
+        entry_bid=0.91,
+        entry_ask=0.94,
+        last_bid=0.91,
+        last_ask=0.94,
+        last_good_mid=0.93,
+    )
+    oms.connector.option_quotes[("NVDA", "NVDA260717C00100000")] = {
+        "bid": 0.69,
+        "ask": 0.74,
+        "ts": now,
+    }
+    oms.evaluate_exits(now)
+    assert "NVDA" in oms.positions
+    assert oms.positions["NVDA"].gap_hold_count == 1
+    oms.evaluate_exits(now + 0.1)
+    assert "NVDA" in oms.positions
+    assert oms.positions["NVDA"].gap_hold_count == 2
+    oms.evaluate_exits(now + 0.2)
+    assert "NVDA" not in oms.positions
+    assert any(
+        kind == "POSITION_CLOSE" and payload.get("reason") == "GAP_FLATTEN"
+        for kind, payload in events
+    )
 
 
 def test_fault_adverse_fill_buy_through_ask():

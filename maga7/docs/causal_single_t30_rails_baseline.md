@@ -61,6 +61,53 @@ python -m maga7.tools.run_replay_offline \
 
 ---
 
+## 2.3 秒级事实源重扫（2026-07-24）
+
+旧数字来自预聚合 1m `stock_root`。现用 `/mnt/s990/data/raw_1s/stocks` → 1s 聚成左标签 1m + `delay=60s`，纯 **T+30**，网格重扫 Rule-A：
+
+```bash
+PYTHONPATH=. python -m maga7.tools.run_t30_sensitivity_stock1s \
+  --tag research_t30_sensitivity_stock1s_dual
+```
+
+| 项 | 结果 |
+|----|------|
+| 网格 | streak∈{6,8,10} × fp∈{1.5,2,2.5}% × vz∈{0.5,1,1.5} × peer=3（27 格） |
+| 双窗 PASS | **12** |
+| **最优（calmar_min）** | **仍是冻结基线** `s8 / fp2% / vz1.0 / peer3` |
+| 1s 上基线 | Jan–Mar **+181.6% / −25.1%**（n=71）；May–Jul **+457.0% / −22.2%**（n=80） |
+| 次优 | `s6/fp2%/vz1`、`s10/fp2%/vz1`（同 fp+vz，略松/略紧 streak） |
+
+产物：`maga7/results/research_t30_sensitivity_stock1s_dual/`。  
+**裁决：** 秒级重扫 **确认** 原 Rule-A 门槛（8 / 2% / 1.0 / peer3）仍为双窗最优；不必因换 1s 源改冻结阈值。May–Jul 绝对收益与旧 1m 缓存数字不可逐点对比（日期截止与数据源不同），以相对排序为准。
+
+### 2.3b HF bar 时钟（5s / 15s）— REJECT 升线
+
+同一入场语义挂到 1s→5s/15s K 线（`wall_eq` 墙钟等价 + `hf_*` 短口袋）：双窗最优仍是 **60s/1m**；5s 仅 `hf_1m+H30` 弱通过，15s 全部 FAIL。产物：`maga7/results/research_t30_hf_bars_stock1s_dual/`。
+
+### 2.4 出场 rails 消融（tp / sl / hold）— KEEP_BASELINE（2026-07-24）
+
+入场冻结（s8 / fp2% / vz1 / peer3，1s→1m，`delay=60`），只扫期权价格轨：
+
+```bash
+PYTHONPATH=. python -m maga7.tools.run_t30_exit_rails_stock1s \
+  --tag research_t30_exit_rails_stock1s_dual
+```
+
+| 项 | 结果 |
+|----|------|
+| 网格 | tp∈{1.4,1.6,2.0,2.5} × sl∈{0.35,0.4,0.5,0.65} × H∈{20,30,45}（48 格） |
+| 双窗 PASS | **44** |
+| **最优 dual_calmar_min** | **仍是冻结** `tp1.6 / sl0.4 / H30`（JM +181.6%/−25.1%；MJ +457.0%/−22.2%） |
+| 次近邻 | `tp1.6/sl0.35/H30`、`tp1.6/sl0.5/H30`（略紧/略松止损，calmar 略差） |
+| 放宽 TP（2.0/2.5）或 H45 | MJ 有时更高，但 JM calmar 明显掉 → **不升线** |
+| 紧 TP（1.4） | MJ 胜率可到 ~62%，但双窗收益/calmar 劣于基线 |
+
+产物：`maga7/results/research_t30_exit_rails_stock1s_dual/`。  
+**裁决：`KEEP_BASELINE`** — 在因果 quote 账本上，出场 rails 的全局最优点仍是 **TP×1.6 / SL×0.4 / T+30**；邻域微调不值得改冻结剖面。
+
+---
+
 ## 3. 为何升格 peer_min3（而不是 SI/PE/动态退出）
 
 同 delay=60 消融结论：

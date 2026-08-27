@@ -105,7 +105,7 @@ python -m maga7.tools.run_stream_parity \
 明细：`results/parity_l1_watchdog_*`；工程说明见 `replay_stream_parity.md`。  
 下一步：观测 L1 触发率（P1.2）+ 假阳性回顾（P1.3）。Hunter 仍 off。
 
-L1 已进 research_baseline；Hunter 仍保持 off 直至 P2/OOS。
+L1 已进 research_baseline；L2 Hunt 亦已进（见 P2 / baseline 文档）。新开仓形态走 P4.1 窄专家注册表，勿再拧 L0。
 
 ---
 
@@ -137,15 +137,14 @@ v2 已修「占坑挡反向」；残余问题是 **假收回本身仍亏**（如
 
 ## 5. P3 — Live / 工程对齐
 
-| # | 动作 |
-|---|------|
-| P3.1 | Scanner：与 replay 一致注入 Hunt 候选（现偏弱） |
-| P3.2 | OMS：`event_source=hunt` 进 exec meta；仓位与 Degrade scale 对齐 |
-| P3.3 | Dash：Board 增加 Watchdog 日状态 / Hunt 笔数 |
-| P3.4 | 日终：`daily.csv` 级对拍 Shadow vs Offline（L1 先、L2 后） |
+| # | 动作 | 2026-07-24 |
+|---|------|------------|
+| P3.1 | Scanner Hunt 注入 | **已做**（`_schedule_hunts` / `drain_hunts`；见 checklist） |
+| P3.2 | OMS：`event_source=hunt` + Hunt `position_frac` | **已补**（POSITION_OPEN 字段；meta.position_frac→`_size`） |
+| P3.3 | Dash Watchdog / Hunt 卡 | **已补**（`load_watchdog_hunt`） |
+| P3.4 | 日终 session vs offline Hunt | **工具** `run_hunt_session_eod_align`；待 Shadow 实跑 |
 
-无 P3，研究数字不能当实盘预期。
-
+无 Shadow 证据前，研究数字仍不能当实盘预期。
 ---
 
 ## 6. P4 — 扩池与新专家（可选）
@@ -158,6 +157,17 @@ v2 已修「占坑挡反向」；残余问题是 **假收回本身仍亏**（如
 | 洗盘→reclaim 变体 | 新 `detector=` 名，默认 off，走 scoreboard |
 | 与事件日历联动 | Halt/Hunt 在事件日额外收缩，不改 L0 信号 |
 
+### P4.1 窄形态专家注册表（2026-07-24 升级）
+
+见 [`narrow_expert_routing_upgrade.md`](narrow_expert_routing_upgrade.md) · `CONFIG/narrow_experts/catalog_v1.json`。
+
+| 状态 | 含义 |
+|------|------|
+| 脊骨已挂 | L1 degrade/halt + L2 Hunt washout_reclaim（research_baseline） |
+| 研究队列 | `core_dn_sync`（trades PASS / **quote REJECT**）、AM delayed/HF sleeves |
+| 纪律 | 默认基线；开仓类专家必须 quote 双窗 PASS 才接线；禁止拧 L0 追近端 |
+
+下一刀：Live 对齐 Hunt（P3）；`core_dn_sync` 已做 quote 覆盖诊断 → **仍 REJECT**（lag 稀疏 + FillSpec sync 杀边；放宽 lag 双窗仍亏）。不是再开 AM 秒级主策略。
 ---
 
 ## 7. 建议执行节奏
@@ -200,5 +210,5 @@ P0.1–P0.2、P1.0–P1.1、P2 升线闸门、旧 L2 并入 `peer3_v1` — 见 [
 
 ## 9. 一句话路线
 
-**研究基线已是 L0+L1+L2；下一刀是 Live 对齐 → Hunt 日预算 → 敏感度，不拧信号旋钮。**  
-详见 [`l2_next_acceptance_checklist.md`](l2_next_acceptance_checklist.md)。
+**研究基线已是 L0+L1+L2；下一刀是 Live 对齐 → Hunt 日预算 → 窄专家 quote 闸（CORE DN sync），不拧 L0 信号旋钮。**  
+详见 [`l2_next_acceptance_checklist.md`](l2_next_acceptance_checklist.md) · [`narrow_expert_routing_upgrade.md`](narrow_expert_routing_upgrade.md)。

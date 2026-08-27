@@ -96,7 +96,7 @@ def _stream_day(
 
     _orig_emit = sc._emit_am_pulse_lane
 
-    def _wrap_emit(lane: str, alert: Any) -> ScannerSignal | None:
+    def _wrap_emit(lane: str, alert: Any, *, decision_ts=None):
         route = "am_pulse_extension" if lane == "am_pulse_extension" else "am_pulse"
         row = {
             "date": str(alert.date),
@@ -113,10 +113,13 @@ def _stream_day(
             "dte": None,
             "skip_reason": "",
         }
-        sig = _orig_emit(lane, alert)
+        outcome = _orig_emit(lane, alert, decision_ts=decision_ts)
+        sig = getattr(outcome, "signal", None)
+        if isinstance(outcome, ScannerSignal):
+            # Backward compatible if emit still returned a bare signal.
+            sig = outcome
         if sig is None:
-            # Infer common skip: no contract left pending empty; blackout counted in skip.
-            row["skip_reason"] = "emit_none"
+            row["skip_reason"] = str(getattr(outcome, "skip_reason", None) or "emit_none")
         else:
             row["emitted"] = True
             row["contract"] = str(sig.contract or "")
@@ -137,7 +140,7 @@ def _stream_day(
                 }
             )
         scout_rows.append(row)
-        return sig
+        return outcome
 
     sc._emit_am_pulse_lane = _wrap_emit  # type: ignore[method-assign]
 

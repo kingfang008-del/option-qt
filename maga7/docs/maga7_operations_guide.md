@@ -23,15 +23,18 @@
 export PYTHONPATH=$PWD
 cd maga7/SHELL
 
-# 监控（侧栏四板）
-python ../../dash/run.py
+# 统一启停（推荐，对齐 quant_system.sh）
+./maga7_system.sh start all          # Redis + Dash + dry
+./maga7_system.sh start dash         # 只开监控
+./maga7_system.sh status
+./maga7_system.sh stop all
 
 # 盘前主检查：打一天 → trade_log → 对 offline
 ./run_day_stream_check.sh 2026-05-28
 
-# 开盘前 Shadow
+# 开盘前（也可：./maga7_system.sh preopen && ./maga7_system.sh start dry）
 ./start_maga7_live_session.sh sync-calendar
-./start_maga7_live_session.sh start shadow
+./start_maga7_live_session.sh start dry
 ```
 
 | 文档 | 内容 |
@@ -48,9 +51,10 @@ python ../../dash/run.py
 ## 1. Dashboard（看）
 
 ```bash
-export PYTHONPATH=$PWD
-python dash/run.py
+cd maga7/SHELL
+./maga7_system.sh start dash
 # http://127.0.0.1:8501
+# 或: python dash/run.py
 ```
 
 侧栏 Board：
@@ -218,7 +222,7 @@ G4 通过（由 dash / manifest 判，不是「进程没挂」）：
 - frames>0，foreign/rejected=0  
 - 有 `manifest.json` / `locks.json` / `signals.*` / `order_events.jsonl`  
 
-产物：`maga7/results/live_sessions/<date>/<session_id>/`
+产物：`/mnt/s990/data/maga7/live_sessions/<date>/<session_id>/`（可用 `MAG7_LIVE_SESSIONS_DIR` 覆盖）
 
 ### 5.3 G5 Paper
 

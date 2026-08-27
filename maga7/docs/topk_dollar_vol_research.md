@@ -42,7 +42,8 @@
 1. **「大行情 = 大成交额」观察成立，但不等于更好的 TopK 目标函数。** 成交额重排会换进更多高换手名字，却打掉 earliest 抓到的早段期权窗口。  
 2. **因果截面门控 `cs_dollar_vol`**：MaxDD 不差（May–Jul −13.0%，Feb–Apr 显著改善至 −16%），但收益腰斩级落后 earliest。  
 3. **不升格**；freeze 保持 `rank_by=earliest`。  
-4. 若继续挖流动性，更合理的是 **软特征**（确认 / size scale），而不是用成交额替换时间序 TopK。
+4. 若继续挖流动性，更合理的是 **软特征**（确认 / size scale），而不是用成交额替换时间序 TopK。  
+5. **2026-07-23 S1 复验**：`dollar_vol` / `cs_dollar_vol` 仍 `REJECT_FOR_BASELINE`；软加仓 `trade.dvol_size_scale` 双窗过线（`PROMOTE_LIQ_RESEARCH`）但不改座位、不修 07-22 NVDA 漏抓 —— 见 [`dvol_liq_soft_research.md`](dvol_liq_soft_research.md)。
 
 ## 复跑
 

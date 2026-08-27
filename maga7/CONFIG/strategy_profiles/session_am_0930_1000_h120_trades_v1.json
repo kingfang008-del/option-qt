@@ -1,0 +1,61 @@
+{
+  "profile": "session_am_0930_1000_h120_trades_v1",
+  "profile_id": "session_am_0930_1000_h120_trades_v1",
+  "description": "VOID 2026-07-24: tuned on left-label 1m look-ahead. Clean stock_1s May–Jul rescan is -EV for H120/MF. Do not live/dry. See docs/sleeve_portfolio_research.md.",
+  "role": "research_sleeve_void",
+  "void": true,
+  "void_reason": "1m_left_label_lookahead; clean_1s_may_jul_reject",
+  "sleeve": "AM",
+  "result_tag": "research_session_am_h120_trades_v1",
+  "research_revision": "2026-07-23_session_h120_v1",
+  "based_on": "strategy_profiles/single_qqq_open_ladder_atm5otm_extend_mtm_full_day_peer3_v1.json",
+  "baseline_doc": "docs/sleeve_portfolio_research.md",
+  "recommended_scheme": "session_h120_trades",
+  "symbols": ["NVDA", "TSLA", "AAPL", "AMZN", "META", "MSFT", "AMD", "GOOGL"],
+  "session_sleeve": {
+    "enabled": true,
+    "session": "AM_0930_1000",
+    "signal_start": "09:30",
+    "signal_end": "10:00",
+    "lookback_sec": 60,
+    "min_abs_stock_ret": 0.0005,
+    "horizon_sec": 120,
+    "stride_sec": 120,
+    "pricing": "option_trades",
+    "trades_root": "/mnt/s990/new_option_data_s3_trades",
+    "slip": 0.01,
+    "reinforce": {
+      "require_mf": true,
+      "streak_min": 0,
+      "peer_min": 0,
+      "vol_z_min": 0.0,
+      "from_open_max": 0.0,
+      "note": "Dual-window pick: MF (mf10 same-sign). Ablation: research_session_am_reinforce_*"
+    }
+  },
+  "trade": {
+    "hold_minutes": 2,
+    "force_horizon_seconds": 120,
+    "position_frac": 0.1,
+    "max_concurrent_positions": 2,
+    "cooldown_minutes": 2,
+    "max_entries_per_symbol": 0,
+    "max_entries_per_session_day": 0,
+    "mode": "opportunity",
+    "moneyness": "ATM",
+    "contract_mode": "open_ladder",
+    "ladder_otm_rungs": 3,
+    "quote_source": "trades"
+  },
+  "lock": {
+    "prefer_dte": 0,
+    "allowed_dte": [0, 1, 2]
+  },
+  "portfolio": {
+    "budget_frac": 0.15,
+    "mutex_vs_core": "hard_tod",
+    "flatten_before": "10:00",
+    "note": "Ends before CORE; trades pricing for early RTH quote gaps."
+  },
+  "note": "Accept: tools/run_session_h120_trades_accept.py"
+}

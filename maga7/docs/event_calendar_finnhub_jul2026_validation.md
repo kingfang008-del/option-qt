@@ -41,6 +41,8 @@ python maga7/tools/sync_event_calendar.py \
 - **NVDA / AMD** 在 7 月窗无财报行（可能在 8 月或未排期）。  
 - 与研究 `full_day` 7 日名单：**无交集**（full_day 覆盖的是 5–6 月事件；7 月是向前 live 日历）。
 
+**2026-07-26 补丁：** 当时写入的 `CONFIG/event_calendar_live.json`（generated 07-20）**漏了** 07-22 TSLA/GOOGL。已手工并入 `symbol_blackout` + `events`（`earnings_ah`），并写入 `event_calendar_manual.json` 以免下次 sync 冲掉；peer3 同步加了 `trade.event_symbol_blackout`（offline 不读 live 文件）。**未**自动禁 07-23（AH+1 / 长波动 sleeve 仍研究中）。
+
 ## Free 档限制（已实测）
 
 | 查询 | 结果 |

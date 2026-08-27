@@ -58,42 +58,61 @@ def _norm_ts(s: pd.Series) -> pd.Series:
 
 
 def _compare_trades(stream_df: pd.DataFrame, offline_df: pd.DataFrame) -> dict[str, Any]:
-    a = stream_df.copy()
-    b = offline_df.copy()
-    a["date"] = a["date"].astype(str)
-    b["date"] = b["date"].astype(str)
+    a = stream_df.copy() if stream_df is not None else pd.DataFrame()
+    b = offline_df.copy() if offline_df is not None else pd.DataFrame()
+    # Both flat → PASS (no-trade days).
+    if a.empty and b.empty:
+        empty = pd.DataFrame(columns=["date", "symbol", "_merge"])
+        return {
+            "stream_n": 0,
+            "offline_n": 0,
+            "matched": 0,
+            "only_stream": 0,
+            "only_offline": 0,
+            "max_abs_ret_diff": 0.0,
+            "reason_mismatch": 0,
+            "ok": True,
+            "merge": empty,
+        }
     if "direction" in a.columns and "dir" not in a.columns:
         a["dir"] = a["direction"]
     if "dir" not in b.columns and "direction" in b.columns:
         b["dir"] = b["direction"]
     keys = ["date", "symbol"]
     if "entry_ts" in a.columns and "entry_ts" in b.columns:
+        keys = ["date", "symbol", "entry_ts"]
+    for col in keys:
+        if col not in a.columns:
+            a[col] = pd.Series(dtype=object)
+        if col not in b.columns:
+            b[col] = pd.Series(dtype=object)
+    a["date"] = a["date"].astype(str)
+    b["date"] = b["date"].astype(str)
+    if "symbol" in keys:
+        a["symbol"] = a["symbol"].astype(str)
+        b["symbol"] = b["symbol"].astype(str)
+    if "entry_ts" in keys:
         a["entry_ts"] = _norm_ts(a["entry_ts"])
         b["entry_ts"] = _norm_ts(b["entry_ts"])
-        keys = ["date", "symbol", "entry_ts"]
     m = a.merge(b, on=keys, how="outer", suffixes=("_stream", "_off"), indicator=True)
     both = m[m["_merge"] == "both"]
-    delta = None
+    delta = 0.0
     ret_s = "ret_stream" if "ret_stream" in both.columns else None
     ret_o = "ret_off" if "ret_off" in both.columns else None
     if ret_s and ret_o and len(both):
         delta = float((both[ret_s] - both[ret_o]).abs().max())
-    # reason / exit clock
     reason_mismatch = 0
     if "reason_stream" in both.columns and "reason_off" in both.columns and len(both):
         reason_mismatch = int((both["reason_stream"].astype(str) != both["reason_off"].astype(str)).sum())
-    ok = bool(
-        len(both) == len(a) == len(b)
-        and delta is not None
-        and delta < 1e-9
-        and reason_mismatch == 0
-    )
+    only_stream = int((m["_merge"] == "left_only").sum())
+    only_offline = int((m["_merge"] == "right_only").sum())
+    ok = bool(only_stream == 0 and only_offline == 0 and reason_mismatch == 0 and delta < 1e-9)
     return {
         "stream_n": int(len(a)),
         "offline_n": int(len(b)),
         "matched": int(len(both)),
-        "only_stream": int((m["_merge"] == "left_only").sum()),
-        "only_offline": int((m["_merge"] == "right_only").sum()),
+        "only_stream": only_stream,
+        "only_offline": only_offline,
         "max_abs_ret_diff": delta,
         "reason_mismatch": reason_mismatch,
         "ok": ok,
@@ -103,15 +122,16 @@ def _compare_trades(stream_df: pd.DataFrame, offline_df: pd.DataFrame) -> dict[s
 
 def _run_local(profile: dict, start: str, end: str, scheme: str, out_dir: Path) -> dict[str, Any]:
     runner = Mag7OmsDryRunner(profile)
+    # 1m research bars + lookback (same stock frames as offline). Fills still use 1s quotes.
     scanner = _drive_interleaved(
-        profile, start, end, ingest="1s", scheme=scheme, runner=runner
+        profile, start, end, ingest="1m", scheme=scheme, runner=runner
     )
     write_signal_audit(scanner.signals, out_dir / "signals.jsonl")
     summary = runner.finalize_summary()
     summary.update(
         {
-            "mode": "DAY_STREAM_LOCAL_1S",
-            "ingest": "stock_1s_inprocess",
+            "mode": "DAY_STREAM_LOCAL_1M",
+            "ingest": "stock_1m_lookback",
             "scheme": scheme,
             "start": start,
             "end": end,
@@ -123,7 +143,7 @@ def _run_local(profile: dict, start: str, end: str, scheme: str, out_dir: Path) 
     runner.write(out_dir)
     write_trade_log(runner.trades, out_dir)
     stream_df = pd.DataFrame([t.__dict__ for t in runner.trades])
-    return {"summary": summary, "trades": stream_df, "transport": "local_1s"}
+    return {"summary": summary, "trades": stream_df, "transport": "local_1m"}
 
 
 def _run_s5(
@@ -218,7 +238,7 @@ def main() -> int:
     use_s5 = (not args.force_local) and _redis_ok(args.redis_host, 6379, args.redis_db)
     print(
         f"==> day stream check date={start}..{end} scheme={scheme} "
-        f"transport={'redis_s5' if use_s5 else 'local_1s'}",
+        f"transport={'redis_s5' if use_s5 else 'local_1m'}",
         flush=True,
     )
 
@@ -267,7 +287,7 @@ def main() -> int:
         c = _compare_trades(stream_df, off["trades"])
         c["merge"].to_csv(out_dir / "compare_offline.csv", index=False)
         cmp = {k: v for k, v in c.items() if k != "merge"}
-        cmp["transport"] = "local_1s"
+        cmp["transport"] = "local_1m"
         cmp["out_dir"] = str(out_dir)
         ok = bool(cmp["ok"])
 

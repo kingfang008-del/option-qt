@@ -83,6 +83,31 @@ def qqq_close_at(qqq_day: pd.DataFrame | None, asof_ts: pd.Timestamp) -> float |
     return px if np.isfinite(px) and px > 0 else None
 
 
+def qqq_adverse_from_prices(
+    *,
+    entry_px: float,
+    now_px: float,
+    direction: str,
+    thresh: float,
+) -> tuple[bool, float | None]:
+    """True if QQQ moved against ``direction`` by ≥ ``thresh`` (price levels).
+
+    Live OMS uses scanner last closes; offline uses ``qqq_adverse_from_entry``.
+    Returns ``(fired, signed_qqq_ret)`` where signed_ret is +favorable to trade.
+    """
+    if thresh is None or float(thresh) <= 0:
+        return False, None
+    px0 = float(entry_px)
+    px1 = float(now_px)
+    if not (np.isfinite(px0) and np.isfinite(px1) and px0 > 0 and px1 > 0):
+        return False, None
+    raw = px1 / px0 - 1.0
+    d = str(direction).upper()
+    signed = raw if d == "UP" else -raw
+    fired = signed <= -float(thresh)
+    return bool(fired), float(signed)
+
+
 def qqq_adverse_from_entry(
     qqq_day: pd.DataFrame | None,
     *,
@@ -103,11 +128,11 @@ def qqq_adverse_from_entry(
     now_vis = pd.Timestamp(now_ts) - delay
     px0 = qqq_close_at(qqq_day, entry_vis)
     px1 = qqq_close_at(qqq_day, now_vis)
-    if px0 is None or px1 is None or px0 <= 0:
+    if px0 is None or px1 is None:
         return False, None
-    raw = px1 / px0 - 1.0
-    d = str(direction).upper()
-    # Favorable signed ret: UP wants QQQ up; DN wants QQQ down.
-    signed = raw if d == "UP" else -raw
-    fired = signed <= -float(thresh)
-    return bool(fired), float(signed)
+    return qqq_adverse_from_prices(
+        entry_px=px0,
+        now_px=px1,
+        direction=direction,
+        thresh=thresh,
+    )

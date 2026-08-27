@@ -67,7 +67,14 @@
 | Redis | `maga7:event_blackout`（JSON / CSV / SET） |
 | 强制当日 | `MAG7_EVENT_BLACKOUT_TODAY=1` |
 
-命中 → Scanner 不发信号；OMS `day_halted` + `EVENT_BLACKOUT`。
+| 范围 | 行为 |
+|---|---|
+| **full-day**（FOMC / NFP / CPI / 无 symbol 的宏观） | OMS `day_halted`，全日不入场 |
+| **symbol**（`earnings_*` / `news_*` + ticker） | **只禁该标的**；其它 Mag7 照常；OMS 不停全日 |
+
+**2026-07-26：** live 补丁 `2026-07-22` TSLA/GOOGL `earnings_ah`（Finnhub 有、07-20 sync 漏）。下次 `sync_event_calendar` 请带 manual，或核对 `symbol_blackout` 未被冲掉。
+
+Live 文件字段：`dates`=full-day；`symbol_blackout`=`{date:[SYM,…]}`；`events`=明细。
 
 运维说明：[`live_session_operations.md`](live_session_operations.md)。
 
@@ -115,9 +122,26 @@ Offline 研究复现 +673%：仍用 profile `event_calendar=default`（7 日 cur
 - 隔夜 / 盘前 **US30Y** 或 **TNX** 跳升超阈 → 当日 blackout  
 - 或 VIX 隔夜涨幅超阈  
 
-### Phase C — 新闻（可选，后置）
+### Phase C — 公司新闻（已接线，无 LLM）
 
-Headline 关键词仅作审计与补漏，不作为第一道硬门。
+开盘前 `sync_event_calendar` 默认拉取：
+
+1. **Finnhub** `company-news`（Mag7 逐票，近 5 日）  
+2. **Investing RSS**（与 `~/notebook/rss_feed/rss_feed_stable.py` 同源：`news_356.rss`）
+
+规则（见 [`event_news_policy.py`](../common/event_news_policy.py)）：
+
+| 层 | 行为 |
+|---|---|
+| 宏观 FOMC/NFP/CPI | **full-day** 禁入 |
+| Mag7 财报 | **symbol** 禁入 |
+| CEO 交接（`hard_risk`） | **symbol** 禁入 |
+| 大单/合作/capex/fab | 只审计；可选 LLM 利好/空提示 |
+| 交易方向 | **永不**由新闻/LLM 设定 |
+
+- 默认 `MAG7_NEWS_MODE=hard_risk`（`blackout` 同义）；纯打分用 `audit`  
+- Dash LLM → `event_news_llm.json`，**不进** live 黑名单  
+- 路径亏损继续靠 tox / 仓位 / 时间止损
 
 ---
 

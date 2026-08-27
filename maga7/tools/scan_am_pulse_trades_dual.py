@@ -27,6 +27,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from maga7.common.am_pulse_scout import (
+    am_pulse_decision_ts,
     load_am_pulse_lane_cfg,
     parse_am_pulse_scout,
     scan_day,
@@ -90,6 +91,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tp", default="0.10,0.15,0.20,0.25")
     ap.add_argument("--sl", default="0.12,0.15,0.20,0.25")
     ap.add_argument("--max-hold-sec", type=int, default=0, help="0 = profile am_pulse value")
+    ap.add_argument(
+        "--bar-delay-sec",
+        type=int,
+        default=60,
+        help="decision_ts = feature_ts + delay (left-labeled 1m availability)",
+    )
     ap.add_argument("--slip", type=float, default=0.01)
     ap.add_argument("--position-frac", type=float, default=0.10)
     ap.add_argument("--max-concurrent", type=int, default=2)
@@ -116,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
         if int(args.max_hold_sec) > 0
         else int(lane_cfg.get("max_hold_sec", 900) or 900)
     )
+    bar_delay_sec = max(0, int(args.bar_delay_sec))
     prefer_dte = int(lane_cfg.get("prefer_dte", 0) or 0)
     allowed_raw = lane_cfg.get("allowed_dte") or (prof.get("lock") or {}).get(
         "allowed_dte"
@@ -199,6 +207,9 @@ def main(argv: list[str] | None = None) -> int:
                         if a.arm != "FO" or a.dir not in dirs:
                             continue
                         arm_ts = to_ny(pd.Timestamp(a.ts))
+                        decision_ts = am_pulse_decision_ts(
+                            arm_ts, delay_seconds=bar_delay_sec
+                        )
                         spot = None
                         if ts_ns is not None and px is not None:
                             spot = _spot_at_arr(ts_ns, px, arm_ts)
@@ -230,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
                                 "lookback_bars": int(args.lookback_bars),
                                 "session": SESSION,
                                 "arm_ts": arm_ts,
+                                "decision_ts": decision_ts,
                                 "fav_from_open": float(a.fav_from_open),
                                 "lookback_ret": a.lookback_ret,
                                 "ticker": ticker,
@@ -259,6 +271,9 @@ def main(argv: list[str] | None = None) -> int:
                         if a.arm != "LB" or a.dir not in dirs:
                             continue
                         arm_ts = to_ny(pd.Timestamp(a.ts))
+                        decision_ts = am_pulse_decision_ts(
+                            arm_ts, delay_seconds=bar_delay_sec
+                        )
                         spot = None
                         if ts_ns is not None and px is not None:
                             spot = _spot_at_arr(ts_ns, px, arm_ts)
@@ -290,6 +305,7 @@ def main(argv: list[str] | None = None) -> int:
                                 "lookback_bars": int(args.lookback_bars),
                                 "session": SESSION,
                                 "arm_ts": arm_ts,
+                                "decision_ts": decision_ts,
                                 "fav_from_open": float(a.fav_from_open),
                                 "lookback_ret": a.lookback_ret,
                                 "ticker": ticker,
@@ -346,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
             wname = _window_of(str(arm["date"]))
             if wname is None:
                 continue
-            entry_ts = arm["arm_ts"]
+            entry_ts = arm["decision_ts"]
             hold_sec = max_hold_sec
             if flatten_before:
                 flat_ts = pd.Timestamp(
@@ -377,6 +393,7 @@ def main(argv: list[str] | None = None) -> int:
                     "symbol": arm["symbol"],
                     "dir": arm["dir"],
                     "session": arm["session"],
+                    "feature_ts": str(to_ny(arm["arm_ts"])),
                     "entry_ts": str(et),
                     "exit_ts": str(et + pd.Timedelta(seconds=sim["hold_sec"])),
                     "ticker": arm["ticker"],
@@ -466,6 +483,8 @@ def main(argv: list[str] | None = None) -> int:
         "pricing": "option_trades_last_slip",
         "dirs": sorted(dirs),
         "arms": sorted(want_arms),
+        "bar_delay_sec": int(bar_delay_sec),
+        "entry_anchor": "decision_ts=feature_ts+bar_delay_sec",
         "n_arms": int(len(arms)),
         "n_cells": int(len(cells)),
         "dual_pass_n": int(len(dual_pass)),

@@ -55,7 +55,14 @@ class LiveRegimeGate:
             self.vixy_closes.append(float(bar["close"]))
 
     def check(self, direction: str, ts) -> RegimeDecision:
+        """Match offline Mag7RegimeGate overlays used by Watchdog experts.
+
+        Honors ``block_directions`` / ``direction_size_scale`` /
+        ``scale_dn_if_qqq_above_open`` so predictive prevention actually bites
+        in shadow/live (previously these keys were ignored).
+        """
         block_missing = bool(self.cfg.get("block_on_missing", False))
+        direction_u = str(direction or "").upper()
         qfp = None
         if self.qqq_previous_close > 0 and self.qqq_close > 0:
             qfp = self.qqq_close / self.qqq_previous_close - 1.0
@@ -79,7 +86,18 @@ class LiveRegimeGate:
             if sd > 0:
                 vz = float((values[-1] - np.mean(values)) / (sd + 1e-6))
 
-        def decision(allow: bool, reason: str) -> RegimeDecision:
+        # Day-open for QQQ (first completed RTH bar of the session).
+        qqq_open = None
+        bars = getattr(self.qqq_state, "bars", None) or []
+        if bars:
+            try:
+                qqq_open = float(bars[0]["open"])
+            except Exception:
+                qqq_open = None
+
+        def decision(
+            allow: bool, reason: str, *, size_scale: float = 1.0
+        ) -> RegimeDecision:
             return RegimeDecision(
                 allow=allow,
                 reason=reason,
@@ -87,6 +105,7 @@ class LiveRegimeGate:
                 qqq_mf10=qmf,
                 vix_reversal=vrev,
                 vixy_z=vz,
+                size_scale=float(size_scale),
             )
 
         vmax = self.cfg.get("vix_reversal_max")
@@ -97,22 +116,66 @@ class LiveRegimeGate:
             if qfp is None and block_missing:
                 return decision(False, "qqq_missing")
             if qfp is not None:
-                if direction == "UP" and qfp < -eps:
+                if direction_u == "UP" and qfp < -eps:
                     return decision(False, "qqq_align_up")
-                if direction == "DN" and qfp > eps:
+                if direction_u == "DN" and qfp > eps:
                     return decision(False, "qqq_align_dn")
+
+        if bool(self.cfg.get("block_dn_if_qqq_above_open", False)) and direction_u == "DN":
+            if (
+                qqq_open is not None
+                and self.qqq_close > 0
+                and self.qqq_close > float(qqq_open)
+            ):
+                return decision(False, "qqq_above_open_dn")
+
+        block_dirs = self.cfg.get("block_directions") or ()
+        if isinstance(block_dirs, str):
+            block_dirs = [x.strip() for x in block_dirs.split(",") if x.strip()]
+        block_dirs_u = {str(x).upper() for x in block_dirs}
+        if direction_u in block_dirs_u:
+            return decision(False, f"block_dir_{direction_u.lower()}")
+
         if bool(self.cfg.get("qqq_mf10_align", False)):
             if qmf is None and block_missing:
                 return decision(False, "qqq_mf10_missing")
             if qmf is not None:
-                if direction == "UP" and qmf <= 0:
+                if direction_u == "UP" and qmf <= 0:
                     return decision(False, "qqq_mf10_up")
-                if direction == "DN" and qmf >= 0:
+                if direction_u == "DN" and qmf >= 0:
                     return decision(False, "qqq_mf10_dn")
         put_min = self.cfg.get("put_vixy_z_min")
-        if put_min is not None and direction == "DN":
+        if put_min is not None and direction_u == "DN":
             if vz is None and block_missing:
                 return decision(False, "vixy_z_missing")
             if vz is not None and vz < float(put_min):
                 return decision(False, "put_vixy_z")
-        return decision(True, "ok" if qfp is not None else "regime_missing")
+
+        scale = 1.0
+        reason = "ok" if qfp is not None else "regime_missing"
+        scale_dn_qqq = self.cfg.get("scale_dn_if_qqq_above_open")
+        if scale_dn_qqq is not None and direction_u == "DN":
+            if (
+                qqq_open is not None
+                and self.qqq_close > 0
+                and self.qqq_close > float(qqq_open)
+            ):
+                sc = max(0.0, min(float(scale_dn_qqq), 1.0))
+                if sc <= 0.0:
+                    return decision(False, "qqq_above_open_dn")
+                if sc < 1.0:
+                    scale *= sc
+                    reason = "qqq_above_open_dn_scale"
+        dir_scales = self.cfg.get("direction_size_scale") or {}
+        if isinstance(dir_scales, dict) and direction_u in dir_scales:
+            sc = max(0.0, min(float(dir_scales[direction_u]), 1.0))
+            if sc <= 0.0:
+                return decision(False, f"dir_scale_{direction_u.lower()}")
+            if sc < 1.0:
+                scale *= sc
+                reason = (
+                    f"dir_scale_{direction_u.lower()}"
+                    if reason in {"ok", "regime_missing"}
+                    else f"{reason}+dir_scale_{direction_u.lower()}"
+                )
+        return decision(True, reason, size_scale=scale)

@@ -142,6 +142,13 @@ PYTHONPATH=. python -m maga7.tools.scan_am_pulse_quote_dual \
 
 ## 亏损复盘后的 Shadow 优化（2026-07-28）
 
+- Profile 顶层 `regime.event_calendar_block` 只约束 CORE 基线；A/B 默认
+  `event_calendar_block=false`，宏观事件日不触发全局 OMS halt。若后续研究证明某个
+  sleeve 需要事件闸门，必须在对应 A/B 配置中显式 opt-in。
+- A/B 的分钟特征时间与可交易时间分离：`feature_ts` 保留分钟标签，
+  `decision_ts` 是完整分钟可用后的实际决策时间。期权报价 5 秒 lag gate 以
+  `decision_ts` 为锚，同时仍要求报价相对墙钟新鲜。入场还启用股票漂移保护：
+  决策后同向追价超过 0.3% 或反向回撤超过 0.15% 时拒绝，避免延迟盲追。
 - A：`ladder_08_03`，可成交 MTM 曾达到 +8% 后，把退出地板抬到 +3%。在冻结 126 笔账本上，Feb–Mar 与 May–Jul09 的资金收益均提高，研究最大回撤约从 −9.0% 降至 −5.1%；但配对 bootstrap 95% CI 仍跨零，因此只进入 shadow。
 - B：保留 UP-only 60 秒确认，将 `abort_thr` 从 8% 放宽至 10%。冻结 225 笔账本与当前结果逐笔对拍一致；候选在 Feb–Mar 无变化，May–Jul09 与 Jul10–23 均改善。B 不启用 A 的利润地板，因为该候选明显损害 B 总收益。
 - 已完成分钟资金流 gate 在安全的 `entry_ts−60s` 口径下不稳定；旧 post-hoc `MF1_SAME` 使用左标分钟时可能包含尚未完成的当前分钟，不作为升格证据。
